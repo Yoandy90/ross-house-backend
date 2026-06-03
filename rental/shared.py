@@ -236,9 +236,12 @@ async def send_rental_push_to_user(user_id: str, title: str, body: str, data: di
 
 
 async def send_rental_push_to_admins(title: str, body: str, data: dict = None):
-    """Send push notification to all admin users"""
+    """Send push notification to Ross House admin users only (app_users collection)"""
     db = get_db()
-    admin_users = await db.users.find(
+
+    # Only query app_users (Ross House Rentals app tokens)
+    # NOT db.users which belongs to Ross Lending/Tax app
+    admin_users = await db.app_users.find(
         {"role": "admin", "push_token": {"$exists": True, "$ne": ""}}
     ).to_list(50)
 
@@ -254,23 +257,5 @@ async def send_rental_push_to_admins(title: str, body: str, data: dict = None):
                     data=data or {}
                 )
                 logging.info(f"📱 Push sent to admin {admin.get('email', '')}: {title}")
-            except Exception as e:
-                logging.warning(f"⚠️ Push to admin error: {e}")
-
-    admin_marketplace = await db.app_users.find(
-        {"role": "admin", "push_token": {"$exists": True, "$ne": ""}}
-    ).to_list(50)
-
-    for admin in admin_marketplace:
-        push_token = admin.get("push_token", "")
-        if push_token:
-            try:
-                from push_notification_service import send_push_notification
-                await send_push_notification(
-                    expo_push_token=push_token,
-                    title=title,
-                    body=body,
-                    data=data or {}
-                )
             except Exception as e:
                 logging.warning(f"⚠️ Push to admin error: {e}")
