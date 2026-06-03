@@ -304,3 +304,142 @@ async def admin_unread_total(request: Request):
     total = result[0]["total"] if result else 0
 
     return {"success": True, "total_unread": total}
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PUBLIC CHAT ENDPOINTS (No auth required — for website visitors)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class PublicChatStartBody(BaseModel):
+    name: str
+    phone: str = ""
+    email: str = ""
+
+
+class PublicChatSendBody(BaseModel):
+    conversation_id: str
+    session_token: str
+    content: str
+
+
+@router.post("/public/start")
+async def public_start_conversation(body: PublicChatStartBody):
+    """Start a public chat conversation (no auth needed). Returns a session token."""
+    import hashlib, secrets
+    db = get_db()
+
+    if not body.name.strip():
+        raise HTTPException(status_code=400, detail="Nombre es requerido")
+
+    session_token = secrets.token_urlsafe(32)
+    token_hash = hashlib.sha256(session_token.encode()).hexdigest()
+
+    conv = {
+        "tenant_id": f"guest_{token_hash[:16]}",
+        "tenant_name": body.name.strip(),
+        "tenant_email": body.email.strip(),
+        "tenant_phone": body.phone.strip(),
+        "is_guest": True,
+        "session_token_hash": token_hash,
+        "last_message": "",
+        "last_message_at": datetime.now(timezone.utc),
+        "unread_tenant": 0,
+        "unread_admin": 0,
+        "created_at": datetime.now(timezone.utc),
+    }
+    result = await db.chat_conversations.insert_one(conv)
+    conv["_id"] = result.inserted_id
+
+    logger.info(f"Public chat started by {body.name} ({body.phone or body.email})")
+
+    return {
+        "success": True,
+        "conversation_id": str(conv["_id"]),
+        "session_token": session_token,
+    }
+
+
+@router.post("/public/send")
+async def public_send_message(body: PublicChatSendBody):
+    """Guest sends a message (verified by session token)."""
+    import hashlib
+    db = get_db()
+
+    token_hash = hashlib.sha256(body.session_token.encode()).hexdigest()
+    conv = await db.chat_conversations.find_one({
+        "_id": ObjectId(body.conversation_id),
+        "session_token_hash": token_hash,
+    })
+    if not conv:
+        raise HTTPException(status_code=403, detail="Sesión no válida")
+
+    conv_id = str(conv["_id"])
+    sender_name = conv.get("tenant_name", "Visitante")
+
+    msg = {
+        "conversation_id": conv_id,
+        "sender_type": "tenant",
+        "sender_id": conv.get("tenant_id", ""),
+        "sender_name": sender_name,
+        "message_type": "text",
+        "content": body.content.strip(),
+        "read": False,
+        "created_at": datetime.now(timezone.utc),
+    }
+    result = await db.chat_messages.insert_one(msg)
+    msg["_id"] = result.inserted_id
+
+    preview = body.content[:80]
+    await db.chat_conversations.update_one(
+        {"_id": conv["_id"]},
+        {
+            "$set": {
+                "last_message": preview,
+                "last_message_at": datetime.now(timezone.utc),
+            },
+            "$inc": {"unread_admin": 1},
+        }
+    )
+
+    try:
+        await send_rental_push_to_admins(
+            title=f"💬 {sender_name} (web)",
+            body=preview,
+            data={"type": "chat_message", "conversation_id": conv_id}
+        )
+    except Exception as e:
+        logger.warning(f"Push to admin failed: {e}")
+
+    return {"success": True, "message": serialize(msg)}
+
+
+@router.get("/public/messages")
+async def public_get_messages(conversation_id: str, session_token: str, limit: int = 50):
+    """Guest retrieves messages for their conversation."""
+    import hashlib
+    db = get_db()
+
+    token_hash = hashlib.sha256(session_token.encode()).hexdigest()
+    conv = await db.chat_conversations.find_one({
+        "_id": ObjectId(conversation_id),
+        "session_token_hash": token_hash,
+    })
+    if not conv:
+        raise HTTPException(status_code=403, detail="Sesión no válida")
+
+    conv_id = str(conv["_id"])
+    messages = await db.chat_messages.find({"conversation_id": conv_id}).sort("_id", -1).limit(limit).to_list(limit)
+    messages.reverse()
+
+    # Mark admin messages as read
+    await db.chat_messages.update_many(
+        {"conversation_id": conv_id, "sender_type": "admin", "read": False},
+        {"$set": {"read": True}}
+    )
+    await db.chat_conversations.update_one(
+        {"_id": conv["_id"]},
+        {"$set": {"unread_tenant": 0}}
+    )
+
+    return {"success": True, "messages": [serialize(m) for m in messages]}
