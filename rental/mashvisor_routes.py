@@ -1,12 +1,21 @@
 """
-Mashvisor API Integration Routes
-Real estate market data, property analysis, and investment metrics via RapidAPI
+Mashvisor API Integration Routes (with MongoDB Cache)
+=====================================================
+Real estate market data, property analysis, and investment metrics via RapidAPI.
+All API calls pass through a MongoDB caching layer to minimize RapidAPI costs.
 """
 
 from fastapi import APIRouter, HTTPException, Query
 from typing import Optional
 import httpx
 import os
+import logging
+
+from rental.mashvisor_cache import (
+    get_cached, set_cached, get_cache_stats, clear_cache,
+)
+
+logger = logging.getLogger("mashvisor")
 
 router = APIRouter(prefix="/admin/market-data", tags=["Market Data"])
 
@@ -20,8 +29,23 @@ HEADERS = {
 }
 
 
-async def _mashvisor_get(path: str, params: dict = None) -> dict:
-    """Helper to make GET requests to Mashvisor API via RapidAPI."""
+# ═══════════════════════════════════════════════════════════════════════════════
+# CORE HELPER — with cache integration
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def _mashvisor_get(path: str, params: dict = None, cache_category: str = "default") -> dict:
+    """
+    GET request to Mashvisor API with transparent MongoDB caching.
+    1. Check cache first → return if hit
+    2. Call Mashvisor API on miss
+    3. Store response in cache for next caller
+    """
+    # ── 1. Try cache ──
+    cached = await get_cached(cache_category, path, params)
+    if cached is not None:
+        return cached
+
+    # ── 2. Call Mashvisor API ──
     async with httpx.AsyncClient(timeout=30.0) as client:
         url = f"{MASHVISOR_BASE}{path}"
         resp = await client.get(url, headers=HEADERS, params=params)
@@ -31,13 +55,24 @@ async def _mashvisor_get(path: str, params: dict = None) -> dict:
                 status_code=resp.status_code or 500,
                 detail=data.get("message", "Mashvisor API error"),
             )
-        return data
 
+    # ── 3. Store in cache ──
+    await set_cached(cache_category, path, data, params)
+
+    return data
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ADMIN ENDPOINTS (require auth)
+# ═══════════════════════════════════════════════════════════════════════════════
 
 @router.get("/city/{state}/{city}")
 async def get_city_market_data(state: str, city: str):
     """Get city-level investment performance metrics."""
-    data = await _mashvisor_get(f"/city/investment/{state.upper()}/{city}")
+    data = await _mashvisor_get(
+        f"/city/investment/{state.upper()}/{city}",
+        cache_category="city_market",
+    )
     return {
         "status": "success",
         "market_data": data.get("content", {}),
@@ -52,8 +87,9 @@ async def get_top_neighborhoods(
 ):
     """Get top neighborhoods with investment metrics."""
     data = await _mashvisor_get(
-        f"/trends/neighborhoods",
+        "/trends/neighborhoods",
         params={"city": city, "state": state.upper(), "items": items},
+        cache_category="neighborhoods",
     )
     content = data.get("content", {})
     return {
@@ -95,7 +131,7 @@ async def get_city_listings(
     if property_type:
         params["property_type"] = property_type
 
-    data = await _mashvisor_get("/city/listings", params=params)
+    data = await _mashvisor_get("/city/listings", params=params, cache_category="listings")
     content = data.get("content", {})
     return {
         "status": "success",
@@ -122,10 +158,9 @@ async def analyze_property(
     if zip_code:
         params["zip_code"] = zip_code
 
-    data = await _mashvisor_get("/property", params=params)
+    data = await _mashvisor_get("/property", params=params, cache_category="property_analysis")
     content = data.get("content", {})
 
-    # Extract key investment metrics
     roi = content.get("ROI", {})
     neighborhood = content.get("neighborhood", {})
 
@@ -176,11 +211,13 @@ async def analyze_property(
 @router.get("/top-properties/{state}/{city}")
 async def get_top_properties(state: str, city: str):
     """Get top investment properties in a city."""
-    data = await _mashvisor_get(f"/city/properties/{state.upper()}/{city}")
+    data = await _mashvisor_get(
+        f"/city/properties/{state.upper()}/{city}",
+        cache_category="top_properties",
+    )
     content = data.get("content", {})
     properties = content.get("properties", [])
 
-    # Format for frontend
     formatted = []
     for p in properties[:20]:
         formatted.append({
@@ -213,6 +250,27 @@ async def get_top_properties(state: str, city: str):
     }
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# CACHE MANAGEMENT ENDPOINTS (Admin)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@router.get("/cache/stats")
+async def cache_stats():
+    """Get cache performance statistics."""
+    stats = await get_cache_stats()
+    return {"status": "success", "cache": stats}
+
+
+@router.delete("/cache/clear")
+async def cache_clear(category: Optional[str] = Query(None, description="Clear specific category or all")):
+    """Clear cache entries. Optionally specify a category."""
+    deleted = await clear_cache(category)
+    return {
+        "status": "success",
+        "message": f"Cleared {deleted} cache entries" + (f" in '{category}'" if category else ""),
+        "deleted": deleted,
+    }
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # PUBLIC ENDPOINTS (No auth — for mobile app users)
@@ -229,16 +287,23 @@ async def public_market_listings(
     beds: Optional[int] = None, baths: Optional[int] = None,
     property_type: Optional[str] = None,
 ):
-    """Public: browse properties for sale (no auth required)."""
-    params = {"state": state, "city": city, "page": page}
-    if min_price: params["min_price"] = min_price
-    if max_price: params["max_price"] = max_price
-    if beds: params["min_beds"] = beds
-    if baths: params["min_baths"] = baths
-    if property_type: params["type"] = property_type
-    data = await _mashvisor_get("/trends/listings", params)
+    """Public: browse properties for sale (no auth required). Cached."""
+    params = {"state": state.upper(), "city": city, "page": page}
+    if min_price:
+        params["min_price"] = min_price
+    if max_price:
+        params["max_price"] = max_price
+    if beds:
+        params["min_beds"] = beds
+    if baths:
+        params["min_baths"] = baths
+    if property_type:
+        params["type"] = property_type
+
+    data = await _mashvisor_get("/trends/listings", params, cache_category="listings")
     listings = data.get("content", {}).get("results", [])
     total = data.get("content", {}).get("total", 0)
+
     formatted = []
     for p in listings[:page_limit]:
         formatted.append({
@@ -265,8 +330,11 @@ async def public_market_listings(
 
 @public_router.get("/overview/{state}/{city}")
 async def public_market_overview(state: str, city: str):
-    """Public: market overview for a city."""
-    data = await _mashvisor_get(f"/trends/summary/{state}/{city}")
+    """Public: market overview for a city. Cached 24h."""
+    data = await _mashvisor_get(
+        f"/trends/summary/{state.upper()}/{city}",
+        cache_category="overview",
+    )
     content = data.get("content", {})
     return {
         "status": "success",
@@ -285,10 +353,9 @@ async def public_market_overview(state: str, city: str):
 
 @public_router.post("/interest")
 async def public_property_interest(request):
-    """Record interest in a property (generates a lead for admin)."""
+    """Record interest in a property (generates a lead for admin). NOT cached."""
     from rental.shared import get_db, send_rental_push_to_admins
     from datetime import datetime, timezone
-    import json
 
     body = await request.json()
     db = get_db()
@@ -313,7 +380,7 @@ async def public_property_interest(request):
 
     try:
         await send_rental_push_to_admins(
-            title=f"🏠 Nuevo Interesado",
+            title="🏠 Nuevo Interesado",
             body=f"{lead['user_name']} interesado en {lead['property_address']} ({lead['property_city']})",
             data={"type": "property_lead", "lead_id": str(result.inserted_id)},
         )

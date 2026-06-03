@@ -37,7 +37,7 @@ db = client[DB_NAME]
 # ─── Lifespan ─────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info(f"🏠 Ross House Rentals API starting...")
+    logger.info("🏠 Ross House Rentals API starting...")
     logger.info(f"   Database: {DB_NAME}")
 
     # Initialize rental storage if key available
@@ -47,6 +47,14 @@ async def lifespan(app: FastAPI):
         logger.info("   ✅ Object Storage initialized")
     except Exception as e:
         logger.warning(f"   ⚠️ Object Storage deferred: {e}")
+
+    # Ensure Mashvisor cache indexes
+    try:
+        from rental.mashvisor_cache import ensure_indexes as cache_ensure_indexes
+        await cache_ensure_indexes()
+        logger.info("   ✅ Mashvisor Cache indexes ready")
+    except Exception as e:
+        logger.warning(f"   ⚠️ Mashvisor Cache indexes deferred: {e}")
 
     yield
     client.close()
@@ -95,6 +103,10 @@ async def health_check():
 try:
     from rental.shared import set_db
     set_db(db)
+
+    # ── Initialize Mashvisor Cache ──
+    from rental.mashvisor_cache import init_cache, ensure_indexes as cache_ensure_indexes
+    init_cache(db)
 
     from rental.auth_router import router as auth_router
     from rental.properties_router import router as properties_router
