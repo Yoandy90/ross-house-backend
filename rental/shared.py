@@ -36,13 +36,24 @@ def set_db(db):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def auth_admin(request: Request):
-    """Authenticate admin user from token"""
+    """Authenticate admin user from JWT or session token"""
     db = get_db()
     auth = request.headers.get('Authorization', '')
     if not auth.startswith('Bearer '):
         raise HTTPException(status_code=401, detail="No autorizado")
     token = auth.replace('Bearer ', '')
 
+    # ── Try JWT first (marketplace tokens) ──
+    try:
+        payload = jwt.decode(token, TENANT_JWT_SECRET, algorithms=["HS256"])
+        if payload.get("type") == "marketplace" and payload.get("role") == "admin":
+            user = await db.app_users.find_one({"_id": ObjectId(payload["user_id"])})
+            if user and user.get("role") == "admin":
+                return serialize(user)
+    except (jwt.ExpiredSignatureError, jwt.InvalidTokenError, Exception):
+        pass  # Fall through to session-based auth
+
+    # ── Fallback: session-based auth ──
     session = await db.user_sessions.find_one({'session_token': token})
     if not session:
         raise HTTPException(status_code=401, detail="Sesión inválida")
