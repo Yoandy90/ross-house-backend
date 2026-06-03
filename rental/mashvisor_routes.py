@@ -211,3 +211,113 @@ async def get_top_properties(state: str, city: str):
         "properties": formatted,
         "total": len(formatted),
     }
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PUBLIC ENDPOINTS (No auth — for mobile app users)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+public_router = APIRouter(prefix="/public/market", tags=["Public Market Data"])
+
+
+@public_router.get("/listings/{state}/{city}")
+async def public_market_listings(
+    state: str, city: str,
+    page: int = Query(1, ge=1), page_limit: int = Query(12, ge=1, le=50),
+    min_price: Optional[int] = None, max_price: Optional[int] = None,
+    beds: Optional[int] = None, baths: Optional[int] = None,
+    property_type: Optional[str] = None,
+):
+    """Public: browse properties for sale (no auth required)."""
+    params = {"state": state, "city": city, "page": page}
+    if min_price: params["min_price"] = min_price
+    if max_price: params["max_price"] = max_price
+    if beds: params["min_beds"] = beds
+    if baths: params["min_baths"] = baths
+    if property_type: params["type"] = property_type
+    data = await _mashvisor_get("/trends/listings", params)
+    listings = data.get("content", {}).get("results", [])
+    total = data.get("content", {}).get("total", 0)
+    formatted = []
+    for p in listings[:page_limit]:
+        formatted.append({
+            "id": p.get("id", ""),
+            "address": p.get("address", ""),
+            "city": p.get("city", city),
+            "state": p.get("state", state),
+            "zip_code": p.get("zip_code", ""),
+            "neighborhood": p.get("neighborhood", ""),
+            "type": p.get("type", ""),
+            "beds": p.get("beds", 0),
+            "baths": p.get("baths", 0),
+            "sqft": p.get("sqft", 0),
+            "list_price": p.get("list_price", 0),
+            "image_url": p.get("image_url", ""),
+            "status": p.get("status", ""),
+            "days_on_market": p.get("days_on_market", 0),
+            "is_foreclosure": p.get("is_foreclosure", 0),
+            "latitude": p.get("latitude"),
+            "longitude": p.get("longitude"),
+        })
+    return {"status": "success", "listings": formatted, "total": total, "page": page}
+
+
+@public_router.get("/overview/{state}/{city}")
+async def public_market_overview(state: str, city: str):
+    """Public: market overview for a city."""
+    data = await _mashvisor_get(f"/trends/summary/{state}/{city}")
+    content = data.get("content", {})
+    return {
+        "status": "success",
+        "market": {
+            "median_price": content.get("median_property_price") or content.get("median_price", 0),
+            "num_properties": content.get("num_of_properties", 0),
+            "sqft": content.get("sqft", 0),
+            "traditional_rental": content.get("median_traditional_rental", 0),
+            "airbnb_rental": content.get("median_airbnb_rental", 0),
+            "traditional_roi": round(content.get("traditional_ROI", 0), 2),
+            "airbnb_roi": round(content.get("airbnb_ROI", 0), 2),
+            "occupancy": round(content.get("airbnb_occupancy", 0)),
+        },
+    }
+
+
+@public_router.post("/interest")
+async def public_property_interest(request):
+    """Record interest in a property (generates a lead for admin)."""
+    from rental.shared import get_db, send_rental_push_to_admins
+    from datetime import datetime, timezone
+    import json
+
+    body = await request.json()
+    db = get_db()
+
+    lead = {
+        "user_id": body.get("user_id", ""),
+        "user_name": body.get("user_name", "Visitante"),
+        "user_phone": body.get("user_phone", ""),
+        "user_email": body.get("user_email", ""),
+        "property_id": body.get("property_id", ""),
+        "property_address": body.get("property_address", ""),
+        "property_city": body.get("property_city", ""),
+        "property_state": body.get("property_state", ""),
+        "property_price": body.get("property_price", 0),
+        "property_image": body.get("property_image", ""),
+        "message": body.get("message", ""),
+        "source": "mobile_app",
+        "status": "new",
+        "created_at": datetime.now(timezone.utc),
+    }
+    result = await db.property_leads.insert_one(lead)
+
+    try:
+        await send_rental_push_to_admins(
+            title=f"🏠 Nuevo Interesado",
+            body=f"{lead['user_name']} interesado en {lead['property_address']} ({lead['property_city']})",
+            data={"type": "property_lead", "lead_id": str(result.inserted_id)},
+        )
+    except Exception:
+        pass
+
+    return {"success": True, "lead_id": str(result.inserted_id)}
