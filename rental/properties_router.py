@@ -62,10 +62,9 @@ async def public_serve_property_file(path: str):
 
 @router.get('/public/properties')
 async def public_list_properties():
-    """Public endpoint: List available properties (own + approved marketplace)"""
-    # Own properties
-    own_query = {"status": "available"}
-    own_cursor = get_db().properties.find(own_query).sort("created_at", -1)
+    """Public endpoint: List all properties (own + approved marketplace)"""
+    # Own properties — show all (available, rented, maintenance)
+    own_cursor = get_db().properties.find({}).sort("created_at", -1)
     properties = []
     async for p in own_cursor:
         prop = serialize(p)
