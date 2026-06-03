@@ -288,24 +288,28 @@ async def public_market_listings(
     property_type: Optional[str] = None,
 ):
     """Public: browse properties for sale (no auth required). Cached."""
-    params = {"state": state.upper(), "city": city, "page": page}
+    params = {
+        "state": state.upper(), "city": city,
+        "page": page, "page_limit": page_limit,
+    }
     if min_price:
         params["min_price"] = min_price
     if max_price:
         params["max_price"] = max_price
     if beds:
-        params["min_beds"] = beds
+        params["beds"] = beds
     if baths:
-        params["min_baths"] = baths
+        params["baths"] = baths
     if property_type:
-        params["type"] = property_type
+        params["property_type"] = property_type
 
-    data = await _mashvisor_get("/trends/listings", params, cache_category="listings")
-    listings = data.get("content", {}).get("results", [])
-    total = data.get("content", {}).get("total", 0)
+    data = await _mashvisor_get("/city/listings", params, cache_category="listings")
+    content = data.get("content", {})
+    listings_raw = content.get("properties", [])
+    total = content.get("total_results", 0)
 
     formatted = []
-    for p in listings[:page_limit]:
+    for p in listings_raw[:page_limit]:
         formatted.append({
             "id": p.get("id", ""),
             "address": p.get("address", ""),
@@ -318,7 +322,7 @@ async def public_market_listings(
             "baths": p.get("baths", 0),
             "sqft": p.get("sqft", 0),
             "list_price": p.get("list_price", 0),
-            "image_url": p.get("image_url", ""),
+            "image_url": p.get("image") or p.get("image_url", ""),
             "status": p.get("status", ""),
             "days_on_market": p.get("days_on_market", 0),
             "is_foreclosure": p.get("is_foreclosure", 0),
@@ -332,7 +336,7 @@ async def public_market_listings(
 async def public_market_overview(state: str, city: str):
     """Public: market overview for a city. Cached 24h."""
     data = await _mashvisor_get(
-        f"/trends/summary/{state.upper()}/{city}",
+        f"/city/investment/{state.upper()}/{city}",
         cache_category="overview",
     )
     content = data.get("content", {})
@@ -344,9 +348,9 @@ async def public_market_overview(state: str, city: str):
             "sqft": content.get("sqft", 0),
             "traditional_rental": content.get("median_traditional_rental", 0),
             "airbnb_rental": content.get("median_airbnb_rental", 0),
-            "traditional_roi": round(content.get("traditional_ROI", 0), 2),
-            "airbnb_roi": round(content.get("airbnb_ROI", 0), 2),
-            "occupancy": round(content.get("airbnb_occupancy", 0)),
+            "traditional_roi": round(content.get("traditional_ROI", 0) or 0, 2),
+            "airbnb_roi": round(content.get("airbnb_ROI", 0) or 0, 2),
+            "occupancy": round(content.get("airbnb_occupancy", 0) or 0),
         },
     }
 
