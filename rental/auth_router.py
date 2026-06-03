@@ -10,6 +10,7 @@ from fastapi import APIRouter, HTTPException, Request
 import os
 import random
 import jwt
+import bcrypt
 from rental.shared import (
     get_db, auth_admin, auth_marketplace, auth_tenant,
     serialize, create_marketplace_token, create_tenant_token,
@@ -18,6 +19,19 @@ from rental.shared import (
 )
 
 router = APIRouter()
+
+
+def hash_password(password: str) -> str:
+    """Hash a password using bcrypt."""
+    return bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+
+
+def verify_password(password: str, hashed: str) -> bool:
+    """Verify a password against its bcrypt hash."""
+    try:
+        return bcrypt.checkpw(password.encode('utf-8'), hashed.encode('utf-8'))
+    except Exception:
+        return False
 
 
 def normalize_rental_phone(phone: str, country_code: str = '+1') -> str:
@@ -112,10 +126,13 @@ async def marketplace_register(request: Request):
     name = data.get("name", "").strip()
     email = data.get("email", "").strip().lower()
     phone = data.get("phone", "").strip()
+    password = data.get("password", "").strip()
     role = data.get("role", "tenant")  # tenant, landlord, buyer
 
     if not name or not email or not phone:
         raise HTTPException(status_code=400, detail="Nombre, email y teléfono son requeridos")
+    if not password or len(password) < 6:
+        raise HTTPException(status_code=400, detail="La contraseña debe tener al menos 6 caracteres")
     if role not in ("tenant", "landlord", "buyer"):
         raise HTTPException(status_code=400, detail="Rol inválido")
 
@@ -128,6 +145,7 @@ async def marketplace_register(request: Request):
         "name": name,
         "email": email,
         "phone": phone,
+        "password_hash": hash_password(password),
         "role": role,
         "status": "active",
         "verified": False,
@@ -173,36 +191,69 @@ async def marketplace_register(request: Request):
 
 @router.post('/public/marketplace-login')
 async def marketplace_login(request: Request):
-    """Login for marketplace users (all roles)"""
+    """Login for marketplace users (all roles).
+    Supports: email+password (primary) or email+phone (legacy fallback).
+    """
     body = await request.json()
     email = body.get("email", "").strip().lower()
+    password = body.get("password", "").strip()
     phone = body.get("phone", "").strip().replace("-", "").replace(" ", "").replace("(", "").replace(")", "")
 
-    if not email or not phone:
-        raise HTTPException(status_code=400, detail="Email y teléfono son requeridos")
+    if not email:
+        raise HTTPException(status_code=400, detail="Email es requerido")
+    if not password and not phone:
+        raise HTTPException(status_code=400, detail="Contraseña o teléfono es requerido")
 
-    # First check app_users collection (marketplace)
+    # Find user
     user = await get_db().app_users.find_one({"email": {"$regex": f"^{email}$", "$options": "i"}})
-    if user:
+    if not user:
+        # Fallback: check tenants collection
+        tenant = await get_db().tenants.find_one({"email": {"$regex": f"^{email}$", "$options": "i"}})
+        if not tenant:
+            raise HTTPException(status_code=401, detail="Credenciales inválidas")
+        user_id = str(tenant["_id"])
+        role = "tenant"
+        token = create_tenant_token(user_id, email, tenant.get("tenant_number", ""))
+        return {
+            "success": True, "token": token,
+            "user": {"id": user_id, "name": tenant.get("name", ""), "email": email,
+                     "role": role, "tenant_number": tenant.get("tenant_number", "")},
+        }
+
+    # Method 1: Password authentication (primary)
+    if password and user.get("password_hash"):
+        if not verify_password(password, user["password_hash"]):
+            raise HTTPException(status_code=401, detail="Contraseña incorrecta")
+    # Method 2: Phone fallback (for users without password)
+    elif phone:
         stored_phone = user.get("phone", "").replace("-", "").replace(" ", "").replace("(", "").replace(")", "")
         if phone != stored_phone and phone != stored_phone[-4:]:
             raise HTTPException(status_code=401, detail="Credenciales inválidas")
+    # Method 3: Password provided but user has no hash — try phone match
+    elif password and not user.get("password_hash"):
+        clean_pw = password.replace("-", "").replace(" ", "").replace("(", "").replace(")", "")
+        stored_phone = user.get("phone", "").replace("-", "").replace(" ", "").replace("(", "").replace(")", "")
+        if clean_pw != stored_phone and clean_pw != stored_phone[-4:]:
+            raise HTTPException(status_code=401, detail="Credenciales inválidas. Usa 'Olvidé mi contraseña' para establecer una.")
+    else:
+        raise HTTPException(status_code=401, detail="Credenciales inválidas")
 
-        user_id = str(user["_id"])
-        role = user.get("role", "tenant")
-        token = create_marketplace_token(user_id, email, role)
+    user_id = str(user["_id"])
+    role = user.get("role", "tenant")
+    token = create_marketplace_token(user_id, email, role)
 
-        return {
-            "success": True,
-            "token": token,
-            "user": {
-                "id": user_id,
-                "name": user.get("name", ""),
-                "email": user.get("email", ""),
-                "role": role,
-                "tenant_number": user.get("tenant_number", ""),
-            }
+    return {
+        "success": True,
+        "token": token,
+        "user": {
+            "id": user_id,
+            "name": user.get("name", ""),
+            "email": user.get("email", ""),
+            "role": role,
+            "tenant_number": user.get("tenant_number", ""),
+            "has_password": bool(user.get("password_hash")),
         }
+    }
 
     # Fallback: check tenants collection (backward compat)
     tenant = await get_db().tenants.find_one({"email": {"$regex": f"^{email}$", "$options": "i"}})
@@ -229,11 +280,117 @@ async def marketplace_login(request: Request):
     raise HTTPException(status_code=401, detail="Credenciales inválidas")
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# PASSWORD MANAGEMENT (Forgot Password + Change Password + Set Password)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@router.post('/auth/forgot-password')
+async def forgot_password(request: Request):
+    """Send a password reset code via SMS to the user's phone."""
+    data = await request.json()
+    email = data.get("email", "").strip().lower()
+
+    if not email:
+        raise HTTPException(status_code=400, detail="Email es requerido")
+
+    user = await get_db().app_users.find_one({"email": {"$regex": f"^{email}$", "$options": "i"}})
+    if not user:
+        return {"success": True, "message": "Si el email está registrado, recibirás un código por SMS."}
+
+    phone = user.get("phone", "")
+    if not phone:
+        raise HTTPException(status_code=400, detail="No hay teléfono asociado a esta cuenta")
+
+    code = str(random.randint(100000, 999999))
+    expires = datetime.utcnow() + timedelta(minutes=10)
+
+    await get_db().password_resets.update_one(
+        {"email": email},
+        {"$set": {"email": email, "code": code, "expires_at": expires, "used": False, "created_at": datetime.utcnow()}},
+        upsert=True,
+    )
+
+    try:
+        from twilio.rest import Client
+        sid = os.environ.get("TWILIO_ACCOUNT_SID", "")
+        token = os.environ.get("TWILIO_AUTH_TOKEN", "")
+        from_phone = os.environ.get("TWILIO_PHONE_NUMBER", "")
+        if sid and token and from_phone:
+            client = Client(sid, token)
+            normalized = normalize_rental_phone(phone)
+            client.messages.create(
+                body=f"Ross House Rentals: Tu código para restablecer contraseña es {code}. Expira en 10 minutos.",
+                from_=from_phone, to=normalized,
+            )
+            logging.info(f"✅ Password reset code sent to {phone[-4:]}")
+    except Exception as e:
+        logging.error(f"Failed to send SMS for password reset: {e}")
+
+    phone_masked = f"***-***-{phone[-4:]}" if len(phone) >= 4 else "***"
+    return {"success": True, "message": "Código enviado por SMS", "phone_masked": phone_masked}
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# RENTAL PHONE OTP AUTH — Uses `app_users` collection for Ross House Rentals
-# ═══════════════════════════════════════════════════════════════════════════════
+@router.post('/auth/reset-password')
+async def reset_password(request: Request):
+    """Verify reset code and set a new password."""
+    data = await request.json()
+    email = data.get("email", "").strip().lower()
+    code = data.get("code", "").strip()
+    new_password = data.get("new_password", "").strip()
+
+    if not email or not code or not new_password:
+        raise HTTPException(status_code=400, detail="Email, código y nueva contraseña son requeridos")
+    if len(new_password) < 6:
+        raise HTTPException(status_code=400, detail="La contraseña debe tener al menos 6 caracteres")
+
+    reset = await get_db().password_resets.find_one({"email": email, "code": code, "used": False})
+    if not reset:
+        raise HTTPException(status_code=400, detail="Código inválido o expirado")
+    if reset.get("expires_at") and reset["expires_at"] < datetime.utcnow():
+        raise HTTPException(status_code=400, detail="El código ha expirado")
+
+    await get_db().password_resets.update_one({"_id": reset["_id"]}, {"$set": {"used": True}})
+
+    hashed = hash_password(new_password)
+    await get_db().app_users.update_one(
+        {"email": {"$regex": f"^{email}$", "$options": "i"}},
+        {"$set": {"password_hash": hashed, "updated_at": datetime.utcnow()}}
+    )
+
+    logging.info(f"✅ Password reset successful for {email}")
+    return {"success": True, "message": "Contraseña actualizada exitosamente"}
+
+
+@router.put('/auth/change-password')
+async def change_password(request: Request):
+    """Change password for authenticated user."""
+    user = await auth_marketplace(request)
+    data = await request.json()
+    current_password = data.get("current_password", "").strip()
+    new_password = data.get("new_password", "").strip()
+
+    if not new_password or len(new_password) < 6:
+        raise HTTPException(status_code=400, detail="La nueva contraseña debe tener al menos 6 caracteres")
+
+    if user.get("password_hash"):
+        if not current_password:
+            raise HTTPException(status_code=400, detail="Contraseña actual es requerida")
+        if not verify_password(current_password, user["password_hash"]):
+            raise HTTPException(status_code=401, detail="Contraseña actual incorrecta")
+
+    hashed = hash_password(new_password)
+    try:
+        oid = ObjectId(user["_id"]) if not isinstance(user["_id"], ObjectId) else user["_id"]
+    except:
+        oid = user["_id"]
+
+    await get_db().app_users.update_one({"_id": oid}, {"$set": {"password_hash": hashed, "updated_at": datetime.utcnow()}})
+
+    msg = "Contraseña actualizada" if user.get("password_hash") else "Contraseña establecida exitosamente"
+    return {"success": True, "message": msg}
+
+
+
 
 def normalize_rental_phone(phone: str, country_code: str = '+1') -> str:
     """Normalize phone number to E.164 format"""
