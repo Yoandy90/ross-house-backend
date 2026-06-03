@@ -108,6 +108,7 @@ try:
     from rental.communications_router import router as communications_router
     from rental.signatures_router import router as signatures_router
     from rental.chat_router import router as chat_router
+    from rental.mashvisor_routes import router as mashvisor_router
 
     app.include_router(auth_router, prefix="/api")
     app.include_router(properties_router, prefix="/api")
@@ -121,8 +122,9 @@ try:
     app.include_router(communications_router, prefix="/api")
     app.include_router(signatures_router, prefix="/api")
     app.include_router(chat_router, prefix="/api")
+    app.include_router(mashvisor_router, prefix="/api")
 
-    logger.info("✅ All 12 rental routers registered successfully")
+    logger.info("✅ All 13 rental routers registered successfully")
 
 except Exception as e:
     import traceback
