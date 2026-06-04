@@ -2,7 +2,7 @@
 Ross House AI Brain — El Cerebro de IA de Ross House Rentals LLC
 ================================================================
 Automated AI assistant for property management, tenant support, and market inquiries.
-Uses emergentintegrations with GPT-4o for intelligent, bilingual (EN/ES) responses.
+Supports multiple LLM providers: OpenAI (direct), Gemini, or Emergent LLM Key.
 
 Collections:
   - ai_brain_config: Global and per-conversation AI settings
@@ -12,6 +12,7 @@ Collections:
 import os
 import logging
 import uuid
+import httpx
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List
 
@@ -81,14 +82,14 @@ class RossHouseAIBrain:
 
     def __init__(self, db):
         self.db = db
-        self.llm_key = os.getenv('EMERGENT_LLM_KEY', '')
-        self._initialized = False
+        self.llm_key = os.getenv('OPENAI_API_KEY', '') or os.getenv('EMERGENT_LLM_KEY', '')
+        self._initialized = bool(self.llm_key)
+        self._provider = "openai"
 
-        if self.llm_key:
-            self._initialized = True
-            logger.info("🧠 Ross House AI Brain initialized with Emergent LLM Key (env)")
+        if self._initialized:
+            logger.info("🧠 Ross House AI Brain initialized with API key (env)")
         else:
-            logger.warning("⚠️ EMERGENT_LLM_KEY not in env - will check DB config on first request")
+            logger.warning("⚠️ No LLM key in env - will check DB config on first request")
 
     @property
     def is_available(self) -> bool:
@@ -101,7 +102,10 @@ class RossHouseAIBrain:
         try:
             config_doc = await self.db.api_config.find_one({"_id": "main"})
             if config_doc:
-                key = config_doc.get("EMERGENT_LLM_KEY") or config_doc.get("emergent_llm_key", "")
+                key = (config_doc.get("OPENAI_API_KEY") or
+                       config_doc.get("openai_api_key") or
+                       config_doc.get("EMERGENT_LLM_KEY") or
+                       config_doc.get("emergent_llm_key", ""))
                 if key:
                     self.llm_key = key
                     self._initialized = True
@@ -110,6 +114,36 @@ class RossHouseAIBrain:
         except Exception as e:
             logger.warning(f"Error loading LLM key from DB: {e}")
         return False
+
+    async def _call_openai(self, system_prompt: str, user_prompt: str) -> Optional[str]:
+        """Call OpenAI GPT-4o directly using httpx (no SDK dependency)."""
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                response = await client.post(
+                    "https://api.openai.com/v1/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {self.llm_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "model": "gpt-4o",
+                        "messages": [
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": user_prompt},
+                        ],
+                        "max_tokens": 800,
+                        "temperature": 0.7,
+                    }
+                )
+                if response.status_code == 200:
+                    data = response.json()
+                    return data["choices"][0]["message"]["content"]
+                else:
+                    logger.error(f"OpenAI API error {response.status_code}: {response.text[:200]}")
+                    return None
+        except Exception as e:
+            logger.error(f"OpenAI call failed: {e}")
+            return None
 
     # ══════════════════════════════════════════════════════════════════
     # CONFIGURATION
@@ -178,31 +212,18 @@ class RossHouseAIBrain:
             return None
 
         try:
-            from emergentintegrations.llm.chat import LlmChat, UserMessage
-
             # Build context from conversation history and property data
             context = await self._build_context(conversation_id, sender_name)
-
-            session_id = f"rosshouse_chat_{conversation_id}_{uuid.uuid4().hex[:8]}"
             system_prompt = ROSS_HOUSE_SYSTEM_PROMPT.format(context=context)
-
-            chat = LlmChat(
-                api_key=self.llm_key,
-                session_id=session_id,
-                system_message=system_prompt,
-            ).with_model("openai", "gpt-4o")
 
             # Get recent messages for context
             recent_messages = await self._get_recent_messages(conversation_id, limit=10)
-
-            # Build the conversation context as a single prompt
             conversation_text = ""
             for msg in recent_messages:
                 role = "Inquilino" if msg["sender_type"] in ("tenant", "guest") else "Admin"
                 if msg.get("is_ai"):
                     role = "Asistente IA"
                 conversation_text += f"{role}: {msg['content']}\n"
-
             conversation_text += f"Inquilino: {user_message}\n"
 
             prompt = f"""Historial de la conversación:
@@ -210,9 +231,10 @@ class RossHouseAIBrain:
 
 Responde al último mensaje del inquilino de manera útil y profesional. Si la pregunta requiere información específica que no tienes, indica que un agente humano responderá pronto."""
 
-            user_msg = UserMessage(text=prompt)
-            response = await chat.send_message(user_msg)
-            ai_text = response.content if hasattr(response, 'content') else str(response)
+            # Call OpenAI directly
+            ai_text = await self._call_openai(system_prompt, prompt)
+            if not ai_text:
+                return None
 
             # Sanitize response
             ai_text = self._sanitize_response(ai_text)
@@ -238,24 +260,14 @@ Responde al último mensaje del inquilino de manera útil y profesional. Si la p
             return None
 
         try:
-            from emergentintegrations.llm.chat import LlmChat, UserMessage
-
-            session_id = f"rosshouse_email_{uuid.uuid4().hex[:8]}"
             system_prompt = ROSS_HOUSE_SYSTEM_PROMPT.format(context="") + """
-            
+
 INSTRUCCIONES ADICIONALES PARA EMAILS:
 - Formato tu respuesta como un email profesional
 - Incluye un saludo apropiado y despedida
 - Firma como "Equipo Ross House Rentals LLC"
 - Mantén el tono profesional pero cálido
 """
-
-            chat = LlmChat(
-                api_key=self.llm_key,
-                session_id=session_id,
-                system_message=system_prompt,
-            ).with_model("openai", "gpt-4o")
-
             prompt = f"""Email recibido:
 De: {sender_email}
 Asunto: {subject}
@@ -263,15 +275,14 @@ Mensaje: {body}
 
 Genera una respuesta profesional a este email."""
 
-            user_msg = UserMessage(text=prompt)
-            response = await chat.send_message(user_msg)
-            ai_text = response.content if hasattr(response, 'content') else str(response)
+            ai_text = await self._call_openai(system_prompt, prompt)
 
-            await self._log_action("email_response", {
-                "sender_email": sender_email,
-                "subject": subject,
-                "ai_response": ai_text[:200],
-            })
+            if ai_text:
+                await self._log_action("email_response", {
+                    "sender_email": sender_email,
+                    "subject": subject,
+                    "ai_response": ai_text[:200],
+                })
 
             return ai_text
 

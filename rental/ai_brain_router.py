@@ -154,18 +154,12 @@ async def test_ai_brain(request: Request):
         return {"success": False, "message": "AI Brain no disponible - falta clave LLM. Use el endpoint /set-key para configurarla."}
 
     try:
-        from emergentintegrations.llm.chat import LlmChat, UserMessage
-        import uuid
-
-        chat = LlmChat(
-            api_key=brain.llm_key,
-            session_id=f"test_{uuid.uuid4().hex[:8]}",
-            system_message="You are a test assistant. Respond briefly.",
-        ).with_model("openai", "gpt-4o")
-
-        response = await chat.send_message(UserMessage(text="Say 'Ross House AI Brain is working!' in both English and Spanish."))
-        text = response.content if hasattr(response, 'content') else str(response)
-
-        return {"success": True, "response": text}
+        result = await brain._call_openai(
+            "You are a test assistant. Respond briefly.",
+            "Say 'Ross House AI Brain is working!' in both English and Spanish."
+        )
+        if result:
+            return {"success": True, "response": result}
+        return {"success": False, "error": "No response from OpenAI"}
     except Exception as e:
         return {"success": False, "error": str(e)}
