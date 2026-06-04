@@ -1664,15 +1664,37 @@ async def delete_property_photo(property_id: str, file_id: str, request: Request
 
 @router.get('/admin/rental-files/{path:path}')
 async def serve_rental_file(path: str, request: Request):
-    """Serve a file from object storage"""
+    """Serve a file from object storage (admin auth required)"""
     user = await auth_admin(request)
-    from rental_storage_service import get_object
+    from rental_storage_service import get_object, set_emergent_key
     from fastapi.responses import Response
     try:
+        # Ensure storage key is loaded
+        config = await get_db().api_config.find_one({"_id": "main"})
+        if config and config.get("EMERGENT_LLM_KEY"):
+            set_emergent_key(config["EMERGENT_LLM_KEY"])
         data, content_type = get_object(path)
-        return Response(content=data, media_type=content_type)
+        return Response(content=data, media_type=content_type,
+                        headers={"Cache-Control": "public, max-age=86400"})
     except Exception as e:
         raise HTTPException(status_code=404, detail=f"Archivo no encontrado: {str(e)}")
+
+
+@router.get('/public/property-photos/{path:path}')
+async def serve_property_photo_public(path: str):
+    """Serve property photos publicly (no auth - for <img> tags)"""
+    from rental_storage_service import get_object, set_emergent_key
+    from fastapi.responses import Response
+    try:
+        config = await get_db().api_config.find_one({"_id": "main"})
+        if config and config.get("EMERGENT_LLM_KEY"):
+            set_emergent_key(config["EMERGENT_LLM_KEY"])
+        full_path = f"ross-rentals/{path}"
+        data, content_type = get_object(full_path)
+        return Response(content=data, media_type=content_type,
+                        headers={"Cache-Control": "public, max-age=86400"})
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=f"Foto no encontrada")
 
 
 # ─── MOVE-IN / MOVE-OUT CHECKLISTS ───────────────────────────────────────────

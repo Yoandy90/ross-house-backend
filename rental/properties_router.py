@@ -45,18 +45,28 @@ async def public_list_property_photos(property_id: str):
 @router.get('/public/property-file/{path:path}')
 async def public_serve_property_file(path: str):
     """Public: Serve a property photo from object storage (no auth required)"""
-    # Only allow serving from properties/ path for security
-    if not path.startswith("properties/"):
+    # Only allow serving from properties/ or checklists/ paths for security
+    if not path.startswith("properties/") and not path.startswith("checklists/"):
         raise HTTPException(status_code=403, detail="Acceso denegado")
     try:
-        from rental_storage_service import get_object
-        data, content_type = get_object(path)
+        from rental_storage_service import get_object, set_emergent_key, APP_NAME
+        # Load key from DB if not in env
+        try:
+            config = await get_db().api_config.find_one({"_id": "main"})
+            if config and config.get("EMERGENT_LLM_KEY"):
+                set_emergent_key(config["EMERGENT_LLM_KEY"])
+        except Exception:
+            pass
+        # Prepend the app name prefix to get the full storage path
+        full_path = f"{APP_NAME}/{path}"
+        data, content_type = get_object(full_path)
         return Response(
             content=data,
             media_type=content_type,
             headers={"Cache-Control": "public, max-age=86400"}
         )
     except Exception as e:
+        logging.error(f"Error serving property file {path}: {e}")
         raise HTTPException(status_code=404, detail=f"Foto no encontrada")
 
 
