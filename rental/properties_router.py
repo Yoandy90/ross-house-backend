@@ -198,19 +198,39 @@ async def public_get_property(property_id: str, request: Request):
         ).sort("uploaded_at", -1).to_list(50)
 
         photo_urls = []
+        categories_map = {}  # {category: [photo_objs]}
         for p in photo_docs:
             sp = p.get("storage_path", "")
             if sp:
-                photo_urls.append({
+                cat = p.get("category", "other")
+                photo_obj = {
                     "url": resolve_url(sp),
                     "caption": p.get("caption", ""),
-                })
+                    "category": cat,
+                }
+                photo_urls.append(photo_obj)
+                if cat not in categories_map:
+                    categories_map[cat] = []
+                categories_map[cat].append(photo_obj)
 
         # Fallback: if no photos in property_photos, try the photos array
         if not photo_urls and prop.get("photos"):
             for path_or_url in prop["photos"]:
                 if isinstance(path_or_url, str):
-                    photo_urls.append({"url": resolve_url(path_or_url), "caption": ""})
+                    photo_obj = {"url": resolve_url(path_or_url), "caption": "", "category": "other"}
+                    photo_urls.append(photo_obj)
+                    if "other" not in categories_map:
+                        categories_map["other"] = []
+                    categories_map["other"].append(photo_obj)
+
+        # Build categories array for the app
+        categories_list = []
+        for cat, photos_in_cat in categories_map.items():
+            categories_list.append({
+                "key": cat,
+                "count": len(photos_in_cat),
+                "thumbnail": photos_in_cat[0]["url"] if photos_in_cat else "",
+            })
 
         return {
             "success": True,
@@ -233,6 +253,7 @@ async def public_get_property(property_id: str, request: Request):
                 "features": prop.get("features", []),
                 "photos": [p["url"] for p in photo_urls],
                 "photos_categorized": photo_urls,
+                "photo_categories": categories_list,
                 "status": prop.get("status", "available"),
                 "owner_type": "ross_house",
                 "owner_name": "Ross House Rentals LLC",

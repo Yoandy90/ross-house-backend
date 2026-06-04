@@ -1593,6 +1593,7 @@ async def upload_property_photo(property_id: str, request: Request):
     filename = data.get('filename', 'photo.jpg')
     content_type = data.get('content_type', 'image/jpeg')
     caption = data.get('caption', '')
+    category = data.get('category', 'other')  # exterior, kitchen, bathroom, bedroom, living_room, patio, garage, other
 
     if not image_data:
         raise HTTPException(status_code=400, detail="No se proporcionaron datos de imagen")
@@ -1622,6 +1623,7 @@ async def upload_property_photo(property_id: str, request: Request):
         raise HTTPException(status_code=500, detail=f"Error subiendo foto: {str(e)}")
 
     photo_info['caption'] = caption
+    photo_info['category'] = category
     photo_info['is_deleted'] = False
 
     # Save reference in DB
@@ -1685,6 +1687,25 @@ async def delete_property_photo(property_id: str, file_id: str, request: Request
         {"$set": {"is_deleted": True}}
     )
     return {"success": True, "message": "Foto eliminada"}
+
+
+@router.put('/admin/properties/{property_id}/photos/{file_id}')
+async def update_property_photo(property_id: str, file_id: str, request: Request):
+    """Update a property photo's category and/or caption"""
+    user = await auth_admin(request)
+    data = await request.json()
+    update_fields = {}
+    if 'category' in data:
+        update_fields['category'] = data['category']
+    if 'caption' in data:
+        update_fields['caption'] = data['caption']
+    if not update_fields:
+        raise HTTPException(status_code=400, detail="No fields to update")
+    result = await get_db().property_photos.update_one(
+        {"file_id": file_id, "property_id": property_id},
+        {"$set": update_fields}
+    )
+    return {"success": True, "message": "Foto actualizada", "modified": result.modified_count}
 
 
 @router.get('/admin/rental-files/{path:path}')
