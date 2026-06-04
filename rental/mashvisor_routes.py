@@ -377,7 +377,7 @@ async def public_market_overview(state: str, city: str):
 
 @public_router.post("/interest")
 async def public_property_interest(request: Request):
-    """Record interest in a property (generates a lead for admin). NOT cached."""
+    """Record interest in a property (generates a lead for admin). Sends confirmation emails."""
     from rental.shared import get_db, send_rental_push_to_admins
     from datetime import datetime, timezone
 
@@ -402,6 +402,7 @@ async def public_property_interest(request: Request):
     }
     result = await db.property_leads.insert_one(lead)
 
+    # ── Push notification to admin ──
     try:
         await send_rental_push_to_admins(
             title="🏠 Nuevo Interesado",
@@ -411,4 +412,106 @@ async def public_property_interest(request: Request):
     except Exception:
         pass
 
+    # ── Send confirmation emails ──
+    try:
+        await _send_interest_emails(db, lead)
+    except Exception as e:
+        logger.warning(f"⚠️ Interest email error: {e}")
+
     return {"success": True, "lead_id": str(result.inserted_id)}
+
+
+async def _send_interest_emails(db, lead: dict):
+    """Send confirmation emails to both client and admin using SendGrid."""
+    sendgrid_key = os.getenv('SENDGRID_API_KEY')
+    from_email_addr = os.getenv('SENDGRID_FROM_EMAIL', 'info@rosshouserentals.com')
+
+    if not sendgrid_key:
+        config_doc = await db.api_config.find_one({'_id': 'main'})
+        if config_doc:
+            sendgrid_key = config_doc.get('sendgrid_api_key') or config_doc.get('SENDGRID_API_KEY')
+            from_email_addr = config_doc.get('sendgrid_from_email', from_email_addr)
+
+    if not sendgrid_key:
+        logger.warning("⚠️ SendGrid not configured — skipping interest emails")
+        return
+
+    import sendgrid
+    from sendgrid.helpers.mail import Mail, Email, To, Content, HtmlContent
+
+    sg = sendgrid.SendGridAPIClient(api_key=sendgrid_key)
+    price_fmt = f"${lead['property_price']:,.0f}" if lead['property_price'] else "Consultar"
+    prop_info = f"{lead['property_address']}, {lead['property_city']}, {lead['property_state']}"
+
+    # ── 1. Email to Admin ──
+    admin_email = os.getenv('ADMIN_EMAIL', 'yoandyross@gmail.com')
+    admin_html = f"""
+    <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; background: #0C0C0E; color: #fff; border-radius: 16px; overflow: hidden;">
+      <div style="background: linear-gradient(135deg, #C8102E, #8B0000); padding: 24px; text-align: center;">
+        <h1 style="margin: 0; font-size: 22px;">🏠 Nuevo Lead de Propiedad</h1>
+      </div>
+      <div style="padding: 24px;">
+        <h2 style="color: #C8102E; margin-top: 0;">Datos del Interesado</h2>
+        <table style="width: 100%; border-collapse: collapse;">
+          <tr><td style="padding: 8px 0; color: #999;">Nombre:</td><td style="padding: 8px 0; font-weight: bold;">{lead['user_name']}</td></tr>
+          <tr><td style="padding: 8px 0; color: #999;">Email:</td><td style="padding: 8px 0;">{lead['user_email'] or 'No proporcionado'}</td></tr>
+          <tr><td style="padding: 8px 0; color: #999;">Teléfono:</td><td style="padding: 8px 0;">{lead['user_phone'] or 'No proporcionado'}</td></tr>
+        </table>
+        <hr style="border: none; border-top: 1px solid #333; margin: 16px 0;">
+        <h2 style="color: #C8102E;">Propiedad de Interés</h2>
+        <table style="width: 100%; border-collapse: collapse;">
+          <tr><td style="padding: 8px 0; color: #999;">Dirección:</td><td style="padding: 8px 0; font-weight: bold;">{prop_info}</td></tr>
+          <tr><td style="padding: 8px 0; color: #999;">Precio:</td><td style="padding: 8px 0; font-weight: bold; color: #C8102E;">{price_fmt}</td></tr>
+        </table>
+        {f'<div style="margin-top: 16px; padding: 12px; background: rgba(255,255,255,0.05); border-radius: 8px; border-left: 3px solid #C8102E;"><strong>Mensaje:</strong><br>{lead["message"]}</div>' if lead.get('message') else ''}
+        <p style="color: #666; font-size: 12px; margin-top: 24px;">Fuente: App Móvil Ross House</p>
+      </div>
+    </div>
+    """
+    try:
+        admin_mail = Mail(
+            from_email=Email(from_email_addr, "Ross House Rentals"),
+            to_emails=To(admin_email),
+            subject=f"🏠 Nuevo Interesado: {lead['property_address']} ({price_fmt})",
+        )
+        admin_mail.add_content(Content("text/html", admin_html))
+        sg.client.mail.send.post(request_body=admin_mail.get())
+        logger.info(f"📧 Admin lead email sent to {admin_email}")
+    except Exception as e:
+        logger.warning(f"⚠️ Admin email failed: {e}")
+
+    # ── 2. Email to Client (only if they provided email) ──
+    client_email = lead.get('user_email')
+    if client_email and '@' in client_email:
+        client_html = f"""
+        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; background: #0C0C0E; color: #fff; border-radius: 16px; overflow: hidden;">
+          <div style="background: linear-gradient(135deg, #C8102E, #8B0000); padding: 24px; text-align: center;">
+            <h1 style="margin: 0; font-size: 22px;">✅ ¡Solicitud Recibida!</h1>
+          </div>
+          <div style="padding: 24px;">
+            <p style="font-size: 16px;">Hola <strong>{lead['user_name']}</strong>,</p>
+            <p>Hemos recibido tu interés en la siguiente propiedad:</p>
+            <div style="background: rgba(255,255,255,0.05); border-radius: 12px; padding: 16px; margin: 16px 0; border: 1px solid rgba(255,255,255,0.1);">
+              <h3 style="margin: 0 0 8px; color: #C8102E;">{lead['property_address']}</h3>
+              <p style="margin: 4px 0; color: #999;">{lead['property_city']}, {lead['property_state']}</p>
+              <p style="margin: 8px 0 0; font-size: 20px; font-weight: bold;">{price_fmt}</p>
+            </div>
+            <p>Un asesor de <strong>Ross House Rentals LLC</strong> se pondrá en contacto contigo lo antes posible.</p>
+            <hr style="border: none; border-top: 1px solid #333; margin: 24px 0;">
+            <p style="color: #999; font-size: 13px;">¿Tienes preguntas? Contáctanos:</p>
+            <p style="color: #999; font-size: 13px;">📞 (806) 934-2018 &nbsp;|&nbsp; 📧 info@rosshouserentals.com</p>
+            <p style="color: #666; font-size: 11px; text-align: center; margin-top: 24px;">Ross House Rentals LLC — Dumas, TX</p>
+          </div>
+        </div>
+        """
+        try:
+            client_mail = Mail(
+                from_email=Email(from_email_addr, "Ross House Rentals"),
+                to_emails=To(client_email),
+                subject=f"✅ Tu interés en {lead['property_address']} ha sido registrado",
+            )
+            client_mail.add_content(Content("text/html", client_html))
+            sg.client.mail.send.post(request_body=client_mail.get())
+            logger.info(f"📧 Client confirmation email sent to {client_email}")
+        except Exception as e:
+            logger.warning(f"⚠️ Client email failed: {e}")
