@@ -1648,7 +1648,32 @@ async def list_property_photos(property_id: str, request: Request):
     photos = await get_db().property_photos.find(
         {"property_id": property_id, "is_deleted": {"$ne": True}}
     ).sort("uploaded_at", -1).to_list(100)
-    return {"success": True, "photos": [serialize(p) for p in photos]}
+    
+    result_photos = [serialize(p) for p in photos]
+    
+    # Fallback: If property_photos collection is empty, build list from property.photos array
+    if not result_photos:
+        prop = await get_db().properties.find_one({"_id": ObjectId(property_id)})
+        if prop and prop.get("photos"):
+            for i, path_or_url in enumerate(prop["photos"]):
+                if isinstance(path_or_url, str) and path_or_url:
+                    storage_path = path_or_url
+                    # Build a clean URL path
+                    clean_path = path_or_url
+                    if clean_path.startswith("ross-rentals/"):
+                        clean_path = clean_path[len("ross-rentals/"):]
+                    result_photos.append({
+                        "_id": f"legacy_{i}",
+                        "file_id": f"legacy_{i}",
+                        "property_id": property_id,
+                        "storage_path": storage_path,
+                        "url": f"/api/public/property-file/{clean_path}",
+                        "filename": path_or_url.split("/")[-1] if "/" in path_or_url else path_or_url,
+                        "caption": "",
+                        "is_legacy": True,
+                    })
+    
+    return {"success": True, "photos": result_photos}
 
 
 @router.delete('/admin/properties/{property_id}/photos/{file_id}')

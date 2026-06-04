@@ -83,6 +83,16 @@ async def public_list_properties():
     async for p in own_cursor:
         prop = serialize(p)
         all_photos = prop.get("photos", [])
+        # Resolve storage paths to proper URLs
+        resolved_photos = []
+        for p in all_photos:
+            if isinstance(p, str):
+                if p.startswith("http"):
+                    resolved_photos.append(p)
+                elif p.startswith("ross-rentals/"):
+                    resolved_photos.append(f"/api/public/property-file/{p[len('ross-rentals/'):]}")
+                elif p.startswith("properties/"):
+                    resolved_photos.append(f"/api/public/property-file/{p}")
         safe_prop = {
             "id": prop.get("_id"),
             "address": prop.get("address", ""),
@@ -99,7 +109,7 @@ async def public_list_properties():
             "listing_type": prop.get("listing_type", "rent"),
             "description": prop.get("notes", ""),
             "features": prop.get("features", []),
-            "photos": [all_photos[0]] if all_photos else [],
+            "photos": [resolved_photos[0]] if resolved_photos else [],
             "photo_count": len(all_photos),
             "status": prop.get("status", "available"),
             "owner_type": "ross_house",
@@ -143,9 +153,9 @@ async def public_list_properties():
 async def public_get_property(property_id: str):
     """Public endpoint: Get a single property with all photos (with resolved URLs)"""
     db = get_db()
-    # Try own properties first
+    # Try own properties first (show all statuses since this is a detail view)
     try:
-        prop = await db.properties.find_one({"_id": ObjectId(property_id), "status": "available"})
+        prop = await db.properties.find_one({"_id": ObjectId(property_id)})
     except:
         prop = None
 
