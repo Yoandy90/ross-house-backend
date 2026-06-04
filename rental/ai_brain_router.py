@@ -119,14 +119,39 @@ async def draft_email_response(request: Request, body: EmailDraftBody):
     raise HTTPException(status_code=500, detail="Error generando respuesta AI")
 
 
+class SetKeyBody(BaseModel):
+    key: str
+
+
+@router.post("/set-key")
+async def set_llm_key(request: Request, body: SetKeyBody):
+    """Store the EMERGENT_LLM_KEY in the database for production use."""
+    await auth_admin(request)
+    brain = get_brain()
+    db = brain.db
+    await db.api_config.update_one(
+        {"_id": "main"},
+        {"$set": {"EMERGENT_LLM_KEY": body.key}},
+        upsert=True
+    )
+    # Immediately update the brain instance
+    brain.llm_key = body.key
+    brain._initialized = True
+    return {"success": True, "message": "LLM key saved and AI Brain activated"}
+
+
+
 @router.post("/test")
 async def test_ai_brain(request: Request):
     """Quick test to verify AI Brain is working."""
     await auth_admin(request)
     brain = get_brain()
 
+    # Try to load key from DB if not in env
+    await brain._ensure_key()
+
     if not brain.is_available:
-        return {"success": False, "message": "AI Brain no disponible - falta clave LLM"}
+        return {"success": False, "message": "AI Brain no disponible - falta clave LLM. Use el endpoint /set-key para configurarla."}
 
     try:
         from emergentintegrations.llm.chat import LlmChat, UserMessage
