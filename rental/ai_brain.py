@@ -84,15 +84,32 @@ class RossHouseAIBrain:
         self.llm_key = os.getenv('EMERGENT_LLM_KEY', '')
         self._initialized = False
 
-        if not self.llm_key:
-            logger.warning("⚠️ EMERGENT_LLM_KEY not found - AI Brain will be disabled")
-        else:
+        if self.llm_key:
             self._initialized = True
-            logger.info("🧠 Ross House AI Brain initialized with Emergent LLM Key")
+            logger.info("🧠 Ross House AI Brain initialized with Emergent LLM Key (env)")
+        else:
+            logger.warning("⚠️ EMERGENT_LLM_KEY not in env - will check DB config on first request")
 
     @property
     def is_available(self) -> bool:
         return self._initialized
+
+    async def _ensure_key(self):
+        """Try to load the LLM key from database if not in env."""
+        if self._initialized:
+            return True
+        try:
+            config_doc = await self.db.api_config.find_one({"_id": "main"})
+            if config_doc:
+                key = config_doc.get("EMERGENT_LLM_KEY") or config_doc.get("emergent_llm_key", "")
+                if key:
+                    self.llm_key = key
+                    self._initialized = True
+                    logger.info("🧠 AI Brain loaded LLM key from database config")
+                    return True
+        except Exception as e:
+            logger.warning(f"Error loading LLM key from DB: {e}")
+        return False
 
     # ══════════════════════════════════════════════════════════════════
     # CONFIGURATION
@@ -152,7 +169,7 @@ class RossHouseAIBrain:
 
     async def generate_chat_response(self, conversation_id: str, user_message: str, sender_name: str = "Usuario") -> Optional[str]:
         """Generate an AI response for a chat message."""
-        if not self.is_available:
+        if not await self._ensure_key():
             logger.warning("AI Brain not available - missing LLM key")
             return None
 
@@ -217,7 +234,7 @@ Responde al último mensaje del inquilino de manera útil y profesional. Si la p
 
     async def generate_email_response(self, subject: str, body: str, sender_email: str) -> Optional[str]:
         """Generate an AI response for an email inquiry."""
-        if not self.is_available:
+        if not await self._ensure_key():
             return None
 
         try:
@@ -375,6 +392,7 @@ Genera una respuesta profesional a este email."""
 
     async def get_stats(self) -> Dict:
         """Get AI Brain statistics."""
+        await self._ensure_key()
         try:
             total_responses = await self.db.ai_brain_logs.count_documents({"action_type": "chat_response"})
             total_emails = await self.db.ai_brain_logs.count_documents({"action_type": "email_response"})
