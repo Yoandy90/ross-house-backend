@@ -232,7 +232,7 @@ async def get_top_properties(state: str, city: str):
             "sqft": p.get("sqft"),
             "list_price": p.get("list_price"),
             "list_price_formatted": p.get("list_price_formatted"),
-            "image": p.get("image") or p.get("image_url"),
+            "image": _secure_url(p.get("image") or p.get("image_url")),
             "traditional_ROI": p.get("traditional_ROI"),
             "airbnb_ROI": p.get("airbnb_ROI"),
             "traditional_rental": p.get("traditional_rental"),
@@ -270,6 +270,13 @@ async def cache_clear(category: Optional[str] = Query(None, description="Clear s
         "message": f"Cleared {deleted} cache entries" + (f" in '{category}'" if category else ""),
         "deleted": deleted,
     }
+
+
+def _secure_url(url: str) -> str:
+    """Convert http:// to https:// for iOS App Transport Security."""
+    if url and url.startswith("http://"):
+        return "https://" + url[7:]
+    return url or ""
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -322,7 +329,7 @@ async def public_market_listings(
             "baths": p.get("baths", 0),
             "sqft": p.get("sqft", 0),
             "list_price": p.get("list_price", 0),
-            "image_url": p.get("image") or p.get("image_url", ""),
+            "image_url": _secure_url(p.get("image") or p.get("image_url", "")),
             "status": p.get("status", ""),
             "days_on_market": p.get("days_on_market", 0),
             "is_foreclosure": p.get("is_foreclosure", 0),
