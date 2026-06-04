@@ -75,24 +75,35 @@ async def public_serve_property_file(path: str):
 
 
 @router.get('/public/properties')
-async def public_list_properties():
+async def public_list_properties(request: Request):
     """Public endpoint: List all properties (own + approved marketplace)"""
+    # Determine base URL for absolute photo URLs
+    base_url = str(request.base_url).rstrip('/')
+    # In production, use the forwarded host if behind a proxy
+    forwarded_host = request.headers.get('x-forwarded-host') or request.headers.get('host')
+    forwarded_proto = request.headers.get('x-forwarded-proto', 'https')
+    if forwarded_host:
+        base_url = f"{forwarded_proto}://{forwarded_host}"
+
+    def resolve_photo(p: str) -> str:
+        """Convert storage path to a full absolute URL"""
+        if p.startswith("http"):
+            return p
+        elif p.startswith("ross-rentals/"):
+            return f"{base_url}/api/public/property-file/{p[len('ross-rentals/'):]}"
+        elif p.startswith("properties/"):
+            return f"{base_url}/api/public/property-file/{p}"
+        elif p.startswith("/api/"):
+            return f"{base_url}{p}"
+        return p
+
     # Own properties — show all (available, rented, maintenance)
     own_cursor = get_db().properties.find({}).sort("created_at", -1)
     properties = []
     async for p in own_cursor:
         prop = serialize(p)
         all_photos = prop.get("photos", [])
-        # Resolve storage paths to proper URLs
-        resolved_photos = []
-        for p in all_photos:
-            if isinstance(p, str):
-                if p.startswith("http"):
-                    resolved_photos.append(p)
-                elif p.startswith("ross-rentals/"):
-                    resolved_photos.append(f"/api/public/property-file/{p[len('ross-rentals/'):]}")
-                elif p.startswith("properties/"):
-                    resolved_photos.append(f"/api/public/property-file/{p}")
+        resolved_photos = [resolve_photo(ph) for ph in all_photos if isinstance(ph, str)]
         safe_prop = {
             "id": prop.get("_id"),
             "address": prop.get("address", ""),
@@ -150,8 +161,26 @@ async def public_list_properties():
 
 
 @router.get('/public/properties/{property_id}')
-async def public_get_property(property_id: str):
+async def public_get_property(property_id: str, request: Request):
     """Public endpoint: Get a single property with all photos (with resolved URLs)"""
+    # Determine base URL for absolute photo URLs
+    base_url = str(request.base_url).rstrip('/')
+    forwarded_host = request.headers.get('x-forwarded-host') or request.headers.get('host')
+    forwarded_proto = request.headers.get('x-forwarded-proto', 'https')
+    if forwarded_host:
+        base_url = f"{forwarded_proto}://{forwarded_host}"
+
+    def resolve_url(path: str) -> str:
+        if path.startswith("http"):
+            return path
+        elif path.startswith("/api/"):
+            return f"{base_url}{path}"
+        elif path.startswith("ross-rentals/"):
+            return f"{base_url}/api/public/property-file/{path[len('ross-rentals/'):]}"
+        elif path.startswith("properties/"):
+            return f"{base_url}/api/public/property-file/{path}"
+        return path
+
     db = get_db()
     # Try own properties first (show all statuses since this is a detail view)
     try:
@@ -172,11 +201,8 @@ async def public_get_property(property_id: str):
         for p in photo_docs:
             sp = p.get("storage_path", "")
             if sp:
-                # Strip the app name prefix for the public URL
-                if sp.startswith("ross-rentals/"):
-                    sp = sp[len("ross-rentals/"):]
                 photo_urls.append({
-                    "url": f"/api/public/property-file/{sp}",
+                    "url": resolve_url(sp),
                     "caption": p.get("caption", ""),
                 })
 
@@ -184,13 +210,7 @@ async def public_get_property(property_id: str):
         if not photo_urls and prop.get("photos"):
             for path_or_url in prop["photos"]:
                 if isinstance(path_or_url, str):
-                    if path_or_url.startswith("http"):
-                        photo_urls.append({"url": path_or_url, "caption": ""})
-                    elif path_or_url.startswith("ross-rentals/"):
-                        clean_path = path_or_url[len("ross-rentals/"):]
-                        photo_urls.append({"url": f"/api/public/property-file/{clean_path}", "caption": ""})
-                    elif path_or_url.startswith("properties/"):
-                        photo_urls.append({"url": f"/api/public/property-file/{path_or_url}", "caption": ""})
+                    photo_urls.append({"url": resolve_url(path_or_url), "caption": ""})
 
         return {
             "success": True,
