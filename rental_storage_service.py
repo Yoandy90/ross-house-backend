@@ -23,10 +23,13 @@ _use_mongo_fallback = False
 
 def set_emergent_key(key: str):
     """Set the Emergent key at runtime (from DB config)."""
-    global EMERGENT_KEY
-    if key:
+    global EMERGENT_KEY, storage_key, _use_mongo_fallback
+    if key and key != EMERGENT_KEY:
         EMERGENT_KEY = key
-        logger.info("✅ Storage service: Emergent key set from DB config")
+        # Reset cached storage state so init_storage() re-initializes with the new key
+        storage_key = None
+        _use_mongo_fallback = False
+        logger.info("✅ Storage service: Emergent key set from DB config (cache cleared)")
 
 
 def init_storage():
