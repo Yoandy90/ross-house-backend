@@ -2,10 +2,12 @@
 Rental Storage Service — Property Photos & Checklist Images
 ============================================================
 Uses Emergent Object Storage for file uploads.
+Falls back to MongoDB base64 storage if Object Storage is unavailable.
 """
 import os
 import uuid
 import logging
+import base64
 import requests
 from datetime import datetime, timezone
 
@@ -16,22 +18,26 @@ EMERGENT_KEY = os.environ.get("EMERGENT_LLM_KEY")
 APP_NAME = "ross-rentals"
 
 storage_key = None
+_use_mongo_fallback = False
 
-MIME_TYPES = {
-    "jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
-    "gif": "image/gif", "webp": "image/webp", "pdf": "application/pdf",
-    "heic": "image/heic", "heif": "image/heif",
-}
 
-MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 MB
-ALLOWED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp", "image/heic", "image/heif"}
+def set_emergent_key(key: str):
+    """Set the Emergent key at runtime (from DB config)."""
+    global EMERGENT_KEY
+    if key:
+        EMERGENT_KEY = key
+        logger.info("✅ Storage service: Emergent key set from DB config")
 
 
 def init_storage():
     """Initialize storage — call once at startup."""
-    global storage_key
+    global storage_key, _use_mongo_fallback
     if storage_key:
         return storage_key
+    if not EMERGENT_KEY:
+        logger.warning("⚠️ No EMERGENT_LLM_KEY - using MongoDB fallback for photos")
+        _use_mongo_fallback = True
+        return None
     try:
         resp = requests.post(
             f"{STORAGE_URL}/init",
@@ -43,15 +49,34 @@ def init_storage():
         logger.info("✅ Rental Object Storage initialized")
         return storage_key
     except Exception as e:
-        logger.error(f"❌ Storage init failed: {e}")
+        logger.warning(f"⚠️ Object Storage init failed: {e} — using MongoDB fallback")
+        _use_mongo_fallback = True
         return None
 
 
 def put_object(path: str, data: bytes, content_type: str) -> dict:
-    """Upload a file to object storage."""
+    """Upload a file to object storage or return MongoDB-ready dict."""
+    if _use_mongo_fallback:
+        # Store as base64 in MongoDB
+        b64 = base64.b64encode(data).decode('utf-8')
+        return {
+            "path": path,
+            "size": len(data),
+            "storage_type": "mongodb",
+            "base64_data": f"data:{content_type};base64,{b64}",
+        }
+
     key = init_storage()
     if not key:
-        raise Exception("Storage not initialized")
+        # Fallback to MongoDB
+        b64 = base64.b64encode(data).decode('utf-8')
+        return {
+            "path": path,
+            "size": len(data),
+            "storage_type": "mongodb",
+            "base64_data": f"data:{content_type};base64,{b64}",
+        }
+
     resp = requests.put(
         f"{STORAGE_URL}/objects/{path}",
         headers={"X-Storage-Key": key, "Content-Type": content_type},
@@ -59,7 +84,9 @@ def put_object(path: str, data: bytes, content_type: str) -> dict:
         timeout=120
     )
     resp.raise_for_status()
-    return resp.json()
+    result = resp.json()
+    result["storage_type"] = "object_storage"
+    return result
 
 
 def get_object(path: str):

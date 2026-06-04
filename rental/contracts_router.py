@@ -1609,8 +1609,18 @@ async def upload_property_photo(property_id: str, request: Request):
     if len(file_bytes) > 10 * 1024 * 1024:
         raise HTTPException(status_code=400, detail="La imagen excede 10MB")
 
-    from rental_storage_service import upload_property_photo as _upload_photo
-    photo_info = _upload_photo(property_id, file_bytes, filename, content_type)
+    # Try to load storage key from DB config if not in env
+    from rental_storage_service import set_emergent_key, upload_property_photo as _upload_photo
+    config = await get_db().api_config.find_one({"_id": "main"})
+    if config and config.get("EMERGENT_LLM_KEY"):
+        set_emergent_key(config["EMERGENT_LLM_KEY"])
+
+    try:
+        photo_info = _upload_photo(property_id, file_bytes, filename, content_type)
+    except Exception as e:
+        logger.error(f"Photo upload error: {e}")
+        raise HTTPException(status_code=500, detail=f"Error subiendo foto: {str(e)}")
+
     photo_info['caption'] = caption
     photo_info['is_deleted'] = False
 
@@ -1622,9 +1632,10 @@ async def upload_property_photo(property_id: str, request: Request):
     })
 
     # Also add to property's photos array
+    storage_path = photo_info.get('storage_path', photo_info.get('base64_data', ''))
     await get_db().properties.update_one(
         {"_id": ObjectId(property_id)},
-        {"$push": {"photos": photo_info['storage_path']}}
+        {"$push": {"photos": storage_path}}
     )
 
     return {"success": True, "message": "Foto subida exitosamente", "photo": photo_info}
