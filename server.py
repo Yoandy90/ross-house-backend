@@ -142,7 +142,18 @@ try:
     app.include_router(faq_router, prefix="/api")
     app.include_router(faq_public_router, prefix="/api")
 
-    logger.info("✅ All 16 rental routers registered successfully")
+    # ── Initialize AI Brain ──
+    from rental.ai_brain import RossHouseAIBrain
+    from rental.ai_brain_router import router as ai_brain_router, set_ai_brain as set_router_brain
+    from rental.chat_router import set_ai_brain as set_chat_ai_brain
+
+    ai_brain = RossHouseAIBrain(db)
+    set_router_brain(ai_brain)
+    set_chat_ai_brain(ai_brain)
+    app.include_router(ai_brain_router, prefix="/api")
+    logger.info("🧠 AI Brain initialized and connected to chat")
+
+    logger.info("✅ All rental routers + AI Brain registered successfully")
 
 except Exception as e:
     import traceback

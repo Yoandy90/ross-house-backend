@@ -9,6 +9,7 @@ Collections:
 """
 
 import logging
+import asyncio
 from datetime import datetime, timezone
 from typing import Optional
 from bson import ObjectId
@@ -19,6 +20,14 @@ from rental.shared import get_db, serialize, auth_marketplace, auth_admin, send_
 
 router = APIRouter(prefix="/chat", tags=["Chat"])
 logger = logging.getLogger(__name__)
+
+# AI Brain reference (set from server.py)
+_ai_brain = None
+
+def set_ai_brain(brain):
+    global _ai_brain
+    _ai_brain = brain
+    logger.info("🧠 Chat router connected to AI Brain")
 
 
 # ── Pydantic Models ──
@@ -169,6 +178,10 @@ async def send_message(request: Request, body: SendMessageBody):
         )
     except Exception as e:
         logger.warning(f"Push to admin failed: {e}")
+
+    # 🧠 AI Brain Auto-Reply (runs in background)
+    if _ai_brain and body.message_type == "text":
+        asyncio.create_task(_ai_auto_reply(conv_id, body.content, user_name))
 
     return {"success": True, "message": serialize(msg)}
 
@@ -411,6 +424,10 @@ async def public_send_message(body: PublicChatSendBody):
     except Exception as e:
         logger.warning(f"Push to admin failed: {e}")
 
+    # 🧠 AI Brain Auto-Reply for public chat
+    if _ai_brain:
+        asyncio.create_task(_ai_auto_reply(conv_id, body.content, sender_name))
+
     return {"success": True, "message": serialize(msg)}
 
 
@@ -443,3 +460,70 @@ async def public_get_messages(conversation_id: str, session_token: str, limit: i
     )
 
     return {"success": True, "messages": [serialize(m) for m in messages]}
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# AI AUTO-REPLY (Background Task)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def _ai_auto_reply(conversation_id: str, user_message: str, sender_name: str):
+    """Generate and send an AI auto-reply in the background."""
+    try:
+        if not _ai_brain:
+            return
+
+        # Small delay to feel more natural
+        await asyncio.sleep(2)
+
+        # Generate AI response
+        ai_text = await _ai_brain.generate_chat_response(conversation_id, user_message, sender_name)
+        if not ai_text:
+            return
+
+        db = get_db()
+
+        # Save AI response as a message
+        ai_msg = {
+            "conversation_id": conversation_id,
+            "sender_type": "admin",
+            "sender_id": "ai_brain",
+            "sender_name": "Ross House AI",
+            "message_type": "text",
+            "content": ai_text,
+            "is_ai": True,
+            "read": False,
+            "created_at": datetime.now(timezone.utc),
+        }
+        await db.chat_messages.insert_one(ai_msg)
+
+        # Update conversation
+        preview = f"🤖 {ai_text[:70]}"
+        await db.chat_conversations.update_one(
+            {"_id": ObjectId(conversation_id)},
+            {
+                "$set": {
+                    "last_message": preview,
+                    "last_message_at": datetime.now(timezone.utc),
+                },
+                "$inc": {"unread_tenant": 1},
+            }
+        )
+
+        # Push notification to tenant
+        try:
+            conv = await db.chat_conversations.find_one({"_id": ObjectId(conversation_id)})
+            if conv and conv.get("tenant_id"):
+                await send_rental_push_to_user(
+                    user_id=conv["tenant_id"],
+                    title="🏠 Ross House Rentals",
+                    body=ai_text[:100],
+                    data={"type": "chat_message", "conversation_id": conversation_id}
+                )
+        except Exception as e:
+            logger.warning(f"Push to tenant failed: {e}")
+
+        logger.info(f"🧠 AI auto-replied to conversation {conversation_id}")
+
+    except Exception as e:
+        logger.error(f"❌ AI auto-reply error: {e}")
