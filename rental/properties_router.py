@@ -32,10 +32,14 @@ async def public_list_property_photos(property_id: str):
 
     result = []
     for p in photos:
+        sp = p.get('storage_path', '')
+        # Strip the app name prefix so the public URL is clean
+        if sp.startswith("ross-rentals/"):
+            sp = sp[len("ross-rentals/"):]
         result.append({
             "id": str(p.get("_id", "")),
             "file_id": p.get("file_id", ""),
-            "url": f"/api/public/property-file/{p.get('storage_path', '')}",
+            "url": f"/api/public/property-file/{sp}",
             "caption": p.get("caption", ""),
             "filename": p.get("filename", ""),
         })
@@ -158,6 +162,9 @@ async def public_get_property(property_id: str):
         for p in photo_docs:
             sp = p.get("storage_path", "")
             if sp:
+                # Strip the app name prefix for the public URL
+                if sp.startswith("ross-rentals/"):
+                    sp = sp[len("ross-rentals/"):]
                 photo_urls.append({
                     "url": f"/api/public/property-file/{sp}",
                     "caption": p.get("caption", ""),
@@ -169,6 +176,9 @@ async def public_get_property(property_id: str):
                 if isinstance(path_or_url, str):
                     if path_or_url.startswith("http"):
                         photo_urls.append({"url": path_or_url, "caption": ""})
+                    elif path_or_url.startswith("ross-rentals/"):
+                        clean_path = path_or_url[len("ross-rentals/"):]
+                        photo_urls.append({"url": f"/api/public/property-file/{clean_path}", "caption": ""})
                     elif path_or_url.startswith("properties/"):
                         photo_urls.append({"url": f"/api/public/property-file/{path_or_url}", "caption": ""})
 
