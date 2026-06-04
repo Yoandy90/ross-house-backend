@@ -112,14 +112,17 @@ async def get_city_listings(
     beds: Optional[int] = None,
     baths: Optional[int] = None,
     property_type: Optional[str] = None,
+    status: Optional[str] = Query(default="active", description="Filter: active, inactive, all"),
 ):
-    """Get active property listings in a city."""
+    """Get property listings in a city. Defaults to active listings."""
     params: dict = {
         "city": city,
         "state": state.upper(),
         "page": page,
         "page_limit": page_limit,
     }
+    if status and status.lower() != "all":
+        params["status"] = status
     if min_price:
         params["min_price"] = min_price
     if max_price:
@@ -133,9 +136,16 @@ async def get_city_listings(
 
     data = await _mashvisor_get("/city/listings", params=params, cache_category="listings")
     content = data.get("content", {})
+    
+    # Secure image URLs for iOS ATS compliance
+    properties = content.get("properties", [])
+    for p in properties:
+        img = p.get("image") or p.get("image_url", "")
+        p["image"] = _secure_url(img)
+    
     return {
         "status": "success",
-        "listings": content.get("properties", []),
+        "listings": properties,
         "total": content.get("total_results", 0),
         "page": content.get("page", page),
         "total_pages": content.get("total_pages", 0),
@@ -293,12 +303,15 @@ async def public_market_listings(
     min_price: Optional[int] = None, max_price: Optional[int] = None,
     beds: Optional[int] = None, baths: Optional[int] = None,
     property_type: Optional[str] = None,
+    status: Optional[str] = Query(default="active", description="Filter: active, inactive, all"),
 ):
     """Public: browse properties for sale (no auth required). Cached."""
     params = {
         "state": state.upper(), "city": city,
         "page": page, "page_limit": page_limit,
     }
+    if status and status.lower() != "all":
+        params["status"] = status
     if min_price:
         params["min_price"] = min_price
     if max_price:
