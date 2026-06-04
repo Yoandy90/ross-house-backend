@@ -5,7 +5,7 @@ Real estate market data, property analysis, and investment metrics via RapidAPI.
 All API calls pass through a MongoDB caching layer to minimize RapidAPI costs.
 """
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
 from typing import Optional
 import httpx
 import os
@@ -376,7 +376,7 @@ async def public_market_overview(state: str, city: str):
 
 
 @public_router.post("/interest")
-async def public_property_interest(request):
+async def public_property_interest(request: Request):
     """Record interest in a property (generates a lead for admin). NOT cached."""
     from rental.shared import get_db, send_rental_push_to_admins
     from datetime import datetime, timezone
