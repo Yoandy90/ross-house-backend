@@ -127,14 +127,19 @@ async def marketplace_register(request: Request):
     email = data.get("email", "").strip().lower()
     phone = data.get("phone", "").strip()
     password = data.get("password", "").strip()
-    role = data.get("role", "tenant")  # tenant, landlord, buyer
+    role = data.get("role", "guest")  # guest, landlord, buyer (tenant is admin-only)
 
     if not name or not email or not phone:
         raise HTTPException(status_code=400, detail="Nombre, email y teléfono son requeridos")
     if not password or len(password) < 6:
         raise HTTPException(status_code=400, detail="La contraseña debe tener al menos 6 caracteres")
-    if role not in ("tenant", "landlord", "buyer"):
+    if role not in ("guest", "tenant", "landlord", "buyer"):
         raise HTTPException(status_code=400, detail="Rol inválido")
+
+    # Self-registration: if someone picks 'tenant', downgrade to 'guest'
+    # Real tenant role is only assigned by admin when creating an actual tenant
+    if role == "tenant":
+        role = "guest"
 
     # Check if email already exists
     existing = await get_db().app_users.find_one({"email": email})
@@ -161,7 +166,7 @@ async def marketplace_register(request: Request):
     result = await get_db().app_users.insert_one(user)
     user_id = str(result.inserted_id)
 
-    # Also create in tenants collection if tenant role (backward compatibility)
+    # Also create in tenants collection if tenant role (admin-created tenants only, not guest self-reg)
     if role == "tenant":
         import random
         tenant_number = f"T-{random.randint(10000, 99999)}"
