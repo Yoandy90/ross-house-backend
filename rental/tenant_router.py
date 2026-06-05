@@ -219,6 +219,8 @@ async def list_tenants(request: Request):
         query['status'] = status_filter
     if search:
         query['$or'] = [
+            {"first_name": {"$regex": search, "$options": "i"}},
+            {"last_name": {"$regex": search, "$options": "i"}},
             {"name": {"$regex": search, "$options": "i"}},
             {"email": {"$regex": search, "$options": "i"}},
             {"phone": {"$regex": search, "$options": "i"}},
@@ -228,10 +230,18 @@ async def list_tenants(request: Request):
     cursor = get_db().tenants.find(query).sort("created_at", -1)
     tenants = []
     async for t in cursor:
+        # Ensure first_name/last_name exist (backward compat with old 'name' field)
+        if not t.get('first_name') and t.get('name'):
+            parts = t['name'].split(' ', 1)
+            t['first_name'] = parts[0]
+            t['last_name'] = parts[1] if len(parts) > 1 else ''
         # Get current property name
         if t.get('current_property_id'):
-            prop = await get_db().properties.find_one({"_id": ObjectId(t['current_property_id'])})
-            t['current_property_address'] = prop.get('address', '') if prop else ''
+            try:
+                prop = await get_db().properties.find_one({"_id": ObjectId(t['current_property_id'])})
+                t['current_property_address'] = prop.get('address', '') if prop else ''
+            except:
+                t['current_property_address'] = ''
         else:
             t['current_property_address'] = ''
         tenants.append(serialize(t))
@@ -241,28 +251,44 @@ async def list_tenants(request: Request):
 
 @router.post('/admin/tenants')
 async def create_tenant(request: Request):
-    """Create a new tenant"""
+    """Create a new tenant + auto-create user account + send welcome email"""
     user = await auth_admin(request)
     data = await request.json()
     now = datetime.utcnow()
+
+    first_name = data.get('first_name', '').strip()
+    last_name = data.get('last_name', '').strip()
+    email = data.get('email', '').strip().lower()
+    phone = data.get('phone', '').strip()
+
+    if not first_name or not last_name:
+        raise HTTPException(status_code=400, detail="Nombre y apellido son requeridos")
+    if not phone:
+        raise HTTPException(status_code=400, detail="Teléfono es requerido")
+
+    full_name = f"{first_name} {last_name}"
 
     count = await get_db().tenants.count_documents({})
     tenant_number = f"INQ-{now.year}-{str(count + 1).zfill(3)}"
 
     tenant_doc = {
         "tenant_number": tenant_number,
-        "name": data.get('name', ''),
-        "email": data.get('email', ''),
-        "phone": data.get('phone', ''),
+        "first_name": first_name,
+        "last_name": last_name,
+        "name": full_name,
+        "email": email,
+        "phone": phone,
+        "address": data.get('address', ''),
+        "photo_url": data.get('photo_url', ''),
         "ssn_last4": data.get('ssn_last4', ''),
-        "id_type": data.get('id_type', ''),  # passport, drivers_license, state_id, itin
+        "id_type": data.get('id_type', ''),
         "id_number": data.get('id_number', ''),
-        "emergency_contact_name": data.get('emergency_contact_name', ''),
-        "emergency_contact_phone": data.get('emergency_contact_phone', ''),
+        "emergency_contact": data.get('emergency_contact', ''),
+        "emergency_phone": data.get('emergency_phone', ''),
         "employer": data.get('employer', ''),
-        "monthly_income": float(data.get('monthly_income', 0)),
+        "monthly_income": float(data.get('monthly_income', 0) or 0),
         "current_property_id": data.get('current_property_id', None),
-        "status": data.get('status', 'active'),  # active, inactive, evicted
+        "status": data.get('status', 'active'),
         "rental_history": [],
         "notes": data.get('notes', ''),
         "created_at": now,
@@ -271,11 +297,54 @@ async def create_tenant(request: Request):
     }
 
     result = await get_db().tenants.insert_one(tenant_doc)
+    tenant_id = str(result.inserted_id)
+
+    # Auto-create user account if email is provided
+    user_created = False
+    generated_password = None
+    if email:
+        existing_user = await get_db().app_users.find_one({"email": email})
+        if not existing_user:
+            import random, string
+            generated_password = ''.join(random.choices(string.ascii_letters + string.digits, k=8))
+            from rental.auth_router import hash_password
+            app_user = {
+                "name": full_name,
+                "email": email,
+                "phone": phone,
+                "password_hash": hash_password(generated_password),
+                "role": "tenant",
+                "status": "active",
+                "verified": True,
+                "tenant_id": tenant_id,
+                "created_at": now,
+                "created_from": "admin_panel",
+            }
+            user_result = await get_db().app_users.insert_one(app_user)
+            tenant_doc['app_user_id'] = str(user_result.inserted_id)
+            await get_db().tenants.update_one(
+                {"_id": result.inserted_id},
+                {"$set": {"app_user_id": str(user_result.inserted_id)}}
+            )
+            user_created = True
+            logging.info(f"✅ Auto-created app user for tenant {tenant_number}: {email}")
+
+            # Send welcome email with credentials
+            await _send_welcome_email(email, full_name, generated_password)
+        else:
+            # Link existing user to tenant
+            await get_db().tenants.update_one(
+                {"_id": result.inserted_id},
+                {"$set": {"app_user_id": str(existing_user["_id"])}}
+            )
+
     return {
         "success": True,
         "message": f"Inquilino {tenant_number} creado",
-        "tenant_id": str(result.inserted_id),
+        "tenant_id": tenant_id,
         "tenant_number": tenant_number,
+        "user_created": user_created,
+        "email_sent": user_created and email != '',
     }
 
 
@@ -291,19 +360,82 @@ async def update_tenant(tenant_id: str, request: Request):
         raise HTTPException(status_code=404, detail="Inquilino no encontrado")
 
     update_fields = {}
-    allowed = ['name', 'email', 'phone', 'ssn_last4', 'id_type', 'id_number',
-               'emergency_contact_name', 'emergency_contact_phone', 'employer',
-               'monthly_income', 'status', 'notes']
+    allowed = ['first_name', 'last_name', 'email', 'phone', 'address', 'photo_url',
+               'ssn_last4', 'id_type', 'id_number', 'emergency_contact', 'emergency_phone',
+               'employer', 'monthly_income', 'current_property_id', 'status', 'notes']
     for field in allowed:
         if field in data:
             if field == 'monthly_income':
-                update_fields[field] = float(data[field])
+                update_fields[field] = float(data[field] or 0)
             else:
                 update_fields[field] = data[field]
-    update_fields['updated_at'] = now
 
+    # Keep 'name' in sync
+    if 'first_name' in data or 'last_name' in data:
+        fn = data.get('first_name', tenant.get('first_name', ''))
+        ln = data.get('last_name', tenant.get('last_name', ''))
+        update_fields['name'] = f"{fn} {ln}".strip()
+
+    update_fields['updated_at'] = now
     await get_db().tenants.update_one({"_id": ObjectId(tenant_id)}, {"$set": update_fields})
     return {"success": True, "message": "Inquilino actualizado"}
+
+
+@router.post('/admin/tenants/{tenant_id}/photo')
+async def upload_tenant_photo(tenant_id: str, request: Request):
+    """Upload a tenant photo (base64 image from file upload or webcam)"""
+    user = await auth_admin(request)
+    data = await request.json()
+    image_data = data.get('image_data', '')
+    content_type = data.get('content_type', 'image/jpeg')
+
+    if not image_data:
+        raise HTTPException(status_code=400, detail="No image data provided")
+
+    tenant = await get_db().tenants.find_one({"_id": ObjectId(tenant_id)})
+    if not tenant:
+        raise HTTPException(status_code=404, detail="Inquilino no encontrado")
+
+    try:
+        import base64, uuid
+        from rental_storage_service import set_emergent_key, put_object, APP_NAME
+
+        # Load storage key from DB
+        config = await get_db().api_config.find_one({"_id": "main"})
+        if config and config.get("EMERGENT_LLM_KEY"):
+            set_emergent_key(config["EMERGENT_LLM_KEY"])
+
+        # Clean base64
+        if ',' in image_data:
+            image_data = image_data.split(',', 1)[1]
+        file_bytes = base64.b64decode(image_data)
+
+        ext = 'jpg' if 'jpeg' in content_type else content_type.split('/')[-1]
+        file_id = str(uuid.uuid4())
+        path = f"{APP_NAME}/tenants/{tenant_id}/{file_id}.{ext}"
+
+        result = put_object(path, file_bytes, content_type)
+        storage_path = result.get("path", path)
+
+        # Build public URL
+        base_url = str(request.base_url).rstrip('/')
+        fwd_host = request.headers.get('x-forwarded-host') or request.headers.get('host')
+        fwd_proto = request.headers.get('x-forwarded-proto', 'https')
+        if fwd_host:
+            base_url = f"{fwd_proto}://{fwd_host}"
+        clean = storage_path.replace(f"{APP_NAME}/", "") if storage_path.startswith(f"{APP_NAME}/") else storage_path
+        photo_url = f"{base_url}/api/public/property-file/{clean}"
+
+        # Update tenant
+        await get_db().tenants.update_one(
+            {"_id": ObjectId(tenant_id)},
+            {"$set": {"photo_url": photo_url, "updated_at": datetime.utcnow()}}
+        )
+
+        return {"success": True, "photo_url": photo_url}
+    except Exception as e:
+        logging.error(f"Tenant photo upload error: {e}")
+        raise HTTPException(status_code=500, detail=f"Error al subir foto: {str(e)}")
 
 
 @router.delete('/admin/tenants/{tenant_id}')
@@ -314,7 +446,6 @@ async def delete_tenant(tenant_id: str, request: Request):
     if not tenant:
         raise HTTPException(status_code=404, detail="Inquilino no encontrado")
 
-    # Check if tenant has active contracts
     active_contract = await get_db().rental_contracts.find_one({"tenant_id": tenant_id, "status": "active"})
     if active_contract:
         from urllib.parse import parse_qs
@@ -325,6 +456,60 @@ async def delete_tenant(tenant_id: str, request: Request):
 
     await get_db().tenants.delete_one({"_id": ObjectId(tenant_id)})
     return {"success": True, "message": f"Inquilino {tenant.get('tenant_number', '')} eliminado"}
+
+
+async def _send_welcome_email(email: str, name: str, password: str):
+    """Send welcome email with login credentials to new tenant"""
+    import os
+    try:
+        sendgrid_key = os.getenv('SENDGRID_API_KEY')
+        from_email = os.getenv('SENDGRID_FROM_EMAIL', 'info@rosshouserentals.com')
+
+        if not sendgrid_key:
+            config = await get_db().api_config.find_one({"_id": "main"})
+            if config:
+                sendgrid_key = config.get('sendgrid_api_key') or config.get('SENDGRID_API_KEY')
+                from_email = config.get('sendgrid_from_email', from_email)
+
+        if not sendgrid_key:
+            logging.warning(f"⚠️ No SendGrid key — skipping welcome email to {email}")
+            return
+
+        import sendgrid
+        from sendgrid.helpers.mail import Mail, Email, To, Content, HtmlContent
+
+        html = f"""
+        <div style="font-family: 'Segoe UI', Tahoma, sans-serif; max-width: 600px; margin: 0 auto; background: #0a0f1a; color: #e2e8f0; border-radius: 16px; overflow: hidden;">
+            <div style="background: linear-gradient(135deg, #7c3aed, #4f46e5); padding: 32px; text-align: center;">
+                <h1 style="color: white; margin: 0; font-size: 24px;">🏠 Ross House Rentals</h1>
+                <p style="color: rgba(255,255,255,0.85); margin: 8px 0 0;">Bienvenido(a) a nuestra plataforma</p>
+            </div>
+            <div style="padding: 32px;">
+                <p style="font-size: 16px;">Hola <strong>{name}</strong>,</p>
+                <p>Tu cuenta ha sido creada exitosamente. Usa las siguientes credenciales para acceder a la aplicacion:</p>
+                <div style="background: rgba(124,58,237,0.1); border: 1px solid rgba(124,58,237,0.3); border-radius: 12px; padding: 20px; margin: 20px 0;">
+                    <p style="margin: 0 0 8px;"><strong>📧 Email:</strong> {email}</p>
+                    <p style="margin: 0;"><strong>🔑 Contrasena:</strong> {password}</p>
+                </div>
+                <p style="color: #94a3b8; font-size: 14px;">Te recomendamos cambiar tu contrasena despues de iniciar sesion por primera vez.</p>
+                <p style="color: #94a3b8; font-size: 14px;">Si tienes alguna pregunta, no dudes en contactarnos.</p>
+                <hr style="border: none; border-top: 1px solid rgba(255,255,255,0.1); margin: 24px 0;" />
+                <p style="text-align: center; color: #64748b; font-size: 12px;">Ross House Rentals LLC<br/>info@rosshouserentals.com</p>
+            </div>
+        </div>
+        """
+
+        sg = sendgrid.SendGridAPIClient(api_key=sendgrid_key)
+        mail = Mail(
+            from_email=Email(from_email, "Ross House Rentals"),
+            to_emails=To(email),
+            subject=f"Bienvenido a Ross House Rentals - Tus credenciales de acceso",
+            html_content=html,
+        )
+        response = sg.send(mail)
+        logging.info(f"✅ Welcome email sent to {email} (status: {response.status_code})")
+    except Exception as e:
+        logging.error(f"❌ Failed to send welcome email to {email}: {e}")
 
 
 

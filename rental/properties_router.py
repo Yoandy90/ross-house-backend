@@ -50,7 +50,7 @@ async def public_list_property_photos(property_id: str):
 async def public_serve_property_file(path: str):
     """Public: Serve a property photo from object storage (no auth required)"""
     # Only allow serving from properties/ or checklists/ paths for security
-    if not path.startswith("properties/") and not path.startswith("checklists/"):
+    if not path.startswith("properties/") and not path.startswith("checklists/") and not path.startswith("tenants/"):
         raise HTTPException(status_code=403, detail="Acceso denegado")
     try:
         from rental_storage_service import get_object, set_emergent_key, APP_NAME

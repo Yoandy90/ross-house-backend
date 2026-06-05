@@ -167,13 +167,23 @@ async def marketplace_register(request: Request):
         tenant_number = f"T-{random.randint(10000, 99999)}"
         await get_db().tenants.insert_one({
             "name": name,
+            "first_name": name.split(' ', 1)[0],
+            "last_name": name.split(' ', 1)[1] if ' ' in name else '',
             "email": email,
             "phone": phone,
             "tenant_number": tenant_number,
             "app_user_id": user_id,
             "status": "active",
             "created_at": datetime.utcnow(),
+            "created_from": "app",
         })
+
+    # Send welcome email with credentials
+    try:
+        from rental.tenant_router import _send_welcome_email
+        await _send_welcome_email(email, name, password)
+    except Exception as e:
+        logging.warning(f"Could not send welcome email: {e}")
 
     token = create_marketplace_token(user_id, email, role)
 
