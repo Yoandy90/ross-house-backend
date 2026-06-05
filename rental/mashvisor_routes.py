@@ -306,6 +306,19 @@ async def public_market_listings(
     status: Optional[str] = Query(default="active", description="Filter: active, inactive, all"),
 ):
     """Public: browse properties for sale (no auth required). Cached."""
+    # Map frontend filter values to Mashvisor's exact type strings
+    MASHVISOR_TYPE_MAP = {
+        "single_family": "Single Family Residential",
+        "multi_family": "Multi Family",
+        "condo": "Condo/Co-op",
+        "townhouse": "Townhouse",
+        "land": "Lots/Land",
+        "apartment": "Apartment",
+        "mobile": "Mobile/Manufactured",
+        "commercial": "Commercial",
+        "farm": "Farm",
+    }
+
     params = {
         "state": state.upper(), "city": city,
         "page": page, "page_limit": page_limit,
@@ -321,7 +334,9 @@ async def public_market_listings(
     if baths:
         params["baths"] = baths
     if property_type:
-        params["property_type"] = property_type
+        # Convert frontend value to Mashvisor's expected value
+        mashvisor_type = MASHVISOR_TYPE_MAP.get(property_type, property_type)
+        params["property_type"] = mashvisor_type
 
     data = await _mashvisor_get("/city/listings", params, cache_category="listings")
     content = data.get("content", {})
