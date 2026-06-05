@@ -13,13 +13,13 @@ logger = logging.getLogger(__name__)
 
 
 def get_db():
-    from rental.shared import get_rental_db
-    return get_rental_db()
+    from rental.shared import get_db as _get_db
+    return _get_db()
 
 
 async def auth_admin(request: Request):
-    from rental.shared import verify_admin_token
-    return await verify_admin_token(request)
+    from rental.shared import auth_admin as _auth_admin
+    return await _auth_admin(request)
 
 
 # ═══════════════════════════════════════════════════════════════
