@@ -161,7 +161,7 @@ def _number_to_words(n):
 # MAIN CONTRACT GENERATOR
 # ═══════════════════════════════════════════════════════════════════════════
 
-def generate_rental_contract_pdf(contract: dict, config: dict = None) -> str:
+def generate_rental_contract_pdf(contract: dict, config: dict = None, tenant_photo_url: str = None) -> str:
     """
     Generate a comprehensive Texas-compliant bilingual lease agreement PDF.
     Returns base64-encoded PDF string.
@@ -280,6 +280,42 @@ def generate_rental_contract_pdf(contract: dict, config: dict = None) -> str:
     ]))
     elements.append(t)
     elements.append(Spacer(1, 8))
+
+    # ─── TENANT IDENTIFICATION PHOTO ─────────────────────────────────
+    if tenant_photo_url:
+        try:
+            import urllib.request
+            photo_data = urllib.request.urlopen(tenant_photo_url, timeout=10).read()
+            photo_buffer = io.BytesIO(photo_data)
+            tenant_photo = RLImage(photo_buffer, width=1.2 * inch, height=1.5 * inch)
+            tenant_photo.hAlign = 'LEFT'
+
+            photo_table_data = [
+                [Paragraph("<b>Tenant Identification Photo / Foto de Identificación del Arrendatario</b>", styles['BodySmall']), ''],
+                [tenant_photo, Paragraph(
+                    f"<b>{contract.get('tenant_name', 'N/A')}</b><br/>"
+                    f"Photo taken at Ross House Rentals office<br/>"
+                    f"Foto tomada en la oficina de Ross House Rentals<br/>"
+                    f"Date / Fecha: {datetime.utcnow().strftime('%m/%d/%Y')}",
+                    styles['BodySmall']
+                )],
+            ]
+            pt = Table(photo_table_data, colWidths=[110, 360])
+            pt.setStyle(TableStyle([
+                ('SPAN', (0, 0), (1, 0)),
+                ('BACKGROUND', (0, 0), (-1, 0), LIGHT_GRAY),
+                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                ('FONTSIZE', (0, 0), (-1, -1), 8),
+                ('VALIGN', (0, 1), (-1, -1), 'MIDDLE'),
+                ('GRID', (0, 0), (-1, -1), 0.5, BORDER_GRAY),
+                ('TOPPADDING', (0, 0), (-1, -1), 5),
+                ('BOTTOMPADDING', (0, 0), (-1, -1), 5),
+                ('LEFTPADDING', (0, 0), (-1, -1), 6),
+            ]))
+            elements.append(pt)
+            elements.append(Spacer(1, 8))
+        except Exception as e:
+            logger.warning(f"Could not include tenant photo in contract: {e}")
 
     # ═══ SECTION 2: PROPERTY / PROPIEDAD ═════════════════════════════
     section += 1
@@ -797,6 +833,96 @@ def generate_rental_contract_pdf(contract: dict, config: dict = None) -> str:
             styles['InitialLine']
         ))
         addendum_letter = chr(ord(addendum_letter) + 1)
+
+    # ─── ADDENDUM: PHOTO ID & CONSENT / CONSENTIMIENTO FOTOGRÁFICO ──
+    elements.append(Spacer(1, 12))
+    elements.append(HRFlowable(width="100%", thickness=1, color=BORDER_GRAY))
+    elements.append(Spacer(1, 8))
+    elements.append(Paragraph(
+        f"ADDENDUM {addendum_letter}: PHOTOGRAPHIC IDENTIFICATION & CONSENT / "
+        f"ADDENDUM {addendum_letter}: IDENTIFICACIÓN FOTOGRÁFICA Y CONSENTIMIENTO",
+        styles['AddendumTitle']
+    ))
+    elements.append(Spacer(1, 6))
+    elements.append(Paragraph(
+        "<b>1. AUTHORIZATION / AUTORIZACIÓN:</b> Tenant hereby authorizes Landlord, its employees, "
+        "and authorized agents to take, store, and use photographic images of Tenant for the following "
+        "purposes:",
+        styles['Body']
+    ))
+    photo_purposes = [
+        "Identity verification during lease execution, lease renewals, and key exchanges.",
+        "Prevention of fraud, identity theft, and unauthorized occupancy.",
+        "Maintaining a visual identification record in the tenant management system.",
+        "Compliance with Landlord's internal security and property management policies.",
+    ]
+    for pp in photo_purposes:
+        elements.append(Paragraph(f"• {pp}", styles['BodySmall']))
+    elements.append(Spacer(1, 4))
+    elements.append(Paragraph(
+        "<b>1. AUTORIZACIÓN:</b> El Arrendatario autoriza al Arrendador, sus empleados y agentes "
+        "autorizados a tomar, almacenar y utilizar imágenes fotográficas del Arrendatario para: "
+        "verificación de identidad durante la firma del contrato, renovaciones y entrega de llaves; "
+        "prevención de fraude, robo de identidad y ocupación no autorizada; mantenimiento de un "
+        "registro de identificación visual en el sistema de gestión de inquilinos; y cumplimiento "
+        "con las políticas internas de seguridad.",
+        styles['Body']
+    ))
+    elements.append(Spacer(1, 4))
+    elements.append(Paragraph(
+        "<b>2. DATA PROTECTION / PROTECCIÓN DE DATOS:</b> Landlord agrees to:",
+        styles['Body']
+    ))
+    protection_items = [
+        "Store all photographic images securely using industry-standard encryption and access controls.",
+        "Not share, sell, or distribute Tenant's photographs to any third party except as required by law or court order.",
+        "Delete or destroy Tenant's photographs within 90 days after lease termination and completion of final move-out inspection.",
+        "Limit access to Tenant's photographs to authorized property management personnel only.",
+    ]
+    for pi in protection_items:
+        elements.append(Paragraph(f"• {pi}", styles['BodySmall']))
+    elements.append(Spacer(1, 4))
+    elements.append(Paragraph(
+        "<b>2. PROTECCIÓN DE DATOS:</b> El Arrendador se compromete a almacenar las imágenes de "
+        "forma segura con encriptación, no compartir ni distribuir las fotografías a terceros "
+        "excepto por requerimiento legal, destruir las fotografías dentro de 90 días después "
+        "de la terminación del contrato, y limitar el acceso solo al personal autorizado.",
+        styles['Body']
+    ))
+    elements.append(Spacer(1, 4))
+    elements.append(Paragraph(
+        "<b>3. TENANT'S RIGHTS / DERECHOS DEL ARRENDATARIO:</b> Tenant has the right to: "
+        "(a) request a copy of any photograph stored by Landlord; "
+        "(b) request deletion of photographs upon lease termination; "
+        "(c) withdraw consent at any time with 30 days' written notice, provided that withdrawal does not "
+        "affect lawful use of photographs taken prior to withdrawal.",
+        styles['Body']
+    ))
+    elements.append(Paragraph(
+        "<b>3. DERECHOS DEL ARRENDATARIO:</b> El Arrendatario tiene derecho a: (a) solicitar "
+        "copia de cualquier fotografía almacenada; (b) solicitar eliminación al terminar el contrato; "
+        "(c) retirar el consentimiento en cualquier momento con 30 días de aviso por escrito.",
+        styles['Body']
+    ))
+    elements.append(Spacer(1, 4))
+    elements.append(Paragraph(
+        "<b>4. GOVERNING LAW / LEY APLICABLE:</b> This addendum is governed by applicable Texas state "
+        "privacy laws and the Texas Business and Commerce Code. If any provision of this addendum is found "
+        "to be unenforceable, the remaining provisions shall remain in full force and effect.",
+        styles['Body']
+    ))
+    elements.append(Paragraph(
+        "<b>4. LEY APLICABLE:</b> Este addendum se rige por las leyes de privacidad del Estado de "
+        "Texas y el Código de Comercio de Texas. Si alguna disposición es inaplicable, las demás "
+        "permanecerán en pleno vigor.",
+        styles['Body']
+    ))
+    elements.append(Spacer(1, 6))
+    elements.append(Paragraph(
+        "Tenant Initials / Iniciales del Arrendatario: ________    Date / Fecha: ____________",
+        styles['InitialLine']
+    ))
+    addendum_letter = chr(ord(addendum_letter) + 1)
 
     # ═══════════════════════════════════════════════════════════════════
     # SIGNATURES / FIRMAS

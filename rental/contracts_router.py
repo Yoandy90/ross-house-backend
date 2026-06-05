@@ -562,8 +562,18 @@ async def generate_contract_pdf(contract_id: str, request: Request):
     # Load rental config for company details
     config = await get_db().rental_config.find_one({"type": "company"})
 
+    # Look up tenant photo for inclusion in contract
+    tenant_photo_url = None
+    if contract.get('tenant_id'):
+        try:
+            tenant = await get_db().tenants.find_one({"_id": ObjectId(contract['tenant_id'])})
+            if tenant:
+                tenant_photo_url = tenant.get('photo_url', '')
+        except Exception:
+            pass
+
     from rental_pdf_service import generate_rental_contract_pdf
-    pdf_b64 = generate_rental_contract_pdf(contract, config=config)
+    pdf_b64 = generate_rental_contract_pdf(contract, config=config, tenant_photo_url=tenant_photo_url)
     filename = f"Lease_Agreement_{contract.get('contract_number', contract_id)}.pdf"
 
     return {"success": True, "pdf_base64": pdf_b64, "filename": filename}

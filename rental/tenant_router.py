@@ -360,7 +360,7 @@ async def update_tenant(tenant_id: str, request: Request):
         raise HTTPException(status_code=404, detail="Inquilino no encontrado")
 
     update_fields = {}
-    allowed = ['first_name', 'last_name', 'email', 'phone', 'address', 'photo_url',
+    allowed = ['first_name', 'last_name', 'email', 'phone', 'address', 'photo_url', 'profile_photo_url',
                'ssn_last4', 'id_type', 'id_number', 'emergency_contact', 'emergency_phone',
                'employer', 'monthly_income', 'current_property_id', 'status', 'notes']
     for field in allowed:
@@ -438,6 +438,25 @@ async def upload_tenant_photo(tenant_id: str, request: Request):
         raise HTTPException(status_code=500, detail=f"Error al subir foto: {str(e)}")
 
 
+@router.post('/admin/tenants/{tenant_id}/use-app-photo')
+async def use_app_photo_as_official(tenant_id: str, request: Request):
+    """Admin: Copy the tenant's self-uploaded app profile photo as the official (office) photo"""
+    user = await auth_admin(request)
+    tenant = await get_db().tenants.find_one({"_id": ObjectId(tenant_id)})
+    if not tenant:
+        raise HTTPException(status_code=404, detail="Inquilino no encontrado")
+
+    profile_photo = tenant.get('profile_photo_url', '')
+    if not profile_photo:
+        raise HTTPException(status_code=400, detail="El inquilino no tiene foto de perfil en la app")
+
+    await get_db().tenants.update_one(
+        {"_id": ObjectId(tenant_id)},
+        {"$set": {"photo_url": profile_photo, "updated_at": datetime.utcnow()}}
+    )
+    return {"success": True, "photo_url": profile_photo, "message": "Foto de la app copiada como foto oficial"}
+
+
 @router.delete('/admin/tenants/{tenant_id}')
 async def delete_tenant(tenant_id: str, request: Request):
     """Delete a tenant"""
@@ -512,6 +531,85 @@ async def _send_welcome_email(email: str, name: str, password: str):
         logging.error(f"❌ Failed to send welcome email to {email}: {e}")
 
 
+
+
+# ==================== TENANT PROFILE PHOTO (FROM MOBILE APP) ====================
+
+@router.post('/marketplace/profile-photo')
+async def upload_profile_photo(request: Request):
+    """Tenant uploads their own profile photo from the mobile app.
+    This is stored as profile_photo_url (separate from the admin's official photo_url)."""
+    user = await auth_marketplace(request)
+    data = await request.json()
+    image_data = data.get('image_data', '')
+    content_type = data.get('content_type', 'image/jpeg')
+
+    if not image_data:
+        raise HTTPException(status_code=400, detail="No image data provided")
+
+    user_email = user.get('email', '')
+    user_id = str(user.get('_id', ''))
+
+    # Find tenant record linked to this user
+    tenant = await get_db().tenants.find_one({
+        "$or": [{"email": user_email}, {"app_user_id": user_id}]
+    })
+
+    try:
+        import base64 as b64_mod, uuid
+        from rental_storage_service import set_emergent_key, put_object, APP_NAME
+
+        # Load storage key from DB
+        config = await get_db().api_config.find_one({"_id": "main"})
+        if config and config.get("EMERGENT_LLM_KEY"):
+            set_emergent_key(config["EMERGENT_LLM_KEY"])
+
+        # Clean base64
+        if ',' in image_data:
+            image_data = image_data.split(',', 1)[1]
+        file_bytes = b64_mod.b64decode(image_data)
+
+        ext = 'jpg' if 'jpeg' in content_type else content_type.split('/')[-1]
+        file_id = str(uuid.uuid4())
+        path = f"{APP_NAME}/profile-photos/{user_id}/{file_id}.{ext}"
+
+        result = put_object(path, file_bytes, content_type)
+        storage_path = result.get("path", path)
+
+        # Build public URL
+        base_url = str(request.base_url).rstrip('/')
+        fwd_host = request.headers.get('x-forwarded-host') or request.headers.get('host')
+        fwd_proto = request.headers.get('x-forwarded-proto', 'https')
+        if fwd_host:
+            base_url = f"{fwd_proto}://{fwd_host}"
+        clean = storage_path.replace(f"{APP_NAME}/", "") if storage_path.startswith(f"{APP_NAME}/") else storage_path
+        photo_url = f"{base_url}/api/public/property-file/{clean}"
+
+        # Update app_users record
+        await get_db().app_users.update_one(
+            {"_id": user.get("_id")},
+            {"$set": {"profile_photo_url": photo_url, "updated_at": datetime.utcnow()}}
+        )
+
+        # Also update tenant record if linked
+        if tenant:
+            await get_db().tenants.update_one(
+                {"_id": tenant["_id"]},
+                {"$set": {"profile_photo_url": photo_url, "updated_at": datetime.utcnow()}}
+            )
+
+        return {"success": True, "profile_photo_url": photo_url}
+    except Exception as e:
+        logging.error(f"Profile photo upload error: {e}")
+        raise HTTPException(status_code=500, detail=f"Error al subir foto: {str(e)}")
+
+
+@router.get('/marketplace/profile-photo')
+async def get_profile_photo(request: Request):
+    """Get the current user's profile photo URL"""
+    user = await auth_marketplace(request)
+    photo_url = user.get('profile_photo_url', '')
+    return {"success": True, "profile_photo_url": photo_url}
 
 
 # ==================== TENANT MAINTENANCE REQUESTS ====================
