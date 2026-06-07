@@ -171,6 +171,8 @@ async def admin_list_investments(request: Request):
             "profit": profit,
             "roi": round(roi, 1),
             "expense_count": len(expenses),
+            "expenses": expenses,  # Include full expenses with receipts
+            "notes": doc.get("notes", ""),
             "photo_count": len(doc.get("photos_before", [])) + len(doc.get("photos_during", [])) + len(doc.get("photos_after", [])),
             "purchase_date": doc.get("purchase_date", ""),
             "sale_date": doc.get("sale_date", ""),
@@ -276,6 +278,7 @@ async def admin_add_expense(inv_id: str, request: Request):
         "vendor": data.get("vendor", ""),
         "date": data.get("date", datetime.utcnow().strftime("%Y-%m-%d")),
         "receipt_photo": data.get("receipt_photo", ""),
+        "receipts": data.get("receipts", []),  # Support multiple receipts
         "notes": data.get("notes", ""),
         "created_at": datetime.utcnow(),
     }
