@@ -807,31 +807,48 @@ async def _get_or_create_stripe_customer(user: dict) -> str:
 @router.post('/tenant/payment-methods/setup')
 async def tenant_setup_payment_method(request: Request):
     """Create a SetupIntent so the tenant can save a card or bank account."""
-    user = await auth_marketplace(request)
-    if user.get("role") not in ("tenant", "landlord", "buyer", "admin"):
-        raise HTTPException(status_code=403, detail="No autorizado")
-
     import stripe as stripe_lib
-    config = await _get_stripe_config()
-    sk = config.get("stripe_secret_key") or os.environ.get("STRIPE_SECRET_KEY") or os.environ.get("STRIPE_API_KEY", "")
-    if not sk:
-        raise HTTPException(status_code=500, detail="Stripe no configurado en el sistema")
-    stripe_lib.api_key = sk
+    
+    try:
+        user = await auth_marketplace(request)
+        if user.get("role") not in ("tenant", "landlord", "buyer", "admin"):
+            raise HTTPException(status_code=403, detail="No autorizado")
 
-    customer_id = await _get_or_create_stripe_customer(user)
+        config = await _get_stripe_config()
+        sk = config.get("stripe_secret_key") or os.environ.get("STRIPE_SECRET_KEY") or os.environ.get("STRIPE_API_KEY", "")
+        
+        if not sk:
+            raise HTTPException(status_code=500, detail="Stripe no configurado en el sistema")
+        
+        # Validate key format
+        sk = sk.strip()
+        if not sk.startswith("sk_"):
+            raise HTTPException(status_code=500, detail=f"Clave de Stripe inválida (debe empezar con sk_)")
+            
+        stripe_lib.api_key = sk
 
-    setup_intent = stripe_lib.SetupIntent.create(
-        customer=customer_id,
-        payment_method_types=["card"],
-        metadata={"user_id": str(user["_id"])},
-    )
+        customer_id = await _get_or_create_stripe_customer(user)
 
-    return {
-        "success": True,
-        "client_secret": setup_intent.client_secret,
-        "setup_intent_id": setup_intent.id,
-        "customer_id": customer_id,
-    }
+        setup_intent = stripe_lib.SetupIntent.create(
+            customer=customer_id,
+            payment_method_types=["card"],
+            metadata={"user_id": str(user["_id"])},
+        )
+
+        return {
+            "success": True,
+            "client_secret": setup_intent.client_secret,
+            "setup_intent_id": setup_intent.id,
+            "customer_id": customer_id,
+        }
+    except stripe_lib.error.AuthenticationError as e:
+        raise HTTPException(status_code=500, detail=f"Error de autenticación con Stripe: {str(e)}")
+    except stripe_lib.error.StripeError as e:
+        raise HTTPException(status_code=500, detail=f"Error de Stripe: {str(e)}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error interno: {str(e)}")
 
 
 @router.get('/tenant/payment-methods')
