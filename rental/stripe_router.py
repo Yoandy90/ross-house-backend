@@ -781,7 +781,7 @@ async def _get_or_create_stripe_customer(user: dict) -> str:
     import stripe as stripe_lib
     db = get_db()
     config = await _get_stripe_config()
-    sk = config.get("stripe_secret_key") or os.environ.get("STRIPE_SECRET_KEY") or os.environ.get("STRIPE_API_KEY", "")
+    sk = config.get("stripe_secret_key") or os.environ.get("STRIPE_SECRET_KEY") or os.environ.get("STRIPE_API_KEY") or os.environ.get("STRIPE_SK") or os.environ.get("STRIPE_KEY", "")
     if not sk:
         raise HTTPException(status_code=500, detail="Stripe no configurado")
     stripe_lib.api_key = sk
@@ -815,7 +815,7 @@ async def tenant_setup_payment_method(request: Request):
             raise HTTPException(status_code=403, detail="No autorizado")
 
         config = await _get_stripe_config()
-        sk = config.get("stripe_secret_key") or os.environ.get("STRIPE_SECRET_KEY") or os.environ.get("STRIPE_API_KEY", "")
+        sk = config.get("stripe_secret_key") or os.environ.get("STRIPE_SECRET_KEY") or os.environ.get("STRIPE_API_KEY") or os.environ.get("STRIPE_SK") or os.environ.get("STRIPE_KEY", "")
         
         if not sk:
             raise HTTPException(status_code=500, detail="Stripe no configurado en el sistema")
@@ -858,7 +858,7 @@ async def tenant_list_payment_methods(request: Request):
 
     import stripe as stripe_lib
     config = await _get_stripe_config()
-    sk = config.get("stripe_secret_key") or os.environ.get("STRIPE_SECRET_KEY") or os.environ.get("STRIPE_API_KEY", "")
+    sk = config.get("stripe_secret_key") or os.environ.get("STRIPE_SECRET_KEY") or os.environ.get("STRIPE_API_KEY") or os.environ.get("STRIPE_SK") or os.environ.get("STRIPE_KEY", "")
     if not sk:
         return {"success": True, "payment_methods": [], "autopay": None}
     stripe_lib.api_key = sk
@@ -915,7 +915,7 @@ async def tenant_delete_payment_method(request: Request, pm_id: str):
 
     import stripe as stripe_lib
     config = await _get_stripe_config()
-    sk = config.get("stripe_secret_key") or os.environ.get("STRIPE_SECRET_KEY") or os.environ.get("STRIPE_API_KEY", "")
+    sk = config.get("stripe_secret_key") or os.environ.get("STRIPE_SECRET_KEY") or os.environ.get("STRIPE_API_KEY") or os.environ.get("STRIPE_SK") or os.environ.get("STRIPE_KEY", "")
     if not sk:
         raise HTTPException(status_code=500, detail="Stripe no configurado")
     stripe_lib.api_key = sk
