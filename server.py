@@ -192,6 +192,73 @@ photos_dir.mkdir(exist_ok=True)
 app.mount("/property_photos", StaticFiles(directory=str(photos_dir)), name="property_photos")
 
 
+# ─── Image Upload Endpoint ─────────────────────────────────────
+from fastapi import UploadFile, File, HTTPException, Header
+import uuid
+
+@app.post("/api/upload/image")
+async def upload_image(
+    file: UploadFile = File(...),
+    authorization: str = Header(None)
+):
+    """Upload an image and return the URL. Used for receipts, photos, etc."""
+    
+    # Basic auth check (optional - can be stricter)
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Authorization header required")
+    
+    # Validate file type
+    allowed_types = ["image/jpeg", "image/png", "image/gif", "image/webp", "image/heic", "application/pdf"]
+    content_type = file.content_type or "application/octet-stream"
+    if content_type not in allowed_types:
+        raise HTTPException(status_code=400, detail=f"File type {content_type} not allowed")
+    
+    # Read file content
+    content = await file.read()
+    if len(content) > 10 * 1024 * 1024:  # 10MB limit
+        raise HTTPException(status_code=400, detail="File too large (max 10MB)")
+    
+    # Generate unique filename
+    ext = file.filename.split(".")[-1] if "." in file.filename else "jpg"
+    unique_name = f"receipts/{datetime.utcnow().strftime('%Y/%m')}/{uuid.uuid4().hex}.{ext}"
+    
+    try:
+        # Try object storage first
+        from rental_storage_service import put_object, init_storage
+        init_storage()
+        result = put_object(unique_name, content, content_type)
+        
+        # Return URL based on storage type
+        if result.get("storage_type") == "object_storage":
+            image_url = result.get("url", result.get("public_url", ""))
+        else:
+            # MongoDB fallback - return base64 data URL
+            image_url = result.get("base64_data", "")
+        
+        return {
+            "success": True,
+            "url": image_url,
+            "image_url": image_url,
+            "filename": file.filename,
+            "size": len(content),
+            "storage_type": result.get("storage_type", "unknown")
+        }
+    except Exception as e:
+        logger.error(f"Upload failed: {e}")
+        # Fallback to base64 if storage fails
+        import base64
+        b64_data = base64.b64encode(content).decode('utf-8')
+        image_url = f"data:{content_type};base64,{b64_data}"
+        return {
+            "success": True,
+            "url": image_url,
+            "image_url": image_url,
+            "filename": file.filename,
+            "size": len(content),
+            "storage_type": "base64_fallback"
+        }
+
+
 # ─── Run ──────────────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
