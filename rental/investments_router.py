@@ -312,6 +312,41 @@ async def admin_delete_expense(inv_id: str, expense_id: str, request: Request):
     return {"success": True, "message": "Gasto eliminado"}
 
 
+@router.put('/admin/investments/{inv_id}/expenses/{expense_id}')
+async def admin_update_expense(inv_id: str, expense_id: str, request: Request):
+    """Admin: Update an expense"""
+    await auth_admin(request)
+    data = await request.json()
+    
+    # Build update fields
+    update_fields = {}
+    if "description" in data:
+        update_fields["expenses.$.description"] = data["description"]
+    if "amount" in data:
+        update_fields["expenses.$.amount"] = float(data["amount"])
+    if "category" in data:
+        update_fields["expenses.$.category"] = data["category"]
+    if "receipts" in data:
+        update_fields["expenses.$.receipts"] = data["receipts"]
+    if "vendor" in data:
+        update_fields["expenses.$.vendor"] = data["vendor"]
+    if "notes" in data:
+        update_fields["expenses.$.notes"] = data["notes"]
+    
+    update_fields["expenses.$.updated_at"] = datetime.utcnow()
+    update_fields["updated_at"] = datetime.utcnow()
+    
+    result = await get_db().investments.update_one(
+        {"_id": ObjectId(inv_id), "expenses.id": expense_id},
+        {"$set": update_fields}
+    )
+    
+    if result.modified_count == 0:
+        raise HTTPException(status_code=404, detail="Gasto no encontrado")
+    
+    return {"success": True, "message": "Gasto actualizado"}
+
+
 @router.post('/admin/investments/{inv_id}/photos')
 async def admin_add_investment_photos(inv_id: str, request: Request):
     """Admin: Add photos to an investment property (before/during/after)"""
