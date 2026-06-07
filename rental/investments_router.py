@@ -254,6 +254,32 @@ async def admin_update_investment(inv_id: str, request: Request):
     return {"success": True, "message": "Inversión actualizada"}
 
 
+@router.delete('/admin/investments/{inv_id}')
+async def admin_delete_investment(inv_id: str, request: Request):
+    """Admin: Delete an investment property"""
+    await auth_admin(request)
+    
+    try:
+        inv = await get_db().investments.find_one({"_id": ObjectId(inv_id)})
+    except:
+        raise HTTPException(status_code=400, detail="ID de inversión inválido")
+    
+    if not inv:
+        raise HTTPException(status_code=404, detail="Inversión no encontrada")
+    
+    # Check if converted to rental
+    if inv.get("phase") == "converted_to_rental":
+        raise HTTPException(status_code=400, detail="No se puede eliminar una inversión convertida a alquiler")
+    
+    # Delete the investment
+    result = await get_db().investments.delete_one({"_id": ObjectId(inv_id)})
+    
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=500, detail="Error al eliminar la inversión")
+    
+    return {"success": True, "message": "Inversión eliminada exitosamente"}
+
+
 @router.post('/admin/investments/{inv_id}/expenses')
 async def admin_add_expense(inv_id: str, request: Request):
     """Admin: Add an expense/repair cost to an investment property"""
