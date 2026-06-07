@@ -17,7 +17,7 @@ from rental.shared import (
 
 router = APIRouter()
 
-INVESTMENT_PHASES = ["adquirida", "en_remodelacion", "en_venta", "vendida"]
+INVESTMENT_PHASES = ["adquirida", "en_remodelacion", "en_venta", "vendida", "converted_to_rental"]
 
 
 @router.post('/admin/investments')
@@ -339,6 +339,90 @@ async def admin_add_investment_photos(inv_id: str, request: Request):
 async def admin_investments_dashboard_v2(request: Request):
     """Duplicate removed - see admin_investments_dashboard above"""
     return await admin_investments_dashboard(request)
+
+
+@router.post('/admin/investments/{inv_id}/convert-to-rental')
+async def admin_convert_investment_to_rental(inv_id: str, request: Request):
+    """
+    Convert an investment property to a rental property.
+    This creates a new property in the rentals system and archives the investment.
+    """
+    await auth_admin(request)
+    data = await request.json()
+    
+    # Get the investment
+    try:
+        inv = await get_db().investments.find_one({"_id": ObjectId(inv_id)})
+    except:
+        raise HTTPException(status_code=400, detail="ID de inversión inválido")
+    
+    if not inv:
+        raise HTTPException(status_code=404, detail="Inversión no encontrada")
+    
+    if inv.get("phase") == "converted_to_rental":
+        raise HTTPException(status_code=400, detail="Esta inversión ya fue convertida a alquiler")
+    
+    # Calculate total invested
+    expenses_total = sum(e.get("amount", 0) for e in inv.get("expenses", []))
+    total_invested = inv.get("purchase_price", 0) + expenses_total
+    
+    # Create the rental property
+    now = datetime.utcnow()
+    rental_property = {
+        "name": data.get("name", inv.get("address", "Propiedad sin nombre")),
+        "address": inv.get("address", ""),
+        "city": inv.get("city", ""),
+        "state": inv.get("state", "TX"),
+        "zip_code": inv.get("zip_code", ""),
+        "property_type": inv.get("property_type", "house"),
+        "bedrooms": inv.get("bedrooms", 0),
+        "bathrooms": inv.get("bathrooms", 0),
+        "square_feet": inv.get("square_feet", 0),
+        "description": data.get("description", inv.get("notes", "")),
+        "amenities": data.get("amenities", []),
+        "photos": inv.get("photos_after", []) or inv.get("photos_during", []) or inv.get("photos_before", []),
+        "rent_price": float(data.get("rent_price", 0)),
+        "deposit_amount": float(data.get("deposit_amount", 0)),
+        "status": "available",
+        "is_active": True,
+        # Investment tracking fields
+        "converted_from_investment": True,
+        "original_investment_id": str(inv["_id"]),
+        "total_investment": total_invested,
+        "purchase_price": inv.get("purchase_price", 0),
+        "repair_costs": expenses_total,
+        "conversion_date": now,
+        # Standard fields
+        "created_at": now,
+        "updated_at": now,
+    }
+    
+    # Insert the rental property
+    result = await get_db().properties.insert_one(rental_property)
+    property_id = str(result.inserted_id)
+    
+    # Update the investment to mark as converted
+    await get_db().investments.update_one(
+        {"_id": ObjectId(inv_id)},
+        {
+            "$set": {
+                "phase": "converted_to_rental",
+                "converted_to_property_id": property_id,
+                "conversion_date": now,
+                "rent_price": float(data.get("rent_price", 0)),
+                "updated_at": now,
+            }
+        }
+    )
+    
+    return {
+        "success": True,
+        "property_id": property_id,
+        "investment_id": inv_id,
+        "total_invested": total_invested,
+        "message": f"Inversión convertida a propiedad de alquiler exitosamente"
+    }
+
 
 
 
