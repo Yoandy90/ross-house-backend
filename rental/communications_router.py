@@ -351,3 +351,25 @@ async def admin_get_inspection(inspection_id: str, request: Request):
         "rooms": INSPECTION_ROOMS,
         "items": INSPECTION_ITEMS,
     }
+
+
+@router.delete('/admin/inspections/{inspection_id}')
+async def admin_delete_inspection(inspection_id: str, request: Request):
+    """Delete an inspection."""
+    await auth_admin(request)
+    db = get_db()
+    
+    try:
+        inspection = await db.inspections.find_one({"_id": ObjectId(inspection_id)})
+    except:
+        raise HTTPException(status_code=400, detail="ID de inspección inválido")
+    
+    if not inspection:
+        raise HTTPException(status_code=404, detail="Inspección no encontrada")
+    
+    result = await db.inspections.delete_one({"_id": ObjectId(inspection_id)})
+    
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=500, detail="Error al eliminar la inspección")
+    
+    return {"success": True, "message": "Inspección eliminada exitosamente"}
