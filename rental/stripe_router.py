@@ -841,14 +841,13 @@ async def tenant_setup_payment_method(request: Request):
             "setup_intent_id": setup_intent.id,
             "customer_id": customer_id,
         }
-    except stripe_lib.error.AuthenticationError as e:
-        raise HTTPException(status_code=500, detail=f"Error de autenticación con Stripe: {str(e)}")
-    except stripe_lib.error.StripeError as e:
-        raise HTTPException(status_code=500, detail=f"Error de Stripe: {str(e)}")
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error interno: {str(e)}")
+        error_msg = str(e)
+        if "Invalid API Key" in error_msg or "authentication" in error_msg.lower():
+            raise HTTPException(status_code=500, detail=f"Error de autenticación con Stripe: {error_msg}")
+        raise HTTPException(status_code=500, detail=f"Error de Stripe: {error_msg}")
 
 
 @router.get('/tenant/payment-methods')
