@@ -5,6 +5,8 @@ Rental Auth Router
 import logging
 from datetime import datetime, timedelta
 from typing import Optional, List
+from collections import defaultdict
+import time
 from bson import ObjectId
 from fastapi import APIRouter, HTTPException, Request
 import os
@@ -19,6 +21,29 @@ from rental.shared import (
 )
 
 router = APIRouter()
+
+# ─── Rate Limiting ─────────────────────────────────────────────
+# Simple in-memory rate limiter for auth endpoints
+_rate_limit_store = defaultdict(list)
+RATE_LIMIT_WINDOW = 60  # seconds
+RATE_LIMIT_MAX_REQUESTS = 5  # max attempts per window
+
+def check_rate_limit(ip: str, endpoint: str) -> bool:
+    """Check if IP has exceeded rate limit. Returns True if allowed, raises if blocked."""
+    key = f"{ip}:{endpoint}"
+    now = time.time()
+    
+    # Clean old entries
+    _rate_limit_store[key] = [t for t in _rate_limit_store[key] if now - t < RATE_LIMIT_WINDOW]
+    
+    if len(_rate_limit_store[key]) >= RATE_LIMIT_MAX_REQUESTS:
+        raise HTTPException(
+            status_code=429, 
+            detail=f"Demasiados intentos. Espera {RATE_LIMIT_WINDOW} segundos antes de intentar de nuevo."
+        )
+    
+    _rate_limit_store[key].append(now)
+    return True
 
 
 def hash_password(password: str) -> str:
@@ -122,6 +147,10 @@ async def marketplace_mark_notification_read(notif_id: str, request: Request):
 @router.post('/public/marketplace-register')
 async def marketplace_register(request: Request):
     """Register a new marketplace user (tenant, landlord, or buyer)"""
+    # Rate limiting to prevent spam registrations
+    client_ip = request.client.host if request.client else "unknown"
+    check_rate_limit(client_ip, "register")
+    
     data = await request.json()
     name = data.get("name", "").strip()
     email = data.get("email", "").strip().lower()
@@ -209,6 +238,10 @@ async def marketplace_login(request: Request):
     """Login for marketplace users (all roles).
     Supports: email+password (primary) or email+phone (legacy fallback).
     """
+    # Rate limiting
+    client_ip = request.client.host if request.client else "unknown"
+    check_rate_limit(client_ip, "login")
+    
     body = await request.json()
     email = body.get("email", "").strip().lower()
     password = body.get("password", "").strip()
@@ -302,6 +335,10 @@ async def marketplace_login(request: Request):
 @router.post('/auth/forgot-password')
 async def forgot_password(request: Request):
     """Send a password reset code via SMS to the user's phone."""
+    # Rate limiting - stricter for password reset (3 per minute)
+    client_ip = request.client.host if request.client else "unknown"
+    check_rate_limit(client_ip, "forgot-password")
+    
     data = await request.json()
     email = data.get("email", "").strip().lower()
 

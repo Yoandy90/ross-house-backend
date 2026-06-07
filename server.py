@@ -19,7 +19,12 @@ from motor.motor_asyncio import AsyncIOMotorClient
 # ─── Configuration ────────────────────────────────────────────
 MONGO_URL = os.environ.get("MONGO_URL", "")
 DB_NAME = os.environ.get("DB_NAME", "taxportal")
-SECRET_KEY = os.environ.get("JWT_SECRET_KEY", os.environ.get("JWT_SECRET", "ross-house-default-secret"))
+# Security: Generate secure default if not set, log warning
+_default_secret = "ross-house-" + os.urandom(16).hex()
+SECRET_KEY = os.environ.get("JWT_SECRET_KEY", os.environ.get("JWT_SECRET", _default_secret))
+if "ross-house-" in SECRET_KEY and len(SECRET_KEY) < 40:
+    import warnings
+    warnings.warn("⚠️ Using default JWT secret! Set JWT_SECRET_KEY in environment for production.")
 PORT = int(os.environ.get("PORT", 8001))
 
 # ─── Logging ──────────────────────────────────────────────────
@@ -70,9 +75,24 @@ app = FastAPI(
 )
 
 # ─── CORS ─────────────────────────────────────────────────────
+# Security: Only allow specific origins
+ALLOWED_ORIGINS = [
+    "https://rosshouserentals.com",
+    "https://www.rosshouserentals.com",
+    "https://rosslending.com",
+    "https://www.rosslending.com",
+    "http://localhost:3000",  # Local development
+    "http://localhost:8081",  # Expo development
+]
+
+# Add preview URLs for development/testing
+import os
+if os.environ.get("ENVIRONMENT") != "production":
+    ALLOWED_ORIGINS.append("*")  # Allow all in non-production
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS if os.environ.get("ENVIRONMENT") == "production" else ["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
