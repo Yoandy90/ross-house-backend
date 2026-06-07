@@ -787,13 +787,20 @@ async def _get_or_create_stripe_customer(user: dict) -> str:
     stripe_lib.api_key = sk
 
     customer_id = user.get("stripe_customer_id", "")
+    
+    # Verify existing customer is valid
     if customer_id:
-        return customer_id
+        try:
+            stripe_lib.Customer.retrieve(customer_id)
+            return customer_id
+        except Exception:
+            # Customer doesn't exist in Stripe, create a new one
+            pass
 
     # Create Stripe customer
     customer = stripe_lib.Customer.create(
         email=user.get("email", ""),
-        name=user.get("name", ""),
+        name=user.get("name", f"{user.get('first_name', '')} {user.get('last_name', '')}".strip()),
         phone=user.get("phone", ""),
         metadata={"user_id": str(user.get("_id", "")), "role": user.get("role", "tenant")},
     )
