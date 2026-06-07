@@ -808,7 +808,7 @@ async def _get_or_create_stripe_customer(user: dict) -> str:
 async def tenant_setup_payment_method(request: Request):
     """Create a SetupIntent so the tenant can save a card or bank account."""
     user = await auth_marketplace(request)
-    if user.get("role") not in ("tenant", "landlord", "buyer"):
+    if user.get("role") not in ("tenant", "landlord", "buyer", "admin"):
         raise HTTPException(status_code=403, detail="No autorizado")
 
     import stripe as stripe_lib
