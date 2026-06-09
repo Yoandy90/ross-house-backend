@@ -549,6 +549,105 @@ async def sign_contract(contract_id: str, request: Request):
     return {"success": True, "message": "Contrato firmado exitosamente", "hash": sig_hash}
 
 
+# ─── Office Signature (In-Person Signing) ─────────────────────────────────
+@router.post('/admin/rental-contracts/{contract_id}/office-sign')
+async def office_sign_contract(contract_id: str, request: Request):
+    """
+    Capture in-office signature for a rental contract.
+    Supports both Canvas (touch) and Topaz Pad signatures.
+    """
+    import hashlib
+    user = await auth_admin(request)
+    data = await request.json()
+
+    contract = await get_db().rental_contracts.find_one({"_id": ObjectId(contract_id)})
+    if not contract:
+        raise HTTPException(status_code=404, detail="Contrato no encontrado")
+
+    sig_type = data.get('type', 'canvas')  # 'canvas' or 'topaz'
+    signature_data = data.get('signature', '')  # base64 image
+    signer_name = data.get('signer_name', '')
+    signer_role = data.get('signer_role', 'tenant')  # 'tenant' or 'admin'
+
+    if not signature_data:
+        raise HTTPException(status_code=400, detail="No se recibió firma")
+
+    if not signer_name:
+        raise HTTPException(status_code=400, detail="Se requiere el nombre del firmante")
+
+    sig_payload = signature_data.encode('utf-8')
+    sig_hash = hashlib.sha256(sig_payload).hexdigest()
+    now = datetime.utcnow()
+    client_ip = request.client.host if request.client else 'unknown'
+
+    signature_record = {
+        "type": sig_type,
+        "image_data": signature_data,
+        "hash": sig_hash,
+        "signed_at": now,
+        "signed_by_admin": user.get('email', 'admin'),
+        "signer_name": signer_name,
+        "signer_role": signer_role,
+        "client_ip": client_ip,
+        "method": "office",  # Indicates in-person signing
+    }
+
+    # Determine which field to update based on signer role
+    if signer_role == 'tenant':
+        update = {
+            "tenant_signature": signature_record,
+            "tenant_signed_at": now,
+            "updated_at": now,
+        }
+        # Check if admin also needs to sign or if contract is ready to activate
+        if contract.get('admin_signature'):
+            update['status'] = 'active'
+        else:
+            update['status'] = 'pending_signature'  # Waiting for admin
+    else:  # admin signature
+        update = {
+            "admin_signature": signature_record,
+            "admin_signed_at": now,
+            "updated_at": now,
+        }
+        # Check if tenant also signed
+        if contract.get('tenant_signature'):
+            update['status'] = 'active'
+        else:
+            update['status'] = 'pending_tenant'
+
+    # Also store in legacy signature field for backward compatibility
+    update['signature'] = signature_record
+    update['signature_status'] = 'signed'
+    update['signed_at'] = now
+
+    # Auto-activate if draft and both parties signed (or single signature mode)
+    current_status = contract.get('status', 'draft')
+    if current_status == 'draft':
+        update['status'] = 'active'
+        # Update property and tenant records
+        await get_db().properties.update_one(
+            {"_id": ObjectId(contract['property_id'])},
+            {"$set": {"status": "rented", "current_tenant_id": contract.get('tenant_id'), "current_contract_id": contract_id, "updated_at": now}}
+        )
+        if contract.get('tenant_id'):
+            await get_db().tenants.update_one(
+                {"_id": ObjectId(contract['tenant_id'])},
+                {"$set": {"current_property_id": contract['property_id'], "updated_at": now}}
+            )
+
+    await get_db().rental_contracts.update_one({"_id": ObjectId(contract_id)}, {"$set": update})
+    
+    return {
+        "success": True, 
+        "message": f"Firma de {signer_role} capturada exitosamente",
+        "signer_name": signer_name,
+        "signer_role": signer_role,
+        "method": sig_type,
+        "hash": sig_hash
+    }
+
+
 # ─── Contract PDF ─────────────────────────────────────────────────────────
 @router.get('/admin/rental-contracts/{contract_id}/pdf')
 async def generate_contract_pdf(contract_id: str, request: Request):
