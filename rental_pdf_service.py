@@ -945,10 +945,14 @@ def generate_rental_contract_pdf(contract: dict, config: dict = None, tenant_pho
     elements.append(Spacer(1, 20))
 
     # Handle digital signature
-    sig = contract.get('signature')
+    sig = contract.get('signature') or contract.get('tenant_signature')
+    admin_sig = contract.get('admin_signature')
     tenant_sig_cell = '_' * 40
-    signed_date_str = '_______________'
+    landlord_sig_cell = '_' * 40
+    tenant_signed_date_str = '_______________'
+    landlord_signed_date_str = '_______________'
 
+    # Tenant signature
     if sig and sig.get('image_data'):
         try:
             sig_img_data = sig['image_data']
@@ -960,18 +964,39 @@ def generate_rental_contract_pdf(contract: dict, config: dict = None, tenant_pho
 
             signed_at = sig.get('signed_at', '')
             if isinstance(signed_at, str) and signed_at:
-                signed_date_str = signed_at[:10]
+                tenant_signed_date_str = signed_at[:10]
             elif hasattr(signed_at, 'strftime'):
-                signed_date_str = signed_at.strftime('%m/%d/%Y')
+                tenant_signed_date_str = signed_at.strftime('%m/%d/%Y')
         except Exception as e:
-            logger.warning(f"Could not process signature: {e}")
+            logger.warning(f"Could not process tenant signature: {e}")
             tenant_sig_cell = '_' * 40
 
+    # Admin/Landlord signature (from contract or from saved admin signature)
+    if admin_sig and admin_sig.get('image_data'):
+        try:
+            admin_img_data = admin_sig['image_data']
+            if admin_img_data.startswith('data:'):
+                admin_img_data = admin_img_data.split(',', 1)[1]
+            admin_bytes = base64.b64decode(admin_img_data)
+            admin_buffer = io.BytesIO(admin_bytes)
+            landlord_sig_cell = RLImage(admin_buffer, width=180, height=55)
+
+            admin_signed_at = admin_sig.get('signed_at', '')
+            if isinstance(admin_signed_at, str) and admin_signed_at:
+                landlord_signed_date_str = admin_signed_at[:10]
+            elif hasattr(admin_signed_at, 'strftime'):
+                landlord_signed_date_str = admin_signed_at.strftime('%m/%d/%Y')
+            else:
+                landlord_signed_date_str = tenant_signed_date_str  # Use tenant date if admin date not available
+        except Exception as e:
+            logger.warning(f"Could not process admin signature: {e}")
+            landlord_sig_cell = '_' * 40
+
     sig_data = [
-        [tenant_sig_cell, '', '_' * 40],
+        [tenant_sig_cell, '', landlord_sig_cell],
         ['Tenant Signature / Firma del Arrendatario', '', 'Landlord Signature / Firma del Arrendador'],
         [contract.get('tenant_name', ''), '', co['name']],
-        [f'Date / Fecha: {signed_date_str}', '', f'Date / Fecha: {signed_date_str}'],
+        [f'Date / Fecha: {tenant_signed_date_str}', '', f'Date / Fecha: {landlord_signed_date_str}'],
     ]
     t = Table(sig_data, colWidths=[200, 70, 200])
     t.setStyle(TableStyle([

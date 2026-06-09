@@ -1659,6 +1659,53 @@ async def update_rental_config(request: Request):
     return {"success": True, "message": "Configuración de renta actualizada exitosamente"}
 
 
+# ─── Admin Signature (Reusable landlord signature) ─────────────────────────
+@router.get('/admin/admin-signature')
+async def get_admin_signature(request: Request):
+    """Get the saved admin/landlord signature"""
+    user = await auth_admin(request)
+    
+    signature_doc = await get_db().admin_signatures.find_one({"type": "landlord_default"})
+    if signature_doc:
+        return {"success": True, "signature": signature_doc.get("image_data")}
+    return {"success": True, "signature": None}
+
+
+@router.put('/admin/admin-signature')
+async def save_admin_signature(request: Request):
+    """Save or update the admin/landlord signature"""
+    user = await auth_admin(request)
+    data = await request.json()
+    now = datetime.utcnow()
+
+    signature_data = data.get('signature', '')
+    if not signature_data:
+        raise HTTPException(status_code=400, detail="No se recibió firma")
+
+    await get_db().admin_signatures.update_one(
+        {"type": "landlord_default"},
+        {"$set": {
+            "type": "landlord_default",
+            "image_data": signature_data,
+            "updated_at": now,
+            "updated_by": user.get('email', 'admin')
+        }},
+        upsert=True
+    )
+
+    return {"success": True, "message": "Firma guardada exitosamente"}
+
+
+@router.delete('/admin/admin-signature')
+async def delete_admin_signature(request: Request):
+    """Delete the admin/landlord signature"""
+    user = await auth_admin(request)
+    
+    await get_db().admin_signatures.delete_one({"type": "landlord_default"})
+    
+    return {"success": True, "message": "Firma eliminada exitosamente"}
+
+
 @router.put('/admin/rental-contracts/{contract_id}/addendums')
 async def update_contract_addendums(contract_id: str, request: Request):
     """Update contract addendums (pets, mold, bedbug, military, lead paint)"""
