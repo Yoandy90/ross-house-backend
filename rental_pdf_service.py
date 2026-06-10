@@ -157,6 +157,67 @@ def _number_to_words(n):
         return str(n)
 
 
+def _get_initials(name: str) -> str:
+    """Extract initials from a full name (e.g., 'John Smith' -> 'J.S.')"""
+    if not name:
+        return "____"
+    parts = name.strip().split()
+    if len(parts) == 0:
+        return "____"
+    initials = '.'.join([p[0].upper() for p in parts if p]) + '.'
+    return initials if initials != '.' else "____"
+
+
+def _format_signature_date(date_val) -> str:
+    """Format signature date from various input formats"""
+    if not date_val:
+        return "____________"
+    try:
+        if isinstance(date_val, str):
+            # Handle ISO format strings
+            if 'T' in date_val:
+                date_val = date_val.split('T')[0]
+            # Try to parse and reformat
+            from datetime import datetime as dt
+            if '-' in date_val:
+                parsed = dt.strptime(date_val[:10], '%Y-%m-%d')
+            elif '/' in date_val:
+                parsed = dt.strptime(date_val, '%m/%d/%Y')
+            else:
+                return date_val[:10]
+            return parsed.strftime('%m/%d/%Y')
+        elif hasattr(date_val, 'strftime'):
+            return date_val.strftime('%m/%d/%Y')
+        else:
+            return str(date_val)[:10]
+    except Exception:
+        return str(date_val)[:10] if date_val else "____________"
+
+
+def _build_initials_line(tenant_name: str, signature_data: dict, styles) -> str:
+    """
+    Build the initials line with real data if signature exists.
+    Returns a formatted Paragraph-compatible string.
+    """
+    initials = _get_initials(tenant_name)
+    
+    # Get signature date from various possible fields
+    sig_date = None
+    if signature_data:
+        sig_date = (signature_data.get('signed_at') or 
+                    signature_data.get('tenant_signed_at') or 
+                    signature_data.get('admin_signed_at') or
+                    signature_data.get('updated_at'))
+    
+    date_str = _format_signature_date(sig_date) if sig_date else datetime.utcnow().strftime('%m/%d/%Y')
+    
+    # If contract is signed, show actual initials and date
+    if signature_data and (signature_data.get('image_data') or signature_data.get('signed_at')):
+        return f"Tenant Initials / Iniciales del Arrendatario: <b>{initials}</b>    Date / Fecha: <b>{date_str}</b>"
+    else:
+        return "Tenant Initials / Iniciales del Arrendatario: ________    Date / Fecha: ____________"
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # MAIN CONTRACT GENERATOR
 # ═══════════════════════════════════════════════════════════════════════════
@@ -194,6 +255,12 @@ def generate_rental_contract_pdf(contract: dict, config: dict = None, tenant_pho
 
     # Payment method
     pm_type = contract.get('payment_method_type', 'cash')
+
+    # ─── EXTRACT SIGNATURE DATA FOR INITIALS ─────────────────────────
+    tenant_name = contract.get('tenant_name', '')
+    tenant_sig = contract.get('signature') or contract.get('tenant_signature') or {}
+    # Build initials line helper (used in all addendums)
+    initials_line = _build_initials_line(tenant_name, tenant_sig, styles)
 
     # ─── HEADER WITH LOGO ────────────────────────────────────────────
     logo_path = _get_logo_path()
@@ -663,7 +730,7 @@ def generate_rental_contract_pdf(contract: dict, config: dict = None, tenant_pho
             styles['Body']
         ))
         elements.append(Paragraph(
-            "Tenant Initials / Iniciales del Arrendatario: ________    Date / Fecha: ____________",
+            initials_line,
             styles['InitialLine']
         ))
         addendum_letter = chr(ord(addendum_letter) + 1)
@@ -703,7 +770,7 @@ def generate_rental_contract_pdf(contract: dict, config: dict = None, tenant_pho
             styles['Body']
         ))
         elements.append(Paragraph(
-            "Tenant Initials / Iniciales del Arrendatario: ________    Date / Fecha: ____________",
+            initials_line,
             styles['InitialLine']
         ))
         addendum_letter = chr(ord(addendum_letter) + 1)
@@ -738,7 +805,7 @@ def generate_rental_contract_pdf(contract: dict, config: dict = None, tenant_pho
             styles['Body']
         ))
         elements.append(Paragraph(
-            "Tenant Initials / Iniciales del Arrendatario: ________    Date / Fecha: ____________",
+            initials_line,
             styles['InitialLine']
         ))
         addendum_letter = chr(ord(addendum_letter) + 1)
@@ -786,7 +853,7 @@ def generate_rental_contract_pdf(contract: dict, config: dict = None, tenant_pho
             styles['Body']
         ))
         elements.append(Paragraph(
-            "Tenant Initials / Iniciales del Arrendatario: ________    Date / Fecha: ____________",
+            initials_line,
             styles['InitialLine']
         ))
         addendum_letter = chr(ord(addendum_letter) + 1)
@@ -829,7 +896,7 @@ def generate_rental_contract_pdf(contract: dict, config: dict = None, tenant_pho
             styles['Body']
         ))
         elements.append(Paragraph(
-            "Tenant Initials / Iniciales del Arrendatario: ________    Date / Fecha: ____________",
+            initials_line,
             styles['InitialLine']
         ))
         addendum_letter = chr(ord(addendum_letter) + 1)
@@ -919,7 +986,7 @@ def generate_rental_contract_pdf(contract: dict, config: dict = None, tenant_pho
     ))
     elements.append(Spacer(1, 6))
     elements.append(Paragraph(
-        "Tenant Initials / Iniciales del Arrendatario: ________    Date / Fecha: ____________",
+        initials_line,
         styles['InitialLine']
     ))
     addendum_letter = chr(ord(addendum_letter) + 1)
@@ -971,17 +1038,14 @@ def generate_rental_contract_pdf(contract: dict, config: dict = None, tenant_pho
             logger.warning(f"Could not process tenant signature: {e}")
             tenant_sig_cell = '_' * 40
 
-    # Admin/Landlord signature (from contract or from saved admin signature)
-    # First try to get from contract, if not found, fetch the default admin signature
+    # Admin/Landlord signature (from contract or from saved admin signature in config)
+    # First try to get from contract, if not found, use the saved_admin_signature from config
     if not admin_sig or not admin_sig.get('image_data'):
-        try:
-            # Fetch the saved admin signature from database
-            saved_admin_sig = db.admin_signatures.find_one({"type": "landlord_default"})
-            if saved_admin_sig and saved_admin_sig.get('image_data'):
-                admin_sig = saved_admin_sig
-                logger.info("Using saved admin signature for contract PDF")
-        except Exception as e:
-            logger.warning(f"Could not fetch saved admin signature: {e}")
+        # Check if saved admin signature was passed via config
+        saved_admin_sig = config.get('saved_admin_signature') if config else None
+        if saved_admin_sig and saved_admin_sig.get('image_data'):
+            admin_sig = saved_admin_sig
+            logger.info("Using saved admin signature from config for contract PDF")
     
     if admin_sig and admin_sig.get('image_data'):
         try:

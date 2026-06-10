@@ -673,6 +673,18 @@ async def generate_contract_pdf(contract_id: str, request: Request):
 
     # Load rental config for company details
     config = await get_db().rental_config.find_one({"type": "company"})
+    if not config:
+        config = {}
+
+    # Fetch saved admin signature if not already in contract
+    if not contract.get('admin_signature') or not contract.get('admin_signature', {}).get('image_data'):
+        try:
+            saved_admin_sig = await get_db().admin_signatures.find_one({"type": "landlord_default"})
+            if saved_admin_sig and saved_admin_sig.get('image_data'):
+                config['saved_admin_signature'] = saved_admin_sig
+                logging.info("Including saved admin signature for PDF generation")
+        except Exception as e:
+            logging.warning(f"Could not fetch saved admin signature: {e}")
 
     # Look up tenant photo for inclusion in contract
     tenant_photo_url = None
