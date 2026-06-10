@@ -188,8 +188,12 @@ try:
 
 except Exception as e:
     import traceback
-    logger.error(f"❌ Failed to register rental routers: {e}")
+    error_msg = f"❌ Failed to register rental routers: {e}"
+    logger.error(error_msg)
     logger.error(traceback.format_exc())
+    # Re-raise to make the error visible in Railway logs
+    print(error_msg)
+    print(traceback.format_exc())
 
 
 # ─── Static photo serving ─────────────────────────────────────
