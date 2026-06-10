@@ -367,6 +367,19 @@ async def create_contract(request: Request):
     }
 
 
+# ─── Get Single Contract Detail ───────────────────────────────────────────
+@router.get('/admin/rental-contracts/{contract_id}')
+async def get_contract_detail(contract_id: str, request: Request):
+    """Get a single rental contract by ID"""
+    user = await auth_admin(request)
+    
+    contract = await get_db().rental_contracts.find_one({"_id": ObjectId(contract_id)})
+    if not contract:
+        raise HTTPException(status_code=404, detail="Contrato no encontrado")
+    
+    return {"success": True, "contract": serialize(contract)}
+
+
 @router.patch('/admin/rental-contracts/{contract_id}/status')
 async def update_contract_status(contract_id: str, request: Request):
     """Update contract status (activate, terminate, expire)"""
