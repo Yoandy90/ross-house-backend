@@ -218,6 +218,55 @@ def _build_initials_line(tenant_name: str, signature_data: dict, styles) -> str:
         return "Tenant Initials / Iniciales del Arrendatario: ________    Date / Fecha: ____________"
 
 
+def _build_dual_initials_block(tenant_name: str, tenant_sig: dict, admin_sig: dict, landlord_name: str = "Ross House Rentals LLC"):
+    """
+    Build a complete initials block for addendums with BOTH tenant and landlord/admin initials.
+    Returns a list of formatted strings for multiple Paragraph elements.
+    
+    For a signed contract, this will show:
+    - Tenant Initials: J.S.    Date: 02/15/2026
+    - Landlord Initials: R.H.  Date: 02/15/2026
+    
+    For unsigned contract, shows blank lines: ________
+    """
+    tenant_initials = _get_initials(tenant_name)
+    landlord_initials = _get_initials(landlord_name)
+    
+    # Tenant signature date
+    tenant_date = "____________"
+    if tenant_sig:
+        t_date = (tenant_sig.get('signed_at') or tenant_sig.get('tenant_signed_at') or tenant_sig.get('updated_at'))
+        if t_date:
+            tenant_date = f"<b>{_format_signature_date(t_date)}</b>"
+        if tenant_sig.get('image_data') or tenant_sig.get('signed_at'):
+            tenant_initials = f"<b>{tenant_initials}</b>"
+        else:
+            tenant_initials = "________"
+            tenant_date = "____________"
+    else:
+        tenant_initials = "________"
+    
+    # Admin/Landlord signature date
+    landlord_date = "____________"
+    if admin_sig:
+        a_date = (admin_sig.get('signed_at') or admin_sig.get('admin_signed_at') or admin_sig.get('updated_at'))
+        if a_date:
+            landlord_date = f"<b>{_format_signature_date(a_date)}</b>"
+        if admin_sig.get('image_data') or admin_sig.get('signed_at'):
+            landlord_initials = f"<b>{landlord_initials}</b>"
+        else:
+            landlord_initials = "________"
+            landlord_date = "____________"
+    else:
+        landlord_initials = "________"
+    
+    lines = [
+        f"Tenant Initials / Iniciales del Arrendatario: {tenant_initials}    Date / Fecha: {tenant_date}",
+        f"Landlord Initials / Iniciales del Arrendador: {landlord_initials}    Date / Fecha: {landlord_date}",
+    ]
+    return lines
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # MAIN CONTRACT GENERATOR
 # ═══════════════════════════════════════════════════════════════════════════
@@ -259,8 +308,21 @@ def generate_rental_contract_pdf(contract: dict, config: dict = None, tenant_pho
     # ─── EXTRACT SIGNATURE DATA FOR INITIALS ─────────────────────────
     tenant_name = contract.get('tenant_name', '')
     tenant_sig = contract.get('signature') or contract.get('tenant_signature') or {}
-    # Build initials line helper (used in all addendums)
-    initials_line = _build_initials_line(tenant_name, tenant_sig, styles)
+    
+    # Get admin signature from contract or from saved signature in config
+    admin_sig = contract.get('admin_signature') or {}
+    if not admin_sig.get('image_data') and config:
+        admin_sig = config.get('saved_admin_signature') or {}
+    
+    # Get landlord/company name for initials
+    landlord_name = co.get('name', 'Ross House Rentals LLC')
+    
+    # Build dual initials block (both tenant AND landlord) for addendums
+    def add_initials_block():
+        """Helper to add dual initials block to elements"""
+        initials_lines = _build_dual_initials_block(tenant_name, tenant_sig, admin_sig, landlord_name)
+        for line in initials_lines:
+            elements.append(Paragraph(line, styles['InitialLine']))
 
     # ─── HEADER WITH LOGO ────────────────────────────────────────────
     logo_path = _get_logo_path()
@@ -729,10 +791,8 @@ def generate_rental_contract_pdf(contract: dict, config: dict = None, tenant_pho
             "Arrendador de cualquier moho visible o olores a humedad.",
             styles['Body']
         ))
-        elements.append(Paragraph(
-            initials_line,
-            styles['InitialLine']
-        ))
+        elements.append(Spacer(1, 6))
+        add_initials_block()
         addendum_letter = chr(ord(addendum_letter) + 1)
 
     # ─── ADDENDUM B: BED BUG DISCLOSURE ─────────────────────────────
@@ -769,10 +829,8 @@ def generate_rental_contract_pdf(contract: dict, config: dict = None, tenant_pho
             "cooperar completamente con cualquier programa de tratamiento de plagas.",
             styles['Body']
         ))
-        elements.append(Paragraph(
-            initials_line,
-            styles['InitialLine']
-        ))
+        elements.append(Spacer(1, 6))
+        add_initials_block()
         addendum_letter = chr(ord(addendum_letter) + 1)
 
     # ─── ADDENDUM C: MILITARY / SCRA ────────────────────────────────
@@ -804,10 +862,8 @@ def generate_rental_contract_pdf(contract: dict, config: dict = None, tenant_pho
             "mediante aviso por escrito al Arrendador junto con una copia de las órdenes militares.",
             styles['Body']
         ))
-        elements.append(Paragraph(
-            initials_line,
-            styles['InitialLine']
-        ))
+        elements.append(Spacer(1, 6))
+        add_initials_block()
         addendum_letter = chr(ord(addendum_letter) + 1)
 
     # ─── ADDENDUM D: PET ADDENDUM ───────────────────────────────────
@@ -852,10 +908,8 @@ def generate_rental_contract_pdf(contract: dict, config: dict = None, tenant_pho
             "El Arrendatario es responsable de todos los daños causados por las mascotas.",
             styles['Body']
         ))
-        elements.append(Paragraph(
-            initials_line,
-            styles['InitialLine']
-        ))
+        elements.append(Spacer(1, 6))
+        add_initials_block()
         addendum_letter = chr(ord(addendum_letter) + 1)
 
     # ─── ADDENDUM E: LEAD PAINT (Pre-1978) ──────────────────────────
@@ -895,10 +949,8 @@ def generate_rental_contract_pdf(contract: dict, config: dict = None, tenant_pho
             "El Arrendatario reconoce haber recibido el folleto de la EPA sobre protección contra el plomo.",
             styles['Body']
         ))
-        elements.append(Paragraph(
-            initials_line,
-            styles['InitialLine']
-        ))
+        elements.append(Spacer(1, 6))
+        add_initials_block()
         addendum_letter = chr(ord(addendum_letter) + 1)
 
     # ─── ADDENDUM: PHOTO ID & CONSENT / CONSENTIMIENTO FOTOGRÁFICO ──
@@ -985,10 +1037,7 @@ def generate_rental_contract_pdf(contract: dict, config: dict = None, tenant_pho
         styles['Body']
     ))
     elements.append(Spacer(1, 6))
-    elements.append(Paragraph(
-        initials_line,
-        styles['InitialLine']
-    ))
+    add_initials_block()
     addendum_letter = chr(ord(addendum_letter) + 1)
 
     # ═══════════════════════════════════════════════════════════════════
