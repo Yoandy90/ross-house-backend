@@ -972,6 +972,17 @@ def generate_rental_contract_pdf(contract: dict, config: dict = None, tenant_pho
             tenant_sig_cell = '_' * 40
 
     # Admin/Landlord signature (from contract or from saved admin signature)
+    # First try to get from contract, if not found, fetch the default admin signature
+    if not admin_sig or not admin_sig.get('image_data'):
+        try:
+            # Fetch the saved admin signature from database
+            saved_admin_sig = db.admin_signatures.find_one({"type": "landlord_default"})
+            if saved_admin_sig and saved_admin_sig.get('image_data'):
+                admin_sig = saved_admin_sig
+                logger.info("Using saved admin signature for contract PDF")
+        except Exception as e:
+            logger.warning(f"Could not fetch saved admin signature: {e}")
+    
     if admin_sig and admin_sig.get('image_data'):
         try:
             admin_img_data = admin_sig['image_data']
@@ -981,7 +992,7 @@ def generate_rental_contract_pdf(contract: dict, config: dict = None, tenant_pho
             admin_buffer = io.BytesIO(admin_bytes)
             landlord_sig_cell = RLImage(admin_buffer, width=180, height=55)
 
-            admin_signed_at = admin_sig.get('signed_at', '')
+            admin_signed_at = admin_sig.get('signed_at') or admin_sig.get('updated_at', '')
             if isinstance(admin_signed_at, str) and admin_signed_at:
                 landlord_signed_date_str = admin_signed_at[:10]
             elif hasattr(admin_signed_at, 'strftime'):
