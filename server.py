@@ -147,6 +147,7 @@ try:
     from rental.utility_payments_router import router as utility_payments_router
     from rental.tenant_utilities_router import router as tenant_utilities_router
     from rental.credit_builder_router import router as credit_builder_router
+    from rental.consent_forms_router import router as consent_forms_router
 
     app.include_router(auth_router, prefix="/api")
     app.include_router(properties_router, prefix="/api")
@@ -167,8 +168,10 @@ try:
     app.include_router(utility_payments_router, prefix="/api")
     app.include_router(tenant_utilities_router, prefix="/api")
     app.include_router(credit_builder_router, prefix="/api")
+    app.include_router(consent_forms_router, prefix="/api")
 
     logger.info("  ✅ Credit Builder Router")
+    logger.info("  ✅ Consent Forms Router")
 
     # ── Initialize AI Brain ──
     from rental.ai_brain import RossHouseAIBrain
