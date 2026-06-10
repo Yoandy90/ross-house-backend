@@ -9,7 +9,7 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 from bson import ObjectId
 
-from database import get_db, serialize
+from rental.shared import get_db, serialize
 from consent_forms_service import (
     generate_background_check_consent,
     generate_income_verification_consent,

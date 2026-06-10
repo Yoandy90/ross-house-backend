@@ -9,7 +9,7 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 from bson import ObjectId
 
-from database import get_db, serialize
+from rental.shared import get_db, serialize
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
