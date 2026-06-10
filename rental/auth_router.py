@@ -651,6 +651,7 @@ async def rental_phone_verify_otp(request: Request):
             'source': 'rental_app',
             'phone_verified': True,
             'auth_method': 'phone_otp',
+            'profile_complete': False,  # Mark as incomplete profile
             'created_at': now,
             'last_login': now,
         }
@@ -674,9 +675,19 @@ async def rental_phone_verify_otp(request: Request):
         'created_at': {'$lt': now - timedelta(hours=1)},
     })
     
+    # Check if profile is complete
+    profile_complete = user.get('profile_complete', True)
+    # If user has real name and email (not placeholder), consider profile complete
+    if not profile_complete:
+        has_real_name = user.get('name', '').strip() and not user.get('name', '').startswith('Usuario ')
+        has_real_email = user.get('email', '') and '@rosshouserentals.com' not in user.get('email', '')
+        profile_complete = has_real_name and has_real_email
+    
     return {
         'success': True,
         'token': token,
+        'is_new_user': user.get('auth_method') == 'phone_otp' and not profile_complete,
+        'profile_complete': profile_complete,
         'user': {
             'id': user_id,
             'name': user.get('name', ''),
@@ -685,6 +696,7 @@ async def rental_phone_verify_otp(request: Request):
             'role': role,
             'phone_verified': True,
             'tenant_number': user.get('tenant_number', ''),
+            'profile_complete': profile_complete,
         }
     }
 
@@ -763,6 +775,79 @@ async def update_marketplace_profile(request: Request):
     }
 
 
+@router.post('/marketplace/complete-profile')
+async def complete_profile(request: Request):
+    """Complete user profile after phone OTP registration.
+    Required fields: first_name, last_name, email
+    """
+    user = await auth_marketplace(request)
+    db = get_db()
+    data = await request.json()
+    
+    first_name = data.get('first_name', '').strip()
+    last_name = data.get('last_name', '').strip()
+    email = data.get('email', '').strip().lower()
+    
+    # Validation
+    errors = []
+    if not first_name:
+        errors.append("Nombre es requerido")
+    if not last_name:
+        errors.append("Apellido es requerido")
+    if not email:
+        errors.append("Email es requerido")
+    elif '@' not in email or '.' not in email:
+        errors.append("Email inválido")
+    
+    if errors:
+        raise HTTPException(status_code=400, detail=", ".join(errors))
+    
+    # Check if email already exists (for another user)
+    existing_email = await db.app_users.find_one({
+        "email": email,
+        "_id": {"$ne": ObjectId(user["_id"]) if not isinstance(user["_id"], ObjectId) else user["_id"]}
+    })
+    if existing_email:
+        raise HTTPException(status_code=400, detail="Este email ya está registrado con otra cuenta")
+    
+    full_name = f"{first_name} {last_name}"
+    
+    try:
+        oid = ObjectId(user["_id"]) if not isinstance(user["_id"], ObjectId) else user["_id"]
+    except:
+        oid = user["_id"]
+    
+    update_data = {
+        "first_name": first_name,
+        "last_name": last_name,
+        "name": full_name,
+        "email": email,
+        "profile_complete": True,
+        "profile_completed_at": datetime.utcnow(),
+        "updated_at": datetime.utcnow(),
+    }
+    
+    await db.app_users.update_one({"_id": oid}, {"$set": update_data})
+    
+    # Fetch updated user
+    updated = await db.app_users.find_one({"_id": oid})
+    
+    logging.info(f"✅ Profile completed for user: {full_name} ({email})")
+    
+    return {
+        "success": True,
+        "message": "¡Perfil completado exitosamente!",
+        "user": {
+            "id": str(updated["_id"]),
+            "name": updated.get("name", ""),
+            "first_name": updated.get("first_name", ""),
+            "last_name": updated.get("last_name", ""),
+            "email": updated.get("email", ""),
+            "phone": updated.get("phone", ""),
+            "role": updated.get("role", "tenant"),
+            "profile_complete": True,
+        }
+    }
 
 
 
