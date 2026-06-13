@@ -7,3 +7,4 @@ build/
 .eggs/
 venv/
 property_photos/
+firebase_config.json
