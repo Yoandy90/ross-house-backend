@@ -255,7 +255,7 @@ async def xcel_connect_url(request: Request, property_id: str):
 @router.get("/tenant/xcel/connect-url")
 async def tenant_xcel_connect_url(request: Request):
     """The tenant authorizes Xcel data sharing for the property of their active contract."""
-    tenant = await auth_tenant(request)
+    tenant = await auth_marketplace(request)
     if not _is_configured():
         raise HTTPException(status_code=500, detail="Integración Xcel no configurada")
     db = get_db()
