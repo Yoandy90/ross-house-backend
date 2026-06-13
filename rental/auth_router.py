@@ -3,6 +3,7 @@ Rental Auth Router
 ===================
 """
 import logging
+import re
 from datetime import datetime, timedelta
 from typing import Optional, List
 from collections import defaultdict
@@ -778,7 +779,8 @@ async def update_marketplace_profile(request: Request):
 @router.post('/marketplace/complete-profile')
 async def complete_profile(request: Request):
     """Complete user profile after phone OTP registration.
-    Required fields: first_name, last_name, email
+    Required fields: first_name, last_name, email, password
+    Enforces unique email AND unique phone per user.
     """
     user = await auth_marketplace(request)
     db = get_db()
@@ -787,6 +789,7 @@ async def complete_profile(request: Request):
     first_name = data.get('first_name', '').strip()
     last_name = data.get('last_name', '').strip()
     email = data.get('email', '').strip().lower()
+    password = data.get('password', '')
     
     # Validation
     errors = []
@@ -798,30 +801,62 @@ async def complete_profile(request: Request):
         errors.append("Email es requerido")
     elif '@' not in email or '.' not in email:
         errors.append("Email inválido")
+    if not password:
+        errors.append("Contraseña es requerida")
+    elif len(password) < 6:
+        errors.append("La contraseña debe tener al menos 6 caracteres")
     
     if errors:
         raise HTTPException(status_code=400, detail=", ".join(errors))
     
-    # Check if email already exists (for another user)
+    # Determine the current user's ObjectId for self-exclusion in uniqueness queries
+    try:
+        oid = ObjectId(user["_id"]) if not isinstance(user["_id"], ObjectId) else user["_id"]
+    except Exception:
+        oid = user["_id"]
+    
+    # ── Email uniqueness across BOTH collections ──
     existing_email = await db.app_users.find_one({
-        "email": email,
-        "_id": {"$ne": ObjectId(user["_id"]) if not isinstance(user["_id"], ObjectId) else user["_id"]}
+        "email": {"$regex": f"^{re.escape(email)}$", "$options": "i"},
+        "_id": {"$ne": oid},
     })
     if existing_email:
         raise HTTPException(status_code=400, detail="Este email ya está registrado con otra cuenta")
+    existing_email_tenant = await db.tenants.find_one({
+        "email": {"$regex": f"^{re.escape(email)}$", "$options": "i"},
+    })
+    if existing_email_tenant:
+        raise HTTPException(status_code=400, detail="Este email ya está registrado con otra cuenta")
+    
+    # ── Phone uniqueness across BOTH collections ──
+    user_phone = (user.get("phone") or "").strip()
+    if user_phone:
+        # normalize for comparison
+        def _norm(p):
+            return (p or "").replace("-", "").replace(" ", "").replace("(", "").replace(")", "").replace("+", "")
+        norm_phone = _norm(user_phone)
+        if norm_phone:
+            existing_phone = await db.app_users.find_one({
+                "phone": user_phone,
+                "_id": {"$ne": oid},
+            })
+            if not existing_phone:
+                # Try normalized match
+                async for u in db.app_users.find({"_id": {"$ne": oid}, "phone": {"$exists": True, "$ne": ""}}):
+                    if _norm(u.get("phone", "")) == norm_phone:
+                        existing_phone = u
+                        break
+            if existing_phone:
+                raise HTTPException(status_code=400, detail="Este teléfono ya está registrado con otra cuenta")
     
     full_name = f"{first_name} {last_name}"
-    
-    try:
-        oid = ObjectId(user["_id"]) if not isinstance(user["_id"], ObjectId) else user["_id"]
-    except:
-        oid = user["_id"]
     
     update_data = {
         "first_name": first_name,
         "last_name": last_name,
         "name": full_name,
         "email": email,
+        "password_hash": hash_password(password),
         "profile_complete": True,
         "profile_completed_at": datetime.utcnow(),
         "updated_at": datetime.utcnow(),
@@ -832,11 +867,11 @@ async def complete_profile(request: Request):
     # Fetch updated user
     updated = await db.app_users.find_one({"_id": oid})
     
-    logging.info(f"✅ Profile completed for user: {full_name} ({email})")
+    logging.info(f"✅ Profile completed for user: {full_name} ({email}) — password set")
     
     return {
         "success": True,
-        "message": "¡Perfil completado exitosamente!",
+        "message": "¡Perfil completado exitosamente! Ya puedes iniciar sesión con tu email y contraseña.",
         "user": {
             "id": str(updated["_id"]),
             "name": updated.get("name", ""),
@@ -846,6 +881,7 @@ async def complete_profile(request: Request):
             "phone": updated.get("phone", ""),
             "role": updated.get("role", "tenant"),
             "profile_complete": True,
+            "has_password": True,
         }
     }
 
