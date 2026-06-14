@@ -405,11 +405,13 @@ async def update_contract_status(contract_id: str, request: Request):
             {"$set": {"current_property_id": contract['property_id'], "updated_at": now}}
         )
     elif new_status in ('terminated', 'expired'):
-        # Free the property
-        await get_db().properties.update_one(
-            {"_id": ObjectId(contract['property_id'])},
-            {"$set": {"status": "available", "current_tenant_id": None, "current_contract_id": None, "updated_at": now}}
-        )
+        # Free the property (only if not manually overridden)
+        prop = await get_db().properties.find_one({"_id": ObjectId(contract['property_id'])})
+        if prop and not prop.get('status_manually_set'):
+            await get_db().properties.update_one(
+                {"_id": ObjectId(contract['property_id'])},
+                {"$set": {"status": "available", "current_tenant_id": None, "current_contract_id": None, "updated_at": now}}
+            )
         await get_db().tenants.update_one(
             {"_id": ObjectId(contract['tenant_id'])},
             {"$set": {"current_property_id": None, "updated_at": now},
@@ -421,9 +423,89 @@ async def update_contract_status(contract_id: str, request: Request):
                  "rent_amount": contract.get('rent_amount', 0),
              }}}
         )
+    elif new_status in ('draft', 'pending_signature', 'pending'):
+        # Contract reverted to draft/pending — free the property if no other active contract uses it
+        prop_id = contract.get('property_id')
+        if prop_id:
+            prop = await get_db().properties.find_one({"_id": ObjectId(prop_id)})
+            if prop and not prop.get('status_manually_set'):
+                # Check if there's any OTHER active contract on this property
+                other_active = await get_db().rental_contracts.find_one({
+                    "property_id": prop_id,
+                    "status": "active",
+                    "_id": {"$ne": ObjectId(contract_id)},
+                })
+                if not other_active:
+                    await get_db().properties.update_one(
+                        {"_id": ObjectId(prop_id)},
+                        {"$set": {"status": "available", "current_tenant_id": None, "current_contract_id": None, "updated_at": now}}
+                    )
 
     await get_db().rental_contracts.update_one({"_id": ObjectId(contract_id)}, {"$set": update})
     return {"success": True, "message": f"Contrato actualizado a: {new_status}"}
+
+
+# ─── Reconcile properties ↔ contracts (admin tool) ─────────────────────────
+@router.post('/admin/properties/sync-status')
+async def sync_property_status(request: Request):
+    """Reconcile property statuses based on actual active contracts.
+    For each property:
+      - If there's an active contract → status = rented (with current_contract_id, current_tenant_id)
+      - Else if status_manually_set is False/missing → status = available
+      - If status_manually_set is True → leave it alone (admin's manual override)
+    """
+    user = await auth_admin(request)
+    db = get_db()
+    now = datetime.utcnow()
+
+    fixed = []
+    skipped_manual = []
+    unchanged = []
+
+    async for prop in db.properties.find({}):
+        pid = str(prop["_id"])
+        active_contract = await db.rental_contracts.find_one({"property_id": pid, "status": "active"})
+
+        if prop.get('status_manually_set'):
+            skipped_manual.append({"id": pid, "address": prop.get('address', ''), "status": prop.get('status')})
+            continue
+
+        if active_contract:
+            target = {
+                "status": "rented",
+                "current_tenant_id": str(active_contract.get('tenant_id', '')),
+                "current_contract_id": str(active_contract.get('_id', '')),
+            }
+        else:
+            target = {
+                "status": "available",
+                "current_tenant_id": None,
+                "current_contract_id": None,
+            }
+
+        # Only update if different
+        needs_update = (
+            prop.get('status') != target['status'] or
+            (str(prop.get('current_contract_id', '') or '') != (target.get('current_contract_id') or ''))
+        )
+        if needs_update:
+            await db.properties.update_one({"_id": prop["_id"]}, {"$set": {**target, "updated_at": now}})
+            fixed.append({
+                "id": pid,
+                "address": prop.get('address', ''),
+                "old_status": prop.get('status'),
+                "new_status": target['status'],
+            })
+        else:
+            unchanged.append({"id": pid, "status": prop.get('status')})
+
+    return {
+        "success": True,
+        "summary": f"{len(fixed)} corregidas, {len(skipped_manual)} ignoradas (manuales), {len(unchanged)} ya correctas",
+        "fixed": fixed,
+        "skipped_manual": skipped_manual,
+        "unchanged_count": len(unchanged),
+    }
 
 
 @router.put('/admin/rental-contracts/{contract_id}')
@@ -486,7 +568,7 @@ async def update_contract(contract_id: str, request: Request):
 
 @router.delete('/admin/rental-contracts/{contract_id}')
 async def delete_contract(contract_id: str, request: Request):
-    """Delete a contract (draft only unless forced)"""
+    """Delete a contract (draft only unless forced). Also frees up the property if it was rented by this contract."""
     user = await auth_admin(request)
     contract = await get_db().rental_contracts.find_one({"_id": ObjectId(contract_id)})
     if not contract:
@@ -499,8 +581,39 @@ async def delete_contract(contract_id: str, request: Request):
         if not force:
             raise HTTPException(status_code=400, detail="No se puede eliminar un contrato activo. Use ?force=true")
 
+    # Free up the property if this contract was the one renting it
+    prop_id = contract.get('property_id')
+    if prop_id:
+        try:
+            prop = await get_db().properties.find_one({"_id": ObjectId(prop_id)})
+        except Exception:
+            prop = None
+        if prop and not prop.get('status_manually_set'):
+            # Only auto-free if admin hasn't manually overridden the status
+            if str(prop.get('current_contract_id', '')) == contract_id:
+                await get_db().properties.update_one(
+                    {"_id": ObjectId(prop_id)},
+                    {"$set": {
+                        "status": "available",
+                        "current_tenant_id": None,
+                        "current_contract_id": None,
+                        "updated_at": datetime.utcnow(),
+                    }}
+                )
+
+    # Also clear the tenant's current_property_id if it pointed to this property
+    tenant_id = contract.get('tenant_id')
+    if tenant_id and prop_id:
+        try:
+            await get_db().tenants.update_one(
+                {"_id": ObjectId(tenant_id), "current_property_id": prop_id},
+                {"$set": {"current_property_id": None, "updated_at": datetime.utcnow()}}
+            )
+        except Exception:
+            pass
+
     await get_db().rental_contracts.delete_one({"_id": ObjectId(contract_id)})
-    return {"success": True, "message": "Contrato eliminado"}
+    return {"success": True, "message": "Contrato eliminado y propiedad liberada"}
 
 
 # ─── Contract Signature ─────────────────────────────────────────────────────

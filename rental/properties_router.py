@@ -756,6 +756,20 @@ async def update_property(property_id: str, request: Request):
                 update_fields[field] = float(data[field])
             else:
                 update_fields[field] = data[field]
+
+    # If admin is manually changing the status, mark it as manual override
+    # so auto-sync logic (from contracts) won't override the choice.
+    if 'status' in data:
+        new_status = data['status']
+        old_status = prop.get('status')
+        if new_status != old_status:
+            update_fields['status_manually_set'] = True
+            update_fields['status_manually_set_at'] = now
+            update_fields['status_manually_set_by'] = user.get('email', 'admin')
+        # Allow admin to "release" the lock by explicitly setting auto-sync
+        if data.get('clear_manual_override'):
+            update_fields['status_manually_set'] = False
+
     update_fields['updated_at'] = now
 
     await get_db().properties.update_one({"_id": ObjectId(property_id)}, {"$set": update_fields})
