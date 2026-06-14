@@ -869,6 +869,19 @@ async def complete_profile(request: Request):
     
     logging.info(f"✅ Profile completed for user: {full_name} ({email}) — password set")
     
+    # ─── Send welcome email + SMS (non-blocking) ───
+    try:
+        from rental.tenant_router import _send_welcome_email_self_registered, _send_welcome_sms
+        await _send_welcome_email_self_registered(email, full_name)
+    except Exception as e:
+        logging.warning(f"Welcome email failed (non-fatal): {e}")
+    try:
+        from rental.tenant_router import _send_welcome_sms
+        if user_phone:
+            await _send_welcome_sms(user_phone, full_name)
+    except Exception as e:
+        logging.warning(f"Welcome SMS failed (non-fatal): {e}")
+    
     return {
         "success": True,
         "message": "¡Perfil completado exitosamente! Ya puedes iniciar sesión con tu email y contraseña.",

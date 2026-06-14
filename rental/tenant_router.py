@@ -495,7 +495,7 @@ async def _send_welcome_email(email: str, name: str, password: str):
             return
 
         import sendgrid
-        from sendgrid.helpers.mail import Mail, Email, To, Content, HtmlContent
+        from sendgrid.helpers.mail import Mail, Email, To
 
         html = f"""
         <div style="font-family: 'Segoe UI', Tahoma, sans-serif; max-width: 600px; margin: 0 auto; background: #0a0f1a; color: #e2e8f0; border-radius: 16px; overflow: hidden;">
@@ -529,6 +529,110 @@ async def _send_welcome_email(email: str, name: str, password: str):
         logging.info(f"✅ Welcome email sent to {email} (status: {response.status_code})")
     except Exception as e:
         logging.error(f"❌ Failed to send welcome email to {email}: {e}")
+
+
+async def _send_welcome_email_self_registered(email: str, name: str):
+    """Welcome email for self-registered tenants (they chose their own password — do NOT email it back)."""
+    import os
+    try:
+        sendgrid_key = os.getenv('SENDGRID_API_KEY')
+        from_email = os.getenv('SENDGRID_FROM_EMAIL', 'info@rosshouserentals.com')
+
+        if not sendgrid_key:
+            config = await get_db().api_config.find_one({"_id": "main"})
+            if config:
+                sendgrid_key = config.get('sendgrid_api_key') or config.get('SENDGRID_API_KEY')
+                from_email = config.get('sendgrid_from_email', from_email)
+
+        if not sendgrid_key:
+            logging.warning(f"⚠️ No SendGrid key — skipping welcome email to {email}")
+            return
+
+        import sendgrid
+        from sendgrid.helpers.mail import Mail, Email, To
+
+        html = f"""
+        <div style="font-family: 'Segoe UI', Tahoma, sans-serif; max-width: 600px; margin: 0 auto; background: #0a0f1a; color: #e2e8f0; border-radius: 16px; overflow: hidden;">
+            <div style="background: linear-gradient(135deg, #C8102E, #DC2626); padding: 32px; text-align: center;">
+                <h1 style="color: white; margin: 0; font-size: 26px;">🏠 Ross House Rentals</h1>
+                <p style="color: rgba(255,255,255,0.92); margin: 10px 0 0; font-size: 15px;">¡Bienvenido(a) a la familia!</p>
+            </div>
+            <div style="padding: 32px;">
+                <p style="font-size: 18px; margin: 0 0 12px;">Hola <strong>{name}</strong> 👋,</p>
+                <p style="font-size: 15px; line-height: 1.6;">¡Gracias por unirte a Ross House Rentals! Tu cuenta ha sido creada exitosamente y ya puedes acceder a todos nuestros servicios desde la app.</p>
+
+                <div style="background: rgba(200,16,46,0.10); border-left: 4px solid #C8102E; padding: 16px 20px; margin: 24px 0; border-radius: 8px;">
+                    <p style="margin: 0; font-weight: bold; color: #C8102E;">📧 Tu email de acceso:</p>
+                    <p style="margin: 6px 0 0; font-size: 16px;">{email}</p>
+                </div>
+
+                <h3 style="color: #fff; margin: 28px 0 12px;">🚀 ¿Qué puedes hacer ahora?</h3>
+                <ul style="font-size: 14px; line-height: 1.8; color: #cbd5e1; padding-left: 20px;">
+                    <li><strong>Pagar tu renta</strong> con tarjeta de forma segura</li>
+                    <li><strong>Conectar Xcel Energy</strong> y ver tu consumo eléctrico real</li>
+                    <li><strong>Escanear tus recibos</strong> con la cámara y la IA</li>
+                    <li><strong>Reportar mantenimiento</strong> 24/7</li>
+                    <li><strong>Recibir notificaciones</strong> de facturas y pagos</li>
+                </ul>
+
+                <p style="color: #94a3b8; font-size: 13px; margin-top: 28px;">Si tienes dudas, responde a este correo o llámanos al teléfono que aparece en tu contrato.</p>
+
+                <hr style="border: none; border-top: 1px solid rgba(255,255,255,0.1); margin: 24px 0;" />
+                <p style="text-align: center; color: #64748b; font-size: 12px; margin: 0;">
+                    Ross House Rentals LLC<br/>
+                    <a href="mailto:info@rosshouserentals.com" style="color: #C8102E; text-decoration: none;">info@rosshouserentals.com</a>
+                </p>
+            </div>
+        </div>
+        """
+
+        sg = sendgrid.SendGridAPIClient(api_key=sendgrid_key)
+        mail = Mail(
+            from_email=Email(from_email, "Ross House Rentals"),
+            to_emails=To(email),
+            subject="🏠 ¡Bienvenido a Ross House Rentals!",
+            html_content=html,
+        )
+        response = sg.send(mail)
+        logging.info(f"✅ Welcome email (self-reg) sent to {email} (status: {response.status_code})")
+    except Exception as e:
+        logging.error(f"❌ Failed to send welcome email to {email}: {e}")
+
+
+async def _send_welcome_sms(phone: str, name: str):
+    """Send a friendly welcome SMS to the new tenant."""
+    import os
+    try:
+        sid = os.environ.get("TWILIO_ACCOUNT_SID", "")
+        token = os.environ.get("TWILIO_AUTH_TOKEN", "")
+        from_phone = os.environ.get("TWILIO_PHONE_NUMBER", "")
+
+        if not sid or not token or not from_phone:
+            config = await get_db().api_config.find_one({"_id": "main"})
+            if config:
+                sid = sid or config.get('twilio_account_sid', '')
+                token = token or config.get('twilio_auth_token', '')
+                from_phone = from_phone or config.get('twilio_phone_number', '')
+
+        if not sid or not token or not from_phone:
+            logging.warning(f"⚠️ No Twilio config — skipping welcome SMS to {phone}")
+            return
+
+        # Normalize phone to E.164 if needed
+        normalized = phone if phone.startswith('+') else f"+1{phone.replace('-', '').replace(' ', '').replace('(', '').replace(')', '')}"
+
+        from twilio.rest import Client
+        client = Client(sid, token)
+        first_name = (name or "").split(' ', 1)[0] or "Vecino"
+        body = (
+            f"Hola {first_name}! 🏠 Bienvenido(a) a Ross House Rentals. "
+            f"Tu cuenta esta lista. Ya puedes pagar tu renta, conectar tu electricidad "
+            f"y reportar mantenimiento desde la app. Gracias por elegirnos!"
+        )
+        msg = client.messages.create(body=body, from_=from_phone, to=normalized)
+        logging.info(f"✅ Welcome SMS sent to {phone[-4:]} (SID: {msg.sid})")
+    except Exception as e:
+        logging.error(f"❌ Failed to send welcome SMS to {phone}: {e}")
 
 
 
