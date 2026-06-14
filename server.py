@@ -61,7 +61,26 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"   ⚠️ Mashvisor Cache indexes deferred: {e}")
 
+    # Start property/contract sync cron job in the background
+    sync_task = None
+    try:
+        import asyncio
+        from rental.property_sync_cron import property_sync_loop
+        sync_task = asyncio.create_task(property_sync_loop())
+        logger.info("   ✅ Property-Contract sync cron scheduled")
+    except Exception as e:
+        logger.warning(f"   ⚠️ Property-sync cron not started: {e}")
+
     yield
+
+    # Graceful shutdown of cron
+    if sync_task and not sync_task.done():
+        sync_task.cancel()
+        try:
+            await sync_task
+        except Exception:
+            pass
+
     client.close()
     logger.info("🏠 Ross House Rentals API stopped.")
 
