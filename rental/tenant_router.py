@@ -249,9 +249,188 @@ async def list_tenants(request: Request):
     return {"success": True, "tenants": tenants, "count": len(tenants)}
 
 
+@router.get('/admin/all-users')
+async def list_all_users(request: Request):
+    """List ALL registered users (tenants + marketplace app_users).
+    Returns a unified list with source = 'tenant' | 'app_user' | 'linked'.
+    Useful for admin to see everyone who has registered through any channel.
+    """
+    user = await auth_admin(request)
+    db = get_db()
+
+    from urllib.parse import parse_qs
+    params = parse_qs(str(request.url.query))
+    search = params.get('search', [''])[0]
+
+    # 1. All tenants (formal tenant records with optional app_user link)
+    tenant_query = {}
+    if search:
+        tenant_query['$or'] = [
+            {"name": {"$regex": search, "$options": "i"}},
+            {"email": {"$regex": search, "$options": "i"}},
+            {"phone": {"$regex": search, "$options": "i"}},
+            {"tenant_number": {"$regex": search, "$options": "i"}},
+        ]
+
+    tenants = []
+    tenant_app_ids = set()
+    tenant_emails = set()
+    tenant_phones = set()
+
+    async for t in db.tenants.find(tenant_query).sort("created_at", -1):
+        if t.get('app_user_id'):
+            tenant_app_ids.add(str(t['app_user_id']))
+        if t.get('email'):
+            tenant_emails.add(t['email'].lower())
+        if t.get('phone'):
+            tenant_phones.add(t['phone'])
+        # Determine if has app account
+        has_app = bool(t.get('app_user_id'))
+        if not has_app and t.get('email'):
+            existing = await db.app_users.find_one({"email": {"$regex": f"^{t['email']}$", "$options": "i"}})
+            if existing:
+                has_app = True
+                tenant_app_ids.add(str(existing['_id']))
+        tenants.append({
+            "id": str(t["_id"]),
+            "source": "tenant",
+            "tenant_number": t.get("tenant_number"),
+            "name": t.get("name", ""),
+            "first_name": t.get("first_name", ""),
+            "last_name": t.get("last_name", ""),
+            "email": t.get("email", ""),
+            "phone": t.get("phone", ""),
+            "photo_url": t.get("photo_url", ""),
+            "status": t.get("status", "active"),
+            "has_contract": bool(t.get("current_property_id")),
+            "has_app_account": has_app,
+            "current_property_id": t.get("current_property_id"),
+            "created_at": t.get("created_at").isoformat() if t.get("created_at") else None,
+        })
+
+    # 2. app_users NOT yet linked to a tenant (registered via OTP, not yet a formal tenant)
+    user_query = {"role": {"$ne": "admin"}}  # Don't list admin accounts in tenant view
+    if search:
+        user_query['$or'] = [
+            {"name": {"$regex": search, "$options": "i"}},
+            {"email": {"$regex": search, "$options": "i"}},
+            {"phone": {"$regex": search, "$options": "i"}},
+            {"first_name": {"$regex": search, "$options": "i"}},
+            {"last_name": {"$regex": search, "$options": "i"}},
+        ]
+
+    unlinked_users = []
+    async for u in db.app_users.find(user_query).sort("created_at", -1):
+        uid = str(u["_id"])
+        u_email = (u.get("email") or "").lower()
+        u_phone = u.get("phone") or ""
+        # Skip if already represented in tenants list
+        if uid in tenant_app_ids:
+            continue
+        if u_email and u_email in tenant_emails:
+            continue
+        if u_phone and u_phone in tenant_phones:
+            continue
+        unlinked_users.append({
+            "id": uid,
+            "source": "app_user",
+            "tenant_number": None,
+            "name": u.get("name", "") or f"{u.get('first_name','')} {u.get('last_name','')}".strip(),
+            "first_name": u.get("first_name", ""),
+            "last_name": u.get("last_name", ""),
+            "email": u.get("email", ""),
+            "phone": u.get("phone", ""),
+            "photo_url": u.get("photo_url", "") or u.get("avatar_url", ""),
+            "status": u.get("status", "active"),
+            "has_contract": False,
+            "has_app_account": True,
+            "role": u.get("role", "tenant"),
+            "profile_complete": u.get("profile_complete", False),
+            "created_at": u.get("created_at").isoformat() if isinstance(u.get("created_at"), datetime) else u.get("created_at"),
+        })
+
+    return {
+        "success": True,
+        "users": tenants + unlinked_users,
+        "summary": {
+            "total": len(tenants) + len(unlinked_users),
+            "tenants": len(tenants),
+            "app_users_unlinked": len(unlinked_users),
+        }
+    }
+
+
+@router.post('/admin/all-users/{user_id}/convert-to-tenant')
+async def convert_app_user_to_tenant(user_id: str, request: Request):
+    """Admin shortcut: take an app_user (registered via OTP without a contract)
+    and create a formal tenant record for them.
+    """
+    admin = await auth_admin(request)
+    db = get_db()
+
+    try:
+        u = await db.app_users.find_one({"_id": ObjectId(user_id)})
+    except Exception:
+        u = None
+    if not u:
+        raise HTTPException(status_code=404, detail="Usuario no encontrado")
+
+    # Don't duplicate
+    if u.get('tenant_id'):
+        existing = await db.tenants.find_one({"_id": ObjectId(u['tenant_id'])})
+        if existing:
+            return {"success": True, "message": "Ya es inquilino", "tenant_id": str(existing["_id"])}
+
+    now = datetime.utcnow()
+    count = await db.tenants.count_documents({})
+    tenant_number = f"INQ-{now.year}-{str(count + 1).zfill(3)}"
+
+    first_name = u.get("first_name") or (u.get("name", "").split(" ", 1)[0] if u.get("name") else "")
+    last_name = u.get("last_name") or (u.get("name", "").split(" ", 1)[1] if u.get("name") and " " in u.get("name", "") else "")
+
+    tenant_doc = {
+        "tenant_number": tenant_number,
+        "first_name": first_name,
+        "last_name": last_name,
+        "name": u.get("name", f"{first_name} {last_name}".strip()),
+        "email": u.get("email", ""),
+        "phone": u.get("phone", ""),
+        "address": "",
+        "photo_url": u.get("photo_url", "") or u.get("avatar_url", ""),
+        "status": "active",
+        "rental_history": [],
+        "app_user_id": str(u["_id"]),
+        "created_at": now,
+        "updated_at": now,
+        "created_by": admin.get("email", "admin"),
+        "converted_from_app_user": True,
+    }
+
+    result = await db.tenants.insert_one(tenant_doc)
+    tenant_id = str(result.inserted_id)
+
+    # Link both ways
+    await db.app_users.update_one(
+        {"_id": u["_id"]},
+        {"$set": {"tenant_id": tenant_id, "role": "tenant", "updated_at": now}}
+    )
+
+    return {
+        "success": True,
+        "message": f"Convertido a inquilino {tenant_number}",
+        "tenant_id": tenant_id,
+        "tenant_number": tenant_number,
+    }
+
+
 @router.post('/admin/tenants')
 async def create_tenant(request: Request):
-    """Create a new tenant + auto-create user account + send welcome email"""
+    """Create a new tenant + auto-create user account + send welcome email + SMS.
+    Optional body fields:
+      - password (str): If provided, admin sets the password. Otherwise a random 10-char
+                        password is generated.
+      - send_welcome (bool, default true): Send welcome email + SMS to the new tenant
+    """
     user = await auth_admin(request)
     data = await request.json()
     now = datetime.utcnow()
@@ -260,11 +439,37 @@ async def create_tenant(request: Request):
     last_name = data.get('last_name', '').strip()
     email = data.get('email', '').strip().lower()
     phone = data.get('phone', '').strip()
+    custom_password = data.get('password', '').strip() if data.get('password') else None
+    send_welcome = data.get('send_welcome', True)
 
     if not first_name or not last_name:
         raise HTTPException(status_code=400, detail="Nombre y apellido son requeridos")
     if not phone:
         raise HTTPException(status_code=400, detail="Teléfono es requerido")
+    if custom_password and len(custom_password) < 6:
+        raise HTTPException(status_code=400, detail="La contraseña debe tener al menos 6 caracteres")
+
+    # Uniqueness checks across BOTH collections
+    if email:
+        import re as _re
+        existing_t = await get_db().tenants.find_one({
+            "email": {"$regex": f"^{_re.escape(email)}$", "$options": "i"}
+        })
+        if existing_t:
+            raise HTTPException(status_code=400, detail=f"Este email ya está registrado para el inquilino {existing_t.get('tenant_number','?')}")
+        existing_u = await get_db().app_users.find_one({
+            "email": {"$regex": f"^{_re.escape(email)}$", "$options": "i"}
+        })
+        if existing_u and not existing_u.get('tenant_id'):
+            # User exists in app_users but not yet linked — we'll link below
+            pass
+        elif existing_u and existing_u.get('tenant_id'):
+            raise HTTPException(status_code=400, detail="Este email ya está en uso por otra cuenta")
+
+    if phone:
+        existing_t_p = await get_db().tenants.find_one({"phone": phone})
+        if existing_t_p:
+            raise HTTPException(status_code=400, detail=f"Este teléfono ya está registrado para el inquilino {existing_t_p.get('tenant_number','?')}")
 
     full_name = f"{first_name} {last_name}"
 
@@ -306,18 +511,26 @@ async def create_tenant(request: Request):
         existing_user = await get_db().app_users.find_one({"email": email})
         if not existing_user:
             import random, string
-            generated_password = ''.join(random.choices(string.ascii_letters + string.digits, k=8))
+            if custom_password:
+                final_password = custom_password
+            else:
+                final_password = ''.join(random.choices(string.ascii_letters + string.digits, k=10))
+            generated_password = final_password
             from rental.auth_router import hash_password
             app_user = {
                 "name": full_name,
+                "first_name": first_name,
+                "last_name": last_name,
                 "email": email,
                 "phone": phone,
-                "password_hash": hash_password(generated_password),
+                "password_hash": hash_password(final_password),
                 "role": "tenant",
                 "status": "active",
                 "verified": True,
+                "profile_complete": True,
                 "tenant_id": tenant_id,
                 "created_at": now,
+                "updated_at": now,
                 "created_from": "admin_panel",
             }
             user_result = await get_db().app_users.insert_one(app_user)
@@ -328,15 +541,39 @@ async def create_tenant(request: Request):
             )
             user_created = True
             logging.info(f"✅ Auto-created app user for tenant {tenant_number}: {email}")
-
-            # Send welcome email with credentials
-            await _send_welcome_email(email, full_name, generated_password)
         else:
-            # Link existing user to tenant
+            # Link existing user to tenant and update password if admin provided one
+            update_fields = {"tenant_id": tenant_id, "updated_at": now}
+            if custom_password:
+                from rental.auth_router import hash_password
+                update_fields["password_hash"] = hash_password(custom_password)
+                generated_password = custom_password
+            await get_db().app_users.update_one(
+                {"_id": existing_user["_id"]},
+                {"$set": update_fields}
+            )
             await get_db().tenants.update_one(
                 {"_id": result.inserted_id},
                 {"$set": {"app_user_id": str(existing_user["_id"])}}
             )
+            user_created = bool(custom_password)
+
+    # ── Send welcome email + SMS ──
+    email_sent = False
+    sms_sent = False
+    if send_welcome:
+        if email and generated_password:
+            try:
+                await _send_welcome_email(email, full_name, generated_password)
+                email_sent = True
+            except Exception as e:
+                logging.warning(f"Welcome email failed: {e}")
+        if phone:
+            try:
+                await _send_welcome_sms(phone, full_name)
+                sms_sent = True
+            except Exception as e:
+                logging.warning(f"Welcome SMS failed: {e}")
 
     return {
         "success": True,
@@ -344,7 +581,13 @@ async def create_tenant(request: Request):
         "tenant_id": tenant_id,
         "tenant_number": tenant_number,
         "user_created": user_created,
-        "email_sent": user_created and email != '',
+        "email_sent": email_sent,
+        "sms_sent": sms_sent,
+        "credentials": {
+            "email": email,
+            "password": generated_password,  # Returned ONCE so admin can show it/copy it
+            "show_to_admin": bool(generated_password),
+        } if generated_password else None,
     }
 
 
