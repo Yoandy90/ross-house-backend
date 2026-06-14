@@ -330,6 +330,7 @@ async def tenant_xcel_connect_url(request: Request):
     tenant = await auth_marketplace(request)
     if not _is_configured():
         raise HTTPException(status_code=500, detail="Integración Xcel no configurada")
+    db = get_db()
     contract = await _find_active_contract_for_user(tenant)
     if not contract or not contract.get("property_id"):
         raise HTTPException(status_code=400, detail="No tienes un contrato activo con propiedad asignada")
