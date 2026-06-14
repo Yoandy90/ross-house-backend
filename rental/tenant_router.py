@@ -635,6 +635,67 @@ async def _send_welcome_sms(phone: str, name: str):
         logging.error(f"❌ Failed to send welcome SMS to {phone}: {e}")
 
 
+@router.post('/admin/resend-welcome')
+async def admin_resend_welcome(request: Request):
+    """Admin-only endpoint to manually resend welcome email + SMS to any user.
+    Body: { "email": "..." } OR { "user_id": "..." } OR { "phone": "..." }
+    """
+    from rental.shared import auth_admin
+    await auth_admin(request)
+    data = await request.json()
+
+    db = get_db()
+    query = {}
+    if data.get("user_id"):
+        try:
+            from bson import ObjectId
+            query["_id"] = ObjectId(data["user_id"])
+        except Exception:
+            query["_id"] = data["user_id"]
+    elif data.get("email"):
+        import re as _re
+        query["email"] = {"$regex": f"^{_re.escape(data['email'])}$", "$options": "i"}
+    elif data.get("phone"):
+        query["phone"] = data["phone"]
+    else:
+        raise HTTPException(status_code=400, detail="Provide user_id, email, or phone")
+
+    user = await db.app_users.find_one(query)
+    if not user:
+        raise HTTPException(status_code=404, detail="Usuario no encontrado")
+
+    email = user.get("email", "")
+    name = user.get("name") or f"{user.get('first_name','')} {user.get('last_name','')}".strip() or "Vecino"
+    phone = user.get("phone", "")
+
+    sent_email = False
+    sent_sms = False
+    err_email = None
+    err_sms = None
+
+    if email:
+        try:
+            await _send_welcome_email_self_registered(email, name)
+            sent_email = True
+        except Exception as e:
+            err_email = str(e)
+    if phone:
+        try:
+            await _send_welcome_sms(phone, name)
+            sent_sms = True
+        except Exception as e:
+            err_sms = str(e)
+
+    return {
+        "success": True,
+        "user": {"email": email, "name": name, "phone": phone},
+        "email_sent": sent_email,
+        "sms_sent": sent_sms,
+        "email_error": err_email,
+        "sms_error": err_sms,
+    }
+
+
 
 
 # ==================== TENANT PROFILE PHOTO (FROM MOBILE APP) ====================
