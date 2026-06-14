@@ -4,11 +4,16 @@ Xcel Energy Green Button Connect (ESPI/NAESB) integration
 - Token storage + refresh per property connection
 - ESPI Atom/XML parsing (IntervalBlock + UsageSummary) into kWh readings
 - Usage endpoints for the admin dashboard (web + mobile)
+- Demo data fallback when no real data is available yet
+- AI-powered saving tips (Emergent LLM key → Claude / GPT-4o)
 """
 import os
+import math
+import json
+import random
 import secrets
 import logging
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, date
 from urllib.parse import urlencode
 import xml.etree.ElementTree as ET
 
@@ -504,19 +509,21 @@ async def xcel_usage(request: Request, property_id: str, months: int = 12):
 async def tenant_xcel_usage(request: Request, months: int = 6):
     """Return Green Button kWh usage data for the logged-in tenant's active property.
     Used by the mobile app to render the consumption dashboard inside 'Mis Servicios'.
+
+    When no real data is available yet (waiting for Xcel approval), returns a
+    realistic demo dataset so the UI can be visualized end-to-end. Real data
+    automatically replaces the demo once Green Button starts ingesting.
     """
     user = await auth_marketplace(request)
     db = get_db()
 
     contract = await _find_active_contract_for_user(user)
     if not contract or not contract.get("property_id"):
-        return {
-            "connected": False,
-            "reason": "no_active_contract",
-            "message": "No tienes un contrato activo asignado a una propiedad.",
-            "monthly": [],
-            "daily_current_month": [],
-        }
+        # Return demo data even without an active contract so the user can preview
+        return _build_demo_usage_payload(
+            reason="no_active_contract",
+            message="Aún no tienes contrato activo; mostrando datos de demostración.",
+        )
 
     property_id = str(contract["property_id"])
     conn = await db.xcel_connections.find_one({"property_id": property_id})
@@ -526,6 +533,11 @@ async def tenant_xcel_usage(request: Request, months: int = 6):
     daily_current_month: list = []
     current_month = datetime.now(timezone.utc).strftime("%Y-%m")
 
+    # Daily by exact ISO date (used for the "Día" tab — last 30 days)
+    daily_30d_map: dict = {}
+    now_utc = datetime.now(timezone.utc)
+    cutoff_30d = (now_utc - timedelta(days=30)).strftime("%Y-%m-%d")
+
     async for doc in db.xcel_usage_daily.find({"property_id": property_id}).sort("date", 1):
         m = doc["date"][:7]
         monthly[m] = monthly.get(m, 0.0) + doc.get("kwh", 0.0)
@@ -534,6 +546,8 @@ async def tenant_xcel_usage(request: Request, months: int = 6):
                 "date": doc["date"],
                 "kwh": round(doc.get("kwh", 0.0), 2),
             })
+        if doc["date"] >= cutoff_30d:
+            daily_30d_map[doc["date"]] = round(doc.get("kwh", 0.0), 2)
 
     series = [{"month": m, "kwh": round(v, 2)} for m, v in sorted(monthly.items())][-months:]
     prev_month = (datetime.now(timezone.utc).replace(day=1) - timedelta(days=1)).strftime("%Y-%m")
@@ -568,15 +582,39 @@ async def tenant_xcel_usage(request: Request, months: int = 6):
     is_connected = bool(conn) and conn.get("status") == "active"
     has_data = len(monthly) > 0
 
+    # ─── If no real data yet, fall back to demo dataset ───
+    if not has_data:
+        demo = _build_demo_usage_payload(
+            reason="awaiting_xcel_data",
+            message="Esperando la primera sincronización de Xcel Green Button.",
+        )
+        demo["connected"] = is_connected
+        demo["status"] = conn.get("status") if conn else "not_connected"
+        demo["property_id"] = property_id
+        demo["property_address"] = prop_address
+        return demo
+
+    # ─── Real data path: build day/week/month series ───
+    daily_30d = _fill_daily_30d_from_map(daily_30d_map, now_utc)
+    weekly_12w = _aggregate_to_weekly(daily_30d, weeks=12, anchor=now_utc)
+    monthly_12m = _aggregate_to_monthly(series, months=12)
+
     return {
         "connected": is_connected,
         "status": conn.get("status") if conn else "not_connected",
         "has_data": has_data,
+        "is_demo": False,
         "last_sync": conn.get("last_sync").isoformat() if conn and conn.get("last_sync") else None,
         "property_id": property_id,
         "property_address": prop_address,
         "monthly": series,
         "daily_current_month": daily_current_month,
+        # New unified time series (used by the chart with tabs in services.tsx)
+        "timeseries": {
+            "daily_30d": daily_30d,
+            "weekly_12w": weekly_12w,
+            "monthly_12m": monthly_12m,
+        },
         "current_month": current_month,
         "current_month_kwh": round(current_kwh, 2),
         "prev_month_kwh": round(prev_kwh, 2),
@@ -585,6 +623,371 @@ async def tenant_xcel_usage(request: Request, months: int = 6):
         "estimated_current_cost": round(current_kwh * estimated_rate, 2),
         "billing_summaries": summaries,
     }
+
+
+# ═══════════════════════════════════════════════════════════════
+# DEMO DATA GENERATOR (used while Xcel hasn't approved the SP yet
+# OR before the first data sync). Deterministic per-day for stability.
+# ═══════════════════════════════════════════════════════════════
+
+def _seeded_random(seed_key: str) -> random.Random:
+    """Stable PRNG seeded by a string so the same day always returns the same kWh."""
+    h = abs(hash(seed_key)) % (2**32)
+    return random.Random(h)
+
+
+def _demo_kwh_for_day(d: date) -> float:
+    """Realistic daily consumption pattern for a residential property in TX panhandle.
+    Includes weekday vs weekend variation + monthly seasonality + noise."""
+    rng = _seeded_random(f"day-{d.isoformat()}")
+    # Base ~25 kWh/day, weekends +20%, summer (Jun-Aug) +35%, winter (Dec-Feb) +25%, fall/spring base
+    base = 25.0
+    if d.weekday() >= 5:  # Sat/Sun
+        base *= 1.20
+    if d.month in (6, 7, 8):
+        base *= 1.35
+    elif d.month in (12, 1, 2):
+        base *= 1.25
+    # Add ±15% noise
+    noise = (rng.random() - 0.5) * 0.30
+    return round(base * (1 + noise), 2)
+
+
+def _fill_daily_30d_from_map(existing: dict, now_utc: datetime) -> list:
+    """Build a complete 30-day series, filling gaps with 0 (real data only)."""
+    out = []
+    for i in range(29, -1, -1):
+        d = (now_utc - timedelta(days=i)).date()
+        iso = d.isoformat()
+        out.append({"date": iso, "kwh": existing.get(iso, 0.0), "weekday": d.weekday()})
+    return out
+
+
+def _aggregate_to_weekly(daily: list, weeks: int = 12, anchor: datetime = None) -> list:
+    """Aggregate daily series into ISO weeks. Falls back to demo if empty."""
+    if not daily:
+        return []
+    anchor = anchor or datetime.now(timezone.utc)
+    out = []
+    for w in range(weeks - 1, -1, -1):
+        week_end = (anchor - timedelta(weeks=w)).date()
+        week_start = week_end - timedelta(days=6)
+        total = 0.0
+        for d in daily:
+            try:
+                dd = date.fromisoformat(d["date"])
+                if week_start <= dd <= week_end:
+                    total += float(d.get("kwh", 0.0))
+            except (ValueError, TypeError):
+                continue
+        out.append({
+            "week_start": week_start.isoformat(),
+            "week_end": week_end.isoformat(),
+            "label": f"S{week_start.strftime('%d')}",
+            "kwh": round(total, 2),
+        })
+    return out
+
+
+def _aggregate_to_monthly(monthly_series: list, months: int = 12) -> list:
+    """Pad/truncate the monthly series to `months` items and add a short label."""
+    if not monthly_series:
+        return []
+    last = monthly_series[-months:]
+    month_labels = ['Ene', 'Feb', 'Mar', 'Abr', 'May', 'Jun', 'Jul', 'Ago', 'Sep', 'Oct', 'Nov', 'Dic']
+    out = []
+    for m in last:
+        try:
+            _, mm = m["month"].split("-")
+            label = month_labels[int(mm) - 1]
+        except Exception:
+            label = m.get("month", "")
+        out.append({"month": m["month"], "kwh": m["kwh"], "label": label})
+    return out
+
+
+def _build_demo_usage_payload(reason: str = "demo", message: str = "") -> dict:
+    """Generate a complete realistic demo payload for the consumption dashboard."""
+    now_utc = datetime.now(timezone.utc)
+    today = now_utc.date()
+
+    # 30 days of daily data
+    daily_30d = []
+    for i in range(29, -1, -1):
+        d = today - timedelta(days=i)
+        daily_30d.append({
+            "date": d.isoformat(),
+            "kwh": _demo_kwh_for_day(d),
+            "weekday": d.weekday(),
+        })
+
+    # 12 months of monthly data
+    monthly_12m = []
+    monthly_dict = {}
+    cur = today.replace(day=1)
+    for _ in range(12):
+        # Walk back 12 months
+        cur = (cur - timedelta(days=1)).replace(day=1)
+    cur = today.replace(day=1)
+    months_back = []
+    pointer = today.replace(day=1)
+    for _ in range(12):
+        months_back.append(pointer.strftime("%Y-%m"))
+        # previous month
+        first_of_prev = (pointer - timedelta(days=1)).replace(day=1)
+        pointer = first_of_prev
+    months_back.reverse()  # oldest → newest
+    month_labels = ['Ene', 'Feb', 'Mar', 'Abr', 'May', 'Jun', 'Jul', 'Ago', 'Sep', 'Oct', 'Nov', 'Dic']
+    for ym in months_back:
+        y, m = ym.split("-")
+        y_i, m_i = int(y), int(m)
+        # Compute days in month
+        if m_i == 12:
+            next_first = date(y_i + 1, 1, 1)
+        else:
+            next_first = date(y_i, m_i + 1, 1)
+        first = date(y_i, m_i, 1)
+        days_in_month = (next_first - first).days
+        total = 0.0
+        for offset in range(days_in_month):
+            dd = first + timedelta(days=offset)
+            if dd <= today:
+                total += _demo_kwh_for_day(dd)
+        monthly_12m.append({
+            "month": ym,
+            "kwh": round(total, 2),
+            "label": month_labels[m_i - 1],
+        })
+        monthly_dict[ym] = round(total, 2)
+
+    # Weekly (last 12 weeks)
+    weekly_12w = _aggregate_to_weekly(daily_30d, weeks=12, anchor=now_utc)
+
+    current_month = today.strftime("%Y-%m")
+    prev_first = (today.replace(day=1) - timedelta(days=1)).replace(day=1)
+    prev_month = prev_first.strftime("%Y-%m")
+    current_kwh = monthly_dict.get(current_month, 0.0)
+    prev_kwh = monthly_dict.get(prev_month, 0.0)
+    delta_pct = round((current_kwh - prev_kwh) / prev_kwh * 100, 1) if prev_kwh else None
+
+    estimated_rate = 0.14
+    return {
+        "connected": False,
+        "status": "demo",
+        "has_data": True,  # We do have data — it's just demo
+        "is_demo": True,
+        "demo_reason": reason,
+        "demo_message": message or "Datos de demostración mientras Xcel aprueba tu cuenta.",
+        "last_sync": None,
+        "property_id": None,
+        "property_address": "309 W 13th St, Dumas, TX 79029 (demo)",
+        "monthly": [{"month": m["month"], "kwh": m["kwh"]} for m in monthly_12m[-6:]],
+        "daily_current_month": [d for d in daily_30d if d["date"].startswith(current_month)],
+        "timeseries": {
+            "daily_30d": daily_30d,
+            "weekly_12w": weekly_12w,
+            "monthly_12m": monthly_12m,
+        },
+        "current_month": current_month,
+        "current_month_kwh": round(current_kwh, 2),
+        "prev_month_kwh": round(prev_kwh, 2),
+        "delta_pct": delta_pct,
+        "estimated_rate_per_kwh": estimated_rate,
+        "estimated_current_cost": round(current_kwh * estimated_rate, 2),
+        "billing_summaries": [],
+    }
+
+
+# ═══════════════════════════════════════════════════════════════
+# AI SAVING TIPS (Emergent LLM Key → GPT-4o)
+# ═══════════════════════════════════════════════════════════════
+
+@router.get("/tenant/xcel/saving-tips")
+async def tenant_xcel_saving_tips(request: Request, refresh: bool = False):
+    """Generate personalized energy-saving tips based on the tenant's
+    consumption pattern. Uses Emergent LLM Key (GPT-4o). Cached 24h per user.
+    """
+    user = await auth_marketplace(request)
+    db = get_db()
+    user_id = str(user["_id"])
+
+    # Cache hit (24h)
+    if not refresh:
+        cached = await db.xcel_saving_tips_cache.find_one({"user_id": user_id})
+        if cached:
+            age = datetime.now(timezone.utc) - cached["generated_at"]
+            if age < timedelta(hours=24):
+                return {
+                    "tips": cached["tips"],
+                    "generated_at": cached["generated_at"].isoformat(),
+                    "cached": True,
+                    "is_demo": cached.get("is_demo", False),
+                }
+
+    # Pull current usage payload (demo or real) to feed the LLM
+    contract = await _find_active_contract_for_user(user)
+    property_id = str(contract["property_id"]) if contract and contract.get("property_id") else None
+
+    # Build a compact summary of the last 30 days + the last 6 months
+    daily_kwh = []
+    monthly_kwh = []
+    is_demo_data = False
+
+    if property_id:
+        now_utc = datetime.now(timezone.utc)
+        cutoff = (now_utc - timedelta(days=30)).strftime("%Y-%m-%d")
+        async for doc in db.xcel_usage_daily.find({
+            "property_id": property_id,
+            "date": {"$gte": cutoff},
+        }).sort("date", 1):
+            daily_kwh.append({"d": doc["date"], "k": round(doc.get("kwh", 0.0), 2)})
+
+        monthly_agg: dict = {}
+        async for doc in db.xcel_usage_daily.find({"property_id": property_id}).sort("date", 1):
+            m = doc["date"][:7]
+            monthly_agg[m] = monthly_agg.get(m, 0.0) + doc.get("kwh", 0.0)
+        monthly_kwh = sorted(
+            [{"m": k, "k": round(v, 2)} for k, v in monthly_agg.items()]
+        )[-6:]
+
+    if not daily_kwh:
+        # Demo fallback
+        is_demo_data = True
+        today = datetime.now(timezone.utc).date()
+        for i in range(29, -1, -1):
+            d = today - timedelta(days=i)
+            daily_kwh.append({"d": d.isoformat(), "k": _demo_kwh_for_day(d)})
+
+    # Compute simple insights to help the LLM be specific
+    total_30d = round(sum(x["k"] for x in daily_kwh), 1)
+    avg_day = round(total_30d / max(len(daily_kwh), 1), 1)
+    peak_day = max(daily_kwh, key=lambda x: x["k"]) if daily_kwh else {"d": "", "k": 0}
+    weekend_kwh = sum(x["k"] for x in daily_kwh
+                      if datetime.fromisoformat(x["d"]).weekday() >= 5)
+    weekday_kwh = sum(x["k"] for x in daily_kwh
+                      if datetime.fromisoformat(x["d"]).weekday() < 5)
+
+    insights = {
+        "total_30d_kwh": total_30d,
+        "avg_daily_kwh": avg_day,
+        "peak_day": peak_day,
+        "weekend_total_kwh": round(weekend_kwh, 1),
+        "weekday_total_kwh": round(weekday_kwh, 1),
+        "current_month": datetime.now(timezone.utc).strftime("%Y-%m"),
+    }
+
+    # Call Emergent LLM (GPT-4o)
+    tips = await _generate_tips_with_llm(insights, daily_kwh, monthly_kwh)
+
+    # Cache
+    await db.xcel_saving_tips_cache.update_one(
+        {"user_id": user_id},
+        {"$set": {
+            "user_id": user_id,
+            "tips": tips,
+            "generated_at": datetime.now(timezone.utc),
+            "is_demo": is_demo_data,
+            "insights": insights,
+        }},
+        upsert=True,
+    )
+
+    return {
+        "tips": tips,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "cached": False,
+        "is_demo": is_demo_data,
+    }
+
+
+async def _generate_tips_with_llm(insights: dict, daily_kwh: list, monthly_kwh: list) -> list:
+    """Call Emergent LLM (GPT-4o) to produce ≥3 personalized Spanish tips."""
+    try:
+        from emergentintegrations.llm.chat import LlmChat, UserMessage  # type: ignore
+    except Exception as e:
+        logger.warning(f"emergentintegrations not available: {e}")
+        return _fallback_tips(insights)
+
+    api_key = os.environ.get("EMERGENT_LLM_KEY", "")
+    if not api_key:
+        return _fallback_tips(insights)
+
+    system = (
+        "Eres un asistente experto en eficiencia energética residencial. "
+        "Analiza el patrón de consumo de un inquilino y entrega entre 3 y 5 "
+        "consejos prácticos, específicos y accionables PARA EL ESPAÑOL. "
+        "Cada consejo debe ser corto (máximo 2 frases) y enfocado en ahorrar "
+        "kWh sin sacrificar confort. Responde ÚNICAMENTE con un JSON válido "
+        "con el siguiente formato exacto: "
+        '{"tips":[{"title":"...","detail":"...","saving":"~$XX/mes","icon":"bulb|snow|water|tv|home|leaf"}]}.'
+    )
+
+    user_prompt = (
+        f"Analiza este patrón de consumo eléctrico de los últimos 30 días en una propiedad "
+        f"residencial en Dumas, TX (clima de panhandle de Texas: veranos calurosos, inviernos fríos).\n\n"
+        f"INSIGHTS:\n{json.dumps(insights, ensure_ascii=False)}\n\n"
+        f"CONSUMO MENSUAL (kWh):\n{json.dumps(monthly_kwh, ensure_ascii=False)}\n\n"
+        f"Genera 4 consejos personalizados en español que ayuden a reducir el consumo. "
+        f"Si el consumo de fin de semana es notablemente mayor que entre semana, menciónalo. "
+        f"Si hay un pico de consumo en un día específico, menciónalo. "
+        f"Tarifa aproximada: $0.14/kWh."
+    )
+
+    try:
+        chat = (
+            LlmChat(
+                api_key=api_key,
+                session_id=f"xcel-tips-{insights.get('current_month')}",
+                system_message=system,
+            )
+            .with_model("openai", "gpt-4o")
+            .with_max_tokens(900)
+        )
+        response = await chat.send_message(UserMessage(text=user_prompt))
+        raw = (response or "").strip()
+        # Strip optional ```json fences
+        if raw.startswith("```"):
+            raw = raw.strip("`")
+            if raw.lower().startswith("json"):
+                raw = raw[4:].strip()
+        parsed = json.loads(raw)
+        tips = parsed.get("tips", [])
+        if isinstance(tips, list) and tips:
+            return tips[:5]
+    except Exception as e:
+        logger.exception(f"LLM tips generation failed: {e}")
+
+    return _fallback_tips(insights)
+
+
+def _fallback_tips(insights: dict) -> list:
+    """Static safe fallback in case the LLM call fails (no key, network, etc.)."""
+    return [
+        {
+            "title": "Sube el termostato 1°C en verano",
+            "detail": "Cada grado extra en aire acondicionado representa ~6-8% menos consumo. Pon el A/C en 25-26°C cuando no estés en casa.",
+            "saving": "~$15/mes",
+            "icon": "snow",
+        },
+        {
+            "title": "Desenchufa electrónicos en modo standby",
+            "detail": "TVs, microondas y cargadores consumen energía aún apagados. Usa una regleta y apágala al salir.",
+            "saving": "~$8/mes",
+            "icon": "tv",
+        },
+        {
+            "title": "Cambia a bombillas LED",
+            "detail": "Las LED consumen 75% menos que las incandescentes y duran 25 veces más.",
+            "saving": "~$10/mes",
+            "icon": "bulb",
+        },
+        {
+            "title": "Lava ropa con agua fría",
+            "detail": "El 90% del consumo de la lavadora es para calentar agua. Usa agua fría y ciclo eco.",
+            "saving": "~$6/mes",
+            "icon": "water",
+        },
+    ]
 
 
 # ═══════════════════════════════════════════════════════════════

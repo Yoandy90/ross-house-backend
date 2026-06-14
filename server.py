@@ -169,6 +169,7 @@ try:
     from rental.consent_forms_router import router as consent_forms_router
     from rental.xcel_energy_router import router as xcel_energy_router
     from rental.utility_billing_router import router as utility_billing_router
+    from rental.tenant_invoices_router import router as tenant_invoices_router
 
     app.include_router(auth_router, prefix="/api")
     app.include_router(properties_router, prefix="/api")
@@ -192,6 +193,7 @@ try:
     app.include_router(consent_forms_router, prefix="/api")
     app.include_router(xcel_energy_router, prefix="/api")
     app.include_router(utility_billing_router, prefix="/api")
+    app.include_router(tenant_invoices_router, prefix="/api")
 
     logger.info("  ✅ Credit Builder Router")
     logger.info("  ✅ Consent Forms Router")
