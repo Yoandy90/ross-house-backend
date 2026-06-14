@@ -57,36 +57,43 @@ async def admin_properties_utility_alignment(
     counts = {"high": 0, "medium": 0, "low": 0, "none": 0, "total": 0}
 
     async for prop in db.properties.find({}):
-        prop_id = str(prop["_id"])
-        owner_entity = (prop.get("owner_entity") or "unknown").lower()
-        utility_holder = (prop.get("utility_account_holder") or "unknown").lower()
-        utility_holder_name = prop.get("utility_account_holder_name") or ""
-        owner_display = prop.get("owner_display_name") or ""
+        try:
+            prop_id = str(prop["_id"])
+            owner_entity = (prop.get("owner_entity") or "unknown").lower()
+            utility_holder = (prop.get("utility_account_holder") or "unknown").lower()
+            utility_holder_name = prop.get("utility_account_holder_name") or ""
+            owner_display = prop.get("owner_display_name") or ""
 
-        # If owner_entity hasn't been set explicitly, try to infer from a
-        # `legal_owner` field that some sources may have populated.
-        if owner_entity == "unknown" and prop.get("legal_owner"):
-            owner_entity = detect_entity_type(prop["legal_owner"])
-            owner_display = owner_display or prop["legal_owner"]
+            # If owner_entity hasn't been set explicitly, try to infer from a
+            # `legal_owner` field that some sources may have populated.
+            if owner_entity == "unknown" and prop.get("legal_owner"):
+                owner_entity = detect_entity_type(prop["legal_owner"])
+                owner_display = owner_display or prop["legal_owner"]
 
-        comparison = compare_property_vs_account(owner_entity, utility_holder)
+            comparison = compare_property_vs_account(owner_entity, utility_holder)
+            risk = comparison.get("risk_level", "low")
+            if risk not in counts:
+                risk = "low"
 
-        items.append({
-            "id": prop_id,
-            "name": prop.get("name") or prop.get("address") or "Sin nombre",
-            "address": prop.get("address") or "",
-            "city": prop.get("city") or "",
-            "state": prop.get("state") or "",
-            "status": prop.get("status") or "available",
-            "owner_entity": owner_entity,
-            "owner_display_name": owner_display,
-            "utility_account_holder": utility_holder,
-            "utility_account_holder_name": utility_holder_name,
-            "comparison": comparison,
-        })
+            items.append({
+                "id": prop_id,
+                "name": prop.get("name") or prop.get("address") or "Sin nombre",
+                "address": prop.get("address") or "",
+                "city": prop.get("city") or "",
+                "state": prop.get("state") or "",
+                "status": prop.get("status") or "available",
+                "owner_entity": owner_entity,
+                "owner_display_name": owner_display,
+                "utility_account_holder": utility_holder,
+                "utility_account_holder_name": utility_holder_name,
+                "comparison": comparison,
+            })
 
-        counts[comparison["risk_level"]] += 1
-        counts["total"] += 1
+            counts[risk] += 1
+            counts["total"] += 1
+        except Exception as e:
+            logger.warning(f"Skipping property {prop.get('_id')}: {e}")
+            continue
 
     if risk_level in ("none", "low", "medium", "high"):
         items = [x for x in items if x["comparison"]["risk_level"] == risk_level]
