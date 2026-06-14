@@ -158,8 +158,10 @@ async def admin_utility_ocr_extract(
         parsed = json.loads(raw)
 
         # Cleanup tempfile
-        try: os.remove(tmp_path)
-        except: pass
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
 
         return OCRBillResponse(
             success=True,
