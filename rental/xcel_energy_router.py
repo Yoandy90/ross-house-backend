@@ -47,6 +47,78 @@ def _is_configured() -> bool:
     return bool(XCEL_CLIENT_ID and XCEL_CLIENT_SECRET and XCEL_REDIRECT_URI)
 
 
+async def _find_active_contract_for_user(user: dict):
+    """Find the active rental contract for a logged-in marketplace user.
+    Looks up by (in order):
+      1. tenant_id == user._id (direct app_user as tenant)
+      2. tenants.app_user_id == user._id → contracts.tenant_id
+      3. tenants.email matches user.email → contracts.tenant_id
+      4. tenants.phone matches user.phone (normalized) → contracts.tenant_id
+    Returns the contract dict or None.
+    """
+    db = get_db()
+    user_id = str(user["_id"])
+
+    # 1. Direct match: app_user._id is the tenant_id
+    contract = await db.rental_contracts.find_one({"tenant_id": user_id, "status": "active"})
+    if contract:
+        return contract
+
+    # 2. Linked: tenants.app_user_id == user._id
+    tenant = await db.tenants.find_one({"app_user_id": user_id})
+    if tenant:
+        contract = await db.rental_contracts.find_one({
+            "tenant_id": str(tenant["_id"]),
+            "status": "active",
+        })
+        if contract:
+            return contract
+
+    # 3. By email
+    user_email = (user.get("email") or "").strip().lower()
+    if user_email:
+        import re
+        tenant = await db.tenants.find_one({
+            "email": {"$regex": f"^{re.escape(user_email)}$", "$options": "i"}
+        })
+        if tenant:
+            # Auto-link tenant ↔ app_user for future queries
+            if not tenant.get("app_user_id"):
+                await db.tenants.update_one(
+                    {"_id": tenant["_id"]},
+                    {"$set": {"app_user_id": user_id, "updated_at": datetime.utcnow()}}
+                )
+            contract = await db.rental_contracts.find_one({
+                "tenant_id": str(tenant["_id"]),
+                "status": "active",
+            })
+            if contract:
+                return contract
+
+    # 4. By phone (normalized)
+    user_phone = (user.get("phone") or "").strip()
+    if user_phone:
+        def _norm(p):
+            return (p or "").replace("-", "").replace(" ", "").replace("(", "").replace(")", "").replace("+", "")
+        target = _norm(user_phone)
+        if target:
+            async for t in db.tenants.find({"phone": {"$exists": True, "$ne": ""}}):
+                if _norm(t.get("phone", "")) == target:
+                    if not t.get("app_user_id"):
+                        await db.tenants.update_one(
+                            {"_id": t["_id"]},
+                            {"$set": {"app_user_id": user_id, "updated_at": datetime.utcnow()}}
+                        )
+                    contract = await db.rental_contracts.find_one({
+                        "tenant_id": str(t["_id"]),
+                        "status": "active",
+                    })
+                    if contract:
+                        return contract
+                    break
+    return None
+
+
 # ═══════════════════════════════════════════════════════════════
 # ESPI XML PARSING
 # ═══════════════════════════════════════════════════════════════
@@ -258,8 +330,7 @@ async def tenant_xcel_connect_url(request: Request):
     tenant = await auth_marketplace(request)
     if not _is_configured():
         raise HTTPException(status_code=500, detail="Integración Xcel no configurada")
-    db = get_db()
-    contract = await db.rental_contracts.find_one({"tenant_id": str(tenant["_id"]), "status": "active"})
+    contract = await _find_active_contract_for_user(tenant)
     if not contract or not contract.get("property_id"):
         raise HTTPException(status_code=400, detail="No tienes un contrato activo con propiedad asignada")
 
@@ -436,10 +507,7 @@ async def tenant_xcel_usage(request: Request, months: int = 6):
     user = await auth_marketplace(request)
     db = get_db()
 
-    contract = await db.rental_contracts.find_one({
-        "tenant_id": str(user["_id"]),
-        "status": "active",
-    })
+    contract = await _find_active_contract_for_user(user)
     if not contract or not contract.get("property_id"):
         return {
             "connected": False,
