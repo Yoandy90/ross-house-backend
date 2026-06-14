@@ -41,7 +41,7 @@ class SetUtilityHolderRequest(BaseModel):
     )
 
 
-@router.get("/admin/properties/utility-alignment")
+@router.get("/admin/utility-alignment")
 async def admin_properties_utility_alignment(
     request: Request,
     risk_level: Optional[str] = None,  # 'none' | 'low' | 'medium' | 'high'
