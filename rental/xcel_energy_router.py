@@ -702,3 +702,21 @@ async def xcel_notify(request: Request):
     })
     logger.info("Xcel Green Button notification received")
     return {"status": "ok"}
+
+
+@router.get("/xcel/notify")
+@router.get("/greenbutton/notify")
+@router.head("/xcel/notify")
+@router.head("/greenbutton/notify")
+async def xcel_notify_probe(request: Request):
+    """Connectivity probe endpoint.
+    Xcel / Green Button Alliance validators may hit the Notification URL with
+    GET or HEAD before approving the Service Provider. Return 200 OK so the
+    endpoint is reported as reachable. Real data delivery still happens over POST."""
+    return {
+        "status": "ok",
+        "service": "Ross House Rentals - Green Button Connect",
+        "endpoint": "notification",
+        "method_allowed": ["POST"],
+        "version": "1.1",
+    }
