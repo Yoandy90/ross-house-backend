@@ -176,26 +176,52 @@ async def sign_lease(lease_id: str, request: Request):
 
 @router.get('/my-leases')
 async def get_my_leases(request: Request):
-    """Get leases for the authenticated user (tenant or landlord)"""
+    """Get leases/contracts for the authenticated user (tenant or landlord).
+
+    Queries BOTH the legacy `leases` collection and the active
+    `rental_contracts` collection so app users (marketplace) see their
+    real contract even when seed data lives in the newer collection.
+    """
+    import re as _re
+    from bson import ObjectId
+
     user = await auth_marketplace(request)
-    user_email = user.get("email", "")
+    db = get_db()
+    user_email = (user.get("email") or "").strip().lower()
     user_id = str(user.get("_id", ""))
     role = user.get("role", "tenant")
 
-    query = {
+    # ── Resolve tenant_ids to try (direct + via tenants._id + email + phone) ──
+    tenant_ids = {user_id}
+    if user_id:
+        async for t in db.tenants.find({"app_user_id": user_id}):
+            tenant_ids.add(str(t["_id"]))
+    if user_email:
+        async for t in db.tenants.find({
+            "email": {"$regex": f"^{_re.escape(user_email)}$", "$options": "i"}
+        }):
+            tenant_ids.add(str(t["_id"]))
+    tenant_ids_list = list(tenant_ids)
+
+    leases: list = []
+    seen_ids: set = set()
+
+    # ── 1) Legacy leases collection ──
+    legacy_query = {
         "$or": [
             {"tenant_email": user_email},
-            {"tenant_id": user_id},
+            {"tenant_id": {"$in": tenant_ids_list}},
             {"landlord_id": user_id},
         ]
     }
-
-    cursor = get_db().leases.find(query).sort("created_at", -1)
-    leases = []
-    async for l in cursor:
+    async for l in db.leases.find(legacy_query).sort("created_at", -1):
         doc = serialize(l)
+        lid = doc.get("_id")
+        if lid in seen_ids:
+            continue
+        seen_ids.add(lid)
         leases.append({
-            "id": doc.get("_id"),
+            "id": lid,
             "property_address": doc.get("property_address", ""),
             "lease_type": doc.get("lease_type", "residential"),
             "start_date": doc.get("start_date", ""),
@@ -211,6 +237,46 @@ async def get_my_leases(request: Request):
             "tenant_signature": doc.get("tenant_signature") if role == "tenant" else None,
             "landlord_signature": doc.get("landlord_signature") if role == "landlord" else None,
             "created_at": doc.get("created_at", ""),
+            "source": "leases",
+        })
+
+    # ── 2) Active rental_contracts collection (where real seed data lives) ──
+    contract_query = {"tenant_id": {"$in": tenant_ids_list}}
+    async for c in db.rental_contracts.find(contract_query).sort("created_at", -1):
+        doc = serialize(c)
+        cid = doc.get("_id")
+        if cid in seen_ids:
+            continue
+        seen_ids.add(cid)
+
+        # Fetch property address if not embedded
+        prop_address = doc.get("property_address", "")
+        if not prop_address and doc.get("property_id"):
+            try:
+                prop = await db.properties.find_one({"_id": ObjectId(doc["property_id"])})
+                if prop:
+                    prop_address = prop.get("address") or prop.get("name") or ""
+            except Exception:
+                pass
+
+        leases.append({
+            "id": cid,
+            "property_address": prop_address,
+            "lease_type": doc.get("lease_type", "residential"),
+            "start_date": doc.get("start_date", ""),
+            "end_date": doc.get("end_date", ""),
+            "rent_amount": doc.get("monthly_rent") or doc.get("rent_amount", 0),
+            "deposit_amount": doc.get("deposit_amount", 0) or doc.get("security_deposit", 0),
+            "terms": doc.get("terms", ""),
+            "clauses": doc.get("clauses", []),
+            "status": doc.get("status", "draft"),
+            "has_tenant_signature": bool(doc.get("tenant_signature")),
+            "has_landlord_signature": bool(doc.get("landlord_signature")),
+            "has_admin_signature": bool(doc.get("admin_signature")),
+            "tenant_signature": doc.get("tenant_signature") if role == "tenant" else None,
+            "landlord_signature": doc.get("landlord_signature") if role == "landlord" else None,
+            "created_at": doc.get("created_at", ""),
+            "source": "rental_contracts",
         })
 
     return {"success": True, "leases": leases, "count": len(leases)}
