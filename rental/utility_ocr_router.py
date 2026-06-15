@@ -194,9 +194,16 @@ async def admin_utility_ocr_extract(
 
 @router.post("/admin/utility-ocr/save-bill")
 async def admin_utility_ocr_save_bill(request: Request):
-    """Persist an extracted bill into `non_xcel_utility_bills`.
-    Body should be the OCR response merged with admin-confirmed fields and a
-    `property_id` (or list) to attach it to."""
+    """Persist an extracted bill into `non_xcel_utility_bills` AND optionally
+    create a payable `tenant_utility_bills` entry so the tenant sees it as a
+    pending invoice in their mobile app.
+
+    Body fields:
+      - property_id or property_ids: required
+      - all OCR fields (provider, bill_type, period_*, total_amount, etc.)
+      - create_tenant_bill: bool (default True) — also makes it payable
+      - tenant_id: optional override; otherwise resolved from active contract
+    """
     await auth_admin(request)
     body = await request.json()
 
@@ -205,8 +212,10 @@ async def admin_utility_ocr_save_bill(request: Request):
         raise HTTPException(status_code=400, detail="Se requiere property_id o property_ids")
 
     db = get_db()
+    now = datetime.now(timezone.utc)
+
     bill_doc = {
-        "property_ids": property_ids,
+        "property_ids": [str(p) for p in property_ids],
         "provider": body.get("provider"),
         "bill_type": body.get("bill_type", "other"),
         "period_start": body.get("period_start"),
@@ -220,12 +229,76 @@ async def admin_utility_ocr_save_bill(request: Request):
         "notes": body.get("notes", ""),
         "source": "ocr",
         "confidence": body.get("confidence"),
-        "created_at": datetime.now(timezone.utc),
+        "created_at": now,
         "created_by": "admin",
     }
     result = await db.non_xcel_utility_bills.insert_one(bill_doc)
     bill_doc["_id"] = str(result.inserted_id)
-    return {"success": True, "bill": serialize(bill_doc)}
+
+    # ─── Also create payable tenant_utility_bills (Phase 2 bridge) ───
+    create_tenant_bill = body.get("create_tenant_bill", True)
+    created_tenant_bills = []
+    if create_tenant_bill and bill_doc["total_amount"] > 0:
+        # Map our bill_type → tenant_utility_bills 'type'
+        type_map = {
+            "water": "water", "sewer": "water", "trash": "trash",
+            "gas": "gas", "electricity_other": "electricity",
+            "internet": "internet", "phone": "phone", "tv": "tv",
+            "hoa": "hoa", "other": "other",
+        }
+        tenant_type = type_map.get(bill_doc["bill_type"], "other")
+
+        # Period: prefer period_end's YYYY-MM, fallback to current period
+        period_iso = ""
+        for ps in (bill_doc.get("period_end"), bill_doc.get("period_start"), bill_doc.get("due_date")):
+            if ps and len(ps) >= 7:
+                period_iso = ps[:7]
+                break
+        if not period_iso:
+            period_iso = now.strftime("%Y-%m")
+
+        # Split amount across properties if multiple (rare; usually one)
+        per_prop_amount = round(bill_doc["total_amount"] / max(len(property_ids), 1), 2)
+
+        for pid in property_ids:
+            tenant_id = body.get("tenant_id")
+            if not tenant_id:
+                # Find active tenant for this property
+                contract = await db.rental_contracts.find_one({
+                    "property_id": str(pid),
+                    "status": {"$in": ["active", "activo"]},
+                })
+                if contract:
+                    tenant_id = str(contract.get("tenant_id", ""))
+
+            t_doc = {
+                "property_id": str(pid),
+                "tenant_id": tenant_id or "",
+                "type": tenant_type,
+                "period": period_iso,
+                "amount": per_prop_amount,
+                "status": "pending",
+                "paid": False,
+                "source": "ocr",
+                "ocr_bill_id": str(result.inserted_id),
+                "provider": bill_doc.get("provider"),
+                "due_date": bill_doc.get("due_date"),
+                "usage_value": bill_doc.get("usage_value"),
+                "usage_unit": bill_doc.get("usage_unit"),
+                "notes": body.get("notes", ""),
+                "created_at": now,
+                "updated_at": now,
+            }
+            tb_res = await db.tenant_utility_bills.insert_one(t_doc)
+            t_doc["_id"] = str(tb_res.inserted_id)
+            created_tenant_bills.append(t_doc)
+
+    return {
+        "success": True,
+        "bill": serialize(bill_doc),
+        "tenant_bills_created": len(created_tenant_bills),
+        "tenant_bill_ids": [b["_id"] for b in created_tenant_bills],
+    }
 
 
 @router.get("/admin/utility-ocr/non-xcel-bills")
