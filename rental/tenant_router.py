@@ -55,15 +55,82 @@ async def tenant_login(request: Request):
 
 @router.get('/tenant/dashboard')
 async def tenant_dashboard(request: Request):
-    """Get tenant dashboard: contract, payments, next due date"""
-    tenant = await auth_tenant(request)
-    tenant_id = tenant["_id"]
-    
-    # Get active contract
-    contract = await get_db().rental_contracts.find_one({
+    """Get tenant dashboard: contract, payments, next due date.
+
+    Accepts BOTH marketplace tokens (app_users) and legacy tenant tokens.
+    For marketplace users, resolves the linked tenant doc via app_user_id /
+    email / normalized phone."""
+    user = await auth_marketplace(request)
+    db = get_db()
+
+    # Resolve the tenant document for this caller
+    tenant = None
+    user_id = str(user.get("_id") or user.get("id") or "")
+
+    # 1. If the user IS already a tenant (legacy login or marketplace tenant
+    #    role), try direct id match against the tenants collection.
+    if user.get("role") == "tenant":
+        try:
+            tenant = await db.tenants.find_one({"_id": ObjectId(user_id)})
+        except Exception:
+            tenant = None
+
+    # 2. Look up via app_user_id link
+    if not tenant and user_id:
+        tenant = await db.tenants.find_one({"app_user_id": user_id})
+
+    # 3. Fallback by email (case-insensitive exact match)
+    email = (user.get("email") or "").strip().lower()
+    if not tenant and email:
+        import re
+        tenant = await db.tenants.find_one({
+            "email": {"$regex": f"^{re.escape(email)}$", "$options": "i"}
+        })
+
+    # 4. Fallback by normalized phone
+    if not tenant and user.get("phone"):
+        def _norm(p: str) -> str:
+            return (p or "").replace("-", "").replace(" ", "").replace("(", "").replace(")", "").replace("+", "")
+        target = _norm(user["phone"])
+        if target:
+            async for t in db.tenants.find({"phone": {"$exists": True, "$ne": ""}}):
+                if _norm(t.get("phone", "")) == target:
+                    tenant = t
+                    break
+
+    if not tenant:
+        # Genuine "no tenant record" case — return empty dashboard so the
+        # frontend renders the "Sin contrato activo" empty state.
+        return {
+            "success": True,
+            "tenant": {
+                "name": user.get("name", ""),
+                "email": user.get("email", ""),
+                "phone": user.get("phone", ""),
+                "tenant_number": "",
+            },
+            "contract": None,
+            "next_payment": None,
+            "payments": [],
+            "property": None,
+        }
+
+    tenant_id = str(tenant["_id"])
+
+    # Get active contract (try both tenant_id stored as string and ObjectId)
+    contract = await db.rental_contracts.find_one({
         "tenant_id": tenant_id,
         "status": "active"
     })
+    if not contract:
+        # Some seed scripts saved tenant_id as ObjectId; try that variant
+        try:
+            contract = await db.rental_contracts.find_one({
+                "tenant_id": ObjectId(tenant_id),
+                "status": "active"
+            })
+        except Exception:
+            contract = None
     
     contract_data = None
     next_payment = None
