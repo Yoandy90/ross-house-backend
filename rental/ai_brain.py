@@ -202,21 +202,43 @@ class RossHouseAIBrain:
     # ══════════════════════════════════════════════════════════════════
 
     async def generate_chat_response(self, conversation_id: str, user_message: str, sender_name: str = "Usuario") -> Optional[str]:
-        """Generate an AI response for a chat message."""
+        """Generate an AI response for a chat message.
+
+        Backward-compatible: returns just the text.
+        Use `generate_chat_response_with_actions` to also get suggested
+        action buttons (PDFs, deep links, etc.)."""
+        result = await self.generate_chat_response_with_actions(conversation_id, user_message, sender_name)
+        if not result:
+            return None
+        return result.get("content")
+
+    async def generate_chat_response_with_actions(
+        self,
+        conversation_id: str,
+        user_message: str,
+        sender_name: str = "Usuario",
+    ) -> Optional[Dict[str, Any]]:
+        """Generate an AI response AND a list of contextual action buttons.
+
+        Returns a dict like:
+            { "content": "Tu recibo está listo.",
+              "actions": [
+                {"type":"download_pdf","label":"Descargar PDF","payload":{"invoice_id":"..."}},
+                {"type":"open_screen","label":"Ver historial","payload":{"route":"/invoices"}}
+              ]
+            }
+        """
         if not await self._ensure_key():
             logger.warning("AI Brain not available - missing LLM key")
             return None
-
         if not await self.is_ai_enabled_for_conversation(conversation_id):
             logger.info(f"AI disabled for conversation {conversation_id}")
             return None
 
         try:
-            # Build context from conversation history and property data
             context = await self._build_context(conversation_id, sender_name)
             system_prompt = ROSS_HOUSE_SYSTEM_PROMPT.format(context=context)
 
-            # Get recent messages for context
             recent_messages = await self._get_recent_messages(conversation_id, limit=10)
             conversation_text = ""
             for msg in recent_messages:
@@ -229,30 +251,204 @@ class RossHouseAIBrain:
             prompt = f"""Historial de la conversación:
 {conversation_text}
 
-Responde al último mensaje del inquilino de manera útil y profesional. Si la pregunta requiere información específica que no tienes, indica que un agente humano responderá pronto."""
+Responde al último mensaje del inquilino de manera útil y profesional. Si la pregunta requiere información específica que no tienes, indica que un agente humano responderá pronto.
 
-            # Call OpenAI directly
+IMPORTANTE: Si el usuario pide un recibo, contrato o factura específica, NO inventes números ni links. El sistema añadirá automáticamente botones de descarga al final de tu respuesta. Solo confirma con un mensaje corto."""
+
             ai_text = await self._call_openai(system_prompt, prompt)
             if not ai_text:
                 return None
-
-            # Sanitize response
             ai_text = self._sanitize_response(ai_text)
 
-            # Log the action
+            # Build contextual actions based on the user's intent
+            actions = await self._detect_actions(conversation_id, user_message)
+
             await self._log_action("chat_response", {
                 "conversation_id": conversation_id,
                 "user_message": user_message[:200],
                 "ai_response": ai_text[:200],
+                "actions_count": len(actions),
                 "sender_name": sender_name,
             })
 
-            return ai_text
+            return {"content": ai_text, "actions": actions}
 
         except Exception as e:
             logger.error(f"AI Brain error generating response: {e}")
             await self._log_action("error", {"conversation_id": conversation_id, "error": str(e)[:300]})
             return None
+
+    async def _detect_actions(self, conversation_id: str, user_message: str) -> List[Dict[str, Any]]:
+        """Detect intent from the user's message and generate contextual action buttons.
+
+        Returns a list of action dicts that the frontend will render as buttons
+        attached to the AI message bubble. Actions are intentionally lightweight
+        (no PDFs embedded in chat history) — they're just deep-links/buttons
+        that resolve to the existing PDF endpoints or screen routes."""
+        actions: List[Dict[str, Any]] = []
+        msg = (user_message or "").lower()
+
+        # Resolve tenant context once
+        from bson import ObjectId
+        import re as _re
+
+        try:
+            conv = await self.db.chat_conversations.find_one({"_id": ObjectId(conversation_id)})
+        except Exception:
+            return actions
+        if not conv:
+            return actions
+
+        app_user_id = conv.get("tenant_id")
+        tenant = None
+        if app_user_id:
+            try:
+                tenant = await self.db.tenants.find_one({"_id": ObjectId(app_user_id)})
+            except Exception:
+                tenant = None
+            if not tenant:
+                tenant = await self.db.tenants.find_one({"app_user_id": app_user_id})
+            if not tenant and app_user_id:
+                au = await self.db.app_users.find_one({"_id": ObjectId(app_user_id)})
+                if au and au.get("email"):
+                    em = au["email"].strip().lower()
+                    tenant = await self.db.tenants.find_one({
+                        "email": {"$regex": f"^{_re.escape(em)}$", "$options": "i"}
+                    })
+
+        tenant_ids_to_try = []
+        if tenant:
+            tenant_ids_to_try.append(str(tenant["_id"]))
+        if app_user_id:
+            tenant_ids_to_try.append(app_user_id)
+
+        contract = None
+        for tid in tenant_ids_to_try:
+            contract = await self.db.rental_contracts.find_one({
+                "tenant_id": tid, "status": {"$in": ["active", "activo"]},
+            })
+            if contract:
+                break
+
+        # ─── Intent: pagar / cuánto debo / cuándo pago ───
+        if any(k in msg for k in ["pagar", "pago", "cuanto debo", "cuánto debo", "cuándo pago", "cuando pago"]):
+            actions.append({
+                "type": "open_screen",
+                "label": "💳 Pagar renta",
+                "payload": {"route": "/(tabs)"},
+                "style": "primary",
+            })
+
+        # ─── Intent: recibo / receipt ───
+        if any(k in msg for k in ["recibo", "receipt", "comprobante de pago"]):
+            # Find a specific receipt if a period is mentioned (e.g., "junio", "mayo")
+            specific_id = await self._find_payment_id_for_period(msg, tenant_ids_to_try)
+            if specific_id:
+                actions.append({
+                    "type": "download_pdf",
+                    "label": "📥 Descargar recibo PDF",
+                    "payload": {
+                        "endpoint": f"/api/tenant/invoices/{specific_id}/pdf",
+                        "filename_hint": f"Recibo_{specific_id[:8]}.pdf",
+                    },
+                    "style": "primary",
+                })
+            actions.append({
+                "type": "open_screen",
+                "label": "📋 Ver historial de pagos",
+                "payload": {"route": "/invoices"},
+                "style": "secondary",
+            })
+
+        # ─── Intent: contrato / lease ───
+        if any(k in msg for k in ["contrato", "contract", "lease"]):
+            if contract:
+                actions.append({
+                    "type": "open_screen",
+                    "label": "📄 Ver mi contrato",
+                    "payload": {"route": "/(tabs)"},
+                    "style": "primary",
+                })
+
+        # ─── Intent: factura de servicios / utility bill ───
+        if any(k in msg for k in ["factura", "luz", "electricidad", "agua", "gas", "servicios"]):
+            actions.append({
+                "type": "open_screen",
+                "label": "⚡ Mis servicios",
+                "payload": {"route": "/services"},
+                "style": "primary",
+            })
+            actions.append({
+                "type": "open_screen",
+                "label": "📋 Historial de facturas",
+                "payload": {"route": "/invoices"},
+                "style": "secondary",
+            })
+
+        # ─── Intent: mantenimiento / repair ───
+        if any(k in msg for k in ["mantenimiento", "reparar", "reparación", "arreglar", "maintenance", "fix"]):
+            actions.append({
+                "type": "open_screen",
+                "label": "🔧 Solicitar mantenimiento",
+                "payload": {"route": "/maintenance"},
+                "style": "primary",
+            })
+
+        # Dedupe by label and cap at 3 to keep UI clean
+        seen = set()
+        unique = []
+        for a in actions:
+            if a["label"] in seen:
+                continue
+            seen.add(a["label"])
+            unique.append(a)
+            if len(unique) >= 3:
+                break
+        return unique
+
+    async def _find_payment_id_for_period(self, msg: str, tenant_ids: List[str]) -> Optional[str]:
+        """If the user mentions a month name, try to find the matching paid
+        rent receipt and return its id. Returns None if no match."""
+        if not tenant_ids:
+            return None
+
+        # Spanish month names → month number
+        months = {
+            "enero":1, "febrero":2, "marzo":3, "abril":4, "mayo":5, "junio":6,
+            "julio":7, "agosto":8, "septiembre":9, "setiembre":9, "octubre":10,
+            "noviembre":11, "diciembre":12,
+        }
+        target_month: Optional[int] = None
+        for name, num in months.items():
+            if name in msg:
+                target_month = num
+                break
+
+        # If no month found, return the most recent payment
+        query = {"tenant_id": {"$in": tenant_ids}}
+        cursor = self.db.rental_payments.find(query).sort("payment_date", -1).limit(20)
+        payments = await cursor.to_list(length=20)
+        if not payments:
+            return None
+
+        if target_month:
+            for p in payments:
+                period = p.get("period") or ""
+                if period and len(period) >= 7:
+                    try:
+                        m = int(period.split("-")[1])
+                        if m == target_month:
+                            return str(p["_id"])
+                    except Exception:
+                        continue
+                # Try payment_date month
+                d = p.get("payment_date")
+                if hasattr(d, "month") and d.month == target_month:
+                    return str(p["_id"])
+            return None
+
+        # No month specified → return most recent
+        return str(payments[0]["_id"])
 
     async def generate_email_response(self, subject: str, body: str, sender_email: str) -> Optional[str]:
         """Generate an AI response for an email inquiry."""

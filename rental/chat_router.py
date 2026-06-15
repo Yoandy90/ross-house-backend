@@ -476,10 +476,12 @@ async def _ai_auto_reply(conversation_id: str, user_message: str, sender_name: s
         # Small delay to feel more natural
         await asyncio.sleep(2)
 
-        # Generate AI response
-        ai_text = await _ai_brain.generate_chat_response(conversation_id, user_message, sender_name)
-        if not ai_text:
+        # Generate AI response with contextual actions
+        ai_result = await _ai_brain.generate_chat_response_with_actions(conversation_id, user_message, sender_name)
+        if not ai_result or not ai_result.get("content"):
             return
+        ai_text = ai_result["content"]
+        ai_actions = ai_result.get("actions", [])
 
         db = get_db()
 
@@ -491,6 +493,7 @@ async def _ai_auto_reply(conversation_id: str, user_message: str, sender_name: s
             "sender_name": "Ross House AI",
             "message_type": "text",
             "content": ai_text,
+            "actions": ai_actions,
             "is_ai": True,
             "read": False,
             "created_at": datetime.now(timezone.utc),
