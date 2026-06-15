@@ -71,6 +71,15 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"   ⚠️ Property-sync cron not started: {e}")
 
+    # Start rent-payment auto-generation cron job (creates pending payments
+    # for every active contract each month; applies $50 late fee after day 5).
+    try:
+        from rental.rent_payment_cron import rent_payment_loop
+        rent_task = asyncio.create_task(rent_payment_loop())
+        logger.info("   ✅ Rent-payment auto-gen cron scheduled")
+    except Exception as e:
+        logger.warning(f"   ⚠️ Rent-payment cron not started: {e}")
+
     yield
 
     # Graceful shutdown of cron

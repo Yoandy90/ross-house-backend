@@ -948,6 +948,18 @@ async def generate_3day_notice(contract_id: str, request: Request):
 # RENTAL PAYMENTS
 # ═══════════════════════════════════════════════════════════════════════════════
 
+@router.post('/admin/rent-payments/auto-generate')
+async def admin_rent_auto_generate(request: Request):
+    """Force a single pass of the rent-payment auto-generation cron.
+    Idempotent: re-running won't duplicate payments for the same period.
+    Returns stats: created / already_exists / late_fee_applied / errors.
+    """
+    await auth_admin(request)
+    from .rent_payment_cron import run_once
+    stats = await run_once(get_db())
+    return {"success": True, "stats": stats}
+
+
 @router.post('/admin/rental-payments')
 async def register_rental_payment(request: Request):
     """Register a rent payment (cash, card, or ACH)"""
@@ -1084,6 +1096,31 @@ async def delete_rental_payment(payment_id: str, request: Request):
 
     await get_db().rental_payments.delete_one({"_id": ObjectId(payment_id)})
     return {"success": True, "message": "Pago eliminado exitosamente"}
+
+
+@router.post('/admin/rental-payments/generate-monthly')
+async def admin_trigger_monthly_rent_generation(request: Request):
+    """Manually trigger the monthly rent payment cron job.
+
+    Useful for:
+      - Creating the first pending payment for new contracts
+      - Forcing re-check of current period payments
+      - Applying late fees outside of the 6h cron interval
+
+    Returns stats: {created, already_exists, late_fee_applied, skip_no_rent, errors}
+    """
+    await auth_admin(request)
+    try:
+        from rental.rent_payment_cron import run_once
+        stats = await run_once(get_db())
+        return {
+            "success": True,
+            "message": "Generación mensual de rentas ejecutada",
+            "stats": stats,
+        }
+    except Exception as e:
+        logging.exception("Manual rent generation failed")
+        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
