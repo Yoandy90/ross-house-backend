@@ -99,21 +99,30 @@ async def tenant_invoices_history(
         async for p in db.rental_payments.find(
             {"tenant_id": {"$in": tenant_ids}}
         ).sort("payment_date", -1).limit(limit):
-            paid = bool(p.get("paid", True))  # rental_payments are mostly paid records
-            paid_at = p.get("payment_date") or p.get("created_at")
-            period = _safe_period(paid_at)
+            # Real paid flag: only true if explicit flag set OR status indicates payment
+            doc_status = (p.get("status") or "").lower()
+            paid = bool(p.get("paid", False)) or doc_status in ("paid", "completed")
+            payment_dt = p.get("payment_date")
+            paid_at = payment_dt if paid else None
+            # Period: prefer explicit field, else derived from due_date / payment_date
+            period = p.get("period") or _safe_period(p.get("due_date") or payment_dt or p.get("created_at"))
+            late_fee = float(p.get("late_fee", 0) or 0)
+            amount = float(p.get("amount", 0) or 0)
+            total_due = float(p.get("total_due", amount + late_fee) or amount)
             items.append({
                 "id": str(p["_id"]),
                 "type": "rent",
                 "label": "Renta mensual",
                 "subtitle": p.get("notes") or p.get("description") or "",
-                "period": p.get("period") or period,
-                "amount": round(float(p.get("amount", 0)), 2),
+                "period": period,
+                "amount": round(total_due, 2),
+                "base_amount": round(amount, 2),
+                "late_fee": round(late_fee, 2),
                 "paid": paid,
-                "paid_at": _safe_iso(paid_at),
+                "paid_at": _safe_iso(paid_at) if paid_at else None,
                 "due_date": _safe_iso(p.get("due_date")),
-                "status": "paid" if paid else "pending",
-                "has_pdf": True,
+                "status": doc_status if doc_status in ("paid", "completed", "pending", "late", "partial", "cancelled") else ("paid" if paid else "pending"),
+                "has_pdf": paid,  # PDF receipt only meaningful after payment
                 "pdf_endpoint": f"/api/tenant/payment/{p['_id']}/receipt",
                 "source": "rental_payments",
                 "icon": "home",

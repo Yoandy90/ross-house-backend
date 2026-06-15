@@ -962,7 +962,7 @@ async def admin_rent_auto_generate(request: Request):
 
 @router.post('/admin/rental-payments')
 async def register_rental_payment(request: Request):
-    """Register a rent payment (cash, card, or ACH)"""
+    """Register a rent payment OR a pending invoice (cash, card, ach, or pending-only)."""
     user = await auth_admin(request)
     data = await request.json()
     now = datetime.utcnow()
@@ -974,12 +974,19 @@ async def register_rental_payment(request: Request):
     if amount <= 0:
         raise HTTPException(status_code=400, detail="Monto debe ser mayor a 0")
 
+    # Admin can specify status (pending => generate invoice without charging)
+    target_status = (data.get('status') or 'completed').lower()
+    if target_status not in ('completed', 'paid', 'pending', 'late', 'partial', 'cancelled'):
+        target_status = 'completed'
+    is_paid = target_status in ('completed', 'paid')
+
     payment_method = data.get('payment_method', 'cash')
     vault_id = data.get('customer_vault_id', '')
     nmi_transaction = None
+    late_fee = float(data.get('late_fee', 0) or 0)
 
-    # NMI charge if card/ach
-    if payment_method in ('card', 'ach') and vault_id:
+    # NMI charge ONLY if status is completed AND a vault is supplied
+    if is_paid and payment_method in ('card', 'ach') and vault_id:
         try:
             from merchant_one_enhanced import charge_vault_customer
             desc = f"Renta {contract.get('property_address', '')} - {contract.get('tenant_name', '')}" if contract else "Pago de renta"
@@ -997,26 +1004,57 @@ async def register_rental_payment(request: Request):
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Error NMI: {str(e)}")
 
-    # Generate receipt number
-    pay_count = await get_db().rental_payments.count_documents({})
-    receipt_number = f"REC-{now.year}-{str(pay_count + 1).zfill(4)}"
+    # Generate receipt number ONLY for completed/paid records
+    receipt_number = ""
+    if is_paid:
+        pay_count = await get_db().rental_payments.count_documents({
+            "status": {"$in": ["completed", "paid"]}
+        })
+        receipt_number = f"REC-{now.year}-{str(pay_count + 1).zfill(4)}"
+
+    # Optional explicit payment_date / due_date
+    def _parse_date(v):
+        if not v:
+            return None
+        if isinstance(v, str):
+            try:
+                if "T" in v:
+                    return datetime.fromisoformat(v.replace("Z", "+00:00"))
+                return datetime.strptime(v, "%Y-%m-%d")
+            except Exception:
+                return None
+        return v
+
+    period_year = int(data.get('period_year', now.year))
+    period_month_num = int(data.get('period_month_num', now.month))
+    period_month_name = data.get('period_month', now.strftime('%B'))
+    period_iso = data.get('period') or f"{period_year}-{str(period_month_num).zfill(2)}"
+
+    payment_date = _parse_date(data.get('payment_date')) or (now if is_paid else None)
+    due_date = _parse_date(data.get('due_date')) or datetime(period_year, period_month_num, 1)
 
     payment_doc = {
         "receipt_number": receipt_number,
         "contract_id": contract_id or '',
-        "property_id": data.get('property_id', contract.get('property_id', '') if contract else ''),
+        "property_id": str(data.get('property_id', contract.get('property_id', '') if contract else '')),
         "property_address": data.get('property_address', contract.get('property_address', '') if contract else ''),
-        "tenant_id": data.get('tenant_id', contract.get('tenant_id', '') if contract else ''),
+        "tenant_id": str(data.get('tenant_id', contract.get('tenant_id', '') if contract else '')),
         "tenant_name": data.get('tenant_name', contract.get('tenant_name', '') if contract else ''),
         "amount": amount,
-        "late_fee": float(data.get('late_fee', 0)),
-        "total_paid": amount + float(data.get('late_fee', 0)),
-        "payment_method": payment_method,
-        "period_month": data.get('period_month', now.strftime('%B')),
-        "period_year": int(data.get('period_year', now.year)),
-        "payment_date": now,
-        "status": "completed",
+        "late_fee": late_fee,
+        "total_due": amount + late_fee,
+        "total_paid": (amount + late_fee) if is_paid else 0.0,
+        "payment_method": payment_method if is_paid else "",
+        "period": period_iso,
+        "period_month": period_month_name,
+        "period_month_num": period_month_num,
+        "period_year": period_year,
+        "due_date": due_date,
+        "payment_date": payment_date,
+        "status": target_status,
+        "paid": is_paid,
         "notes": data.get('notes', ''),
+        "auto_generated": False,
         "recorded_by": user.get('email', 'admin'),
         "created_at": now,
     }
@@ -1024,13 +1062,15 @@ async def register_rental_payment(request: Request):
         payment_doc['nmi_transaction'] = nmi_transaction
         payment_doc['customer_vault_id'] = vault_id
 
-    await get_db().rental_payments.insert_one(payment_doc)
+    result = await get_db().rental_payments.insert_one(payment_doc)
 
     return {
         "success": True,
-        "message": f"Pago {receipt_number} registrado — ${amount:,.2f}",
+        "message": f"Factura {receipt_number or 'pendiente'} creada — ${amount:,.2f}",
+        "id": str(result.inserted_id),
         "receipt_number": receipt_number,
         "amount": amount,
+        "status": target_status,
     }
 
 
@@ -1059,7 +1099,12 @@ async def list_rental_payments(request: Request):
 
 @router.put('/admin/rental-payments/{payment_id}')
 async def update_rental_payment(payment_id: str, request: Request):
-    """Update a rental payment"""
+    """Update a rental payment.
+
+    Allows editing all key fields: amount, late_fee, status, period, due_date,
+    payment_date, payment_method, notes. When status is set to 'completed' /
+    'paid', automatically marks `paid=true` and stamps `payment_date` if empty.
+    """
     user = await auth_admin(request)
     data = await request.json()
 
@@ -1067,14 +1112,58 @@ async def update_rental_payment(payment_id: str, request: Request):
     if not existing:
         raise HTTPException(status_code=404, detail="Pago no encontrado")
 
-    update_fields = {"updated_at": datetime.utcnow()}
-    allowed = ["amount", "payment_method", "period_month", "period_year", "late_fee", "notes", "status"]
-    for field in allowed:
-        if field in data:
-            if field in ("amount", "late_fee"):
-                update_fields[field] = float(data[field])
-            else:
-                update_fields[field] = data[field]
+    now = datetime.utcnow()
+    update_fields = {"updated_at": now}
+
+    float_fields = ["amount", "late_fee", "total_due", "total_paid"]
+    str_fields = ["payment_method", "period_month", "notes", "status", "receipt_number", "tenant_name", "property_address"]
+    int_fields = ["period_year", "period_month_num"]
+    date_fields = ["payment_date", "due_date"]
+
+    for f in float_fields:
+        if f in data:
+            try:
+                update_fields[f] = float(data[f] or 0)
+            except (TypeError, ValueError):
+                pass
+    for f in str_fields:
+        if f in data:
+            update_fields[f] = str(data[f] or "")
+    for f in int_fields:
+        if f in data:
+            try:
+                update_fields[f] = int(data[f] or 0)
+            except (TypeError, ValueError):
+                pass
+    for f in date_fields:
+        if f in data and data[f]:
+            try:
+                # Accept ISO strings or 'YYYY-MM-DD'
+                v = data[f]
+                if isinstance(v, str):
+                    if "T" in v:
+                        update_fields[f] = datetime.fromisoformat(v.replace("Z", "+00:00"))
+                    else:
+                        update_fields[f] = datetime.strptime(v, "%Y-%m-%d")
+                else:
+                    update_fields[f] = v
+            except Exception:
+                pass
+
+    # Auto-set paid flag based on status
+    new_status = update_fields.get("status", existing.get("status", "pending")).lower()
+    if new_status in ("completed", "paid"):
+        update_fields["paid"] = True
+        if not update_fields.get("payment_date") and not existing.get("payment_date"):
+            update_fields["payment_date"] = now
+        # Auto-assign receipt number if missing
+        if not (update_fields.get("receipt_number") or existing.get("receipt_number")):
+            pay_count = await get_db().rental_payments.count_documents({
+                "status": {"$in": ["completed", "paid"]}
+            })
+            update_fields["receipt_number"] = f"REC-{now.year}-{str(pay_count + 1).zfill(4)}"
+    elif new_status in ("pending", "late", "cancelled"):
+        update_fields["paid"] = False
 
     await get_db().rental_payments.update_one(
         {"_id": ObjectId(payment_id)},
