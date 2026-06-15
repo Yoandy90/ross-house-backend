@@ -285,25 +285,59 @@ async def get_my_leases(request: Request):
 @router.get('/lease/{lease_id}')
 async def get_lease_detail(lease_id: str, request: Request):
     """Get full lease details for signing"""
+    import re as _re
     user = await auth_marketplace(request)
-    user_email = user.get("email", "")
+    user_email = (user.get("email") or "").strip().lower()
     user_id = str(user.get("_id", ""))
+    db = get_db()
 
     try:
-        lease = await get_db().leases.find_one({"_id": ObjectId(lease_id)})
-    except:
+        oid = ObjectId(lease_id)
+    except Exception:
         raise HTTPException(status_code=400, detail="ID inválido")
+
+    # Try leases collection first, then rental_contracts (where seed data lives)
+    lease = await db.leases.find_one({"_id": oid})
+    source = "leases"
+    if not lease:
+        lease = await db.rental_contracts.find_one({"_id": oid})
+        source = "rental_contracts"
 
     if not lease:
         raise HTTPException(status_code=404, detail="Contrato no encontrado")
 
     doc = serialize(lease)
+    doc["source"] = source
 
-    # Verify user has access to this lease
-    is_tenant = (doc.get("tenant_email") == user_email or doc.get("tenant_id") == user_id)
+    # Resolve tenant_ids the user might match against (direct + via tenants doc)
+    tenant_ids = {user_id}
+    async for t in db.tenants.find({"app_user_id": user_id}):
+        tenant_ids.add(str(t["_id"]))
+    if user_email:
+        async for t in db.tenants.find({
+            "email": {"$regex": f"^{_re.escape(user_email)}$", "$options": "i"}
+        }):
+            tenant_ids.add(str(t["_id"]))
+
+    is_tenant = (
+        doc.get("tenant_email", "").lower() == user_email
+        or doc.get("tenant_id") in tenant_ids
+    )
     is_landlord = (doc.get("landlord_id") == user_id)
     if not is_tenant and not is_landlord:
         raise HTTPException(status_code=403, detail="No tienes acceso a este contrato")
+
+    # Normalize fields for the frontend (rental_contracts uses monthly_rent)
+    if source == "rental_contracts":
+        doc.setdefault("rent_amount", doc.get("monthly_rent", 0))
+        # Enrich property_address from properties collection
+        if not doc.get("property_address") and doc.get("property_id"):
+            try:
+                prop = await db.properties.find_one({"_id": ObjectId(doc["property_id"])})
+                if prop:
+                    doc["property_address"] = prop.get("address") or prop.get("name") or ""
+            except Exception:
+                pass
 
     return {"success": True, "lease": doc}
 
