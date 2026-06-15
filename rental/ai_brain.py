@@ -295,51 +295,198 @@ Genera una respuesta profesional a este email."""
     # ══════════════════════════════════════════════════════════════════
 
     async def _build_context(self, conversation_id: str, sender_name: str) -> str:
-        """Build context about the tenant and their property."""
+        """Build context about the tenant and their property.
+
+        Resolves the linked tenant doc via direct id / app_user_id / email /
+        phone so the AI works for marketplace users (app_users collection)
+        and not only legacy tenant logins.
+        """
         context_parts = []
 
         try:
-            # Get conversation info
             from bson import ObjectId
-            conv = await self.db.chat_conversations.find_one({"_id": ObjectId(conversation_id)})
-            if conv:
-                context_parts.append(f"📌 CONVERSACIÓN CON: {conv.get('tenant_name', sender_name)}")
-                tenant_id = conv.get("tenant_id")
+            import re as _re
+            from datetime import datetime, timezone
 
-                if tenant_id:
-                    # Get tenant info
-                    tenant = await self.db.app_users.find_one({"_id": ObjectId(tenant_id)})
-                    if tenant:
-                        context_parts.append(f"👤 Email: {tenant.get('email', 'N/A')}")
-                        context_parts.append(f"📱 Teléfono: {tenant.get('phone', 'N/A')}")
+            # Get conversation info
+            try:
+                conv = await self.db.chat_conversations.find_one({"_id": ObjectId(conversation_id)})
+            except Exception:
+                conv = None
+            if not conv:
+                return ""
 
-                    # Get tenant's active contract
+            display_name = conv.get('tenant_name', sender_name)
+            context_parts.append(f"📌 CONVERSACIÓN CON: {display_name}")
+
+            # `tenant_id` in chat_conversations is actually the app_user_id (see
+            # chat_router.py). We need to find the matching tenants doc to query
+            # contracts (which key by tenants._id).
+            app_user_id = conv.get("tenant_id")  # actually the app_user id
+            app_user = None
+            if app_user_id:
+                try:
+                    app_user = await self.db.app_users.find_one({"_id": ObjectId(app_user_id)})
+                except Exception:
+                    app_user = None
+
+            if app_user:
+                context_parts.append(f"👤 Email: {app_user.get('email', 'N/A')}")
+                context_parts.append(f"📱 Teléfono: {app_user.get('phone', 'N/A')}")
+
+            # ── Resolve the linked tenant doc ──
+            tenant = None
+            if app_user_id:
+                # 1) direct id (legacy tenant login)
+                try:
+                    tenant = await self.db.tenants.find_one({"_id": ObjectId(app_user_id)})
+                except Exception:
+                    tenant = None
+                # 2) app_user_id link
+                if not tenant:
+                    tenant = await self.db.tenants.find_one({"app_user_id": app_user_id})
+                # 3) email match
+                if not tenant and app_user and app_user.get("email"):
+                    em = app_user["email"].strip().lower()
+                    tenant = await self.db.tenants.find_one({
+                        "email": {"$regex": f"^{_re.escape(em)}$", "$options": "i"}
+                    })
+
+            tenant_ids_to_try = []
+            if tenant:
+                tenant_ids_to_try.append(str(tenant["_id"]))
+            if app_user_id:
+                tenant_ids_to_try.append(app_user_id)
+
+            # ── Active contract ──
+            contract = None
+            for tid in tenant_ids_to_try:
+                contract = await self.db.rental_contracts.find_one({
+                    "tenant_id": tid,
+                    "status": {"$in": ["active", "activo"]},
+                })
+                if contract:
+                    break
+                # ObjectId variant
+                try:
                     contract = await self.db.rental_contracts.find_one({
-                        "tenant_id": tenant_id,
-                        "status": {"$in": ["active", "activo"]}
+                        "tenant_id": ObjectId(tid),
+                        "status": {"$in": ["active", "activo"]},
                     })
                     if contract:
-                        context_parts.append(f"📄 Contrato activo: {contract.get('property_address', 'N/A')}")
-                        context_parts.append(f"💰 Renta mensual: ${contract.get('rent_amount', 'N/A')}")
-                        context_parts.append(f"📅 Vencimiento: {contract.get('end_date', 'N/A')}")
+                        break
+                except Exception:
+                    pass
 
-                    # Get maintenance requests
-                    maintenance_cursor = self.db.maintenance_requests.find({
-                        "tenant_id": tenant_id,
-                        "status": {"$in": ["pending", "in_progress", "pendiente", "en_progreso"]}
-                    }).sort("created_at", -1).limit(3)
-                    maintenance = await maintenance_cursor.to_list(length=3)
-                    if maintenance:
-                        context_parts.append("🔧 SOLICITUDES DE MANTENIMIENTO ACTIVAS:")
-                        for m in maintenance:
-                            context_parts.append(f"  - {m.get('description', 'N/A')[:60]} ({m.get('status', 'N/A')})")
+            if contract:
+                # Property address
+                prop_address = contract.get("property_address")
+                if not prop_address and contract.get("property_id"):
+                    try:
+                        prop = await self.db.properties.find_one({"_id": ObjectId(contract["property_id"])})
+                        if prop:
+                            prop_address = prop.get("address") or prop.get("name")
+                    except Exception:
+                        pass
+                if prop_address:
+                    context_parts.append(f"📄 Propiedad alquilada: {prop_address}")
 
-            # Get available properties
-            active_props = await self.db.properties.find({"status": "active"}).to_list(length=10)
-            if active_props:
-                context_parts.append("\n🏠 PROPIEDADES DISPONIBLES:")
-                for p in active_props:
-                    context_parts.append(f"  - {p.get('address', 'N/A')}: ${p.get('rent_amount', 'N/A')}/mes, {p.get('bedrooms', '?')} hab, {p.get('bathrooms', '?')} baños")
+                rent = contract.get("monthly_rent") or contract.get("rent_amount") or 0
+                context_parts.append(f"💰 Renta mensual: ${rent:.2f}")
+
+                # Contract dates
+                start = contract.get("start_date") or contract.get("lease_start")
+                end = contract.get("end_date") or contract.get("lease_end")
+                if start:
+                    s = start.isoformat()[:10] if hasattr(start, 'isoformat') else str(start)[:10]
+                    context_parts.append(f"📅 Inicio del contrato: {s}")
+                if end:
+                    e = end.isoformat()[:10] if hasattr(end, 'isoformat') else str(end)[:10]
+                    context_parts.append(f"📅 Fin del contrato: {e}")
+
+                # Next payment computation
+                now_utc = datetime.now(timezone.utc)
+                # Rent is due on the 1st of each month, grace period until day 5
+                if now_utc.day <= 5:
+                    # Current period still due
+                    due_year = now_utc.year
+                    due_month = now_utc.month
+                else:
+                    # Next period
+                    due_month = now_utc.month + 1
+                    due_year = now_utc.year
+                    if due_month > 12:
+                        due_month = 1
+                        due_year += 1
+                due_date_str = f"{due_year}-{due_month:02d}-01"
+                period_label = f"{due_year}-{due_month:02d}"
+                context_parts.append(f"🗓️ Próximo pago: ${rent:.2f} con fecha límite {due_date_str} (período {period_label})")
+                if now_utc.day > 5:
+                    context_parts.append("⏰ El período actual ya tiene cargo por mora ($50) si no se paga.")
+
+                # Recent payments (last 3)
+                contract_id_str = str(contract["_id"])
+                payments_cursor = self.db.rental_payments.find({
+                    "$or": [
+                        {"contract_id": contract_id_str},
+                        {"tenant_id": {"$in": tenant_ids_to_try}},
+                    ]
+                }).sort("payment_date", -1).limit(3)
+                recent_payments = await payments_cursor.to_list(length=3)
+                if recent_payments:
+                    context_parts.append("💳 ÚLTIMOS PAGOS DE RENTA:")
+                    for p in recent_payments:
+                        amt = p.get("amount", 0)
+                        when = p.get("payment_date") or p.get("created_at")
+                        when_str = when.isoformat()[:10] if hasattr(when, 'isoformat') else str(when)[:10]
+                        per = p.get("period", "")
+                        context_parts.append(f"  • ${amt:.2f} pagado el {when_str} (período {per})")
+                else:
+                    context_parts.append("💳 Sin pagos registrados en el sistema todavía.")
+            else:
+                context_parts.append("⚠️ Este usuario no tiene un contrato activo registrado.")
+
+            # ── Pending utility bills ──
+            unpaid_bills = []
+            for tid in tenant_ids_to_try:
+                async for b in self.db.tenant_utility_bills.find({
+                    "tenant_id": tid,
+                    "status": {"$ne": "paid"},
+                }).sort("due_date", 1).limit(5):
+                    unpaid_bills.append(b)
+                if unpaid_bills:
+                    break
+            if unpaid_bills:
+                context_parts.append("💡 FACTURAS DE SERVICIOS PENDIENTES:")
+                for b in unpaid_bills:
+                    bt = b.get("type", "servicio")
+                    amt = b.get("amount", 0)
+                    per = b.get("period", "")
+                    context_parts.append(f"  • {bt.title()} ${amt:.2f} ({per})")
+
+            # ── Maintenance requests ──
+            for tid in tenant_ids_to_try:
+                maintenance_cursor = self.db.maintenance_requests.find({
+                    "tenant_id": tid,
+                    "status": {"$in": ["pending", "in_progress", "pendiente", "en_progreso"]}
+                }).sort("created_at", -1).limit(3)
+                maintenance = await maintenance_cursor.to_list(length=3)
+                if maintenance:
+                    context_parts.append("🔧 SOLICITUDES DE MANTENIMIENTO ACTIVAS:")
+                    for m in maintenance:
+                        context_parts.append(f"  - {m.get('description', 'N/A')[:60]} ({m.get('status', 'N/A')})")
+                    break
+
+            # ── Available properties (only show if no active contract) ──
+            if not contract:
+                active_props = await self.db.properties.find({"status": "active"}).to_list(length=10)
+                if active_props:
+                    context_parts.append("\n🏠 PROPIEDADES DISPONIBLES:")
+                    for p in active_props:
+                        context_parts.append(
+                            f"  - {p.get('address', 'N/A')}: ${p.get('rent_amount', 'N/A')}/mes, "
+                            f"{p.get('bedrooms', '?')} hab, {p.get('bathrooms', '?')} baños"
+                        )
 
         except Exception as e:
             logger.warning(f"Error building context: {e}")
