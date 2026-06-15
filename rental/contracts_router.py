@@ -56,7 +56,7 @@ async def admin_create_lease(request: Request):
         "updated_at": datetime.utcnow(),
     }
 
-    result = await get_db().leases.insert_one(lease)
+    result = await get_db().rental_contracts.insert_one(lease)
     return {
         "success": True,
         "lease_id": str(result.inserted_id),
@@ -66,7 +66,7 @@ async def admin_create_lease(request: Request):
 
 @router.get('/admin/leases')
 async def admin_list_leases(request: Request):
-    """Admin: List all lease contracts"""
+    """Admin: List all lease contracts (now backed by rental_contracts)."""
     await auth_admin(request)
     status_filter = request.query_params.get("status", "all")
 
@@ -74,7 +74,7 @@ async def admin_list_leases(request: Request):
     if status_filter != "all":
         query["status"] = status_filter
 
-    cursor = get_db().leases.find(query).sort("created_at", -1)
+    cursor = get_db().rental_contracts.find(query).sort("created_at", -1)
     leases = []
     async for l in cursor:
         doc = serialize(l)
@@ -86,10 +86,10 @@ async def admin_list_leases(request: Request):
             "lease_type": doc.get("lease_type", "residential"),
             "start_date": doc.get("start_date", ""),
             "end_date": doc.get("end_date", ""),
-            "rent_amount": doc.get("rent_amount", 0),
+            "rent_amount": doc.get("rent_amount", doc.get("monthly_rent", 0)),
             "status": doc.get("status", "draft"),
             "has_tenant_signature": bool(doc.get("tenant_signature")),
-            "has_landlord_signature": bool(doc.get("landlord_signature")),
+            "has_landlord_signature": bool(doc.get("landlord_signature") or doc.get("admin_signature")),
             "has_admin_signature": bool(doc.get("admin_signature")),
             "created_at": doc.get("created_at", ""),
         })
@@ -99,11 +99,11 @@ async def admin_list_leases(request: Request):
 
 @router.get('/admin/leases/{lease_id}')
 async def admin_get_lease(lease_id: str, request: Request):
-    """Admin: Get full lease details including signatures"""
+    """Admin: Get full lease details (now backed by rental_contracts)."""
     await auth_admin(request)
     try:
-        lease = await get_db().leases.find_one({"_id": ObjectId(lease_id)})
-    except:
+        lease = await get_db().rental_contracts.find_one({"_id": ObjectId(lease_id)})
+    except Exception:
         raise HTTPException(status_code=400, detail="ID de contrato inválido")
 
     if not lease:
@@ -115,7 +115,7 @@ async def admin_get_lease(lease_id: str, request: Request):
 
 @router.post('/lease/{lease_id}/sign')
 async def sign_lease(lease_id: str, request: Request):
-    """Sign a lease contract (tenant, landlord, or admin)"""
+    """Sign a lease contract (tenant, landlord, or admin) — uses rental_contracts."""
     data = await request.json()
     signature = data.get("signature", "")
     signer_role = data.get("role", "")
@@ -128,8 +128,8 @@ async def sign_lease(lease_id: str, request: Request):
         raise HTTPException(status_code=400, detail="Rol de firmante inválido")
 
     try:
-        lease = await get_db().leases.find_one({"_id": ObjectId(lease_id)})
-    except:
+        lease = await get_db().rental_contracts.find_one({"_id": ObjectId(lease_id)})
+    except Exception:
         raise HTTPException(status_code=400, detail="ID de contrato inválido")
 
     if not lease:
@@ -165,7 +165,7 @@ async def sign_lease(lease_id: str, request: Request):
         update["admin_signed_at"] = datetime.utcnow()
         update["admin_signer_name"] = signer_name
 
-    await get_db().leases.update_one({"_id": ObjectId(lease_id)}, {"$set": update})
+    await get_db().rental_contracts.update_one({"_id": ObjectId(lease_id)}, {"$set": update})
 
     return {
         "success": True,
@@ -176,11 +176,10 @@ async def sign_lease(lease_id: str, request: Request):
 
 @router.get('/my-leases')
 async def get_my_leases(request: Request):
-    """Get leases/contracts for the authenticated user (tenant or landlord).
+    """Get contracts for the authenticated user from `rental_contracts`.
 
-    Queries BOTH the legacy `leases` collection and the active
-    `rental_contracts` collection so app users (marketplace) see their
-    real contract even when seed data lives in the newer collection.
+    Resolves all tenant_ids that match the user (direct id, via tenants link,
+    or via email/phone) and returns every matching contract.
     """
     import re as _re
     from bson import ObjectId
@@ -191,7 +190,7 @@ async def get_my_leases(request: Request):
     user_id = str(user.get("_id", ""))
     role = user.get("role", "tenant")
 
-    # ── Resolve tenant_ids to try (direct + via tenants._id + email + phone) ──
+    # Resolve tenant_ids to try (direct + via tenants._id + email)
     tenant_ids = {user_id}
     if user_id:
         async for t in db.tenants.find({"app_user_id": user_id}):
@@ -206,42 +205,13 @@ async def get_my_leases(request: Request):
     leases: list = []
     seen_ids: set = set()
 
-    # ── 1) Legacy leases collection ──
-    legacy_query = {
+    contract_query = {
         "$or": [
-            {"tenant_email": user_email},
             {"tenant_id": {"$in": tenant_ids_list}},
-            {"landlord_id": user_id},
+            {"tenant_email": user_email} if user_email else {"_id": None},
+            {"landlord_id": user_id} if user_id else {"_id": None},
         ]
     }
-    async for l in db.leases.find(legacy_query).sort("created_at", -1):
-        doc = serialize(l)
-        lid = doc.get("_id")
-        if lid in seen_ids:
-            continue
-        seen_ids.add(lid)
-        leases.append({
-            "id": lid,
-            "property_address": doc.get("property_address", ""),
-            "lease_type": doc.get("lease_type", "residential"),
-            "start_date": doc.get("start_date", ""),
-            "end_date": doc.get("end_date", ""),
-            "rent_amount": doc.get("rent_amount", 0),
-            "deposit_amount": doc.get("deposit_amount", 0),
-            "terms": doc.get("terms", ""),
-            "clauses": doc.get("clauses", []),
-            "status": doc.get("status", "draft"),
-            "has_tenant_signature": bool(doc.get("tenant_signature")),
-            "has_landlord_signature": bool(doc.get("landlord_signature")),
-            "has_admin_signature": bool(doc.get("admin_signature")),
-            "tenant_signature": doc.get("tenant_signature") if role == "tenant" else None,
-            "landlord_signature": doc.get("landlord_signature") if role == "landlord" else None,
-            "created_at": doc.get("created_at", ""),
-            "source": "leases",
-        })
-
-    # ── 2) Active rental_contracts collection (where real seed data lives) ──
-    contract_query = {"tenant_id": {"$in": tenant_ids_list}}
     async for c in db.rental_contracts.find(contract_query).sort("created_at", -1):
         doc = serialize(c)
         cid = doc.get("_id")
@@ -271,7 +241,7 @@ async def get_my_leases(request: Request):
             "clauses": doc.get("clauses", []),
             "status": doc.get("status", "draft"),
             "has_tenant_signature": bool(doc.get("tenant_signature")),
-            "has_landlord_signature": bool(doc.get("landlord_signature")),
+            "has_landlord_signature": bool(doc.get("landlord_signature") or doc.get("admin_signature")),
             "has_admin_signature": bool(doc.get("admin_signature")),
             "tenant_signature": doc.get("tenant_signature") if role == "tenant" else None,
             "landlord_signature": doc.get("landlord_signature") if role == "landlord" else None,
@@ -296,12 +266,9 @@ async def get_lease_detail(lease_id: str, request: Request):
     except Exception:
         raise HTTPException(status_code=400, detail="ID inválido")
 
-    # Try leases collection first, then rental_contracts (where seed data lives)
-    lease = await db.leases.find_one({"_id": oid})
-    source = "leases"
-    if not lease:
-        lease = await db.rental_contracts.find_one({"_id": oid})
-        source = "rental_contracts"
+    # Lookup in rental_contracts (unified collection)
+    lease = await db.rental_contracts.find_one({"_id": oid})
+    source = "rental_contracts"
 
     if not lease:
         raise HTTPException(status_code=404, detail="Contrato no encontrado")
