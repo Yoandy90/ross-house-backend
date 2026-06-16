@@ -190,6 +190,7 @@ try:
     from rental.tenant_invoices_router import router as tenant_invoices_router
     from rental.property_entity_router import router as property_entity_router
     from rental.utility_ocr_router import router as utility_ocr_router
+    from rental.vault_router import router as vault_router
 
     app.include_router(auth_router, prefix="/api")
     app.include_router(properties_router, prefix="/api")
@@ -216,6 +217,7 @@ try:
     app.include_router(tenant_invoices_router, prefix="/api")
     app.include_router(property_entity_router, prefix="/api")
     app.include_router(utility_ocr_router, prefix="/api")
+    app.include_router(vault_router, prefix="/api")
 
     logger.info("  ✅ Credit Builder Router")
     logger.info("  ✅ Consent Forms Router")
