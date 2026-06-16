@@ -453,9 +453,19 @@ async def tenant_create_stripe_payment(request: Request):
     if existing:
         raise HTTPException(status_code=400, detail="Ya existe un pago registrado para este mes")
 
-    amount = data.get("amount", contract.get("rent_amount", 0))
-    late_fee = data.get("late_fee", 0)
-    total = float(amount) + float(late_fee)
+    # ─── Amount resolution (avoid double-counting late fee) ──────────────
+    # New client behavior: sends rent_amount (base) + late_fee separately, so
+    # the source of truth is rent_amount + late_fee.
+    # Legacy client behavior: sends amount as the FULL total (incl. late fee).
+    if "rent_amount" in data:
+        amount = float(data.get("rent_amount") or 0)
+        late_fee = float(data.get("late_fee") or 0)
+        total = amount + late_fee
+    else:
+        # Fallback for older clients: treat `amount` as the full total
+        total = float(data.get("amount") or contract.get("rent_amount") or 0)
+        amount = total
+        late_fee = 0.0
 
     if total <= 0:
         raise HTTPException(status_code=400, detail="Monto inválido")
@@ -1145,5 +1155,48 @@ async def tenant_autopay_status(request: Request):
             "enabled": autopay.get("enabled", False),
             "payment_method_id": autopay.get("payment_method_id", ""),
             "day_of_month": autopay.get("day_of_month", 1),
+            "last_attempt_date": autopay.get("last_attempt_date"),
+            "last_attempt_status": autopay.get("last_attempt_status"),
+            "last_attempt_error": autopay.get("last_attempt_error"),
+            "successful_charges": autopay.get("successful_charges", 0),
+            "failed_charges": autopay.get("failed_charges", 0),
         }
     }
+
+
+@router.get('/admin/autopay/configs')
+async def admin_list_autopay_configs(request: Request):
+    """Admin: List ALL autopay configs across tenants with stats."""
+    await auth_admin(request)
+    items = []
+    cursor = get_db().autopay_config.find({}).sort("updated_at", -1)
+    async for c in cursor:
+        items.append({
+            "id": str(c["_id"]),
+            "user_id": c.get("user_id", ""),
+            "user_name": c.get("user_name", ""),
+            "user_email": c.get("user_email", ""),
+            "enabled": c.get("enabled", False),
+            "day_of_month": c.get("day_of_month", 1),
+            "payment_method_id": c.get("payment_method_id", ""),
+            "last_attempt_date": c.get("last_attempt_date"),
+            "last_attempt_status": c.get("last_attempt_status"),
+            "last_attempt_error": c.get("last_attempt_error"),
+            "successful_charges": c.get("successful_charges", 0),
+            "failed_charges": c.get("failed_charges", 0),
+            "updated_at": c.get("updated_at"),
+        })
+    return {"success": True, "configs": items, "count": len(items)}
+
+
+@router.post('/admin/autopay/run-now')
+async def admin_trigger_autopay(request: Request):
+    """Admin: Manually trigger the autopay cron once (useful for testing/recovery)."""
+    await auth_admin(request)
+    try:
+        from rental.autopay_cron import run_once
+        stats = await run_once(get_db())
+        return {"success": True, "message": "Autopago ejecutado", "stats": stats}
+    except Exception as e:
+        logging.exception("Autopay manual run failed")
+        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")

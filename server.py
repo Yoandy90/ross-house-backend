@@ -80,6 +80,15 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"   ⚠️ Rent-payment cron not started: {e}")
 
+    # Start autopay cron — charges saved cards on the configured day_of_month
+    autopay_task = None
+    try:
+        from rental.autopay_cron import autopay_loop
+        autopay_task = asyncio.create_task(autopay_loop())
+        logger.info("   ✅ Autopay cron scheduled")
+    except Exception as e:
+        logger.warning(f"   ⚠️ Autopay cron not started: {e}")
+
     yield
 
     # Graceful shutdown of cron
