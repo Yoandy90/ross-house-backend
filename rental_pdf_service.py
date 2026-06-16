@@ -1186,14 +1186,15 @@ def generate_rental_contract_pdf(contract: dict, config: dict = None, tenant_pho
 # ═══════════════════════════════════════════════════════════════════════════
 
 def generate_3day_notice_pdf(contract: dict, config: dict = None, reason: str = 'nonpayment', amount_owed: float = 0) -> str:
-    """Generate a Texas 3-Day Notice to Vacate (TX Property Code §24.005)"""
+    """Generate a Texas 3-Day Notice to Vacate (TX Property Code §24.005) — premium design."""
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(
         buffer, pagesize=letter,
-        topMargin=0.75 * inch, bottomMargin=0.75 * inch,
-        leftMargin=0.75 * inch, rightMargin=0.75 * inch
+        topMargin=0.45 * inch, bottomMargin=0.5 * inch,
+        leftMargin=0.6 * inch, rightMargin=0.6 * inch,
+        title="Aviso de 3 Días — Three-Day Notice to Vacate",
     )
-    styles = _build_styles()
+    base_styles = getSampleStyleSheet()
     elements = []
 
     co = {**DEFAULT_COMPANY}
@@ -1202,108 +1203,281 @@ def generate_3day_notice_pdf(contract: dict, config: dict = None, reason: str = 
             if config.get(k):
                 co[k] = config[k]
 
-    # Header
+    # ─── Brand styles ─────────────────────────────────────────
+    S = {}
+    S['hero_title'] = ParagraphStyle('hero_title', parent=base_styles['Normal'],
+        fontSize=20, leading=24, textColor=colors.white,
+        fontName='Helvetica-Bold', alignment=TA_LEFT)
+    S['hero_sub'] = ParagraphStyle('hero_sub', parent=base_styles['Normal'],
+        fontSize=9, leading=12, textColor=colors.HexColor('#FFD1D1'),
+        fontName='Helvetica', alignment=TA_LEFT)
+    S['legal_ref'] = ParagraphStyle('legal_ref', parent=base_styles['Normal'],
+        fontSize=9, leading=12, textColor=GRAY,
+        fontName='Helvetica-Oblique', alignment=TA_CENTER, spaceAfter=8)
+    S['notice_title'] = ParagraphStyle('notice_title', parent=base_styles['Normal'],
+        fontSize=16, leading=20, textColor=BRAND_RED,
+        fontName='Helvetica-Bold', alignment=TA_CENTER, spaceAfter=4)
+    S['section'] = ParagraphStyle('section', parent=base_styles['Normal'],
+        fontSize=8, leading=11, textColor=MUTED_GRAY,
+        fontName='Helvetica-Bold', spaceAfter=4)
+    S['lbl'] = ParagraphStyle('lbl', parent=base_styles['Normal'],
+        fontSize=8, leading=11, textColor=MUTED_GRAY,
+        fontName='Helvetica')
+    S['val'] = ParagraphStyle('val', parent=base_styles['Normal'],
+        fontSize=11, leading=15, textColor=BRAND_CHARCOAL,
+        fontName='Helvetica-Bold')
+    S['body'] = ParagraphStyle('body', parent=base_styles['Normal'],
+        fontSize=10.5, leading=15, textColor=BRAND_CHARCOAL,
+        fontName='Helvetica', alignment=TA_JUSTIFY, spaceAfter=6)
+    S['body_es'] = ParagraphStyle('body_es', parent=base_styles['Normal'],
+        fontSize=10.5, leading=15, textColor=BRAND_CHARCOAL,
+        fontName='Helvetica-Oblique', alignment=TA_JUSTIFY, spaceAfter=6)
+    S['warning_box'] = ParagraphStyle('warning_box', parent=base_styles['Normal'],
+        fontSize=10.5, leading=14, textColor=colors.HexColor('#92400E'),
+        fontName='Helvetica-Bold', alignment=TA_JUSTIFY)
+    S['amount_big'] = ParagraphStyle('amount_big', parent=base_styles['Normal'],
+        fontSize=22, leading=26, textColor=BRAND_RED,
+        fontName='Helvetica-Bold', alignment=TA_CENTER)
+    S['action_label'] = ParagraphStyle('action_label', parent=base_styles['Normal'],
+        fontSize=11, leading=14, textColor=BRAND_CHARCOAL,
+        fontName='Helvetica-Bold', alignment=TA_LEFT, spaceAfter=2)
+    S['action_body'] = ParagraphStyle('action_body', parent=base_styles['Normal'],
+        fontSize=10, leading=13, textColor=BRAND_CHARCOAL,
+        fontName='Helvetica', alignment=TA_LEFT, spaceAfter=0)
+    S['footer'] = ParagraphStyle('footer', parent=base_styles['Normal'],
+        fontSize=7.5, leading=10, textColor=MUTED_GRAY,
+        fontName='Helvetica', alignment=TA_CENTER)
+    S['sig_label'] = ParagraphStyle('sig_label', parent=base_styles['Normal'],
+        fontSize=8.5, leading=11, textColor=MUTED_GRAY,
+        fontName='Helvetica')
+    S['sig_val'] = ParagraphStyle('sig_val', parent=base_styles['Normal'],
+        fontSize=10, leading=13, textColor=BRAND_CHARCOAL,
+        fontName='Helvetica-Bold')
+
+    # ─── HERO HEADER (logo + title on black) ─────────────────
     logo_path = _get_logo_path()
     if logo_path:
         try:
-            # Ross House Rentals logo — correct 2.29:1 aspect ratio
-            logo = RLImage(logo_path, width=2 * inch, height=0.87 * inch)
-            logo.hAlign = 'CENTER'
-            elements.append(logo)
+            logo = RLImage(logo_path, width=1.1 * inch, height=1.1 * inch, kind='proportional')
         except Exception:
-            pass
+            logo = Paragraph(co['name'], S['hero_title'])
+    else:
+        logo = Paragraph(co['name'], S['hero_title'])
 
+    title_block = [
+        Paragraph("AVISO LEGAL", S['hero_title']),
+        Spacer(1, 2),
+        Paragraph("Notice to Vacate  •  TX Property Code §24.005", S['hero_sub']),
+    ]
+    hero = Table(
+        [[logo, title_block]],
+        colWidths=[1.25 * inch, 6.05 * inch],
+        rowHeights=[1.0 * inch],
+    )
+    hero.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, -1), BRAND_CHARCOAL),
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ('ALIGN', (0, 0), (0, 0), 'CENTER'),
+        ('LEFTPADDING', (0, 0), (-1, -1), 12),
+        ('RIGHTPADDING', (0, 0), (-1, -1), 12),
+    ]))
+    elements.append(hero)
+    elements.append(HRFlowable(width="100%", thickness=4, color=BRAND_RED, spaceBefore=0, spaceAfter=0))
+    elements.append(Spacer(1, 14))
+
+    # ─── Notice title ─────────────────────────────────────────
+    elements.append(Paragraph("AVISO DE TRES (3) DÍAS PARA DESALOJAR", S['notice_title']))
+    elements.append(Paragraph("Three-Day Notice to Vacate", S['notice_title']))
     elements.append(Spacer(1, 4))
-    elements.append(Spacer(1, 8))
-    elements.append(HRFlowable(width="100%", thickness=2, color=RED))
-    elements.append(Spacer(1, 10))
-
     elements.append(Paragraph(
-        "THREE-DAY NOTICE TO VACATE / AVISO DE TRES DÍAS PARA DESALOJAR",
-        ParagraphStyle('NoticeTitle', fontName='Helvetica-Bold', fontSize=14,
-                      textColor=RED, alignment=TA_CENTER, spaceAfter=8)
+        "Bajo el Código de Propiedad de Texas, Sección §24.005  •  Under Texas Property Code §24.005",
+        S['legal_ref']
     ))
-    elements.append(Paragraph(
-        "(Texas Property Code §24.005)",
-        styles['LegalRef']
-    ))
-    elements.append(Spacer(1, 12))
-
-    # Notice content
-    today = datetime.utcnow().strftime('%B %d, %Y')
-    elements.append(Paragraph(f"<b>Date / Fecha:</b> {today}", styles['Body']))
-    elements.append(Paragraph(f"<b>To / Para:</b> {contract.get('tenant_name', 'TENANT')}", styles['Body']))
-    elements.append(Paragraph(f"<b>Property / Propiedad:</b> {contract.get('property_address', '')}", styles['Body']))
     elements.append(Spacer(1, 8))
 
+    # ─── Recipient info card ──────────────────────────────────
+    today_es = datetime.utcnow().strftime('%d de %B de %Y')
+    today_es_map = {
+        'January':'Enero','February':'Febrero','March':'Marzo','April':'Abril',
+        'May':'Mayo','June':'Junio','July':'Julio','August':'Agosto',
+        'September':'Septiembre','October':'Octubre','November':'Noviembre','December':'Diciembre'
+    }
+    for en, es in today_es_map.items():
+        today_es = today_es.replace(en, es)
+    today_en = datetime.utcnow().strftime('%B %d, %Y')
+
+    info_rows = [
+        [Paragraph("FECHA  •  DATE", S['lbl']), Paragraph(f"{today_es}  /  {today_en}", S['val'])],
+        [Paragraph("DESTINATARIO  •  TO", S['lbl']), Paragraph(contract.get('tenant_name', 'INQUILINO / TENANT'), S['val'])],
+        [Paragraph("PROPIEDAD  •  PROPERTY", S['lbl']), Paragraph(contract.get('property_address', '—'), S['val'])],
+    ]
+    if contract.get('contract_number'):
+        info_rows.append([
+            Paragraph("CONTRATO  •  LEASE N.°", S['lbl']),
+            Paragraph(contract['contract_number'], S['val'])
+        ])
+
+    info_card = Table(info_rows, colWidths=[1.6 * inch, 5.7 * inch])
+    info_card.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor('#F9FAFB')),
+        ('BOX', (0, 0), (-1, -1), 0.5, BORDER_GRAY),
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ('TOPPADDING', (0, 0), (-1, -1), 8),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
+        ('LEFTPADDING', (0, 0), (-1, -1), 12),
+        ('RIGHTPADDING', (0, 0), (-1, -1), 12),
+        ('LINEBELOW', (0, 0), (-1, -2), 0.4, BORDER_GRAY),
+    ]))
+    elements.append(info_card)
+    elements.append(Spacer(1, 16))
+
+    # ─── Amount owed box (only for nonpayment) ────────────────
+    if reason == 'nonpayment' and amount_owed > 0:
+        amount_box = Table(
+            [
+                [Paragraph("MONTO TOTAL ADEUDADO  •  TOTAL AMOUNT OWED", S['section'])],
+                [Paragraph(f"${amount_owed:,.2f}", S['amount_big'])],
+            ],
+            colWidths=[7.3 * inch],
+        )
+        amount_box.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor('#FFF5F7')),
+            ('BOX', (0, 0), (-1, -1), 2, BRAND_RED),
+            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+            ('TOPPADDING', (0, 0), (-1, -1), 8),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 10),
+        ]))
+        elements.append(amount_box)
+        elements.append(Spacer(1, 14))
+
+    # ─── Notice body ──────────────────────────────────────────
     if reason == 'nonpayment':
         elements.append(Paragraph(
-            f"You are hereby notified that you are in default of your lease for nonpayment of rent. "
-            f"The total amount owed is <b>{format_currency(amount_owed)}</b>. You are required to either:",
-            styles['Body']
+            "Por la presente se le <b>notifica formalmente</b> que se encuentra en incumplimiento "
+            "de su contrato de arrendamiento por <b>falta de pago de renta</b>. "
+            "Se le requiere tomar una de las siguientes acciones:",
+            S['body_es']
         ))
         elements.append(Paragraph(
-            f"Por la presente se le notifica que está en incumplimiento de su contrato por falta de pago de renta. "
-            f"El monto total adeudado es <b>{format_currency(amount_owed)}</b>. Se le requiere:",
-            styles['Body']
+            "<i>You are hereby formally notified that you are in default of your lease "
+            "agreement for <b>nonpayment of rent</b>. You are required to take one of the "
+            "following actions:</i>",
+            S['body']
         ))
     else:
         elements.append(Paragraph(
-            "You are hereby notified that your right to occupancy of the above-referenced property "
-            "has been terminated.",
-            styles['Body']
+            "Por la presente se le <b>notifica formalmente</b> que su derecho de ocupación "
+            "de la propiedad arriba mencionada ha sido <b>terminado</b>.",
+            S['body_es']
+        ))
+        elements.append(Paragraph(
+            "<i>You are hereby formally notified that your right to occupy the above-referenced "
+            "property has been <b>terminated</b>.</i>",
+            S['body']
         ))
 
     elements.append(Spacer(1, 8))
-    elements.append(Paragraph(
-        "<b>1.</b> Pay the full amount owed within THREE (3) DAYS from the date of this notice; OR",
-        styles['Body']
-    ))
-    elements.append(Paragraph(
-        "<b>2.</b> Vacate the premises within THREE (3) DAYS from the date of this notice.",
-        styles['Body']
-    ))
-    elements.append(Spacer(1, 8))
-    elements.append(Paragraph(
-        "<b>1.</b> Pagar el monto total adeudado dentro de TRES (3) DÍAS a partir de la fecha de este aviso; O",
-        styles['Body']
-    ))
-    elements.append(Paragraph(
-        "<b>2.</b> Desalojar las instalaciones dentro de TRES (3) DÍAS a partir de la fecha de este aviso.",
-        styles['Body']
-    ))
-    elements.append(Spacer(1, 12))
-    elements.append(Paragraph(
-        "If you fail to comply, legal proceedings may be initiated against you for eviction and recovery "
-        "of all amounts owed, including attorney's fees and court costs as permitted by law.",
-        styles['Warning']
-    ))
-    elements.append(Paragraph(
-        "Si no cumple, se podrán iniciar procedimientos legales en su contra por desalojo y recuperación "
-        "de todos los montos adeudados, incluyendo honorarios de abogado y costos judiciales.",
-        styles['Warning']
-    ))
 
-    # Landlord signature
-    elements.append(Spacer(1, 30))
-    sig_data = [
-        ['_' * 40, '', '_' * 30],
-        ['Landlord / Arrendador', '', 'Date / Fecha'],
-        [co['name'], '', today],
+    # ─── Actions (numbered cards) ─────────────────────────────
+    action_1_body = []
+    if reason == 'nonpayment':
+        action_1_body = [
+            Paragraph("OPCIÓN 1  •  OPTION 1", S['section']),
+            Paragraph("Pagar el monto total adeudado", S['action_label']),
+            Paragraph("Pay the full amount owed within THREE (3) DAYS from the date of this notice.", S['action_body']),
+            Paragraph("Pagar dentro de TRES (3) DÍAS a partir de la fecha de este aviso.", S['action_body']),
+        ]
+    action_2_body = [
+        Paragraph(("OPCIÓN 2  •  OPTION 2" if reason == 'nonpayment' else "ACCIÓN REQUERIDA  •  REQUIRED ACTION"), S['section']),
+        Paragraph("Desalojar la propiedad", S['action_label']),
+        Paragraph("Vacate the premises within THREE (3) DAYS from the date of this notice.", S['action_body']),
+        Paragraph("Desalojar las instalaciones dentro de TRES (3) DÍAS a partir de la fecha de este aviso.", S['action_body']),
     ]
-    t = Table(sig_data, colWidths=[220, 60, 190])
-    t.setStyle(TableStyle([
-        ('FONTSIZE', (0, 0), (-1, -1), 9),
-        ('FONTNAME', (0, 1), (-1, 1), 'Helvetica-Bold'),
-        ('TOPPADDING', (0, 0), (-1, -1), 4),
-    ]))
-    elements.append(t)
 
+    if action_1_body:
+        actions = Table(
+            [[action_1_body, '', action_2_body]],
+            colWidths=[3.45 * inch, 0.4 * inch, 3.45 * inch],
+        )
+        actions.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (0, 0), colors.HexColor('#F9FAFB')),
+            ('BACKGROUND', (2, 0), (2, 0), colors.HexColor('#F9FAFB')),
+            ('BOX', (0, 0), (0, 0), 0.5, BORDER_GRAY),
+            ('BOX', (2, 0), (2, 0), 0.5, BORDER_GRAY),
+            ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+            ('TOPPADDING', (0, 0), (-1, -1), 10),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 10),
+            ('LEFTPADDING', (0, 0), (-1, -1), 12),
+            ('RIGHTPADDING', (0, 0), (-1, -1), 12),
+        ]))
+    else:
+        actions = Table([[action_2_body]], colWidths=[7.3 * inch])
+        actions.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor('#F9FAFB')),
+            ('BOX', (0, 0), (-1, -1), 0.5, BORDER_GRAY),
+            ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+            ('TOPPADDING', (0, 0), (-1, -1), 12),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 12),
+            ('LEFTPADDING', (0, 0), (-1, -1), 14),
+            ('RIGHTPADDING', (0, 0), (-1, -1), 14),
+        ]))
+    elements.append(actions)
+    elements.append(Spacer(1, 16))
+
+    # ─── Warning box ──────────────────────────────────────────
+    warning_box = Table(
+        [[Paragraph(
+            "<b>⚠️ ADVERTENCIA LEGAL  •  LEGAL WARNING</b><br/><br/>"
+            "Si no cumple con este aviso, se podrán iniciar procedimientos legales en su contra "
+            "por <b>desalojo</b> y recuperación de todos los montos adeudados, incluyendo "
+            "honorarios de abogado y costos judiciales según lo permite la ley de Texas.<br/><br/>"
+            "<i>If you fail to comply with this notice, legal proceedings may be initiated against you "
+            "for <b>eviction</b> and recovery of all amounts owed, including attorney's fees and court "
+            "costs as permitted by Texas law.</i>",
+            S['warning_box']
+        )]],
+        colWidths=[7.3 * inch],
+    )
+    warning_box.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor('#FEF3C7')),
+        ('LINEABOVE', (0, 0), (-1, 0), 2, colors.HexColor('#F59E0B')),
+        ('LINEBELOW', (0, 0), (-1, 0), 2, colors.HexColor('#F59E0B')),
+        ('TOPPADDING', (0, 0), (-1, -1), 12),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 12),
+        ('LEFTPADDING', (0, 0), (-1, -1), 14),
+        ('RIGHTPADDING', (0, 0), (-1, -1), 14),
+    ]))
+    elements.append(warning_box)
+    elements.append(Spacer(1, 28))
+
+    # ─── Signature block ──────────────────────────────────────
+    sig = Table(
+        [
+            [Paragraph('_' * 38, S['sig_label']), '', Paragraph('_' * 24, S['sig_label'])],
+            [Paragraph("Arrendador  •  Landlord", S['sig_label']), '', Paragraph("Fecha  •  Date", S['sig_label'])],
+            [Paragraph(co['name'], S['sig_val']), '', Paragraph(today_en, S['sig_val'])],
+        ],
+        colWidths=[3.5 * inch, 0.6 * inch, 3.2 * inch],
+    )
+    sig.setStyle(TableStyle([
+        ('TOPPADDING', (0, 0), (-1, -1), 2),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 2),
+        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+    ]))
+    elements.append(sig)
     elements.append(Spacer(1, 20))
+
+    # ─── Footer ───────────────────────────────────────────────
     elements.append(HRFlowable(width="100%", thickness=0.5, color=BORDER_GRAY))
+    elements.append(Spacer(1, 6))
     elements.append(Paragraph(
-        f"Generated by {co['name']} — {co['address']} | {co['phone']}",
-        styles['Footer']
+        f"<b>{co['name']}</b>  •  {co['address']}  •  {co['phone']}  •  {co['email']}",
+        S['footer']
+    ))
+    elements.append(Paragraph(
+        f"Documento generado el {datetime.utcnow().strftime('%d/%m/%Y %H:%M')} UTC",
+        S['footer']
     ))
 
     doc.build(elements)

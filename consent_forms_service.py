@@ -7,17 +7,35 @@ Generates individual consent/authorization PDFs for:
 - ACH/Auto-Debit Authorization
 """
 import io
+import os
 import base64
 import logging
 from datetime import datetime
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import inch
-from reportlab.lib.colors import HexColor
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image
+from reportlab.lib.colors import HexColor, white
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image, HRFlowable
 from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_JUSTIFY
 
 logger = logging.getLogger(__name__)
+
+# ─── Brand constants ─────────────────────────────────────────
+BRAND_RED = HexColor('#C8102E')
+BRAND_CHARCOAL = HexColor('#1F2937')
+BORDER_GRAY = HexColor('#E5E7EB')
+MUTED_GRAY = HexColor('#6B7280')
+
+
+def _get_logo_path():
+    """Locate Ross House Rentals logo (same logic as rental_pdf_service)."""
+    base = os.path.dirname(os.path.abspath(__file__))
+    for name in ['ross_house_logo.png', 'company_logo.png']:
+        p = os.path.join(base, 'assets', name)
+        if os.path.exists(p):
+            return p
+    return None
+
 
 # ═══════════════════════════════════════════════════════════════════
 # STYLES
@@ -25,68 +43,109 @@ logger = logging.getLogger(__name__)
 def get_consent_styles():
     """Get styled paragraph styles for consent forms"""
     styles = getSampleStyleSheet()
-    
+
+    styles.add(ParagraphStyle(
+        name='HeroTitle', fontName='Helvetica-Bold', fontSize=20,
+        leading=24, textColor=white, alignment=TA_LEFT, spaceAfter=0,
+    ))
+    styles.add(ParagraphStyle(
+        name='HeroSub', fontName='Helvetica', fontSize=9,
+        leading=12, textColor=HexColor('#FFD1D1'),
+        alignment=TA_LEFT, spaceAfter=0,
+    ))
+
     styles.add(ParagraphStyle(
         name='ConsentTitle',
         fontName='Helvetica-Bold',
         fontSize=16,
-        textColor=HexColor('#1a1a1a'),
+        textColor=BRAND_RED,
         alignment=TA_CENTER,
-        spaceAfter=20,
+        spaceAfter=4,
+        leading=20,
     ))
-    
+
     styles.add(ParagraphStyle(
         name='ConsentSubtitle',
         fontName='Helvetica',
         fontSize=11,
-        textColor=HexColor('#666666'),
+        textColor=MUTED_GRAY,
         alignment=TA_CENTER,
-        spaceAfter=30,
+        spaceAfter=16,
+        leading=14,
     ))
-    
+
     styles.add(ParagraphStyle(
         name='ConsentBody',
         fontName='Helvetica',
         fontSize=10,
-        textColor=HexColor('#333333'),
+        textColor=BRAND_CHARCOAL,
         alignment=TA_JUSTIFY,
-        spaceAfter=12,
+        spaceAfter=10,
         leading=14,
     ))
-    
+
     styles.add(ParagraphStyle(
         name='ConsentBold',
         fontName='Helvetica-Bold',
         fontSize=10,
-        textColor=HexColor('#1a1a1a'),
+        textColor=BRAND_CHARCOAL,
         spaceAfter=8,
+        leading=13,
     ))
-    
+
     styles.add(ParagraphStyle(
         name='ConsentSmall',
         fontName='Helvetica',
         fontSize=8,
-        textColor=HexColor('#666666'),
+        textColor=MUTED_GRAY,
         alignment=TA_CENTER,
-        spaceAfter=6,
+        spaceAfter=4,
+        leading=11,
     ))
-    
+
     return styles
 
 
 def add_header(elements, styles, title: str, subtitle: str = None):
-    """Add company header to consent form"""
-    elements.append(Paragraph(
-        "<b>ROSS HOUSE RENTALS LLC</b>",
-        styles['ConsentTitle']
-    ))
+    """Add premium branded header (logo + title on black) to consent form."""
+    logo_path = _get_logo_path()
+    if logo_path:
+        try:
+            logo = Image(logo_path, width=1.05 * inch, height=1.05 * inch, kind='proportional')
+        except Exception:
+            logo = Paragraph("<b>ROSS HOUSE</b>", styles['HeroTitle'])
+    else:
+        logo = Paragraph("<b>ROSS HOUSE</b>", styles['HeroTitle'])
+
+    title_block = [
+        Paragraph("ROSS HOUSE RENTALS LLC", styles['HeroTitle']),
+        Spacer(1, 2),
+        Paragraph("Formulario de Consentimiento  •  Consent Form", styles['HeroSub']),
+    ]
+
+    hero = Table(
+        [[logo, title_block]],
+        colWidths=[1.2 * inch, 6.05 * inch],
+        rowHeights=[0.95 * inch],
+    )
+    hero.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, -1), BRAND_CHARCOAL),
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ('ALIGN', (0, 0), (0, 0), 'CENTER'),
+        ('LEFTPADDING', (0, 0), (-1, -1), 10),
+        ('RIGHTPADDING', (0, 0), (-1, -1), 10),
+    ]))
+    elements.append(hero)
+    elements.append(HRFlowable(width="100%", thickness=4, color=BRAND_RED,
+                               spaceBefore=0, spaceAfter=0))
+    elements.append(Spacer(1, 14))
+
+    # Form title
+    elements.append(Paragraph(f"<b>{title}</b>", styles['ConsentTitle']))
     if subtitle:
         elements.append(Paragraph(subtitle, styles['ConsentSubtitle']))
-    elements.append(Paragraph(
-        f"<b>{title}</b>",
-        styles['ConsentTitle']
-    ))
-    elements.append(Spacer(1, 20))
+    else:
+        elements.append(Spacer(1, 12))
 
 
 def add_signature_block(elements, styles, signer_name: str, signature_data: str = None, date_signed: str = None):
