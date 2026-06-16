@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Request, HTTPException
 from bson import ObjectId
 
-from .shared import get_db, auth_admin, auth_tenant
+from .shared import get_db, auth_admin, auth_tenant, auth_tenant_flex
 
 logger = logging.getLogger("utility_billing")
 router = APIRouter()
@@ -282,7 +282,7 @@ async def admin_delete_bill(request: Request, bill_id: str):
 
 @router.get("/tenant/utility-bills")
 async def tenant_list_bills(request: Request):
-    tenant = await auth_tenant(request)
+    tenant = await auth_tenant_flex(request)
     db = get_db()
     tenant_id = str(tenant["_id"])
     bills = []
@@ -315,7 +315,7 @@ async def tenant_list_bills(request: Request):
 @router.post("/tenant/utility-bills/{bill_id}/create-payment")
 async def tenant_create_bill_payment(request: Request, bill_id: str):
     """Create a Stripe PaymentIntent to pay a utility bill in the app."""
-    tenant = await auth_tenant(request)
+    tenant = await auth_tenant_flex(request)
     db = get_db()
     bill = await db.tenant_utility_bills.find_one({"_id": ObjectId(bill_id), "tenant_id": str(tenant["_id"])})
     if not bill:
@@ -362,7 +362,7 @@ async def tenant_create_bill_payment(request: Request, bill_id: str):
 @router.post("/tenant/utility-bills/{bill_id}/confirm-payment")
 async def tenant_confirm_bill_payment(request: Request, bill_id: str):
     """Verify the PaymentIntent succeeded and mark the bill as paid."""
-    tenant = await auth_tenant(request)
+    tenant = await auth_tenant_flex(request)
     db = get_db()
     data = await request.json()
     payment_intent_id = (data.get("payment_intent_id") or "").strip()

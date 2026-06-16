@@ -1279,7 +1279,7 @@ async def get_tenant_payment_config(request: Request):
     tenant = await auth_tenant_flex(request)
 
     # Get rental config for payment methods
-    config = await get_db().rental_config.find_one({}) or {}
+    config = await get_db().rental_config.find_one({"type": "company"}) or {}
 
     # Resolve possible tenant_ids that contracts may reference
     tenant_ids_to_try = set()
