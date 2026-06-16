@@ -158,6 +158,60 @@ async def auth_tenant(request: Request):
         raise HTTPException(status_code=401, detail="Token inválido")
 
 
+async def auth_tenant_flex(request: Request):
+    """Accept BOTH legacy `tenant` JWTs and modern `marketplace` JWTs.
+
+    Returns a tenant-like dict so existing endpoints keep working.
+    For marketplace users with role=tenant, resolves the matching
+    `tenants` document (or builds an in-memory one) so callers can use
+    `tenant['_id']` as the contract.tenant_id.
+    """
+    db = get_db()
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Token requerido")
+    token = auth.split(" ")[1]
+
+    # ── 1) Try legacy tenant JWT ──
+    try:
+        payload = jwt.decode(token, TENANT_JWT_SECRET, algorithms=["HS256"])
+        if payload.get("type") == "tenant":
+            tenant = await db.tenants.find_one({"_id": ObjectId(payload["tenant_id"])})
+            if tenant:
+                return serialize(tenant)
+    except Exception:
+        pass
+
+    # ── 2) Fall back to marketplace JWT and resolve tenant by app_user_id/email ──
+    try:
+        user = await auth_marketplace(request)
+    except HTTPException as e:
+        raise e
+    except Exception:
+        raise HTTPException(status_code=401, detail="Token inválido")
+
+    user_id = str(user.get("_id", ""))
+    user_email = (user.get("email") or "").strip().lower()
+
+    # Try linked tenants record
+    tenant = None
+    if user_id:
+        tenant = await db.tenants.find_one({"app_user_id": user_id})
+    if not tenant and user_email:
+        import re as _re
+        tenant = await db.tenants.find_one({
+            "email": {"$regex": f"^{_re.escape(user_email)}$", "$options": "i"}
+        })
+
+    if tenant:
+        return serialize(tenant)
+
+    # No tenants record exists — return the marketplace user as-is so endpoints
+    # that only need _id / email can still work. Contracts use tenant_id which
+    # for some seed data is the app_user_id directly.
+    return user
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # SERIALIZATION
 # ═══════════════════════════════════════════════════════════════════════════════

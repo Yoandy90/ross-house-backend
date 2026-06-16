@@ -10,7 +10,7 @@ from fastapi import APIRouter, HTTPException, Request
 import jwt
 import hashlib
 from rental.shared import (
-    get_db, auth_admin, auth_marketplace, auth_tenant,
+    get_db, auth_admin, auth_marketplace, auth_tenant, auth_tenant_flex,
     serialize, create_marketplace_token, create_tenant_token,
     send_rental_push_to_user, send_rental_push_to_admins,
     TENANT_JWT_SECRET,
@@ -228,7 +228,7 @@ async def tenant_dashboard(request: Request):
 @router.get('/tenant/payment/{payment_id}/receipt')
 async def tenant_payment_receipt(payment_id: str, request: Request):
     """Generate PDF receipt for a specific payment (tenant-authenticated)"""
-    tenant = await auth_tenant(request)
+    tenant = await auth_tenant_flex(request)
     tenant_id = tenant["_id"]
 
     try:
@@ -1092,7 +1092,7 @@ async def get_profile_photo(request: Request):
 @router.post('/tenant/maintenance-request')
 async def create_maintenance_request(request: Request):
     """Tenant: Submit a maintenance request"""
-    tenant = await auth_tenant(request)
+    tenant = await auth_tenant_flex(request)
     data = await request.json()
     
     title = data.get("title", "").strip()
@@ -1149,7 +1149,7 @@ async def create_maintenance_request(request: Request):
 @router.get('/tenant/maintenance-requests')
 async def list_tenant_maintenance_requests(request: Request):
     """Tenant: List their maintenance requests"""
-    tenant = await auth_tenant(request)
+    tenant = await auth_tenant_flex(request)
     
     cursor = get_db().maintenance_requests.find(
         {"tenant_id": tenant["_id"]}
@@ -1276,22 +1276,48 @@ async def update_maintenance_request(request_id: str, request: Request):
 @router.get('/tenant/payment-config')
 async def get_tenant_payment_config(request: Request):
     """Tenant: Get payment configuration and methods"""
-    tenant = await auth_tenant(request)
-    
+    tenant = await auth_tenant_flex(request)
+
     # Get rental config for payment methods
     config = await get_db().rental_config.find_one({}) or {}
-    
-    # Get contract for amount due
+
+    # Resolve possible tenant_ids that contracts may reference
+    tenant_ids_to_try = set()
+    if tenant.get("_id"):
+        tenant_ids_to_try.add(str(tenant["_id"]))
+    if tenant.get("app_user_id"):
+        tenant_ids_to_try.add(str(tenant["app_user_id"]))
+    tenant_email = (tenant.get("email") or "").strip().lower()
+    if tenant_email:
+        import re as _re
+        async for t in get_db().tenants.find({
+            "email": {"$regex": f"^{_re.escape(tenant_email)}$", "$options": "i"}
+        }):
+            tenant_ids_to_try.add(str(t["_id"]))
+            if t.get("app_user_id"):
+                tenant_ids_to_try.add(str(t["app_user_id"]))
+
     contract = await get_db().rental_contracts.find_one({
-        "tenant_id": tenant["_id"],
-        "status": "active"
+        "tenant_id": {"$in": list(tenant_ids_to_try)},
+        "status": {"$in": ["active", "activo"]},
     })
-    
+
+    # Find latest pending rental_payment for accurate amount_due (includes late fee)
+    pending_payment = None
+    if contract:
+        pending_payment = await get_db().rental_payments.find_one(
+            {
+                "contract_id": str(contract["_id"]),
+                "status": {"$in": ["pending", "late", "partial"]},
+            },
+            sort=[("due_date", 1), ("created_at", 1)]
+        )
+
     # Check if current month is paid
     now = datetime.utcnow()
     current_month = now.strftime('%B').lower()
     current_year = now.year
-    
+
     current_paid = False
     if contract:
         existing = await get_db().rental_payments.find_one({
@@ -1301,14 +1327,29 @@ async def get_tenant_payment_config(request: Request):
             "status": {"$in": ["completed", "paid", "pending_verification"]}
         })
         current_paid = existing is not None
-    
+
     payment_methods = config.get("payment_methods", {})
-    
+
+    # Compute real amount due (rent + late fee from pending payment)
+    rent_amount = 0.0
+    late_fee = 0.0
+    amount_due = 0.0
+    if pending_payment:
+        rent_amount = float(pending_payment.get("amount", 0) or 0)
+        late_fee = float(pending_payment.get("late_fee", 0) or 0)
+        amount_due = rent_amount + late_fee
+    elif contract:
+        rent_amount = float(contract.get("monthly_rent") or contract.get("rent_amount") or 0)
+        late_fee = float(contract.get("late_fee_amount", 0) or 0) if not current_paid else 0
+        amount_due = rent_amount
+
     return {
         "success": True,
         "stripe_enabled": bool(config.get("stripe_enabled", False) and config.get("stripe_secret_key")),
-        "rent_amount": contract.get("rent_amount", 0) if contract else 0,
-        "late_fee": contract.get("late_fee_amount", 0) if contract else 0,
+        "rent_amount": rent_amount,
+        "late_fee": late_fee,
+        "amount_due": amount_due,
+        "pending_payment_id": str(pending_payment["_id"]) if pending_payment else None,
         "due_day": contract.get("payment_due_day", 1) if contract else 1,
         "current_month_paid": current_paid,
         "current_month": now.strftime('%B %Y'),
@@ -1341,7 +1382,7 @@ async def get_tenant_payment_config(request: Request):
 @router.post('/tenant/submit-payment')
 async def tenant_submit_payment(request: Request):
     """Tenant: Submit a payment confirmation for verification"""
-    tenant = await auth_tenant(request)
+    tenant = await auth_tenant_flex(request)
     data = await request.json()
     
     payment_method = data.get("payment_method", "").strip()
@@ -1414,7 +1455,7 @@ async def tenant_submit_payment(request: Request):
 @router.get('/tenant/payment-history')
 async def tenant_payment_history(request: Request):
     """Tenant: Get detailed payment history"""
-    tenant = await auth_tenant(request)
+    tenant = await auth_tenant_flex(request)
     
     # Get all contracts for this tenant
     contracts = await get_db().rental_contracts.find(
