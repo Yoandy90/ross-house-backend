@@ -221,24 +221,32 @@ async def vault_list_payment_methods(request: Request):
 
     # ── Stripe cards (saved via /tenant/payment-methods/setup) ──
     async for pm in db.payment_methods.find({}).sort("created_at", -1):
+        # Normalize legacy field names
+        card_last4 = pm.get("card_last4") or pm.get("last4") or pm.get("last_4", "")
+        card_brand = pm.get("card_brand") or pm.get("brand", "")
+        is_legacy = bool(pm.get("encrypted_number") or pm.get("nmi_vault_id"))
         items.append({
             "id": str(pm["_id"]),
-            "type": pm.get("type") or ("card" if pm.get("card_last4") else "bank"),
+            "type": pm.get("type") or ("card" if (card_last4 or pm.get("encrypted_number")) else "bank"),
             "user_id": str(pm.get("user_id", "")),
-            "user_name": pm.get("user_name", ""),
+            "user_name": pm.get("user_name") or pm.get("client_name") or pm.get("cardholder_name", ""),
             "user_email": pm.get("user_email", ""),
-            "card_brand": pm.get("card_brand", ""),
-            "card_last4": pm.get("card_last4", ""),
-            "card_exp": pm.get("card_exp", ""),
+            "card_brand": card_brand,
+            "card_last4": card_last4,
+            "card_exp": pm.get("card_exp") or (f"{pm.get('exp_month', '')}/{pm.get('exp_year', '')}" if pm.get("exp_month") else ""),
             "bank_name": pm.get("bank_name", ""),
             "account_type": pm.get("account_type", ""),
             "account_last4": pm.get("account_last4", ""),
-            "routing_masked": mask(decrypt(pm.get("routing_encrypted", "")), visible=4) if pm.get("routing_encrypted") else "",
+            "routing_masked": (mask(decrypt(pm.get("routing_encrypted", "")), visible=4)
+                               if pm.get("routing_encrypted")
+                               else (mask(pm.get("routing_number", ""), visible=4) if pm.get("routing_number") else "")),
             "is_default": bool(pm.get("is_default", False)),
             "is_active_for_autopay": bool(pm.get("is_active_for_autopay", False)),
             "stripe_payment_method_id": pm.get("stripe_payment_method_id", ""),
             "created_at": pm.get("created_at"),
             "source": pm.get("source", "stripe"),
+            "is_legacy": is_legacy,
+            "has_nmi_vault": bool(pm.get("nmi_vault_id")),
         })
 
     return {"success": True, "items": items, "count": len(items)}
@@ -246,7 +254,13 @@ async def vault_list_payment_methods(request: Request):
 
 @router.get("/admin/vault/payment-methods/{method_id}/reveal")
 async def vault_reveal_method(method_id: str, request: Request):
-    """Reveal full routing + account numbers — requires vault session token."""
+    """Reveal full routing + account numbers — requires vault session token.
+
+    Supports BOTH data formats:
+      - New format (routing_encrypted / account_encrypted) — Fernet-decrypted
+      - Legacy plain-text format (routing_number / account_number) — passed through
+      - Legacy NMI/loans card format (nmi_vault_id) — only metadata returned
+    """
     admin = await auth_admin(request)
     session = await _require_vault_session(request)
     db = get_db()
@@ -255,28 +269,66 @@ async def vault_reveal_method(method_id: str, request: Request):
     if not pm:
         raise HTTPException(status_code=404, detail="Método de pago no encontrado")
 
-    routing = decrypt(pm.get("routing_encrypted", ""))
-    account = decrypt(pm.get("account_encrypted", ""))
+    # ── Try multiple field names (new + legacy) ─────────────
+    routing_full = ""
+    account_full = ""
+    decrypt_error = None
+
+    # NEW format (our /tenant/bank-accounts/add)
+    if pm.get("routing_encrypted"):
+        try:
+            routing_full = decrypt(pm["routing_encrypted"])
+            if not routing_full:
+                decrypt_error = "Encriptación con llave diferente"
+        except Exception:
+            decrypt_error = "Error al desencriptar (llave incorrecta)"
+    if pm.get("account_encrypted"):
+        try:
+            decrypted = decrypt(pm["account_encrypted"])
+            if decrypted:
+                account_full = decrypted
+        except Exception:
+            pass
+
+    # LEGACY plain-text format (older loan flow)
+    if not routing_full and pm.get("routing_number"):
+        routing_full = str(pm.get("routing_number", ""))
+    if not account_full and pm.get("account_number"):
+        account_full = str(pm.get("account_number", ""))
+
+    # LEGACY card-only with no bank info → nothing to reveal
+    is_card_only = bool(pm.get("encrypted_number") or pm.get("nmi_vault_id") or pm.get("card_brand")) and not (routing_full or account_full)
 
     await _audit(db, admin.get("email", ""), "reveal", target=method_id, meta={
         "user_id": str(pm.get("user_id", "")),
         "type": pm.get("type"),
+        "had_routing": bool(routing_full),
+        "had_account": bool(account_full),
+        "decrypt_error": decrypt_error,
     })
 
     return {
         "success": True,
         "id": str(pm["_id"]),
-        "type": pm.get("type"),
-        "routing_full": routing,
-        "account_full": account,
-        "card_last4": pm.get("card_last4", ""),
-        "card_brand": pm.get("card_brand", ""),
-        "card_exp": pm.get("card_exp", ""),
+        "type": pm.get("type") or ("card" if is_card_only else "bank"),
+        "routing_full": routing_full,
+        "account_full": account_full,
+        "card_last4": pm.get("card_last4") or pm.get("last4") or pm.get("last_4", ""),
+        "card_brand": pm.get("card_brand") or pm.get("brand", ""),
+        "card_exp": pm.get("card_exp") or (f"{pm.get('exp_month', '')}/{pm.get('exp_year', '')}" if pm.get("exp_month") else ""),
         "bank_name": pm.get("bank_name", ""),
         "account_type": pm.get("account_type", ""),
         "account_last4": pm.get("account_last4", ""),
-        "user_name": pm.get("user_name", ""),
+        "user_name": pm.get("user_name") or pm.get("client_name") or pm.get("cardholder_name", ""),
         "user_email": pm.get("user_email", ""),
+        "nmi_vault_id": pm.get("nmi_vault_id", ""),
+        "legacy_format": is_card_only or bool(pm.get("encrypted_number")),
+        "decrypt_warning": decrypt_error,
+        "message": (
+            "⚠️ Tarjeta legacy del sistema antiguo (encriptada con llave diferente). "
+            "Solo metadatos disponibles. Para ver el número completo, accede al NMI Vault con el customer_vault_id."
+            if is_card_only else None
+        ),
     }
 
 
