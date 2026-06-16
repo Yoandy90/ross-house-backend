@@ -474,6 +474,37 @@ async def tenant_create_stripe_payment(request: Request):
         import stripe
         stripe.api_key = stripe_secret
 
+        # ─── Resolve Stripe Customer so saved cards appear in PaymentSheet ────
+        # Saved payment methods are stored against `app_users.stripe_customer_id`
+        # (the "Métodos de Pago" screen uses `auth_marketplace`).
+        # The `auth_tenant_flex` returns a `tenants` doc, so we have to find the
+        # linked app_user to reuse the same Stripe customer.
+        stripe_customer_id = None
+        ephemeral_key_secret = None
+        try:
+            app_user = None
+            app_user_id = tenant.get("app_user_id")
+            if app_user_id:
+                try:
+                    app_user = await get_db().app_users.find_one({"_id": ObjectId(app_user_id)})
+                except Exception:
+                    app_user = None
+            if not app_user and tenant.get("email"):
+                import re as _re
+                _email = tenant["email"].strip().lower()
+                app_user = await get_db().app_users.find_one({
+                    "email": {"$regex": f"^{_re.escape(_email)}$", "$options": "i"}
+                })
+
+            if app_user:
+                stripe_customer_id = await _get_or_create_stripe_customer(app_user)
+            elif tenant.get("stripe_customer_id"):
+                # Last resort: tenant doc itself has one stored
+                stripe_customer_id = tenant["stripe_customer_id"]
+        except Exception as e:
+            logging.warning(f"Stripe customer resolution failed for tenant {tenant.get('_id')}: {e}")
+            stripe_customer_id = None
+
         # Check if property has a connected owner (Stripe Connect split payment)
         property_id = str(contract.get("property_id", ""))
         owner_stripe_account = None
@@ -504,6 +535,12 @@ async def tenant_create_stripe_payment(request: Request):
             "receipt_email": tenant.get("email"),
         }
 
+        # Attach customer (enables saved cards in PaymentSheet) and persist
+        # future-use so any new card entered also gets saved automatically.
+        if stripe_customer_id:
+            intent_params["customer"] = stripe_customer_id
+            intent_params["setup_future_usage"] = "off_session"
+
         # If owner has Stripe Connect, add automatic split
         if owner_stripe_account:
             application_fee = int(total * 100 * (commission_rate / 100))
@@ -515,6 +552,19 @@ async def tenant_create_stripe_payment(request: Request):
 
         intent = stripe.PaymentIntent.create(**intent_params)
 
+        # Create an Ephemeral Key so the mobile PaymentSheet can list/manage
+        # the customer's saved payment methods.
+        if stripe_customer_id:
+            try:
+                ek = stripe.EphemeralKey.create(
+                    customer=stripe_customer_id,
+                    stripe_version="2024-06-20",
+                )
+                ephemeral_key_secret = ek.secret
+            except Exception as e:
+                logging.warning(f"EphemeralKey creation failed: {e}")
+                ephemeral_key_secret = None
+
         return {
             "success": True,
             "client_secret": intent.client_secret,
@@ -523,6 +573,8 @@ async def tenant_create_stripe_payment(request: Request):
             "publishable_key": config.get("stripe_publishable_key", ""),
             "split_payment": bool(owner_stripe_account),
             "commission_rate": commission_rate if owner_stripe_account else 0,
+            "customer_id": stripe_customer_id or "",
+            "ephemeral_key": ephemeral_key_secret or "",
         }
 
     except Exception as e:

@@ -632,12 +632,23 @@ async def update_contract(contract_id: str, request: Request):
 
     update_fields = {"updated_at": now}
 
+    # Accept legacy `late_fee` (from Next.js admin) as alias of `late_fee_amount`
+    if 'late_fee' in data and 'late_fee_amount' not in data:
+        data['late_fee_amount'] = data['late_fee']
+    # Accept legacy `grace_period_days` alias
+    if 'grace_period_days' in data and 'late_fee_grace_days' not in data:
+        data['late_fee_grace_days'] = data['grace_period_days']
+    # Accept legacy `payment_day` alias
+    if 'payment_day' in data and 'payment_due_day' not in data:
+        data['payment_due_day'] = data['payment_day']
+
     # Fields that can be updated
     editable_fields = [
         'start_date', 'end_date', 'rent_amount', 'deposit_amount',
         'payment_due_day', 'late_fee_amount', 'late_fee_grace_days',
         'terms', 'special_conditions', 'payment_method_type',
         'customer_vault_id', 'vault_display', 'vault_customer_name',
+        'status',
     ]
 
     for field in editable_fields:
@@ -671,9 +682,48 @@ async def update_contract(contract_id: str, request: Request):
 
     await get_db().rental_contracts.update_one({"_id": ObjectId(contract_id)}, {"$set": update_fields})
 
+    # ---- Sync late_fee_amount changes to pending invoices ----
+    synced_invoices = 0
+    if 'late_fee_amount' in data:
+        try:
+            new_late_fee = float(data['late_fee_amount']) if data['late_fee_amount'] else 0.0
+            old_late_fee = float(contract.get('late_fee_amount') or contract.get('late_fee') or 0)
+            if abs(new_late_fee - old_late_fee) > 0.001:
+                # Update pending invoices that ALREADY have a late fee applied.
+                # We don't touch pending invoices with late_fee=0 (not late yet)
+                # because the cron will apply the new amount when they go past due.
+                pending_cursor = get_db().rental_payments.find({
+                    "contract_id": contract_id,
+                    "status": "pending",
+                    "late_fee": {"$gt": 0},
+                })
+                async for inv in pending_cursor:
+                    base_amount = float(inv.get('amount') or 0)
+                    new_total = base_amount + new_late_fee
+                    new_paid = new_total if (inv.get('total_paid') or 0) >= (inv.get('total_due') or 0) else float(inv.get('total_paid') or 0)
+                    await get_db().rental_payments.update_one(
+                        {"_id": inv["_id"]},
+                        {"$set": {
+                            "late_fee": new_late_fee,
+                            "total_due": new_total,
+                            "total_paid": new_paid,
+                            "updated_at": now,
+                            "late_fee_synced_from_contract": True,
+                        }},
+                    )
+                    synced_invoices += 1
+        except Exception as e:
+            # Don't fail the contract update if sync fails — log and continue.
+            print(f"[contract update] late_fee sync error: {e}")
+
+    msg = f"Contrato {contract.get('contract_number', '')} actualizado exitosamente"
+    if synced_invoices:
+        msg += f". {synced_invoices} factura(s) pendiente(s) recalculada(s) con el nuevo cargo por mora."
+
     return {
         "success": True,
-        "message": f"Contrato {contract.get('contract_number', '')} actualizado exitosamente",
+        "message": msg,
+        "synced_pending_invoices": synced_invoices,
     }
 
 
