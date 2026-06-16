@@ -1319,195 +1319,381 @@ def generate_3day_notice_pdf(contract: dict, config: dict = None, reason: str = 
 
 def generate_rental_receipt_pdf(payment: dict, contract: dict = None, tenant: dict = None, config: dict = None):
     """
-    Generate a professional PDF receipt for a rental payment.
+    Generate a premium, modern PDF receipt for a rental payment.
+    Bilingual ES/EN with Ross House Rentals branding.
     Returns base64-encoded PDF string.
     """
+    from reportlab.platypus.flowables import Flowable
     co = {**DEFAULT_COMPANY, **(config or {})}
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(
         buffer, pagesize=letter,
-        leftMargin=0.75 * inch, rightMargin=0.75 * inch,
-        topMargin=0.6 * inch, bottomMargin=0.6 * inch,
+        leftMargin=0.5 * inch, rightMargin=0.5 * inch,
+        topMargin=0.45 * inch, bottomMargin=0.45 * inch,
+        title=f"Recibo de Renta — {payment.get('receipt_number','')}",
+        author=co['name'],
     )
 
-    styles = getSampleStyleSheet()
-    styles.add(ParagraphStyle('ReceiptTitle', parent=styles['Title'], fontSize=22, textColor=NAVY, spaceAfter=4, fontName='Helvetica-Bold'))
-    styles.add(ParagraphStyle('ReceiptSubtitle', parent=styles['Normal'], fontSize=10, textColor=GRAY, alignment=TA_CENTER, spaceAfter=8))
-    styles.add(ParagraphStyle('SectionHead', parent=styles['Normal'], fontSize=12, textColor=NAVY, fontName='Helvetica-Bold', spaceBefore=14, spaceAfter=6))
-    styles.add(ParagraphStyle('FieldLabel', parent=styles['Normal'], fontSize=9, textColor=MUTED_GRAY))
-    styles.add(ParagraphStyle('FieldValue', parent=styles['Normal'], fontSize=10, textColor=DARK_GRAY, fontName='Helvetica-Bold'))
-    styles.add(ParagraphStyle('SmallText', parent=styles['Normal'], fontSize=8, textColor=MUTED_GRAY, alignment=TA_CENTER))
-    styles.add(ParagraphStyle('BigAmount', parent=styles['Normal'], fontSize=28, textColor=BRAND_RED, fontName='Helvetica-Bold', alignment=TA_CENTER))
-    styles.add(ParagraphStyle('PaidBadge', parent=styles['Normal'], fontSize=14, textColor=GREEN, fontName='Helvetica-Bold', alignment=TA_CENTER))
+    # ─── Styles ───────────────────────────────────────────────
+    base_styles = getSampleStyleSheet()
+    S = {}
+    S['hero_title'] = ParagraphStyle('hero_title', parent=base_styles['Normal'],
+        fontSize=24, leading=28, textColor=colors.white,
+        fontName='Helvetica-Bold', alignment=TA_LEFT, spaceAfter=0)
+    S['hero_sub'] = ParagraphStyle('hero_sub', parent=base_styles['Normal'],
+        fontSize=10, leading=14, textColor=colors.HexColor('#FFD1D1'),
+        fontName='Helvetica', alignment=TA_LEFT, spaceAfter=0)
+    S['hero_meta'] = ParagraphStyle('hero_meta', parent=base_styles['Normal'],
+        fontSize=8.5, leading=12, textColor=colors.white,
+        fontName='Helvetica', alignment=TA_RIGHT)
+    S['hero_meta_b'] = ParagraphStyle('hero_meta_b', parent=base_styles['Normal'],
+        fontSize=10, leading=13, textColor=colors.white,
+        fontName='Helvetica-Bold', alignment=TA_RIGHT)
+    S['amount_big'] = ParagraphStyle('amount_big', parent=base_styles['Normal'],
+        fontSize=42, leading=46, textColor=BRAND_CHARCOAL,
+        fontName='Helvetica-Bold', alignment=TA_CENTER, spaceAfter=2)
+    S['amount_lbl'] = ParagraphStyle('amount_lbl', parent=base_styles['Normal'],
+        fontSize=9, leading=12, textColor=MUTED_GRAY,
+        fontName='Helvetica', alignment=TA_CENTER, spaceAfter=0,
+        kerning=2)
+    S['status_paid'] = ParagraphStyle('status_paid', parent=base_styles['Normal'],
+        fontSize=10, leading=14, textColor=colors.white,
+        fontName='Helvetica-Bold', alignment=TA_CENTER)
+    S['section'] = ParagraphStyle('section', parent=base_styles['Normal'],
+        fontSize=8, leading=11, textColor=MUTED_GRAY,
+        fontName='Helvetica-Bold', alignment=TA_LEFT, spaceAfter=4)
+    S['lbl'] = ParagraphStyle('lbl', parent=base_styles['Normal'],
+        fontSize=7.5, leading=10, textColor=MUTED_GRAY,
+        fontName='Helvetica', spaceAfter=2)
+    S['val'] = ParagraphStyle('val', parent=base_styles['Normal'],
+        fontSize=10.5, leading=14, textColor=BRAND_CHARCOAL,
+        fontName='Helvetica-Bold')
+    S['val_small'] = ParagraphStyle('val_small', parent=base_styles['Normal'],
+        fontSize=8.5, leading=12, textColor=GRAY,
+        fontName='Helvetica')
+    S['table_th'] = ParagraphStyle('table_th', parent=base_styles['Normal'],
+        fontSize=8.5, leading=11, textColor=colors.white,
+        fontName='Helvetica-Bold')
+    S['table_td'] = ParagraphStyle('table_td', parent=base_styles['Normal'],
+        fontSize=10, leading=14, textColor=BRAND_CHARCOAL,
+        fontName='Helvetica')
+    S['table_td_amount'] = ParagraphStyle('table_td_amount', parent=base_styles['Normal'],
+        fontSize=10, leading=14, textColor=BRAND_CHARCOAL,
+        fontName='Helvetica-Bold', alignment=TA_RIGHT)
+    S['total_label'] = ParagraphStyle('total_label', parent=base_styles['Normal'],
+        fontSize=11, leading=15, textColor=BRAND_CHARCOAL,
+        fontName='Helvetica-Bold', alignment=TA_LEFT)
+    S['total_amount'] = ParagraphStyle('total_amount', parent=base_styles['Normal'],
+        fontSize=16, leading=20, textColor=BRAND_RED,
+        fontName='Helvetica-Bold', alignment=TA_RIGHT)
+    S['footer'] = ParagraphStyle('footer', parent=base_styles['Normal'],
+        fontSize=7.5, leading=11, textColor=MUTED_GRAY,
+        fontName='Helvetica', alignment=TA_CENTER)
+    S['footer_bold'] = ParagraphStyle('footer_bold', parent=base_styles['Normal'],
+        fontSize=8.5, leading=12, textColor=BRAND_CHARCOAL,
+        fontName='Helvetica-Bold', alignment=TA_CENTER)
+    S['stamp'] = ParagraphStyle('stamp', parent=base_styles['Normal'],
+        fontSize=28, leading=34, textColor=colors.HexColor('#10B981'),
+        fontName='Helvetica-Bold', alignment=TA_CENTER)
 
     elements = []
 
-    # ─── HEADER with Logo ─────────────────────────────────────
-    logo_path = _get_logo_path()
-    header_items = []
-    if logo_path:
-        try:
-            logo = RLImage(logo_path, width=1.6 * inch, height=0.6 * inch, kind='proportional')
-            header_items.append(logo)
-        except Exception:
-            header_items.append(Paragraph(f"<b>{co['name']}</b>", styles['ReceiptTitle']))
-    else:
-        header_items.append(Paragraph(f"<b>{co['name']}</b>", styles['ReceiptTitle']))
-
+    # ─── Resolve dates and basic data ────────────────────────
     receipt_number = payment.get('receipt_number', 'N/A')
     payment_date_raw = payment.get('payment_date', '')
     try:
         if isinstance(payment_date_raw, datetime):
-            payment_date = payment_date_raw.strftime('%m/%d/%Y')
+            payment_dt = payment_date_raw
         else:
-            payment_date = datetime.fromisoformat(str(payment_date_raw).replace(' ', 'T').split('.')[0]).strftime('%m/%d/%Y')
+            payment_dt = datetime.fromisoformat(str(payment_date_raw).replace(' ', 'T').split('.')[0])
+        payment_date = payment_dt.strftime('%d %b %Y')
+        payment_time = payment_dt.strftime('%I:%M %p')
     except Exception:
         payment_date = str(payment_date_raw)[:10]
+        payment_time = ''
 
-    # Header table: logo left, receipt info right
-    header_right = f"""
-    <b>PAYMENT RECEIPT / RECIBO DE PAGO</b><br/>
-    <font size="9" color="#718096">Receipt # / Recibo #: <b>{receipt_number}</b></font><br/>
-    <font size="9" color="#718096">Date / Fecha: <b>{payment_date}</b></font>
-    """
-    header_table = Table(
-        [[header_items[0] if header_items else '', Paragraph(header_right, styles['Normal'])]],
-        colWidths=[3 * inch, 4 * inch]
-    )
-    header_table.setStyle(TableStyle([
-        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
-        ('ALIGN', (1, 0), (1, 0), 'RIGHT'),
-    ]))
-    elements.append(header_table)
-    elements.append(Spacer(1, 6))
-    elements.append(HRFlowable(width="100%", thickness=2, color=BRAND_RED))
-    elements.append(Spacer(1, 14))
+    tenant_name = (tenant.get('name') if tenant else None) or payment.get('tenant_name', 'N/A')
+    tenant_num = (tenant.get('tenant_number') if tenant else None) or ''
+    tenant_email = (tenant.get('email') if tenant else None) or payment.get('tenant_email', '')
+    property_addr = (contract.get('property_address') if contract else None) or payment.get('property_address', 'N/A')
+    contract_num = (contract.get('contract_number') if contract else None) or 'N/A'
 
-    # ─── PAID STATUS BADGE ─────────────────────────────────────
-    status = payment.get('status', 'completed')
-    if status == 'completed':
-        elements.append(Paragraph("✓ PAID / PAGADO", styles['PaidBadge']))
-    else:
-        elements.append(Paragraph(f"Status: {status.upper()}", styles['PaidBadge']))
-    elements.append(Spacer(1, 10))
-
-    # ─── TOTAL AMOUNT ──────────────────────────────────────────
-    total_paid = payment.get('total_paid', payment.get('amount', 0))
-    elements.append(Paragraph(f"${total_paid:,.2f}", styles['BigAmount']))
-    elements.append(Paragraph("Total Paid / Total Pagado", styles['SmallText']))
-    elements.append(Spacer(1, 16))
-
-    # ─── TENANT & PROPERTY INFO ────────────────────────────────
-    elements.append(HRFlowable(width="100%", thickness=0.5, color=BORDER_GRAY))
-    elements.append(Spacer(1, 8))
-
-    tenant_name = tenant.get('name', 'N/A') if tenant else payment.get('tenant_name', 'N/A')
-    tenant_num = tenant.get('tenant_number', '') if tenant else ''
-    property_addr = contract.get('property_address', 'N/A') if contract else payment.get('property_address', 'N/A')
-    contract_num = contract.get('contract_number', 'N/A') if contract else 'N/A'
-
-    info_data = [
-        [
-            Paragraph("<b>Tenant / Inquilino</b>", styles['FieldLabel']),
-            Paragraph("<b>Property / Propiedad</b>", styles['FieldLabel']),
-        ],
-        [
-            Paragraph(f"{tenant_name}<br/><font size='8' color='#718096'>{tenant_num}</font>", styles['FieldValue']),
-            Paragraph(f"{property_addr}<br/><font size='8' color='#718096'>Contract / Contrato: {contract_num}</font>", styles['FieldValue']),
-        ],
-    ]
-    info_table = Table(info_data, colWidths=[3.4 * inch, 3.4 * inch])
-    info_table.setStyle(TableStyle([
-        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
-        ('TOPPADDING', (0, 0), (-1, -1), 4),
-        ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
-    ]))
-    elements.append(info_table)
-    elements.append(Spacer(1, 14))
-
-    # ─── PAYMENT DETAILS TABLE ─────────────────────────────────
-    elements.append(Paragraph("Payment Details / Detalles del Pago", styles['SectionHead']))
-
-    period_month = payment.get('period_month', '').capitalize()
+    period_month_es = {
+        'january':'Enero','february':'Febrero','march':'Marzo','april':'Abril',
+        'may':'Mayo','june':'Junio','july':'Julio','august':'Agosto',
+        'september':'Septiembre','october':'Octubre','november':'Noviembre','december':'Diciembre'
+    }
+    period_month_raw = (payment.get('period_month') or '').lower()
+    period_month = period_month_es.get(period_month_raw, period_month_raw.capitalize())
     period_year = payment.get('period_year', '')
-    amount = payment.get('amount', 0)
-    late_fee = payment.get('late_fee', 0)
-    payment_method = payment.get('payment_method', 'N/A').capitalize()
+
+    amount = float(payment.get('amount', 0) or 0)
+    late_fee = float(payment.get('late_fee', 0) or 0)
+    total_paid = float(payment.get('total_paid', payment.get('amount', 0)) or 0)
+
+    payment_method_raw = (payment.get('payment_method') or 'N/A').lower()
+    method_map = {
+        'card': 'Tarjeta de Crédito/Débito',
+        'credit_card': 'Tarjeta de Crédito',
+        'debit_card': 'Tarjeta de Débito',
+        'stripe': 'Tarjeta (Stripe)',
+        'ach': 'Transferencia ACH',
+        'bank_transfer': 'Transferencia Bancaria',
+        'cash': 'Efectivo',
+        'check': 'Cheque',
+        'autopay': 'Pago Automático',
+    }
+    payment_method = method_map.get(payment_method_raw, payment_method_raw.replace('_', ' ').title())
+
+    status = (payment.get('status') or 'completed').lower()
+
+    # ─── HERO HEADER (red banner with logo on black background) ──
+    logo_path = _get_logo_path()
+    if logo_path:
+        try:
+            logo = RLImage(logo_path, width=1.25 * inch, height=1.25 * inch, kind='proportional')
+        except Exception:
+            logo = Paragraph(f"<b>{co['name']}</b>", S['hero_title'])
+    else:
+        logo = Paragraph(f"<b>{co['name']}</b>", S['hero_title'])
+
+    title_block = [
+        Paragraph("RECIBO DE PAGO", S['hero_title']),
+        Spacer(1, 2),
+        Paragraph("Payment Receipt — Renta / Rent", S['hero_sub']),
+    ]
+
+    meta_block = [
+        Paragraph("RECIBO N.°", S['hero_sub']),
+        Paragraph(f"<b>{receipt_number}</b>", S['hero_meta_b']),
+        Spacer(1, 4),
+        Paragraph("FECHA / DATE", S['hero_sub']),
+        Paragraph(f"<b>{payment_date}</b>", S['hero_meta_b']),
+    ]
+
+    hero = Table(
+        [[logo, title_block, meta_block]],
+        colWidths=[1.15 * inch, 3.6 * inch, 2.65 * inch],
+        rowHeights=[1.1 * inch],
+    )
+    hero.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, -1), BRAND_CHARCOAL),
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ('ALIGN', (0, 0), (0, 0), 'CENTER'),
+        ('LEFTPADDING', (0, 0), (-1, -1), 14),
+        ('RIGHTPADDING', (0, 0), (-1, -1), 14),
+        ('TOPPADDING', (0, 0), (-1, -1), 10),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 10),
+    ]))
+    elements.append(hero)
+
+    # Red accent bar
+    elements.append(HRFlowable(width="100%", thickness=4, color=BRAND_RED, spaceBefore=0, spaceAfter=0))
+    elements.append(Spacer(1, 18))
+
+    # ─── AMOUNT HERO + STATUS BADGE ─────────────────────────
+    if status == 'completed':
+        badge_text = "✓ PAGADO  •  PAID"
+        badge_color = colors.HexColor('#10B981')
+    elif status == 'pending':
+        badge_text = "PENDIENTE  •  PENDING"
+        badge_color = colors.HexColor('#F59E0B')
+    else:
+        badge_text = status.upper()
+        badge_color = MUTED_GRAY
+
+    amount_block = [
+        Paragraph("MONTO TOTAL PAGADO  •  TOTAL PAID", S['amount_lbl']),
+        Spacer(1, 4),
+        Paragraph(f"${total_paid:,.2f}", S['amount_big']),
+        Spacer(1, 8),
+    ]
+
+    badge_table = Table(
+        [[Paragraph(badge_text, S['status_paid'])]],
+        colWidths=[2.4 * inch],
+        rowHeights=[0.28 * inch],
+    )
+    badge_table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, -1), badge_color),
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+        ('ROUNDEDCORNERS', [12, 12, 12, 12]),
+    ]))
+    amount_block.append(badge_table)
+
+    amount_wrap = Table([[a] for a in amount_block],
+                       colWidths=[7.5 * inch])
+    amount_wrap.setStyle(TableStyle([
+        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ('LEFTPADDING', (0, 0), (-1, -1), 0),
+        ('RIGHTPADDING', (0, 0), (-1, -1), 0),
+        ('TOPPADDING', (0, 0), (-1, -1), 0),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 0),
+    ]))
+    elements.append(amount_wrap)
+    elements.append(Spacer(1, 22))
+
+    # ─── INFO CARDS (Tenant + Property) ─────────────────────
+    tenant_card = [
+        Paragraph("INQUILINO  •  TENANT", S['section']),
+        Paragraph(tenant_name, S['val']),
+    ]
+    if tenant_num:
+        tenant_card.append(Paragraph(f"ID: {tenant_num}", S['val_small']))
+    if tenant_email:
+        tenant_card.append(Paragraph(tenant_email, S['val_small']))
+
+    prop_card = [
+        Paragraph("PROPIEDAD  •  PROPERTY", S['section']),
+        Paragraph(property_addr, S['val']),
+        Paragraph(f"Contrato N.°: {contract_num}", S['val_small']),
+    ]
+
+    info_cards = Table(
+        [[tenant_card, '', prop_card]],
+        colWidths=[3.6 * inch, 0.2 * inch, 3.6 * inch],
+    )
+    info_cards.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (0, 0), colors.HexColor('#F9FAFB')),
+        ('BACKGROUND', (2, 0), (2, 0), colors.HexColor('#F9FAFB')),
+        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+        ('LEFTPADDING', (0, 0), (-1, -1), 14),
+        ('RIGHTPADDING', (0, 0), (-1, -1), 14),
+        ('TOPPADDING', (0, 0), (-1, -1), 12),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 12),
+        ('BOX', (0, 0), (0, 0), 0.5, BORDER_GRAY),
+        ('BOX', (2, 0), (2, 0), 0.5, BORDER_GRAY),
+        # Middle column = transparent gap
+        ('BACKGROUND', (1, 0), (1, 0), colors.white),
+        ('LEFTPADDING', (1, 0), (1, 0), 0),
+        ('RIGHTPADDING', (1, 0), (1, 0), 0),
+    ]))
+    elements.append(info_cards)
+    elements.append(Spacer(1, 18))
+
+    # ─── PAYMENT DETAILS TABLE ─────────────────────────────
+    elements.append(Paragraph("DETALLE DEL PAGO  •  PAYMENT DETAILS", S['section']))
+    elements.append(Spacer(1, 4))
 
     detail_rows = [
         [
-            Paragraph("<b>Description / Descripción</b>", styles['FieldLabel']),
-            Paragraph("<b>Amount / Monto</b>", styles['FieldLabel']),
+            Paragraph("Concepto / Description", S['table_th']),
+            Paragraph("Período / Period", S['table_th']),
+            Paragraph("Monto / Amount", S['table_th']),
         ],
         [
-            Paragraph(f"Rent / Renta — {period_month} {period_year}", styles['Normal']),
-            Paragraph(f"${amount:,.2f}", styles['FieldValue']),
+            Paragraph("Renta Mensual  •  Monthly Rent", S['table_td']),
+            Paragraph(f"{period_month} {period_year}", S['table_td']),
+            Paragraph(f"${amount:,.2f}", S['table_td_amount']),
         ],
     ]
     if late_fee > 0:
         detail_rows.append([
-            Paragraph("Late Fee / Cargo por Atraso", styles['Normal']),
-            Paragraph(f"${late_fee:,.2f}", styles['FieldValue']),
+            Paragraph("Cargo por Mora  •  Late Fee", S['table_td']),
+            Paragraph(f"{period_month} {period_year}", S['table_td']),
+            Paragraph(f"${late_fee:,.2f}", S['table_td_amount']),
         ])
-    detail_rows.append([
-        Paragraph("<b>TOTAL</b>", styles['FieldValue']),
-        Paragraph(f"<b>${total_paid:,.2f}</b>", ParagraphStyle('TotalRight', parent=styles['FieldValue'], textColor=BRAND_RED)),
-    ])
 
-    detail_table = Table(detail_rows, colWidths=[4.8 * inch, 2 * inch])
+    detail_table = Table(detail_rows,
+        colWidths=[3.8 * inch, 1.9 * inch, 1.8 * inch],
+    )
     detail_table.setStyle(TableStyle([
-        ('BACKGROUND', (0, 0), (-1, 0), LIGHT_BLUE),
-        ('FONTSIZE', (0, 0), (-1, -1), 10),
-        ('TOPPADDING', (0, 0), (-1, -1), 8),
-        ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
-        ('LEFTPADDING', (0, 0), (-1, -1), 10),
-        ('RIGHTPADDING', (0, 0), (-1, -1), 10),
-        ('ALIGN', (1, 0), (1, -1), 'RIGHT'),
-        ('LINEBELOW', (0, 0), (-1, 0), 1, NAVY),
-        ('LINEBELOW', (0, -2), (-1, -2), 0.5, BORDER_GRAY),
-        ('LINEABOVE', (0, -1), (-1, -1), 1.5, NAVY),
-        ('BACKGROUND', (0, -1), (-1, -1), colors.HexColor('#f0f4ff')),
+        # Header
+        ('BACKGROUND', (0, 0), (-1, 0), BRAND_CHARCOAL),
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+        ('TOPPADDING', (0, 0), (-1, 0), 9),
+        ('BOTTOMPADDING', (0, 0), (-1, 0), 9),
+        ('LEFTPADDING', (0, 0), (-1, -1), 12),
+        ('RIGHTPADDING', (0, 0), (-1, -1), 12),
+        # Body
+        ('TOPPADDING', (0, 1), (-1, -1), 10),
+        ('BOTTOMPADDING', (0, 1), (-1, -1), 10),
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ('LINEBELOW', (0, 0), (-1, -2), 0.5, BORDER_GRAY),
+        ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#F9FAFB')]),
+        ('ALIGN', (2, 0), (2, -1), 'RIGHT'),
     ]))
     elements.append(detail_table)
-    elements.append(Spacer(1, 12))
 
-    # ─── PAYMENT METHOD ────────────────────────────────────────
-    method_data = [
-        [
-            Paragraph("<b>Payment Method / Método de Pago:</b>", styles['FieldLabel']),
-            Paragraph(payment_method, styles['FieldValue']),
-            Paragraph("<b>Date / Fecha:</b>", styles['FieldLabel']),
-            Paragraph(payment_date, styles['FieldValue']),
-        ],
-    ]
-    method_table = Table(method_data, colWidths=[1.8 * inch, 1.6 * inch, 1.4 * inch, 2 * inch])
-    method_table.setStyle(TableStyle([
+    # ─── TOTAL BAR ──────────────────────────────────────────
+    total_bar = Table(
+        [[
+            Paragraph("TOTAL PAGADO  •  TOTAL PAID", S['total_label']),
+            Paragraph(f"${total_paid:,.2f}", S['total_amount']),
+        ]],
+        colWidths=[5.7 * inch, 1.8 * inch],
+    )
+    total_bar.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor('#FFF5F7')),
+        ('LINEABOVE', (0, 0), (-1, 0), 2, BRAND_RED),
+        ('LINEBELOW', (0, 0), (-1, 0), 2, BRAND_RED),
+        ('TOPPADDING', (0, 0), (-1, -1), 12),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 12),
+        ('LEFTPADDING', (0, 0), (-1, -1), 14),
+        ('RIGHTPADDING', (0, 0), (-1, -1), 14),
         ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
-        ('TOPPADDING', (0, 0), (-1, -1), 6),
-        ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
-        ('BACKGROUND', (0, 0), (-1, -1), LIGHT_GRAY),
-        ('LEFTPADDING', (0, 0), (-1, -1), 8),
-        ('BOX', (0, 0), (-1, -1), 0.5, BORDER_GRAY),
     ]))
-    elements.append(method_table)
-    elements.append(Spacer(1, 24))
+    elements.append(total_bar)
+    elements.append(Spacer(1, 18))
 
-    # ─── FOOTER ────────────────────────────────────────────────
+    # ─── PAYMENT METHOD STRIP ──────────────────────────────
+    method_strip = Table(
+        [[
+            Paragraph("MÉTODO DE PAGO", S['lbl']),
+            Paragraph(payment_method, S['val']),
+            Paragraph("PROCESADO", S['lbl']),
+            Paragraph(f"{payment_date}  {payment_time}", S['val']),
+        ]],
+        colWidths=[1.4 * inch, 2.4 * inch, 1.3 * inch, 2.4 * inch],
+    )
+    method_strip.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor('#F9FAFB')),
+        ('BOX', (0, 0), (-1, -1), 0.5, BORDER_GRAY),
+        ('TOPPADDING', (0, 0), (-1, -1), 10),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 10),
+        ('LEFTPADDING', (0, 0), (-1, -1), 12),
+        ('RIGHTPADDING', (0, 0), (-1, -1), 12),
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+    ]))
+    elements.append(method_strip)
+    elements.append(Spacer(1, 28))
+
+    # ─── PAID STAMP (decorative) ───────────────────────────
+    if status == 'completed':
+        elements.append(Paragraph("✓ PAGO RECIBIDO", S['stamp']))
+        elements.append(Spacer(1, 4))
+        elements.append(Paragraph(
+            "Este recibo confirma que su pago ha sido procesado y recibido exitosamente.",
+            ParagraphStyle('thanks', parent=base_styles['Normal'],
+                fontSize=9, leading=12, textColor=GRAY,
+                fontName='Helvetica-Oblique', alignment=TA_CENTER)
+        ))
+        elements.append(Paragraph(
+            "This receipt confirms your payment has been successfully processed and received.",
+            ParagraphStyle('thanks2', parent=base_styles['Normal'],
+                fontSize=8, leading=11, textColor=MUTED_GRAY,
+                fontName='Helvetica-Oblique', alignment=TA_CENTER)
+        ))
+        elements.append(Spacer(1, 20))
+
+    # ─── FOOTER ─────────────────────────────────────────────
     elements.append(HRFlowable(width="100%", thickness=0.5, color=BORDER_GRAY))
-    elements.append(Spacer(1, 6))
+    elements.append(Spacer(1, 8))
+    elements.append(Paragraph(f"{co['name']}", S['footer_bold']))
     elements.append(Paragraph(
-        "This receipt confirms payment has been received. / Este recibo confirma que el pago ha sido recibido.",
-        ParagraphStyle('ThankYou', parent=styles['Normal'], fontSize=9, textColor=GRAY, alignment=TA_CENTER)
+        f"{co['address']}  •  {co['phone']}  •  {co['email']}",
+        S['footer']
     ))
+    if co.get('website'):
+        elements.append(Paragraph(co['website'], S['footer']))
     elements.append(Spacer(1, 4))
     elements.append(Paragraph(
-        f"<b>{co['name']}</b> — {co['address']} | {co['phone']} | {co['email']}",
-        styles['SmallText']
-    ))
-    elements.append(Spacer(1, 2))
-    elements.append(Paragraph(
-        f"Generated / Generado: {datetime.utcnow().strftime('%m/%d/%Y %I:%M %p')} UTC",
-        styles['SmallText']
+        f"Documento generado el {datetime.utcnow().strftime('%d/%m/%Y %H:%M')} UTC  •  Recibo: {receipt_number}",
+        ParagraphStyle('gen', parent=base_styles['Normal'],
+            fontSize=6.5, leading=9, textColor=MUTED_GRAY,
+            fontName='Helvetica', alignment=TA_CENTER)
     ))
 
     doc.build(elements)
