@@ -332,6 +332,35 @@ async def list_contracts(request: Request):
     return {"success": True, "contracts": contracts, "count": len(contracts)}
 
 
+@router.get('/admin/properties/{property_id}/contract-defaults')
+async def get_contract_defaults_from_property(property_id: str, request: Request):
+    """Returns suggested defaults for a new rental contract based on the property's
+    saved rent/deposit. Frontend should call this when selecting a property
+    in the contract form to prefill rent_amount and deposit_amount."""
+    await auth_admin(request)
+    try:
+        prop = await get_db().properties.find_one({"_id": ObjectId(property_id)})
+    except Exception:
+        raise HTTPException(status_code=400, detail="ID de propiedad inválido")
+    if not prop:
+        raise HTTPException(status_code=404, detail="Propiedad no encontrada")
+
+    # Try multiple field names used historically
+    rent = float(prop.get('rent_amount') or prop.get('monthly_rent') or prop.get('rent') or 0)
+    deposit = float(prop.get('deposit_amount') or prop.get('security_deposit') or prop.get('deposit') or 0)
+
+    return {
+        "success": True,
+        "property_id": str(prop["_id"]),
+        "property_address": prop.get('address', ''),
+        "rent_amount": rent,
+        "deposit_amount": deposit,
+        "suggested_late_fee_amount": 50.0,
+        "suggested_late_fee_grace_days": 5,
+        "suggested_payment_due_day": 1,
+    }
+
+
 @router.post('/admin/rental-contracts')
 async def create_contract(request: Request):
     """Create a rental contract linking a tenant to a property"""
@@ -462,6 +491,21 @@ async def update_contract_status(contract_id: str, request: Request):
     update = {"status": new_status, "updated_at": now}
 
     if new_status == 'active':
+        # ── Validate ALL required signatures before activating ─────────
+        force = bool(data.get('force_activate', False))  # admin override
+        missing = []
+        if not contract.get('tenant_signature'):
+            missing.append('Inquilino')
+        # Either landlord or admin signature is acceptable as "office" signer
+        if not (contract.get('landlord_signature') or contract.get('admin_signature')):
+            missing.append('Propietario/Admin')
+        if missing and not force:
+            raise HTTPException(
+                status_code=400,
+                detail=f"No se puede activar el contrato. Firmas faltantes: {', '.join(missing)}. "
+                       f"Para forzar la activación envía force_activate=true."
+            )
+
         # Mark property as rented
         await get_db().properties.update_one(
             {"_id": ObjectId(contract['property_id'])},

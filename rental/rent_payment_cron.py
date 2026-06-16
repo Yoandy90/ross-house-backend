@@ -98,7 +98,18 @@ async def run_once(db) -> dict:
     """Run a single pass: ensure current-period payment for every active contract.
     Also creates next month's payment 7 days before its start to give the
     tenant visibility ahead of time."""
-    stats = {"created": 0, "already_exists": 0, "late_fee_applied": 0, "skip_no_rent": 0, "errors": 0}
+    stats = {"created": 0, "already_exists": 0, "late_fee_applied": 0, "skip_no_rent": 0, "errors": 0, "orphans_cleaned": 0}
+
+    # ── Cleanup: archive payments whose contract no longer exists ──
+    valid_ids = set()
+    async for c in db.rental_contracts.find({}, {"_id": 1}):
+        valid_ids.add(str(c["_id"]))
+    async for p in db.rental_payments.find({"status": {"$in": ["pending", "late", "partial"]}}):
+        if str(p.get("contract_id", "")) not in valid_ids:
+            await db.rental_payments_archive.insert_one({**p, "archived_reason": "orphan_no_contract"})
+            await db.rental_payments.delete_one({"_id": p["_id"]})
+            stats["orphans_cleaned"] += 1
+
     cursor = db.rental_contracts.find({"status": {"$in": ["active", "activo"]}})
     async for c in cursor:
         try:
