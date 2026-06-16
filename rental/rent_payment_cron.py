@@ -55,6 +55,23 @@ async def _resolve_late_fee_config(db, contract: dict) -> tuple[float, int]:
     return DEFAULT_LATE_FEE_AMOUNT, DEFAULT_GRACE_PERIOD_DAYS
 
 
+async def _parse_contract_date(value) -> datetime | None:
+    """Best-effort parse a contract start/end date to UTC-aware datetime."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if isinstance(value, str):
+        try:
+            # Accept "YYYY-MM-DD" and ISO formats
+            s = value.replace("Z", "+00:00")
+            dt = datetime.fromisoformat(s) if "T" in s else datetime.strptime(s[:10], "%Y-%m-%d")
+            return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+        except Exception:
+            return None
+    return None
+
+
 async def ensure_current_period_payment(db, contract: dict) -> str:
     """Ensure a pending rental_payments doc exists for this contract's
     current period. Returns a short status string."""
@@ -65,6 +82,16 @@ async def ensure_current_period_payment(db, contract: dict) -> str:
     period_month_num = now.month
 
     contract_id = str(contract["_id"])
+
+    # ── Validate contract date window ──
+    # Don't generate or apply late fees outside the contract's effective range.
+    start_dt = await _parse_contract_date(contract.get("start_date"))
+    end_dt = await _parse_contract_date(contract.get("end_date"))
+    if start_dt and now < start_dt:
+        return "skip_not_started"
+    if end_dt and now > end_dt:
+        return "skip_ended"
+
     monthly_rent = float(
         contract.get("monthly_rent") or contract.get("rent_amount") or 0
     )
@@ -135,7 +162,7 @@ async def run_once(db) -> dict:
 
     # ── Cleanup: archive payments whose contract no longer exists ──
     valid_ids = set()
-    async for c in db.rental_contracts.find({}, {"_id": 1}):
+    async for c in db.rental_contracts.find({"status": {"$in": ["active", "activo"]}}, {"_id": 1}):
         valid_ids.add(str(c["_id"]))
     async for p in db.rental_payments.find({"status": {"$in": ["pending", "late", "partial"]}}):
         if str(p.get("contract_id", "")) not in valid_ids:
@@ -161,7 +188,17 @@ async def run_once(db) -> dict:
             else:
                 next_month_first = datetime(now.year, now.month + 1, 1, tzinfo=timezone.utc)
             days_until_next = (next_month_first - now).days
-            if days_until_next <= 7:
+
+            # Validate contract date window for the *next* period too
+            c_start = await _parse_contract_date(c.get("start_date"))
+            c_end = await _parse_contract_date(c.get("end_date"))
+            next_in_range = True
+            if c_start and next_month_first < c_start:
+                next_in_range = False
+            if c_end and next_month_first > c_end:
+                next_in_range = False
+
+            if days_until_next <= 7 and next_in_range:
                 # Temporarily simulate "now" being the next month
                 contract_copy = dict(c)
                 # We use a fake current period directly:
