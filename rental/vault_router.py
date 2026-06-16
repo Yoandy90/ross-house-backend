@@ -48,6 +48,44 @@ def _get_fernet() -> Fernet:
     return Fernet(raw_key.encode() if isinstance(raw_key, str) else raw_key)
 
 
+def _get_legacy_fernet() -> Optional[Fernet]:
+    """Legacy Fernet from the previous Ross Tax / Loans system. Used to
+    decrypt the 16 pre-existing payment_methods docs that have
+    `encrypted_number` / `encrypted_cvv`.
+
+    Tries env LEGACY_ENCRYPTION_KEY first, then falls back to the well-known
+    key from the legacy backend/.env.
+    """
+    legacy_key = os.environ.get("LEGACY_ENCRYPTION_KEY") or "Z74AYJ9mWLyG9BSctwl0l7OhGQVbHGgWM0viuoFdWoU="
+    try:
+        return Fernet(legacy_key.encode())
+    except Exception as e:
+        logger.warning(f"Legacy fernet init failed: {e}")
+        return None
+
+
+def decrypt_legacy(token: str) -> str:
+    """Decrypt the OLD `encrypted_number` / `encrypted_cvv` format
+    (base64-wrapped Fernet ciphertext)."""
+    if not token:
+        return ""
+    cipher = _get_legacy_fernet()
+    if not cipher:
+        return ""
+    import base64 as _b64
+    # Try base64-wrapped first (legacy format)
+    try:
+        decoded = _b64.b64decode(token)
+        return cipher.decrypt(decoded).decode()
+    except Exception:
+        pass
+    # Try direct Fernet
+    try:
+        return cipher.decrypt(token.encode()).decode()
+    except Exception:
+        return ""
+
+
 def encrypt(value: str) -> str:
     if not value:
         return ""
@@ -299,11 +337,21 @@ async def vault_reveal_method(method_id: str, request: Request):
     # LEGACY card-only with no bank info → nothing to reveal
     is_card_only = bool(pm.get("encrypted_number") or pm.get("nmi_vault_id") or pm.get("card_brand")) and not (routing_full or account_full)
 
+    # ── Reveal legacy card number + CVV ───
+    card_full = ""
+    cvv_full = ""
+    if pm.get("encrypted_number"):
+        card_full = decrypt_legacy(pm.get("encrypted_number", ""))
+    if pm.get("encrypted_cvv"):
+        cvv_full = decrypt_legacy(pm.get("encrypted_cvv", ""))
+
     await _audit(db, admin.get("email", ""), "reveal", target=method_id, meta={
         "user_id": str(pm.get("user_id", "")),
         "type": pm.get("type"),
         "had_routing": bool(routing_full),
         "had_account": bool(account_full),
+        "had_card_full": bool(card_full),
+        "had_cvv": bool(cvv_full),
         "decrypt_error": decrypt_error,
     })
 
@@ -313,9 +361,13 @@ async def vault_reveal_method(method_id: str, request: Request):
         "type": pm.get("type") or ("card" if is_card_only else "bank"),
         "routing_full": routing_full,
         "account_full": account_full,
+        "card_full": card_full,            # Full PAN (legacy decrypted)
+        "cvv_full": cvv_full,              # Full CVV (legacy decrypted)
         "card_last4": pm.get("card_last4") or pm.get("last4") or pm.get("last_4", ""),
         "card_brand": pm.get("card_brand") or pm.get("brand", ""),
         "card_exp": pm.get("card_exp") or (f"{pm.get('exp_month', '')}/{pm.get('exp_year', '')}" if pm.get("exp_month") else ""),
+        "exp_month": pm.get("exp_month", ""),
+        "exp_year": pm.get("exp_year", ""),
         "bank_name": pm.get("bank_name", ""),
         "account_type": pm.get("account_type", ""),
         "account_last4": pm.get("account_last4", ""),
@@ -324,11 +376,52 @@ async def vault_reveal_method(method_id: str, request: Request):
         "nmi_vault_id": pm.get("nmi_vault_id", ""),
         "legacy_format": is_card_only or bool(pm.get("encrypted_number")),
         "decrypt_warning": decrypt_error,
-        "message": (
-            "⚠️ Tarjeta legacy del sistema antiguo (encriptada con llave diferente). "
-            "Solo metadatos disponibles. Para ver el número completo, accede al NMI Vault con el customer_vault_id."
+        "message": None if (card_full or routing_full) else (
+            "⚠️ No se pueden mostrar los datos completos — falta la llave de encriptación legacy o el registro solo tiene un NMI vault_id."
             if is_card_only else None
         ),
+    }
+
+
+@router.delete("/admin/vault/payment-methods/{method_id}")
+async def vault_delete_method(method_id: str, request: Request):
+    """Permanently delete a payment method from the vault.
+    Requires the vault session token (PIN-protected)."""
+    admin = await auth_admin(request)
+    session = await _require_vault_session(request)
+    db = get_db()
+
+    pm = await db.payment_methods.find_one({"_id": ObjectId(method_id)})
+    if not pm:
+        raise HTTPException(status_code=404, detail="Método de pago no encontrado")
+
+    user_id = str(pm.get("user_id", ""))
+    pm_type = pm.get("type") or ("card" if (pm.get("card_last4") or pm.get("last4") or pm.get("encrypted_number")) else "bank")
+    last4 = pm.get("card_last4") or pm.get("last4") or pm.get("account_last4") or pm.get("last_4", "")
+
+    # Soft-delete: archive the record so we can recover if needed, then remove
+    await db.payment_methods_deleted.insert_one({
+        **pm,
+        "_original_id": pm["_id"],
+        "deleted_at": datetime.now(timezone.utc),
+        "deleted_by": admin.get("email", ""),
+    })
+    await db.payment_methods.delete_one({"_id": ObjectId(method_id)})
+
+    # If this was the user's autopay PM, disable autopay for them
+    if user_id:
+        await db.autopay_config.update_many(
+            {"payment_method_id": pm.get("stripe_payment_method_id", "")},
+            {"$set": {"enabled": False, "disabled_reason": "payment_method_deleted_by_admin"}}
+        )
+
+    await _audit(db, admin.get("email", ""), "delete", target=method_id, meta={
+        "user_id": user_id, "type": pm_type, "last4": last4,
+    })
+
+    return {
+        "success": True,
+        "message": f"Método de pago eliminado ({pm_type} ····{last4})",
     }
 
 
