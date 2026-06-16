@@ -22,8 +22,37 @@ logger = logging.getLogger("rent_payment_cron")
 
 PERIOD_FORMAT = "%Y-%m"
 DEFAULT_INTERVAL_SECONDS = 6 * 60 * 60   # every 6h
-LATE_FEE_AMOUNT = 50.0
-GRACE_PERIOD_DAYS = 5
+DEFAULT_LATE_FEE_AMOUNT = 50.0           # fallback if neither contract nor config has one
+DEFAULT_GRACE_PERIOD_DAYS = 5
+
+
+async def _resolve_late_fee_config(db, contract: dict) -> tuple[float, int]:
+    """Resolve the late fee amount and grace days from (in priority order):
+       1. The contract itself (contract.late_fee_amount, contract.late_fee_grace_days)
+       2. The rental_config company-wide defaults
+       3. Hardcoded fallback ($50 / 5 days)
+    """
+    # 1) Per-contract
+    if contract.get("late_fee_amount") is not None:
+        try:
+            amt = float(contract["late_fee_amount"])
+            grace = int(contract.get("late_fee_grace_days", DEFAULT_GRACE_PERIOD_DAYS))
+            return amt, grace
+        except (TypeError, ValueError):
+            pass
+
+    # 2) Company-wide
+    cfg = await db.rental_config.find_one({"type": "company"}) or {}
+    if cfg.get("default_late_fee_amount") is not None:
+        try:
+            amt = float(cfg["default_late_fee_amount"])
+            grace = int(cfg.get("default_late_fee_grace_days", DEFAULT_GRACE_PERIOD_DAYS))
+            return amt, grace
+        except (TypeError, ValueError):
+            pass
+
+    # 3) Fallback
+    return DEFAULT_LATE_FEE_AMOUNT, DEFAULT_GRACE_PERIOD_DAYS
 
 
 async def ensure_current_period_payment(db, contract: dict) -> str:
@@ -42,6 +71,8 @@ async def ensure_current_period_payment(db, contract: dict) -> str:
     if monthly_rent <= 0:
         return "skip_no_rent"
 
+    late_fee_amount, grace_days = await _resolve_late_fee_config(db, contract)
+
     # Look for existing payment for this period
     existing = await db.rental_payments.find_one({
         "contract_id": contract_id,
@@ -55,13 +86,15 @@ async def ensure_current_period_payment(db, contract: dict) -> str:
     if existing:
         # Apply late fee if past grace period and still unpaid
         status = existing.get("status", "pending")
-        if status == "pending" and now.day > GRACE_PERIOD_DAYS:
-            if not existing.get("late_fee"):
+        if status == "pending" and now.day > grace_days and late_fee_amount > 0:
+            current_fee = float(existing.get("late_fee", 0) or 0)
+            # Only update if the configured fee differs from what's stored
+            if abs(current_fee - late_fee_amount) > 0.01:
                 await db.rental_payments.update_one(
                     {"_id": existing["_id"]},
                     {"$set": {
-                        "late_fee": LATE_FEE_AMOUNT,
-                        "total_due": monthly_rent + LATE_FEE_AMOUNT,
+                        "late_fee": late_fee_amount,
+                        "total_due": monthly_rent + late_fee_amount,
                         "late_fee_applied_at": now,
                     }},
                 )

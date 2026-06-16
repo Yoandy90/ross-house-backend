@@ -626,6 +626,8 @@ async def get_stripe_config(request: Request):
         "has_secret_key": bool(secret),
         "has_publishable_key": bool(pub),
         "payment_methods": config.get("payment_methods", {}),
+        "default_late_fee_amount": float(config.get("default_late_fee_amount", 50.0)),
+        "default_late_fee_grace_days": int(config.get("default_late_fee_grace_days", 5)),
     }
 
 
@@ -655,6 +657,18 @@ async def update_payment_methods(request: Request):
     # Top-level Stripe toggle
     if "stripe_enabled" in data:
         update["stripe_enabled"] = bool(data["stripe_enabled"])
+
+    # ── Default late fee (company-wide) ──
+    if "default_late_fee_amount" in data:
+        try:
+            update["default_late_fee_amount"] = float(data["default_late_fee_amount"])
+        except (TypeError, ValueError):
+            pass
+    if "default_late_fee_grace_days" in data:
+        try:
+            update["default_late_fee_grace_days"] = int(data["default_late_fee_grace_days"])
+        except (TypeError, ValueError):
+            pass
 
     # Stripe credentials (allow updating individually; ignore empty/masked values)
     if data.get("stripe_publishable_key"):
