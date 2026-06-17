@@ -52,11 +52,22 @@ BRAND_CREAM = colors.HexColor('#FAF3E8')     # Warm cream background
 BRAND_GOLD = colors.HexColor('#F5A623')      # Premium gold accent
 
 
-def _get_logo_path():
-    """Find Ross House Rentals logo in assets folder"""
+def _get_logo_path(variant: str = "light"):
+    """Find Ross House Rentals logo in assets folder.
+
+    `variant`:
+      - "light" (default): original logo with black 'ROSS HOUSE' text — use
+        on white/light backgrounds.
+      - "dark": white-text version — use on dark/black backgrounds (PDF
+        headers, branded banners).
+    """
     base = os.path.dirname(os.path.abspath(__file__))
-    # Prioritize Ross House Rentals logo
-    for name in ['ross_house_logo.png', 'company_logo.png', 'ross_logo.png']:
+    if variant == "dark":
+        candidates = ['ross_house_logo_dark.png', 'ross_house_logo_white.png',
+                      'ross_house_logo.png', 'company_logo.png']
+    else:
+        candidates = ['ross_house_logo.png', 'company_logo.png', 'ross_logo.png']
+    for name in candidates:
         path = os.path.join(base, 'assets', name)
         if os.path.exists(path):
             return path
@@ -1255,7 +1266,7 @@ def generate_3day_notice_pdf(contract: dict, config: dict = None, reason: str = 
         fontName='Helvetica-Bold')
 
     # ─── HERO HEADER (logo + title on black) ─────────────────
-    logo_path = _get_logo_path()
+    logo_path = _get_logo_path("dark")
     if logo_path:
         try:
             logo = RLImage(logo_path, width=1.1 * inch, height=1.1 * inch, kind='proportional')
@@ -1622,7 +1633,7 @@ def generate_rental_receipt_pdf(payment: dict, contract: dict = None, tenant: di
     status = (payment.get('status') or 'completed').lower()
 
     # ─── HERO HEADER (red banner with logo on black background) ──
-    logo_path = _get_logo_path()
+    logo_path = _get_logo_path("dark")
     if logo_path:
         try:
             logo = RLImage(logo_path, width=1.25 * inch, height=1.25 * inch, kind='proportional')

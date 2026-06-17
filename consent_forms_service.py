@@ -27,10 +27,18 @@ BORDER_GRAY = HexColor('#E5E7EB')
 MUTED_GRAY = HexColor('#6B7280')
 
 
-def _get_logo_path():
-    """Locate Ross House Rentals logo (same logic as rental_pdf_service)."""
+def _get_logo_path(variant: str = "dark"):
+    """Locate Ross House Rentals logo (same logic as rental_pdf_service).
+    Default variant is 'dark' (white text) since consent forms use a
+    dark hero header.
+    """
     base = os.path.dirname(os.path.abspath(__file__))
-    for name in ['ross_house_logo.png', 'company_logo.png']:
+    if variant == "dark":
+        candidates = ['ross_house_logo_dark.png', 'ross_house_logo_white.png',
+                      'ross_house_logo.png', 'company_logo.png']
+    else:
+        candidates = ['ross_house_logo.png', 'company_logo.png']
+    for name in candidates:
         p = os.path.join(base, 'assets', name)
         if os.path.exists(p):
             return p

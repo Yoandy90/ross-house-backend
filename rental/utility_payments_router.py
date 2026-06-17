@@ -260,10 +260,11 @@ async def generate_receipt(payment_id: str, request: Request):
     MUTED = HexColor('#6B7280')
     GREEN = HexColor('#10B981')
 
-    # Locate logo
+    # Locate logo (dark variant for black hero header)
     logo_path = None
     base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    for name in ['ross_house_logo.png', 'company_logo.png']:
+    for name in ['ross_house_logo_dark.png', 'ross_house_logo_white.png',
+                 'ross_house_logo.png', 'company_logo.png']:
         p = os.path.join(base, 'assets', name)
         if os.path.exists(p):
             logo_path = p
