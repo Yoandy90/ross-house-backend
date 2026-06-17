@@ -1117,13 +1117,15 @@ async def create_maintenance_request(request: Request):
     }
     
     result = await get_db().maintenance_requests.insert_one(maintenance)
+    request_id = str(result.inserted_id)
     
-    # ── Send push notifications to admins and property owner ──
+    # ── Notify admins: Push + Email + SMS ──
     try:
+        # 1. PUSH notifications
         await send_rental_push_to_admins(
             title="🔧 Nueva Solicitud de Mantenimiento",
             body=f"{tenant.get('name', 'Inquilino')}: {title}",
-            data={"type": "maintenance_new", "request_id": str(result.inserted_id)}
+            data={"type": "maintenance_new", "request_id": request_id}
         )
         # Notify property owner if property has one
         property_id = tenant.get("current_property_id", "")
@@ -1134,15 +1136,184 @@ async def create_maintenance_request(request: Request):
                     user_id=prop["owner_id"],
                     title="🔧 Solicitud de Mantenimiento",
                     body=f"{tenant.get('name', 'Inquilino')}: {title}",
-                    data={"type": "maintenance_new", "request_id": str(result.inserted_id)}
+                    data={"type": "maintenance_new", "request_id": request_id}
                 )
     except Exception as e:
         logging.warning(f"⚠️ Push notification error (maintenance create): {e}")
     
+    # 2. EMAIL + SMS notifications to admins
+    try:
+        import os as _os
+        admins = await get_db().app_users.find({
+            "$or": [
+                {"is_admin": True},
+                {"role": {"$in": ["admin", "super_admin"]}},
+                {"is_super_admin": True},
+            ]
+        }).to_list(20)
+        # Also include property owner email if applicable
+        owner_emails = set()
+        try:
+            property_id = tenant.get("current_property_id", "")
+            if property_id and ObjectId.is_valid(property_id):
+                prop = await get_db().properties.find_one({"_id": ObjectId(property_id)})
+                if prop and prop.get("owner_email"):
+                    owner_emails.add(prop["owner_email"])
+        except Exception:
+            pass
+
+        priority_label = {
+            "low": "🟢 Baja",
+            "normal": "🟡 Normal",
+            "medium": "🟡 Normal",
+            "high": "🟠 Alta",
+            "urgent": "🔴 URGENTE",
+        }.get(maintenance.get("priority", "normal"), "🟡 Normal")
+        photos_n = len(maintenance.get("photos", []))
+        photos_note = f"\n📸 {photos_n} foto(s) adjunta(s)" if photos_n else ""
+
+        email_subject = f"🔧 Nueva Solicitud de Mantenimiento — {title}"
+        email_body_text = f"""Nueva solicitud de mantenimiento recibida.
+
+INQUILINO: {tenant.get('name', 'N/A')}
+EMAIL: {tenant.get('email', 'N/A')}
+TELÉFONO: {tenant.get('phone', 'N/A')}
+
+TÍTULO: {title}
+PRIORIDAD: {priority_label}
+CATEGORÍA: {maintenance.get('category', 'general')}
+
+DESCRIPCIÓN:
+{description}{photos_note}
+
+Solicitud ID: {request_id}
+Recibida: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}
+
+Ver detalles en el panel: https://rosshouserentals.com/admin/mantenimiento
+"""
+        email_body_html = f"""<!DOCTYPE html>
+<html><body style="font-family: -apple-system, Helvetica, Arial, sans-serif; background:#f4f4f5; padding:20px;">
+  <div style="max-width:600px; margin:0 auto; background:white; border-radius:12px; overflow:hidden;">
+    <div style="background:#1F2937; color:white; padding:24px; border-bottom:4px solid #C8102E;">
+      <h1 style="margin:0; font-size:20px;">🔧 Nueva Solicitud de Mantenimiento</h1>
+      <p style="margin:6px 0 0; opacity:0.8; font-size:13px;">Ross House Rentals LLC</p>
+    </div>
+    <div style="padding:24px;">
+      <h2 style="color:#C8102E; margin:0 0 16px; font-size:18px;">{title}</h2>
+      <div style="background:#FFF5F7; border-left:4px solid #C8102E; padding:12px 16px; border-radius:4px; margin-bottom:16px;">
+        <b>Prioridad:</b> {priority_label}<br>
+        <b>Categoría:</b> {maintenance.get('category','general').capitalize()}
+        {('<br><b>📸 Fotos:</b> ' + str(photos_n) + ' adjuntas') if photos_n else ''}
+      </div>
+      <h3 style="margin:16px 0 8px; color:#1F2937; font-size:14px;">Descripción:</h3>
+      <p style="background:#F9FAFB; padding:12px; border-radius:6px; margin:0 0 16px;">{description}</p>
+      <h3 style="margin:16px 0 8px; color:#1F2937; font-size:14px;">Inquilino:</h3>
+      <table style="width:100%; border-collapse:collapse;">
+        <tr><td style="padding:6px 0; color:#6B7280; width:30%;">Nombre:</td><td style="padding:6px 0;"><b>{tenant.get('name','N/A')}</b></td></tr>
+        <tr><td style="padding:6px 0; color:#6B7280;">Email:</td><td style="padding:6px 0;">{tenant.get('email','N/A')}</td></tr>
+        <tr><td style="padding:6px 0; color:#6B7280;">Teléfono:</td><td style="padding:6px 0;">{tenant.get('phone','N/A')}</td></tr>
+      </table>
+      <div style="text-align:center; margin-top:24px;">
+        <a href="https://rosshouserentals.com/admin/mantenimiento" style="background:#C8102E; color:white; padding:12px 24px; border-radius:8px; text-decoration:none; font-weight:bold;">Ver en panel admin →</a>
+      </div>
+    </div>
+    <div style="background:#F9FAFB; padding:12px; text-align:center; color:#6B7280; font-size:11px;">
+      Ross House Rentals LLC · Solicitud {request_id} · {datetime.utcnow().strftime('%d/%m/%Y %H:%M UTC')}
+    </div>
+  </div>
+</body></html>"""
+
+        # Collect admin recipients
+        admin_emails = set()
+        admin_phones = []
+        for a in admins:
+            if a.get("email"):
+                admin_emails.add(a["email"])
+            if a.get("phone"):
+                admin_phones.append((a.get("name") or "Admin", a["phone"]))
+        admin_emails.update(owner_emails)
+
+        # Send emails via SendGrid
+        sendgrid_key = _os.getenv('SENDGRID_API_KEY')
+        from_email = _os.getenv('SENDGRID_FROM_EMAIL', 'info@rosshouserentals.com')
+        # Fallback to DB-stored SendGrid config
+        if not sendgrid_key:
+            try:
+                cfg = await get_db().api_config.find_one({"_id": "main"})
+                if cfg:
+                    sendgrid_key = cfg.get('sendgrid_api_key') or cfg.get('SENDGRID_API_KEY')
+                    from_email = cfg.get('sendgrid_from_email', from_email)
+            except Exception:
+                pass
+        if sendgrid_key and admin_emails:
+            try:
+                import sendgrid
+                from sendgrid.helpers.mail import Mail, Email, To, Content
+                sg = sendgrid.SendGridAPIClient(api_key=sendgrid_key)
+                for em in admin_emails:
+                    try:
+                        mail = Mail(
+                            from_email=Email(from_email, "Ross House Rentals"),
+                            to_emails=To(em),
+                            subject=email_subject,
+                            plain_text_content=Content("text/plain", email_body_text),
+                            html_content=Content("text/html", email_body_html),
+                        )
+                        sg.client.mail.send.post(request_body=mail.get())
+                        logging.info(f"📧 Maintenance email sent to {em}")
+                    except Exception as ee:
+                        logging.warning(f"📧 Email failed for {em}: {ee}")
+            except Exception as e:
+                logging.warning(f"📧 SendGrid not available: {e}")
+
+        # Send SMS via Twilio
+        twilio_sid = _os.getenv('TWILIO_ACCOUNT_SID')
+        twilio_token = _os.getenv('TWILIO_AUTH_TOKEN')
+        twilio_phone = _os.getenv('TWILIO_PHONE_NUMBER')
+        # Fallback to DB-stored Twilio config
+        if not twilio_sid:
+            try:
+                cfg = await get_db().api_config.find_one({"_id": "main"})
+                if cfg:
+                    twilio_sid = cfg.get('twilio_account_sid') or cfg.get('TWILIO_ACCOUNT_SID')
+                    twilio_token = cfg.get('twilio_auth_token') or cfg.get('TWILIO_AUTH_TOKEN')
+                    twilio_phone = cfg.get('twilio_phone_number') or cfg.get('TWILIO_PHONE_NUMBER')
+            except Exception:
+                pass
+        if twilio_sid and twilio_token and twilio_phone and admin_phones:
+            try:
+                from twilio.rest import Client
+                client = Client(twilio_sid, twilio_token)
+                sms_body = (
+                    f"🔧 Ross House Rentals\n"
+                    f"Nueva solicitud de mantenimiento de {tenant.get('name','Inquilino')}.\n"
+                    f"Título: {title}\n"
+                    f"Prioridad: {priority_label}"
+                    f"{photos_note}\n"
+                    f"\nVer: rosshouserentals.com/admin/mantenimiento"
+                )
+                for name, phone in admin_phones:
+                    try:
+                        digits = ''.join(filter(str.isdigit, phone))
+                        if len(digits) == 10:
+                            phone_e164 = f'+1{digits}'
+                        elif not phone.startswith('+'):
+                            phone_e164 = f'+1{digits}'
+                        else:
+                            phone_e164 = phone
+                        client.messages.create(body=sms_body, from_=twilio_phone, to=phone_e164)
+                        logging.info(f"📱 Maintenance SMS sent to {name} ({phone_e164[-4:]})")
+                    except Exception as se:
+                        logging.warning(f"📱 SMS failed for {name}: {se}")
+            except Exception as e:
+                logging.warning(f"📱 Twilio not available: {e}")
+    except Exception as e:
+        logging.warning(f"⚠️ Email/SMS notification error (maintenance create): {e}")
+    
     return {
         "success": True,
         "message": "Solicitud de mantenimiento creada",
-        "request_id": str(result.inserted_id),
+        "request_id": request_id,
     }
 
 
@@ -1195,13 +1366,20 @@ async def admin_list_maintenance_requests(
             "tenant_id": r.get("tenant_id", ""),
             "tenant_name": r.get("tenant_name", ""),
             "tenant_email": r.get("tenant_email", ""),
+            "tenant_phone": r.get("tenant_phone", ""),
             "property_id": r.get("property_id", ""),
+            "property_address": r.get("property_address", ""),
             "title": r.get("title", ""),
             "description": r.get("description", ""),
             "category": r.get("category", ""),
             "priority": r.get("priority", ""),
             "status": r.get("status", "open"),
+            "photos": r.get("photos", []) or [],
+            "photo_count": len(r.get("photos", []) or []),
             "created_at": r.get("created_at", "").isoformat() if r.get("created_at") else "",
+            "updated_at": r.get("updated_at", "").isoformat() if r.get("updated_at") else "",
+            "completed_at": r.get("completed_at", "").isoformat() if r.get("completed_at") else "",
+            "admin_notes": r.get("admin_notes", ""),
         })
     
     return {"success": True, "requests": requests_list, "total": total}
