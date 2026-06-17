@@ -1169,56 +1169,139 @@ async def create_maintenance_request(request: Request):
             "high": "🟠 Alta",
             "urgent": "🔴 URGENTE",
         }.get(maintenance.get("priority", "normal"), "🟡 Normal")
-        photos_n = len(maintenance.get("photos", []))
+        photos_list = maintenance.get("photos", []) or []
+        photos_n = len(photos_list)
         photos_note = f"\n📸 {photos_n} foto(s) adjunta(s)" if photos_n else ""
+
+        # Local TX time for friendlier display
+        try:
+            from zoneinfo import ZoneInfo
+            local_dt = datetime.utcnow().replace(tzinfo=ZoneInfo("UTC")).astimezone(ZoneInfo("America/Chicago"))
+            submitted_local = local_dt.strftime('%A, %d %B %Y · %I:%M %p CT')
+        except Exception:
+            submitted_local = datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')
+        submitted_utc = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')
+
+        category_label = {
+            "plumbing": "🚰 Plomería",
+            "electrical": "⚡ Electricidad",
+            "hvac": "❄️ Aire / Calefacción",
+            "appliance": "🔌 Electrodomésticos",
+            "general": "🔧 General",
+            "structural": "🏗️ Estructural",
+            "pest": "🐜 Plagas",
+            "other": "📝 Otro",
+        }.get(maintenance.get("category", "general"), maintenance.get("category", "General").capitalize())
 
         email_subject = f"🔧 Nueva Solicitud de Mantenimiento — {title}"
         email_body_text = f"""Nueva solicitud de mantenimiento recibida.
 
-INQUILINO: {tenant.get('name', 'N/A')}
-EMAIL: {tenant.get('email', 'N/A')}
-TELÉFONO: {tenant.get('phone', 'N/A')}
+FECHA / HORA:
+{submitted_local}
+({submitted_utc})
 
-TÍTULO: {title}
-PRIORIDAD: {priority_label}
-CATEGORÍA: {maintenance.get('category', 'general')}
+INQUILINO:
+{tenant.get('name', 'N/A')}
+Email: {tenant.get('email', 'N/A')}
+Teléfono: {tenant.get('phone', 'N/A')}
+
+PROPIEDAD:
+{maintenance.get('property_address') or 'N/A'}
+
+SOLICITUD:
+Título: {title}
+Prioridad: {priority_label}
+Categoría: {category_label}
 
 DESCRIPCIÓN:
 {description}{photos_note}
 
 Solicitud ID: {request_id}
-Recibida: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}
 
 Ver detalles en el panel: https://rosshouserentals.com/admin/mantenimiento
 """
+        # Embed each photo as inline <img> using its base64 data URL
+        photos_html_block = ""
+        if photos_n:
+            photos_html_block = (
+                '<h3 style="margin:20px 0 10px; color:#1F2937; font-size:14px; border-top:1px solid #E5E7EB; padding-top:16px;">'
+                f'📸 Fotos adjuntas ({photos_n}):'
+                '</h3>'
+                '<div style="display:block; line-height:0;">'
+            )
+            for p in photos_list[:5]:
+                if isinstance(p, str) and (p.startswith("data:image") or p.startswith("http")):
+                    photos_html_block += (
+                        f'<img src="{p}" alt="Foto" '
+                        'style="max-width:48%; width:280px; height:auto; '
+                        'border-radius:8px; margin:4px; '
+                        'border:1px solid #E5E7EB; display:inline-block;"/>'
+                    )
+            photos_html_block += '</div>'
+            # Note: data: URLs may inflate email size; Gmail/Outlook usually render them
+            # but some clients (Apple Mail) display inline reliably. If size exceeds
+            # 25MB Gmail will reject — capped to 5 photos.
+
         email_body_html = f"""<!DOCTYPE html>
-<html><body style="font-family: -apple-system, Helvetica, Arial, sans-serif; background:#f4f4f5; padding:20px;">
-  <div style="max-width:600px; margin:0 auto; background:white; border-radius:12px; overflow:hidden;">
+<html><body style="font-family: -apple-system, Helvetica, Arial, sans-serif; background:#f4f4f5; padding:20px; margin:0;">
+  <div style="max-width:680px; margin:0 auto; background:white; border-radius:12px; overflow:hidden; box-shadow:0 4px 12px rgba(0,0,0,0.08);">
     <div style="background:#1F2937; color:white; padding:24px; border-bottom:4px solid #C8102E;">
-      <h1 style="margin:0; font-size:20px;">🔧 Nueva Solicitud de Mantenimiento</h1>
-      <p style="margin:6px 0 0; opacity:0.8; font-size:13px;">Ross House Rentals LLC</p>
+      <h1 style="margin:0; font-size:22px; font-weight:700;">🔧 Nueva Solicitud de Mantenimiento</h1>
+      <p style="margin:6px 0 0; opacity:0.75; font-size:13px;">Ross House Rentals LLC · Notificación Automática</p>
     </div>
+
     <div style="padding:24px;">
-      <h2 style="color:#C8102E; margin:0 0 16px; font-size:18px;">{title}</h2>
-      <div style="background:#FFF5F7; border-left:4px solid #C8102E; padding:12px 16px; border-radius:4px; margin-bottom:16px;">
-        <b>Prioridad:</b> {priority_label}<br>
-        <b>Categoría:</b> {maintenance.get('category','general').capitalize()}
-        {('<br><b>📸 Fotos:</b> ' + str(photos_n) + ' adjuntas') if photos_n else ''}
+      <!-- Title + Priority -->
+      <h2 style="color:#C8102E; margin:0 0 12px; font-size:20px;">{title}</h2>
+
+      <!-- Quick summary -->
+      <div style="background:#FFF5F7; border-left:4px solid #C8102E; padding:14px 18px; border-radius:6px; margin-bottom:18px;">
+        <table style="width:100%; border-collapse:collapse; font-size:13px;">
+          <tr><td style="padding:4px 0; color:#6B7280; width:35%;">Prioridad:</td><td style="padding:4px 0; font-weight:600;">{priority_label}</td></tr>
+          <tr><td style="padding:4px 0; color:#6B7280;">Categoría:</td><td style="padding:4px 0; font-weight:600;">{category_label}</td></tr>
+          {('<tr><td style="padding:4px 0; color:#6B7280;">📸 Fotos:</td><td style="padding:4px 0; font-weight:600;">' + str(photos_n) + ' adjunta(s)</td></tr>') if photos_n else ''}
+        </table>
       </div>
-      <h3 style="margin:16px 0 8px; color:#1F2937; font-size:14px;">Descripción:</h3>
-      <p style="background:#F9FAFB; padding:12px; border-radius:6px; margin:0 0 16px;">{description}</p>
-      <h3 style="margin:16px 0 8px; color:#1F2937; font-size:14px;">Inquilino:</h3>
-      <table style="width:100%; border-collapse:collapse;">
-        <tr><td style="padding:6px 0; color:#6B7280; width:30%;">Nombre:</td><td style="padding:6px 0;"><b>{tenant.get('name','N/A')}</b></td></tr>
-        <tr><td style="padding:6px 0; color:#6B7280;">Email:</td><td style="padding:6px 0;">{tenant.get('email','N/A')}</td></tr>
-        <tr><td style="padding:6px 0; color:#6B7280;">Teléfono:</td><td style="padding:6px 0;">{tenant.get('phone','N/A')}</td></tr>
+
+      <!-- Date / Time -->
+      <h3 style="margin:18px 0 8px; color:#1F2937; font-size:13px; text-transform:uppercase; letter-spacing:0.5px;">📅 Fecha y Hora</h3>
+      <p style="margin:0 0 14px; padding:10px 14px; background:#F9FAFB; border-radius:6px; font-size:13px;">
+        <b style="color:#1F2937;">{submitted_local}</b><br>
+        <span style="color:#9CA3AF; font-size:11px;">{submitted_utc}</span>
+      </p>
+
+      <!-- Tenant -->
+      <h3 style="margin:18px 0 8px; color:#1F2937; font-size:13px; text-transform:uppercase; letter-spacing:0.5px;">👤 Inquilino</h3>
+      <table style="width:100%; border-collapse:collapse; background:#F9FAFB; border-radius:6px; font-size:13px;">
+        <tr><td style="padding:8px 14px; color:#6B7280; width:30%;">Nombre:</td><td style="padding:8px 14px;"><b>{tenant.get('name','N/A')}</b></td></tr>
+        <tr><td style="padding:8px 14px; color:#6B7280; border-top:1px solid #E5E7EB;">Email:</td><td style="padding:8px 14px; border-top:1px solid #E5E7EB;"><a href="mailto:{tenant.get('email','')}" style="color:#C8102E;">{tenant.get('email','N/A')}</a></td></tr>
+        <tr><td style="padding:8px 14px; color:#6B7280; border-top:1px solid #E5E7EB;">Teléfono:</td><td style="padding:8px 14px; border-top:1px solid #E5E7EB;"><a href="tel:{tenant.get('phone','')}" style="color:#C8102E;">{tenant.get('phone','N/A')}</a></td></tr>
       </table>
-      <div style="text-align:center; margin-top:24px;">
-        <a href="https://rosshouserentals.com/admin/mantenimiento" style="background:#C8102E; color:white; padding:12px 24px; border-radius:8px; text-decoration:none; font-weight:bold;">Ver en panel admin →</a>
+
+      <!-- Property -->
+      <h3 style="margin:18px 0 8px; color:#1F2937; font-size:13px; text-transform:uppercase; letter-spacing:0.5px;">🏠 Propiedad</h3>
+      <p style="margin:0 0 14px; padding:10px 14px; background:#F9FAFB; border-radius:6px; font-size:13px; font-weight:600;">
+        {maintenance.get('property_address') or 'No asignada'}
+      </p>
+
+      <!-- Description -->
+      <h3 style="margin:18px 0 8px; color:#1F2937; font-size:13px; text-transform:uppercase; letter-spacing:0.5px;">📝 Descripción del Inquilino</h3>
+      <div style="background:#F9FAFB; padding:14px 18px; border-radius:6px; margin:0 0 16px; font-size:14px; line-height:1.6; color:#1F2937; white-space:pre-wrap;">{description}</div>
+
+      {photos_html_block}
+
+      <!-- CTA -->
+      <div style="text-align:center; margin:28px 0 8px;">
+        <a href="https://rosshouserentals.com/admin/mantenimiento" style="background:#C8102E; color:white; padding:14px 28px; border-radius:8px; text-decoration:none; font-weight:700; font-size:14px; display:inline-block;">Ver en panel admin →</a>
       </div>
+      <p style="text-align:center; margin:8px 0 0; color:#9CA3AF; font-size:11px;">
+        ID de solicitud: <code style="background:#F3F4F6; padding:2px 6px; border-radius:3px;">{request_id}</code>
+      </p>
     </div>
-    <div style="background:#F9FAFB; padding:12px; text-align:center; color:#6B7280; font-size:11px;">
-      Ross House Rentals LLC · Solicitud {request_id} · {datetime.utcnow().strftime('%d/%m/%Y %H:%M UTC')}
+
+    <div style="background:#1F2937; color:#9CA3AF; padding:14px; text-align:center; font-size:11px;">
+      <b style="color:white;">Ross House Rentals LLC</b> · Sistema de Gestión<br>
+      Esta es una notificación automática. Por favor responda al inquilino lo antes posible.
     </div>
   </div>
 </body></html>"""
