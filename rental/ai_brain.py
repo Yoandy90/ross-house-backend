@@ -253,7 +253,14 @@ class RossHouseAIBrain:
 
 Responde al último mensaje del inquilino de manera útil y profesional. Si la pregunta requiere información específica que no tienes, indica que un agente humano responderá pronto.
 
-IMPORTANTE: Si el usuario pide un recibo, contrato o factura específica, NO inventes números ni links. El sistema añadirá automáticamente botones de descarga al final de tu respuesta. Solo confirma con un mensaje corto."""
+REGLAS ESTRICTAS DE FORMATO (¡no romper!):
+1. NO escribas placeholders como "[Botón de descarga aquí]", "[Link aquí]", "[Insertar enlace]", "[Aquí va el botón]", "[Ver recibo aquí]" o variantes. NUNCA uses corchetes [] para marcar dónde van botones.
+2. NO inventes URLs, números de recibo, IDs ni enlaces.
+3. El sistema añadirá los botones de descarga / navegación automáticamente DEBAJO de tu mensaje. Tu trabajo es escribir SOLO un mensaje corto y amable confirmando la solicitud.
+4. Ejemplo correcto si piden un recibo: "Aquí tienes tu recibo, Anaelis. 🎉"
+5. Ejemplo INCORRECTO (¡prohibido!): "Aquí está el [Botón de descarga del recibo]. ¡Gracias!"
+
+Mantén el mensaje breve (1-3 líneas)."""
 
             ai_text = await self._call_openai(system_prompt, prompt)
             if not ai_text:
@@ -713,6 +720,27 @@ Genera una respuesta profesional a este email."""
         # Remove potential system prompt leakage
         for phrase in ["Como asistente virtual", "As an AI", "I'm an AI", "Soy una IA"]:
             text = text.replace(phrase, "")
+        # Strip AI-generated placeholder markers like:
+        #   [Botón de descarga del recibo aquí]
+        #   [Link de descarga aquí]
+        #   [Aquí va el botón]
+        #   [Insertar enlace al PDF]
+        # These appear because the AI invents a placeholder where it expects a
+        # link to be — but our system renders buttons separately via the
+        # `actions` array, so the text should never reference them.
+        import re as _re
+        placeholder_patterns = [
+            r"\[\s*(bot[oó]n|button)\s+[^\]]*\]",
+            r"\[\s*(link|enlace)\s+[^\]]*\]",
+            r"\[\s*descarga[r]?\s+[^\]]*\]",
+            r"\[\s*[^\]]*(aqu[ií]|here|insertar|inserta)[^\]]*\]",
+            r"\[\s*ver\s+(recibo|contrato|factura|invoice)[^\]]*\]",
+        ]
+        for pat in placeholder_patterns:
+            text = _re.sub(pat, "", text, flags=_re.IGNORECASE)
+        # Collapse multiple blank lines / trailing spaces
+        text = _re.sub(r"\n{3,}", "\n\n", text)
+        text = _re.sub(r"[ \t]+\n", "\n", text)
         # Limit length
         if len(text) > 1500:
             text = text[:1500] + "..."
