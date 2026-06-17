@@ -1106,19 +1106,29 @@ async def create_maintenance_request(request: Request):
     # Only renters under an active lease should be able to file maintenance
     # tickets. Guests / former tenants are blocked.
     tenant_id_str = str(tenant["_id"])
-    contract_query = {
+    tenant_email_lc = (tenant.get("email") or "").strip().lower()
+    tenant_app_user_id = tenant.get("app_user_id") or None
+
+    or_clauses = [
+        {"tenant_id": tenant_id_str},
+        {"tenant_id": tenant["_id"]},
+    ]
+    # Only add app_user_id filter when we actually HAVE an id — otherwise
+    # we'd match every contract whose own app_user_id field is also None.
+    if tenant_app_user_id:
+        or_clauses.append({"app_user_id": tenant_app_user_id})
+        or_clauses.append({"app_user_id": str(tenant_app_user_id)})
+    if tenant_email_lc:
+        or_clauses.append({
+            "tenant_email": {"$regex": f"^{re.escape(tenant_email_lc)}$", "$options": "i"}
+        })
+
+    active_contract = await get_db().rental_contracts.find_one({
         "$and": [
-            {"$or": [
-                {"tenant_id": tenant_id_str},
-                {"tenant_id": tenant["_id"]},
-                {"app_user_id": tenant.get("app_user_id")},
-                {"tenant_email": {"$regex": f"^{re.escape(tenant.get('email','').lower())}$", "$options": "i"}}
-                    if tenant.get("email") else {"tenant_email": "__never_match__"},
-            ]},
+            {"$or": or_clauses},
             {"status": {"$in": ["active", "activo"]}},
         ]
-    }
-    active_contract = await get_db().rental_contracts.find_one(contract_query)
+    })
     if not active_contract:
         raise HTTPException(
             status_code=403,
