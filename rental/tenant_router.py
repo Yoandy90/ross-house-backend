@@ -3,6 +3,7 @@ Rental Tenant Router
 =====================
 """
 import logging
+import re
 from datetime import datetime, timedelta
 from typing import Optional, List
 from bson import ObjectId
@@ -1091,7 +1092,7 @@ async def get_profile_photo(request: Request):
 
 @router.post('/tenant/maintenance-request')
 async def create_maintenance_request(request: Request):
-    """Tenant: Submit a maintenance request"""
+    """Tenant: Submit a maintenance request (requires ACTIVE rental contract)"""
     tenant = await auth_tenant_flex(request)
     data = await request.json()
     
@@ -1100,12 +1101,48 @@ async def create_maintenance_request(request: Request):
     
     if not title or not description:
         raise HTTPException(status_code=400, detail="Título y descripción son requeridos")
+
+    # ─── Verify tenant has an ACTIVE rental contract ─────────────
+    # Only renters under an active lease should be able to file maintenance
+    # tickets. Guests / former tenants are blocked.
+    tenant_id_str = str(tenant["_id"])
+    contract_query = {
+        "$and": [
+            {"$or": [
+                {"tenant_id": tenant_id_str},
+                {"tenant_id": tenant["_id"]},
+                {"app_user_id": tenant.get("app_user_id")},
+                {"tenant_email": {"$regex": f"^{re.escape(tenant.get('email','').lower())}$", "$options": "i"}}
+                    if tenant.get("email") else {"tenant_email": "__never_match__"},
+            ]},
+            {"status": {"$in": ["active", "activo"]}},
+        ]
+    }
+    active_contract = await get_db().rental_contracts.find_one(contract_query)
+    if not active_contract:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "Solo los inquilinos con un contrato de arrendamiento activo "
+                "pueden enviar solicitudes de mantenimiento. Si crees que "
+                "esto es un error, contacta a la administración."
+            ),
+        )
+
+    # Snapshot property info from the active contract so the admin email
+    # and panel get an accurate property address even if the tenant doc
+    # doesn't have current_property_id set.
+    contract_property_id = str(active_contract.get("property_id", "")) or tenant.get("current_property_id", "")
+    contract_property_addr = active_contract.get("property_address", "")
     
     maintenance = {
         "tenant_id": tenant["_id"],
         "tenant_name": tenant.get("name", ""),
         "tenant_email": tenant.get("email", ""),
-        "property_id": tenant.get("current_property_id", ""),
+        "tenant_phone": tenant.get("phone", ""),
+        "contract_id": str(active_contract["_id"]),
+        "property_id": contract_property_id,
+        "property_address": contract_property_addr,
         "title": title,
         "description": description,
         "category": data.get("category", "general"),
