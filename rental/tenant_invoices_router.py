@@ -178,7 +178,13 @@ async def tenant_invoices_history(
             or (x.get("period") or "").startswith(str(year))
         ]
     if status in ("paid", "pending"):
-        items = [x for x in items if x.get("status") == status]
+        # Use the already-normalized `paid` boolean instead of literal string match
+        # because rental_payments use status="completed" for paid invoices while
+        # utility bills use status="paid". The `paid` flag handles both correctly.
+        if status == "paid":
+            items = [x for x in items if x.get("paid")]
+        else:  # pending
+            items = [x for x in items if not x.get("paid")]
 
     # ─── Sort newest first ────────────────────────────────────
     def _sort_key(x):
