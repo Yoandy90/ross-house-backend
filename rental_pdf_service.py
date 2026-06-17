@@ -1636,7 +1636,10 @@ def generate_rental_receipt_pdf(payment: dict, contract: dict = None, tenant: di
     logo_path = _get_logo_path("dark")
     if logo_path:
         try:
-            logo = RLImage(logo_path, width=1.25 * inch, height=1.25 * inch, kind='proportional')
+            # Logo aspect ratio is ~2.29:1 (very wide). Constrain width so the
+            # rendered image actually fits inside its table cell (1.4" minus
+            # paddings). Otherwise it overflows to the LEFT of the black box.
+            logo = RLImage(logo_path, width=1.1 * inch, height=0.55 * inch, kind='proportional')
         except Exception:
             logo = Paragraph(f"<b>{co['name']}</b>", S['hero_title'])
     else:
@@ -1658,7 +1661,7 @@ def generate_rental_receipt_pdf(payment: dict, contract: dict = None, tenant: di
 
     hero = Table(
         [[logo, title_block, meta_block]],
-        colWidths=[1.15 * inch, 3.6 * inch, 2.65 * inch],
+        colWidths=[1.55 * inch, 3.3 * inch, 2.55 * inch],
         rowHeights=[1.1 * inch],
     )
     hero.setStyle(TableStyle([
