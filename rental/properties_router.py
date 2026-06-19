@@ -16,6 +16,7 @@ from rental.shared import (
     send_rental_push_to_user, send_rental_push_to_admins,
     TENANT_JWT_SECRET,
 )
+from rental.tx_fmr_data import get_fmr, compute_s8_impact
 
 router = APIRouter()
 
@@ -125,6 +126,7 @@ async def public_list_properties(request: Request):
             "status": prop.get("status", "available"),
             "owner_type": "ross_house",
             "owner_name": "Ross House Rentals LLC",
+            "section8_accepted": bool(prop.get("section8_accepted", False)),
         }
         properties.append(safe_prop)
 
@@ -683,6 +685,13 @@ async def create_property(request: Request):
         "latitude": float(data['latitude']) if data.get('latitude') else None,
         "longitude": float(data['longitude']) if data.get('longitude') else None,
         "photos": [],  # List of photo storage paths
+        # ─── Section 8 / Housing Choice Voucher fields ───
+        "section8_accepted": bool(data.get('section8_accepted', False)),
+        "section8_pha": data.get('section8_pha', ''),  # e.g., "Amarillo Housing Authority"
+        "section8_pha_contact": data.get('section8_pha_contact', ''),  # liaison name/phone
+        "section8_last_inspection": data.get('section8_last_inspection'),  # ISO date or None
+        "section8_next_inspection": data.get('section8_next_inspection'),  # ISO date or None
+        "section8_notes": data.get('section8_notes', ''),
         "created_at": now,
         "updated_at": now,
         "created_by": user.get('email', 'admin'),
@@ -742,7 +751,10 @@ async def update_property(property_id: str, request: Request):
 
     update_fields = {}
     allowed = ['name', 'address', 'city', 'state', 'zip_code', 'type', 'bedrooms', 'bathrooms',
-               'square_feet', 'rent_amount', 'deposit_amount', 'features', 'status', 'notes', 'description']
+               'square_feet', 'rent_amount', 'deposit_amount', 'features', 'status', 'notes', 'description',
+               # Section 8 fields
+               'section8_accepted', 'section8_pha', 'section8_pha_contact',
+               'section8_last_inspection', 'section8_next_inspection', 'section8_notes']
     # Also accept frontend field aliases
     alias_map = {'zip': 'zip_code', 'sqft': 'square_feet'}
     for alias, real in alias_map.items():
@@ -754,6 +766,8 @@ async def update_property(property_id: str, request: Request):
                 update_fields[field] = int(data[field])
             elif field in ('bathrooms', 'rent_amount', 'deposit_amount'):
                 update_fields[field] = float(data[field])
+            elif field == 'section8_accepted':
+                update_fields[field] = bool(data[field])
             else:
                 update_fields[field] = data[field]
 
@@ -792,5 +806,200 @@ async def delete_property(property_id: str, request: Request):
 
     await get_db().properties.delete_one({"_id": ObjectId(property_id)})
     return {"success": True, "message": f"Propiedad {prop.get('property_number', '')} eliminada"}
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# SECTION 8 — NOI Impact Calculator
+# ═══════════════════════════════════════════════════════════════════════
+
+@router.get('/admin/properties/{property_id}/s8-impact')
+async def admin_property_s8_impact(property_id: str, request: Request):
+    """Calculate the Section 8 NOI impact for a single property.
+
+    Compares the property's current rent vs. the HUD Fair Market Rent (FMR)
+    for the matching Texas MSA and bedroom count. Returns the monthly/annual
+    uplift potential plus a recommendation.
+    """
+    await auth_admin(request)
+    db = get_db()
+    try:
+        prop = await db.properties.find_one({"_id": ObjectId(property_id)})
+    except Exception:
+        raise HTTPException(status_code=400, detail="ID inválido")
+    if not prop:
+        raise HTTPException(status_code=404, detail="Propiedad no encontrada")
+
+    city = prop.get("city", "")
+    bedrooms = int(prop.get("bedrooms", 0) or 0)
+    current_rent = float(prop.get("rent_amount", 0) or 0)
+
+    fmr_info = get_fmr(city, bedrooms)
+    impact = compute_s8_impact(current_rent, fmr_info["fmr_amount"])
+
+    return {
+        "success": True,
+        "property_id": property_id,
+        "property_name": prop.get("name") or prop.get("address"),
+        "city": city,
+        "bedrooms": bedrooms,
+        "section8_accepted": bool(prop.get("section8_accepted", False)),
+        "fmr": fmr_info,
+        "impact": impact,
+    }
+
+
+@router.get('/admin/properties/s8-impact-summary')
+async def admin_properties_s8_impact_summary(request: Request):
+    """Aggregate S8 NOI impact across ALL properties.
+
+    Returns per-property impact + portfolio totals:
+      - total potential uplift if all non-S8 properties activated S8
+      - count of properties with positive uplift opportunity
+      - top 3 properties by absolute annual uplift
+    """
+    await auth_admin(request)
+    db = get_db()
+
+    items = []
+    total_potential_monthly = 0.0
+    total_potential_annual = 0.0
+    eligible_count = 0
+    already_s8_count = 0
+    no_data_count = 0
+
+    async for prop in db.properties.find({}):
+        city = prop.get("city", "")
+        bedrooms = int(prop.get("bedrooms", 0) or 0)
+        current_rent = float(prop.get("rent_amount", 0) or 0)
+        is_s8 = bool(prop.get("section8_accepted", False))
+        fmr_info = get_fmr(city, bedrooms)
+        impact = compute_s8_impact(current_rent, fmr_info["fmr_amount"])
+
+        items.append({
+            "property_id": str(prop["_id"]),
+            "name": prop.get("name") or prop.get("address", ""),
+            "address": prop.get("address", ""),
+            "city": city,
+            "bedrooms": bedrooms,
+            "section8_accepted": is_s8,
+            "current_rent": impact["current_rent"],
+            "fmr_amount": impact["fmr_amount"],
+            "monthly_uplift": impact["monthly_uplift"],
+            "annual_uplift": impact["annual_uplift"],
+            "pct_uplift": impact["pct_uplift"],
+            "recommendation": impact["recommendation"],
+            "msa": fmr_info["msa_display"],
+        })
+
+        if is_s8:
+            already_s8_count += 1
+        elif impact["recommendation"] == "no_data":
+            no_data_count += 1
+        elif impact["monthly_uplift"] > 0:
+            eligible_count += 1
+            total_potential_monthly += impact["monthly_uplift"]
+            total_potential_annual += impact["annual_uplift"]
+
+    # Top 3 opportunities (only non-S8 with positive uplift)
+    top_3 = sorted(
+        [i for i in items if not i["section8_accepted"] and i["monthly_uplift"] > 0],
+        key=lambda x: x["annual_uplift"],
+        reverse=True,
+    )[:3]
+
+    return {
+        "success": True,
+        "properties": items,
+        "totals": {
+            "property_count": len(items),
+            "already_s8": already_s8_count,
+            "eligible_for_uplift": eligible_count,
+            "no_fmr_data": no_data_count,
+            "total_potential_monthly": round(total_potential_monthly, 2),
+            "total_potential_annual": round(total_potential_annual, 2),
+        },
+        "top_opportunities": top_3,
+    }
+
+
+@router.get('/admin/section8/inspections')
+async def admin_section8_inspections(request: Request):
+    """List all Section 8 properties + their next-inspection status.
+
+    Each entry classifies urgency based on days-until-inspection:
+      - overdue   (negative days)
+      - urgent    (0-7 days)
+      - soon      (8-15 days)
+      - upcoming  (16-30 days)
+      - scheduled (>30 days)
+      - none      (S8 enabled but no next_inspection date set)
+
+    Returns: {inspections[], counts{overdue,urgent,soon,upcoming,scheduled,none}}
+    """
+    await auth_admin(request)
+    db = get_db()
+    today = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+
+    items = []
+    counts = {"overdue": 0, "urgent": 0, "soon": 0, "upcoming": 0, "scheduled": 0, "none": 0}
+
+    async for prop in db.properties.find({"section8_accepted": True}):
+        next_str = prop.get("section8_next_inspection")
+        last_str = prop.get("section8_last_inspection")
+
+        next_dt = None
+        if next_str:
+            try:
+                if isinstance(next_str, datetime):
+                    next_dt = next_str
+                else:
+                    s = str(next_str)[:10]
+                    next_dt = datetime.strptime(s, "%Y-%m-%d")
+            except Exception:
+                next_dt = None
+
+        if next_dt is None:
+            urgency = "none"
+            days_until = None
+        else:
+            days_until = (next_dt - today).days
+            if days_until < 0:
+                urgency = "overdue"
+            elif days_until <= 7:
+                urgency = "urgent"
+            elif days_until <= 15:
+                urgency = "soon"
+            elif days_until <= 30:
+                urgency = "upcoming"
+            else:
+                urgency = "scheduled"
+
+        counts[urgency] = counts.get(urgency, 0) + 1
+
+        items.append({
+            "property_id": str(prop["_id"]),
+            "name": prop.get("name") or prop.get("address", ""),
+            "address": prop.get("address", ""),
+            "city": prop.get("city", ""),
+            "section8_pha": prop.get("section8_pha", ""),
+            "section8_pha_contact": prop.get("section8_pha_contact", ""),
+            "section8_last_inspection": str(last_str)[:10] if last_str else None,
+            "section8_next_inspection": next_dt.strftime("%Y-%m-%d") if next_dt else None,
+            "days_until": days_until,
+            "urgency": urgency,
+            "notes": prop.get("section8_notes", ""),
+        })
+
+    # Sort: overdue first, then urgent, then by days
+    URGENCY_ORDER = {"overdue": 0, "urgent": 1, "soon": 2, "upcoming": 3, "scheduled": 4, "none": 5}
+    items.sort(key=lambda x: (URGENCY_ORDER[x["urgency"]], x["days_until"] if x["days_until"] is not None else 99999))
+
+    return {
+        "success": True,
+        "inspections": items,
+        "counts": counts,
+        "total": len(items),
+        "needs_attention": counts["overdue"] + counts["urgent"] + counts["soon"] + counts["none"],
+    }
 
 

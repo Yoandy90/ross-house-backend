@@ -54,6 +54,116 @@ async def tenant_login(request: Request):
     }
 
 
+@router.post('/tenant/section8/declare')
+async def tenant_declare_section8(request: Request):
+    """Tenant-facing: declare/update Section 8 voucher information.
+
+    Mobile wizard sends:
+      - has_voucher: bool
+      - voucher_number: str (optional)
+      - pha: str (Public Housing Authority name)
+      - voucher_bedrooms: int
+      - voucher_amount: float (monthly max HUD will pay)
+      - voucher_expiration: YYYY-MM-DD
+      - photo_base64: str (optional voucher document upload)
+      - notes: str
+    """
+    # Best effort: works for any authenticated user (tenant or app_user)
+    user = None
+    for auth_fn in (auth_tenant, auth_marketplace):
+        try:
+            user = await auth_fn(request)
+            if user:
+                break
+        except Exception:
+            continue
+    if not user:
+        raise HTTPException(status_code=401, detail="No autenticado")
+
+    data = await request.json()
+    user_id = str(user.get("_id") or user.get("id") or "")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="No autenticado")
+
+    s8_data = {
+        "is_section8": bool(data.get("has_voucher", False)),
+        "section8_voucher": (data.get("voucher_number") or "").strip(),
+        "section8_pha": (data.get("pha") or "").strip(),
+        "section8_voucher_bedrooms": int(data.get("voucher_bedrooms") or 0),
+        "section8_voucher_amount": float(data.get("voucher_amount") or 0),
+        "section8_voucher_expiration": data.get("voucher_expiration") or None,
+        "section8_notes": (data.get("notes") or "").strip(),
+        "section8_declared_at": datetime.utcnow(),
+    }
+
+    photo_b64 = data.get("photo_base64") or ""
+    if photo_b64 and isinstance(photo_b64, str) and len(photo_b64) < 5_000_000:
+        s8_data["section8_voucher_photo"] = photo_b64  # base64 stored inline (small docs)
+
+    db = get_db()
+
+    # Update both app_users and (if exists) tenants record
+    try:
+        await db.app_users.update_one({"_id": ObjectId(user_id)}, {"$set": s8_data})
+    except Exception:
+        pass
+    user_email = (user.get("email") or "").lower()
+    if user_email:
+        try:
+            await db.tenants.update_one(
+                {"email": {"$regex": f"^{user_email}$", "$options": "i"}},
+                {"$set": s8_data},
+            )
+        except Exception:
+            pass
+
+    # Notify admins
+    try:
+        msg = (
+            f"🏛️ {user.get('name', 'Inquilino')} declaró voucher Section 8: "
+            f"{s8_data.get('section8_pha', '?')}, {s8_data.get('section8_voucher_bedrooms', '?')}BR, "
+            f"max ${s8_data.get('section8_voucher_amount', 0):.0f}/mes"
+        )
+        await send_rental_push_to_admins(
+            title="Nueva declaración Section 8",
+            body=msg,
+            data={"type": "section8_declaration", "user_id": user_id},
+        )
+    except Exception:
+        pass
+
+    return {
+        "success": True,
+        "message": "Información de Section 8 guardada. El admin la revisará.",
+        "data": {
+            "is_section8": s8_data["is_section8"],
+            "voucher_number": s8_data["section8_voucher"],
+            "pha": s8_data["section8_pha"],
+            "voucher_amount": s8_data["section8_voucher_amount"],
+        },
+    }
+
+
+@router.get('/tenant/section8/status')
+async def tenant_section8_status(request: Request):
+    """Return the tenant's current S8 declaration (so the mobile wizard can prefill)."""
+    try:
+        user = await auth_tenant(request)
+    except Exception:
+        user = await auth_marketplace(request)
+    return {
+        "success": True,
+        "is_section8": bool(user.get("is_section8", False)),
+        "voucher_number": user.get("section8_voucher", ""),
+        "pha": user.get("section8_pha", ""),
+        "voucher_bedrooms": user.get("section8_voucher_bedrooms", 0),
+        "voucher_amount": user.get("section8_voucher_amount", 0),
+        "voucher_expiration": user.get("section8_voucher_expiration", ""),
+        "notes": user.get("section8_notes", ""),
+        "declared_at": user.get("section8_declared_at").isoformat() if user.get("section8_declared_at") else None,
+    }
+
+
 @router.get('/tenant/dashboard')
 async def tenant_dashboard(request: Request):
     """Get tenant dashboard: contract, payments, next due date.
@@ -322,16 +432,38 @@ async def list_all_users(request: Request):
     """List ALL registered users (tenants + marketplace app_users).
     Returns a unified list with source = 'tenant' | 'app_user' | 'linked'.
     Useful for admin to see everyone who has registered through any channel.
+
+    Query params:
+      - search: substring across name/email/phone/tenant_number
+      - source: 'all' | 'tenant' | 'app_user'  (filter by record source)
+      - status: 'all' | 'active' | 'inactive'
+      - has_contract: 'all' | 'yes' | 'no'  (only meaningful for tenants)
+      - section8: 'all' | 'yes' | 'no'  (filter by Section 8 voucher status)
+      - page: 1-based (default 1)
+      - page_size: default 50, max 200
     """
     user = await auth_admin(request)
     db = get_db()
 
-    from urllib.parse import parse_qs
-    params = parse_qs(str(request.url.query))
-    search = params.get('search', [''])[0]
+    qp = request.query_params
+    search = qp.get('search') or ''
+    source_filter = (qp.get('source') or 'all').lower()
+    status_filter = (qp.get('status') or 'all').lower()
+    has_contract = (qp.get('has_contract') or 'all').lower()
+    section8_filter = (qp.get('section8') or 'all').lower()
+
+    try:
+        page = max(1, int(qp.get('page') or 1))
+    except (TypeError, ValueError):
+        page = 1
+    try:
+        page_size = int(qp.get('page_size') or 50)
+    except (TypeError, ValueError):
+        page_size = 50
+    page_size = max(1, min(page_size, 200))
 
     # 1. All tenants (formal tenant records with optional app_user link)
-    tenant_query = {}
+    tenant_query: dict = {}
     if search:
         tenant_query['$or'] = [
             {"name": {"$regex": search, "$options": "i"}},
@@ -339,6 +471,8 @@ async def list_all_users(request: Request):
             {"phone": {"$regex": search, "$options": "i"}},
             {"tenant_number": {"$regex": search, "$options": "i"}},
         ]
+    if status_filter in ('active', 'inactive'):
+        tenant_query['status'] = status_filter
 
     tenants = []
     tenant_app_ids = set()
@@ -359,6 +493,16 @@ async def list_all_users(request: Request):
             if existing:
                 has_app = True
                 tenant_app_ids.add(str(existing['_id']))
+        t_has_contract = bool(t.get("current_property_id"))
+        if has_contract == 'yes' and not t_has_contract:
+            continue
+        if has_contract == 'no' and t_has_contract:
+            continue
+        t_section8 = bool(t.get("section8_voucher") or t.get("is_section8") or False)
+        if section8_filter == 'yes' and not t_section8:
+            continue
+        if section8_filter == 'no' and t_section8:
+            continue
         tenants.append({
             "id": str(t["_id"]),
             "source": "tenant",
@@ -370,14 +514,17 @@ async def list_all_users(request: Request):
             "phone": t.get("phone", ""),
             "photo_url": t.get("photo_url", ""),
             "status": t.get("status", "active"),
-            "has_contract": bool(t.get("current_property_id")),
+            "has_contract": t_has_contract,
             "has_app_account": has_app,
             "current_property_id": t.get("current_property_id"),
+            "is_section8": t_section8,
+            "section8_voucher": t.get("section8_voucher", ""),
+            "section8_pha": t.get("section8_pha", ""),
             "created_at": t.get("created_at").isoformat() if t.get("created_at") else None,
         })
 
     # 2. app_users NOT yet linked to a tenant (registered via OTP, not yet a formal tenant)
-    user_query = {"role": {"$ne": "admin"}}  # Don't list admin accounts in tenant view
+    user_query: dict = {"role": {"$ne": "admin"}}  # Don't list admin accounts in tenant view
     if search:
         user_query['$or'] = [
             {"name": {"$regex": search, "$options": "i"}},
@@ -386,6 +533,8 @@ async def list_all_users(request: Request):
             {"first_name": {"$regex": search, "$options": "i"}},
             {"last_name": {"$regex": search, "$options": "i"}},
         ]
+    if status_filter in ('active', 'inactive'):
+        user_query['status'] = status_filter
 
     unlinked_users = []
     async for u in db.app_users.find(user_query).sort("created_at", -1):
@@ -398,6 +547,9 @@ async def list_all_users(request: Request):
         if u_email and u_email in tenant_emails:
             continue
         if u_phone and u_phone in tenant_phones:
+            continue
+        # app_users never "have a contract" — filter out if requesting only those that do
+        if has_contract == 'yes':
             continue
         unlinked_users.append({
             "id": uid,
@@ -417,9 +569,28 @@ async def list_all_users(request: Request):
             "created_at": u.get("created_at").isoformat() if isinstance(u.get("created_at"), datetime) else u.get("created_at"),
         })
 
+    # Apply source filter (after merge)
+    if source_filter == 'tenant':
+        merged = tenants
+    elif source_filter == 'app_user':
+        merged = unlinked_users
+    else:
+        merged = tenants + unlinked_users
+
+    total = len(merged)
+    total_pages = max(1, (total + page_size - 1) // page_size)
+    page = min(page, total_pages) if total > 0 else 1
+    start = (page - 1) * page_size
+    end_i = start + page_size
+    page_slice = merged[start:end_i]
+
     return {
         "success": True,
-        "users": tenants + unlinked_users,
+        "users": page_slice,
+        "page": page,
+        "page_size": page_size,
+        "total": total,
+        "total_pages": total_pages,
         "summary": {
             "total": len(tenants) + len(unlinked_users),
             "tenants": len(tenants),
@@ -488,6 +659,116 @@ async def convert_app_user_to_tenant(user_id: str, request: Request):
         "message": f"Convertido a inquilino {tenant_number}",
         "tenant_id": tenant_id,
         "tenant_number": tenant_number,
+    }
+
+
+@router.delete('/admin/app-users/{user_id}')
+async def admin_delete_app_user(user_id: str, request: Request):
+    """Delete an app_user account (registered via OTP / mobile app, not yet a formal tenant).
+
+    Safety guards:
+      - Refuses to delete admin accounts
+      - Refuses if the user is linked to an active tenant record (use ?force=true to override —
+        will also remove the linked tenant if it has no active contracts)
+      - Cleans up related auth artifacts: otp_codes, push tokens, sessions, marketplace data
+
+    Query params:
+      - force=true → bypass the linked-tenant guard and also delete the linked tenant
+                     (only if no active contracts)
+    """
+    admin = await auth_admin(request)
+    db = get_db()
+
+    try:
+        oid = ObjectId(user_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="ID inválido")
+
+    u = await db.app_users.find_one({"_id": oid})
+    if not u:
+        raise HTTPException(status_code=404, detail="Usuario no encontrado")
+
+    # Don't allow deleting admins
+    if (u.get("role") or "").lower() == "admin":
+        raise HTTPException(status_code=400, detail="No se puede eliminar cuentas de administrador")
+
+    from urllib.parse import parse_qs
+    params = parse_qs(str(request.url.query))
+    force = params.get('force', ['false'])[0].lower() == 'true'
+
+    email = (u.get("email") or "").lower()
+    phone = u.get("phone") or ""
+
+    # Check if linked to a formal tenant
+    linked_tenant = None
+    if u.get("tenant_id"):
+        try:
+            linked_tenant = await db.tenants.find_one({"_id": ObjectId(u["tenant_id"])})
+        except Exception:
+            linked_tenant = None
+    if not linked_tenant and email:
+        linked_tenant = await db.tenants.find_one({"email": {"$regex": f"^{email}$", "$options": "i"}})
+    if not linked_tenant and phone:
+        linked_tenant = await db.tenants.find_one({"phone": phone})
+
+    if linked_tenant and not force:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Esta cuenta está vinculada al inquilino "
+                f"{linked_tenant.get('tenant_number', '?')} ({linked_tenant.get('name','')}). "
+                "Elimina primero el inquilino, o usa ?force=true."
+            ),
+        )
+
+    # If force and linked tenant exists, check for active contracts before nuking
+    if linked_tenant and force:
+        tid = str(linked_tenant["_id"])
+        active_contract = await db.rental_contracts.find_one({
+            "tenant_id": tid,
+            "status": "active",
+        })
+        if active_contract:
+            raise HTTPException(
+                status_code=400,
+                detail="No se puede eliminar: el inquilino vinculado tiene un contrato activo.",
+            )
+        try:
+            await db.tenants.delete_one({"_id": linked_tenant["_id"]})
+        except Exception as e:
+            logging.warning(f"Tenant cleanup failed for {tid}: {e}")
+
+    # Delete the app_user
+    await db.app_users.delete_one({"_id": oid})
+
+    # Best-effort cleanup of related auth/marketplace artifacts
+    cleanup_counts = {}
+    for coll, query in [
+        ("otp_codes", {"$or": [{"user_id": user_id}, {"email": email}, {"phone": phone}]}),
+        ("push_tokens", {"user_id": user_id}),
+        ("user_sessions", {"user_id": user_id}),
+        ("marketplace_messages", {"$or": [{"sender_id": user_id}, {"recipient_id": user_id}]}),
+        ("notifications", {"user_id": user_id}),
+        ("user_preferences", {"user_id": user_id}),
+        ("biometric_credentials", {"user_id": user_id}),
+    ]:
+        try:
+            # Filter out falsy keys (e.g., empty email/phone) to avoid over-broad deletes
+            if "$or" in query:
+                query["$or"] = [q for q in query["$or"] if any(v for v in q.values())]
+                if not query["$or"]:
+                    continue
+            res = await db[coll].delete_many(query)
+            if res.deleted_count:
+                cleanup_counts[coll] = res.deleted_count
+        except Exception:
+            pass
+
+    return {
+        "success": True,
+        "message": f"Cuenta eliminada ({u.get('name') or email or phone})",
+        "deleted_tenant": str(linked_tenant["_id"]) if (linked_tenant and force) else None,
+        "cleanup": cleanup_counts,
     }
 
 
@@ -1476,19 +1757,46 @@ async def list_tenant_maintenance_requests(request: Request):
 async def admin_list_maintenance_requests(
     request: Request,
     status: str = "",
+    priority: str = "",
+    search: str = "",
     page: int = 1,
     limit: int = 50,
 ):
-    """Admin: List all maintenance requests"""
+    """Admin: List all maintenance requests with server-side pagination + filters.
+
+    Query params:
+      - status: open | in_progress | completed | cancelled (or '' for all)
+      - priority: low | medium | high | urgent (or '' for all)
+      - search: substring across tenant_name | property_address | title | description
+      - page, limit (default 50, max 200)
+    """
     user = await auth_admin(request)
-    query = {}
+    # Clamp
+    page = max(1, int(page or 1))
+    limit = max(1, min(int(limit or 50), 200))
+
+    query: dict = {}
     if status:
         query["status"] = status
-    
-    total = await get_db().maintenance_requests.count_documents(query)
+    if priority:
+        query["priority"] = priority
+    if search:
+        import re as _re
+        rg = {"$regex": _re.escape(search), "$options": "i"}
+        query["$or"] = [
+            {"tenant_name": rg},
+            {"property_address": rg},
+            {"title": rg},
+            {"description": rg},
+        ]
+
+    db = get_db()
+    total = await db.maintenance_requests.count_documents(query)
+    total_pages = max(1, (total + limit - 1) // limit)
+    page = min(page, total_pages) if total > 0 else 1
     skip = (page - 1) * limit
-    cursor = get_db().maintenance_requests.find(query).sort("created_at", -1).skip(skip).limit(limit)
-    
+    cursor = db.maintenance_requests.find(query).sort("created_at", -1).skip(skip).limit(limit)
+
     requests_list = []
     async for r in cursor:
         requests_list.append({
@@ -1511,8 +1819,32 @@ async def admin_list_maintenance_requests(
             "completed_at": r.get("completed_at", "").isoformat() if r.get("completed_at") else "",
             "admin_notes": r.get("admin_notes", ""),
         })
-    
-    return {"success": True, "requests": requests_list, "total": total}
+
+    # Aggregate counts (status breakdown across full filtered set — useful for UI badges)
+    stats = {"open": 0, "in_progress": 0, "completed": 0, "cancelled": 0, "urgent": 0}
+    try:
+        async for d in db.maintenance_requests.aggregate([
+            {"$match": query},
+            {"$group": {"_id": "$status", "count": {"$sum": 1}}},
+        ]):
+            k = (d.get("_id") or "").lower()
+            if k in stats:
+                stats[k] = d.get("count", 0)
+        # Count urgent (across all statuses still in query)
+        urgent_q = {**query, "priority": "urgent"}
+        stats["urgent"] = await db.maintenance_requests.count_documents(urgent_q)
+    except Exception:
+        pass
+
+    return {
+        "success": True,
+        "requests": requests_list,
+        "total": total,
+        "page": page,
+        "limit": limit,
+        "total_pages": total_pages,
+        "stats": stats,
+    }
 
 
 @router.put('/admin/maintenance-requests/{request_id}')

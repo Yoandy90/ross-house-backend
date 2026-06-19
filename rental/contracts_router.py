@@ -1137,25 +1137,155 @@ async def register_rental_payment(request: Request):
 
 @router.get('/admin/rental-payments')
 async def list_rental_payments(request: Request):
-    """List rental payments"""
-    user = await auth_admin(request)
-    from urllib.parse import parse_qs
-    params = parse_qs(str(request.url.query))
-    contract_id = params.get('contract_id', [None])[0]
-    property_id = params.get('property_id', [None])[0]
+    """List rental payments with server-side pagination and filtering.
 
-    query = {}
+    Query params:
+      - contract_id, property_id (optional filters)
+      - status: 'all' | 'paid' | 'pending'  (groups completed/paid vs pending/late/partial)
+      - year: '2025' (matches period_year, falls back to payment_date.year)
+      - search: substring matched against tenant_name | property_address | receipt_number
+      - page: 1-based page (default 1)
+      - page_size: default 50, max 200
+
+    Returns:
+      {
+        success, payments[], count, total,
+        page, page_size, total_pages,
+        stats: { paid_count, pending_count, total_completed, total_pending }
+      }
+
+    NOTE: keeps backward compatibility — old callers without `page` still receive
+    up to `page_size` (default 50) most-recent docs.
+    """
+    user = await auth_admin(request)
+    qp = request.query_params
+
+    contract_id = qp.get('contract_id') or None
+    property_id = qp.get('property_id') or None
+    status_filter = (qp.get('status') or 'all').lower()
+    year_filter = qp.get('year') or 'all'
+    search = (qp.get('search') or '').strip()
+
+    try:
+        page = max(1, int(qp.get('page') or 1))
+    except (TypeError, ValueError):
+        page = 1
+    try:
+        page_size = int(qp.get('page_size') or 50)
+    except (TypeError, ValueError):
+        page_size = 50
+    page_size = max(1, min(page_size, 200))
+
+    query: dict = {}
     if contract_id:
         query['contract_id'] = contract_id
     if property_id:
         query['property_id'] = property_id
 
-    cursor = get_db().rental_payments.find(query).sort("payment_date", -1).limit(100)
+    if status_filter == 'paid':
+        query['status'] = {'$in': ['completed', 'paid']}
+    elif status_filter == 'pending':
+        query['status'] = {'$in': ['pending', 'late', 'partial']}
+
+    if year_filter and year_filter != 'all':
+        try:
+            y = int(year_filter)
+            query['$or'] = [
+                {'period_year': y},
+                {'payment_date': {
+                    '$gte': datetime(y, 1, 1),
+                    '$lt': datetime(y + 1, 1, 1),
+                }},
+            ]
+        except ValueError:
+            pass
+
+    if search:
+        # Case-insensitive partial match across common text fields
+        import re as _re
+        escaped = _re.escape(search)
+        regex = {'$regex': escaped, '$options': 'i'}
+        text_or = [
+            {'tenant_name': regex},
+            {'property_address': regex},
+            {'receipt_number': regex},
+        ]
+        if '$or' in query:
+            # Combine with year filter using $and
+            query = {'$and': [{'$or': query.pop('$or')}, {'$or': text_or}], **query}
+        else:
+            query['$or'] = text_or
+
+    db = get_db()
+    total = await db.rental_payments.count_documents(query)
+    total_pages = max(1, (total + page_size - 1) // page_size)
+    page = min(page, total_pages) if total > 0 else 1
+    skip = (page - 1) * page_size
+
+    cursor = (db.rental_payments
+              .find(query)
+              .sort("payment_date", -1)
+              .skip(skip)
+              .limit(page_size))
     payments = []
     async for p in cursor:
         payments.append(serialize(p))
 
-    return {"success": True, "payments": payments, "count": len(payments)}
+    # Aggregate stats (across all filtered results, not just current page)
+    stats_pipeline = [
+        {'$match': query},
+        {'$group': {
+            '_id': None,
+            'paid_count': {'$sum': {'$cond': [
+                {'$in': [{'$ifNull': ['$status', '']}, ['completed', 'paid']]}, 1, 0
+            ]}},
+            'pending_count': {'$sum': {'$cond': [
+                {'$in': [{'$ifNull': ['$status', '']}, ['pending', 'late']]}, 1, 0
+            ]}},
+            'total_completed': {'$sum': {'$cond': [
+                {'$in': [{'$ifNull': ['$status', '']}, ['completed', 'paid']]},
+                {'$add': [{'$ifNull': ['$amount', 0]}, {'$ifNull': ['$late_fee', 0]}]},
+                0,
+            ]}},
+            'total_pending': {'$sum': {'$cond': [
+                {'$in': [{'$ifNull': ['$status', '']}, ['pending', 'late', 'partial']]},
+                {'$add': [{'$ifNull': ['$amount', 0]}, {'$ifNull': ['$late_fee', 0]}]},
+                0,
+            ]}},
+        }}
+    ]
+    stats = {'paid_count': 0, 'pending_count': 0, 'total_completed': 0.0, 'total_pending': 0.0}
+    try:
+        async for row in db.rental_payments.aggregate(stats_pipeline):
+            stats.update({k: v for k, v in row.items() if k != '_id'})
+    except Exception:
+        pass
+
+    # Available years (lightweight distinct, capped)
+    try:
+        years_set = set()
+        async for d in db.rental_payments.aggregate([
+            {'$group': {'_id': '$period_year'}},
+            {'$match': {'_id': {'$ne': None}}},
+            {'$limit': 30},
+        ]):
+            if d.get('_id') is not None:
+                years_set.add(str(d['_id']))
+        available_years = sorted(years_set, reverse=True)
+    except Exception:
+        available_years = []
+
+    return {
+        "success": True,
+        "payments": payments,
+        "count": len(payments),
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "total_pages": total_pages,
+        "stats": stats,
+        "available_years": available_years,
+    }
 
 
 @router.put('/admin/rental-payments/{payment_id}')
@@ -1271,6 +1401,302 @@ async def admin_trigger_monthly_rent_generation(request: Request):
     except Exception as e:
         logging.exception("Manual rent generation failed")
         raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# BULK OPERATIONS (Sprint 2 — scalability for 142+ units)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@router.post('/admin/rental-payments/bulk-reminders')
+async def admin_send_bulk_payment_reminders(request: Request):
+    """Send bulk payment reminders for multiple invoices at once.
+
+    Body:
+      - payment_ids: list[str]  → invoice IDs to remind
+      - channel: 'email' | 'sms' | 'both'   (default 'email')
+      - custom_message: str (optional) → overrides default reminder text
+
+    For each payment:
+      1. Resolves tenant email / phone via the linked rental_contract
+      2. Builds a personalized reminder (period, amount, due date, late fee)
+      3. Sends via SendGrid (email) and/or Twilio (SMS)
+
+    Returns per-payment status + aggregate stats.
+    """
+    await auth_admin(request)
+    db = get_db()
+    data = await request.json()
+
+    payment_ids = data.get('payment_ids', []) or []
+    channel = (data.get('channel') or 'email').lower()
+    custom_message = (data.get('custom_message') or '').strip()
+
+    if not payment_ids:
+        raise HTTPException(status_code=400, detail="Selecciona al menos una factura")
+    if channel not in ('email', 'sms', 'both'):
+        channel = 'email'
+
+    # ── Resolve API credentials (env first, fallback api_config) ──
+    sendgrid_key = os.getenv('SENDGRID_API_KEY')
+    from_email = os.getenv('SENDGRID_FROM_EMAIL', 'info@rosshouserentals.com')
+    twilio_sid = os.getenv('TWILIO_ACCOUNT_SID')
+    twilio_token = os.getenv('TWILIO_AUTH_TOKEN')
+    twilio_phone = os.getenv('TWILIO_PHONE_NUMBER')
+
+    if (not sendgrid_key) or (not twilio_sid):
+        try:
+            cfg = await db.api_config.find_one({'_id': 'main'})
+            if cfg:
+                if not sendgrid_key:
+                    sendgrid_key = cfg.get('sendgrid_api_key') or cfg.get('SENDGRID_API_KEY')
+                    from_email = cfg.get('sendgrid_from_email', from_email)
+                if not twilio_sid:
+                    twilio_sid = cfg.get('twilio_account_sid') or cfg.get('TWILIO_ACCOUNT_SID')
+                    twilio_token = cfg.get('twilio_auth_token') or cfg.get('TWILIO_AUTH_TOKEN')
+                    twilio_phone = cfg.get('twilio_phone_number') or cfg.get('TWILIO_PHONE_NUMBER')
+        except Exception:
+            pass
+
+    sg_client = None
+    if channel in ('email', 'both') and sendgrid_key:
+        try:
+            import sendgrid
+            sg_client = sendgrid.SendGridAPIClient(api_key=sendgrid_key)
+        except Exception as e:
+            logging.warning(f"SendGrid init failed: {e}")
+
+    twilio_client = None
+    if channel in ('sms', 'both') and twilio_sid and twilio_token and twilio_phone:
+        try:
+            from twilio.rest import Client
+            twilio_client = Client(twilio_sid, twilio_token)
+        except Exception as e:
+            logging.warning(f"Twilio init failed: {e}")
+
+    def _fmt_money(n: float) -> str:
+        try:
+            return f"${float(n or 0):,.2f}"
+        except Exception:
+            return f"${n}"
+
+    def _month_label(period_year, period_month_num, period_month):
+        names = ['Enero','Febrero','Marzo','Abril','Mayo','Junio',
+                 'Julio','Agosto','Septiembre','Octubre','Noviembre','Diciembre']
+        try:
+            if period_month_num and 1 <= int(period_month_num) <= 12:
+                return f"{names[int(period_month_num) - 1]} {period_year}"
+        except Exception:
+            pass
+        return f"{period_month or ''} {period_year or ''}".strip()
+
+    def _normalize_phone(raw: str) -> Optional[str]:
+        if not raw:
+            return None
+        digits = ''.join(filter(str.isdigit, str(raw)))
+        if not digits:
+            return None
+        if len(digits) == 10:
+            return f'+1{digits}'
+        if len(digits) == 11 and digits.startswith('1'):
+            return f'+{digits}'
+        if str(raw).startswith('+'):
+            return str(raw)
+        return f'+{digits}'
+
+    results = {
+        "total": len(payment_ids),
+        "email_sent": 0,
+        "sms_sent": 0,
+        "skipped_no_contact": 0,
+        "failed": 0,
+        "details": [],
+    }
+
+    for pid in payment_ids:
+        item = {"payment_id": pid, "email": False, "sms": False, "errors": []}
+        try:
+            try:
+                pay = await db.rental_payments.find_one({"_id": ObjectId(pid)})
+            except Exception:
+                pay = None
+            if not pay:
+                item["errors"].append("Factura no encontrada")
+                results["failed"] += 1
+                results["details"].append(item)
+                continue
+
+            # Skip already paid invoices defensively
+            status = (pay.get('status') or '').lower()
+            if status in ('completed', 'paid', 'cancelled'):
+                item["errors"].append(f"Ignorada ({status})")
+                results["details"].append(item)
+                continue
+
+            tenant_email = pay.get('tenant_email', '') or ''
+            tenant_phone = pay.get('tenant_phone', '') or ''
+            tenant_name = pay.get('tenant_name', '') or 'Inquilino'
+            property_address = pay.get('property_address', '') or ''
+
+            # Fallback to contract for contact info
+            if (not tenant_email or not tenant_phone) and pay.get('contract_id'):
+                try:
+                    contract = await db.rental_contracts.find_one({"_id": ObjectId(pay['contract_id'])})
+                except Exception:
+                    contract = None
+                if contract:
+                    if not tenant_email:
+                        tenant_email = contract.get('tenant_email', '') or ''
+                    if not tenant_phone:
+                        tenant_phone = contract.get('tenant_phone', '') or ''
+                    if not tenant_name:
+                        tenant_name = contract.get('tenant_name', tenant_name)
+                    if not property_address:
+                        property_address = contract.get('property_address', property_address)
+
+            if (channel == 'email' and not tenant_email) or \
+               (channel == 'sms' and not tenant_phone) or \
+               (channel == 'both' and not tenant_email and not tenant_phone):
+                results["skipped_no_contact"] += 1
+                item["errors"].append("Sin contacto")
+                results["details"].append(item)
+                continue
+
+            # ── Build personalized reminder content ──
+            period_label = _month_label(
+                pay.get('period_year'),
+                pay.get('period_month_num'),
+                pay.get('period_month'),
+            )
+            amount = float(pay.get('amount', 0) or 0)
+            late_fee = float(pay.get('late_fee', 0) or 0)
+            total = amount + late_fee
+            due_date = pay.get('due_date')
+            if isinstance(due_date, datetime):
+                due_str = due_date.strftime('%d/%m/%Y')
+            else:
+                due_str = ''
+
+            if custom_message:
+                msg_text = custom_message
+            else:
+                msg_lines = [
+                    f"Hola {tenant_name},",
+                    "",
+                    f"Te recordamos que tu pago de renta correspondiente a {period_label} sigue pendiente.",
+                    f"• Monto: {_fmt_money(amount)}",
+                ]
+                if late_fee > 0:
+                    msg_lines.append(f"• Recargo por atraso: {_fmt_money(late_fee)}")
+                    msg_lines.append(f"• Total a pagar: {_fmt_money(total)}")
+                if due_str:
+                    msg_lines.append(f"• Vencimiento: {due_str}")
+                if property_address:
+                    msg_lines.append(f"• Propiedad: {property_address}")
+                msg_lines += [
+                    "",
+                    "Puedes pagar desde la app Ross House Rentals o contactarnos para coordinar.",
+                    "",
+                    "Gracias,",
+                    "Ross House Rentals",
+                ]
+                msg_text = "\n".join(msg_lines)
+
+            subject = f"Recordatorio de pago — {period_label}"
+
+            # ── Email ──
+            if channel in ('email', 'both') and tenant_email:
+                if sg_client:
+                    try:
+                        from sendgrid.helpers.mail import Mail, Email, To, Content
+                        html_msg = msg_text.replace('\n', '<br>')
+                        mail = Mail(
+                            from_email=Email(from_email, "Ross House Rentals"),
+                            to_emails=To(tenant_email),
+                            subject=subject,
+                            plain_text_content=Content("text/plain", msg_text),
+                        )
+                        try:
+                            mail.add_content(Content("text/html",
+                                f"<div style='font-family:Arial,sans-serif;font-size:14px;color:#222;line-height:1.5'>{html_msg}</div>"))
+                        except Exception:
+                            pass
+                        sg_client.client.mail.send.post(request_body=mail.get())
+                        item["email"] = True
+                        results["email_sent"] += 1
+                    except Exception as e:
+                        item["errors"].append(f"Email: {str(e)[:120]}")
+                        results["failed"] += 1
+                else:
+                    item["errors"].append("SendGrid no configurado")
+
+            # ── SMS ──
+            if channel in ('sms', 'both') and tenant_phone:
+                if twilio_client:
+                    try:
+                        to_phone = _normalize_phone(tenant_phone)
+                        sms_body = msg_text
+                        # SMS keep it concise if too long
+                        if len(sms_body) > 480:
+                            sms_body = (
+                                f"Ross House Rentals: Hola {tenant_name}, tienes pendiente la renta de "
+                                f"{period_label} por {_fmt_money(total)}"
+                                + (f" (vence {due_str})" if due_str else "")
+                                + ". Paga desde la app o contáctanos."
+                            )
+                        twilio_client.messages.create(
+                            body=sms_body, from_=twilio_phone, to=to_phone
+                        )
+                        item["sms"] = True
+                        results["sms_sent"] += 1
+                    except Exception as e:
+                        item["errors"].append(f"SMS: {str(e)[:120]}")
+                        results["failed"] += 1
+                else:
+                    item["errors"].append("Twilio no configurado")
+
+            # Stamp on the invoice
+            try:
+                now = datetime.utcnow()
+                history_entry = {
+                    "at": now,
+                    "channel": channel,
+                    "email_sent": item["email"],
+                    "sms_sent": item["sms"],
+                }
+                await db.rental_payments.update_one(
+                    {"_id": ObjectId(pid)},
+                    {
+                        "$set": {"last_reminder_at": now, "updated_at": now},
+                        "$inc": {"reminder_count": 1},
+                        "$push": {"reminder_history": history_entry},
+                    },
+                )
+            except Exception:
+                pass
+
+            results["details"].append(item)
+        except Exception as e:
+            logging.exception(f"Bulk reminder failed for {pid}")
+            item["errors"].append(str(e)[:200])
+            results["failed"] += 1
+            results["details"].append(item)
+
+    # Log aggregate to message history
+    try:
+        await db.message_history.insert_one({
+            "channel": channel,
+            "subject": "Bulk payment reminders",
+            "message": custom_message or "(auto-generated reminder)",
+            "recipient_count": len(payment_ids),
+            "sent": results["email_sent"] + results["sms_sent"],
+            "failed": results["failed"],
+            "kind": "bulk_payment_reminder",
+            "created_at": datetime.utcnow(),
+        })
+    except Exception:
+        pass
+
+    return {"success": True, **results}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
