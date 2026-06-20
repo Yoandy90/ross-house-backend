@@ -943,6 +943,288 @@ async def admin_marketplace_commissions(request: Request):
     }
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# MONTHLY COMMISSION REPORT — PDF + AUTO-EMAIL
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@router.post('/admin/marketplace-commissions/{landlord_id}/report-pdf')
+async def email_commission_report(landlord_id: str, request: Request):
+    """Admin: generate + email a monthly commission report PDF to a specific landlord.
+    Optional body: { "period": "2026-01" } to override the period (default = current month).
+    """
+    import os as _os
+    import io as _io
+    import base64 as _b64
+    from datetime import datetime as _dt
+    await auth_admin(request)
+    if not ObjectId.is_valid(landlord_id):
+        raise HTTPException(status_code=400, detail="ID inválido")
+    db = get_db()
+    landlord = await db.app_users.find_one({"_id": ObjectId(landlord_id)})
+    if not landlord:
+        raise HTTPException(status_code=404, detail="Landlord no encontrado")
+
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:
+        pass
+    period = (body.get("period") if isinstance(body, dict) else None) or _dt.utcnow().strftime("%Y-%m")
+
+    # Compute landlord's stats
+    owner_id = str(landlord["_id"])
+    property_ids = [str(l["_id"]) async for l in db.marketplace_listings.find({"owner_id": owner_id, "status": "approved"})]
+    contract_q = {"$or": [{"landlord_id": owner_id}]}
+    if property_ids:
+        contract_q["$or"].append({"property_id": {"$in": property_ids}})
+    contracts = []
+    async for c in db.rental_contracts.find({**contract_q, "status": {"$in": ["active", "completed"]}}):
+        contracts.append(c)
+    total_rent = sum(float(c.get("rent_amount", 0) or 0) for c in contracts)
+    commission_rate = float(landlord.get("commission_rate", 10))
+    commission = (total_rent * commission_rate) / 100.0
+    net_payout = total_rent - commission
+
+    # Build PDF
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import LETTER
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import inch
+    from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+    buf = _io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=LETTER, topMargin=0.5*inch, bottomMargin=0.5*inch, leftMargin=0.6*inch, rightMargin=0.6*inch)
+    styles = getSampleStyleSheet()
+    h_style = ParagraphStyle('h', parent=styles['Heading1'], fontSize=18, textColor=colors.HexColor("#0b1220"), spaceAfter=4)
+    sub = ParagraphStyle('s', parent=styles['Normal'], fontSize=10, textColor=colors.HexColor("#475569"), spaceAfter=14)
+    sec = ParagraphStyle('sec', parent=styles['Heading2'], fontSize=12, textColor=colors.HexColor("#10b981"), spaceAfter=8, spaceBefore=14)
+    story = [
+        Paragraph(f"<b>Ross House Rentals</b> — Reporte de Comisiones", h_style),
+        Paragraph(f"Landlord: <b>{landlord.get('name','')}</b> ({landlord.get('email','')})<br/>Período: <b>{period}</b> · Generado: {_dt.utcnow().strftime('%Y-%m-%d %H:%M UTC')}", sub),
+        Paragraph("Resumen del Período", sec),
+    ]
+    summary_data = [
+        ["Contratos activos", str(len(contracts))],
+        ["Renta total mensual (gross)", f"${total_rent:,.2f}"],
+        ["Tasa de comisión", f"{commission_rate}%"],
+        ["Comisión Ross House", f"${commission:,.2f}"],
+        ["Pago neto al landlord", f"${net_payout:,.2f}"],
+    ]
+    t = Table(summary_data, colWidths=[2.5*inch, 2.5*inch])
+    t.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (0,-1), colors.HexColor("#F1F5F9")),
+        ("FONTNAME", (0,0), (0,-1), "Helvetica-Bold"),
+        ("FONTSIZE", (0,0), (-1,-1), 10),
+        ("GRID", (0,0), (-1,-1), 0.3, colors.HexColor("#E2E8F0")),
+        ("BACKGROUND", (0,-1), (-1,-1), colors.HexColor("#ECFDF5")),
+        ("FONTNAME", (1,-1), (1,-1), "Helvetica-Bold"),
+        ("TEXTCOLOR", (1,-1), (1,-1), colors.HexColor("#059669")),
+        ("LEFTPADDING", (0,0), (-1,-1), 8),
+        ("TOPPADDING", (0,0), (-1,-1), 6),
+        ("BOTTOMPADDING", (0,0), (-1,-1), 6),
+    ]))
+    story.append(t)
+    if contracts:
+        story.append(Paragraph(f"Contratos ({len(contracts)})", sec))
+        rows = [["Propiedad", "Inquilino", "Renta", "Comisión", "Neto"]]
+        for c in contracts:
+            r = float(c.get("rent_amount", 0) or 0)
+            cm = r * commission_rate / 100
+            rows.append([c.get("property_address","")[:32], c.get("tenant_name","")[:22], f"${r:,.0f}", f"${cm:,.0f}", f"${r-cm:,.0f}"])
+        rows.append(["", "TOTAL", f"${total_rent:,.0f}", f"${commission:,.0f}", f"${net_payout:,.0f}"])
+        tt = Table(rows, colWidths=[2.4*inch, 1.8*inch, 0.9*inch, 0.9*inch, 0.9*inch])
+        tt.setStyle(TableStyle([
+            ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#10b981")),
+            ("TEXTCOLOR", (0,0), (-1,0), colors.white),
+            ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
+            ("FONTSIZE", (0,0), (-1,-1), 9),
+            ("GRID", (0,0), (-1,-1), 0.3, colors.HexColor("#E2E8F0")),
+            ("BACKGROUND", (0,-1), (-1,-1), colors.HexColor("#F1F5F9")),
+            ("FONTNAME", (0,-1), (-1,-1), "Helvetica-Bold"),
+            ("ALIGN", (2,1), (4,-1), "RIGHT"),
+        ]))
+        story.append(tt)
+    story.append(Spacer(1, 14))
+    story.append(Paragraph("<i>Documento informativo · Confidencial · Ross House Rentals · Dumas, TX</i>", sub))
+    doc.build(story)
+    buf.seek(0)
+    pdf_b64 = _b64.b64encode(buf.read()).decode("utf-8")
+    filename = f"Comisiones_{landlord.get('name','landlord').replace(' ','_')}_{period}.pdf"
+
+    # Email via SendGrid (best-effort)
+    landlord_email = (landlord.get("email") or "").strip()
+    sendgrid_key = _os.getenv("SENDGRID_API_KEY")
+    from_email = _os.getenv("SENDGRID_FROM_EMAIL", "info@rosshouserentals.com")
+    sent_to = []
+    if sendgrid_key and landlord_email:
+        try:
+            import sendgrid
+            from sendgrid.helpers.mail import Mail, Email, To, Content, Attachment, FileContent, FileName, FileType, Disposition
+            sg = sendgrid.SendGridAPIClient(api_key=sendgrid_key)
+            html = f"""
+            <div style="font-family:Helvetica,Arial,sans-serif;max-width:560px;margin:auto;background:#0b1220;color:#fff;border-radius:14px;padding:24px;">
+              <div style="background:linear-gradient(135deg,#10b981,#06b6d4);padding:14px;border-radius:10px;text-align:center;">
+                <h2 style="margin:0;color:#fff;">📊 Reporte de Comisiones — {period}</h2>
+              </div>
+              <p style="color:#cbd5e1;margin-top:18px;">Hola <strong style="color:#fff;">{landlord.get('name','')}</strong>,</p>
+              <p style="color:#cbd5e1;">Adjunto encontrarás el reporte de comisiones de tus propiedades para el período <strong>{period}</strong>.</p>
+              <div style="margin:14px 0;padding:14px;background:#111827;border-radius:10px;color:#e2e8f0;font-size:14px;">
+                <div><strong style="color:#94a3b8;">Renta total:</strong> ${total_rent:,.2f}</div>
+                <div><strong style="color:#94a3b8;">Comisión ({commission_rate}%):</strong> ${commission:,.2f}</div>
+                <div style="margin-top:8px;padding-top:8px;border-top:1px solid #1e293b;"><strong style="color:#94a3b8;">Pago neto:</strong> <strong style="color:#10b981;font-size:18px;">${net_payout:,.2f}</strong></div>
+              </div>
+              <p style="color:#64748b;font-size:11px;margin-top:18px;border-top:1px solid #1e293b;padding-top:12px;">— Ross House Rentals · Dumas, TX</p>
+            </div>
+            """
+            mail = Mail(
+                from_email=Email(from_email, "Ross House Rentals"),
+                to_emails=To(landlord_email),
+                subject=f"📊 Reporte de Comisiones — {period}",
+                plain_text_content=Content("text/plain", f"Tu reporte de comisiones de {period} está adjunto. Renta: ${total_rent:,.2f} · Comisión: ${commission:,.2f} · Neto: ${net_payout:,.2f}"),
+            )
+            mail.add_content(Content("text/html", html))
+            mail.attachment = Attachment(FileContent(pdf_b64), FileName(filename), FileType("application/pdf"), Disposition("attachment"))
+            sg.client.mail.send.post(request_body=mail.get())
+            sent_to.append(landlord_email)
+            logging.info(f"📊 Commission report sent to {landlord_email}")
+        except Exception as e:
+            logging.warning(f"Commission report email failed: {e}")
+
+    return {"success": True, "pdf_base64": pdf_b64, "filename": filename, "emailed_to": sent_to,
+            "summary": {"total_rent": round(total_rent,2), "commission_rate": commission_rate, "commission": round(commission,2), "net_payout": round(net_payout,2), "contracts": len(contracts)}}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# LANDLORD ONBOARDING (registration + KYC)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@router.post('/public/landlord-register')
+async def landlord_register(request: Request):
+    """Public: landlord signup with KYC. Creates app_users (role=landlord, status=pending_kyc).
+    Body: { name, email, phone, password, business_name?, tax_id?, address?, bank_info?, id_doc_base64? }
+    """
+    import os as _os
+    import bcrypt as _bcrypt
+    from datetime import datetime as _dt
+    data = await request.json()
+    name = (data.get("name") or "").strip()
+    email = (data.get("email") or "").strip().lower()
+    phone = (data.get("phone") or "").strip()
+    password = data.get("password") or ""
+    if not name or not email or not password:
+        raise HTTPException(status_code=400, detail="Nombre, email y password requeridos")
+    if len(password) < 6:
+        raise HTTPException(status_code=400, detail="Password mínimo 6 caracteres")
+
+    db = get_db()
+    existing = await db.app_users.find_one({"email": email})
+    if existing:
+        raise HTTPException(status_code=409, detail="Ya existe una cuenta con ese email")
+
+    user = {
+        "email": email,
+        "name": name,
+        "phone": phone,
+        "role": "landlord",
+        "password_hash": _bcrypt.hashpw(password.encode(), _bcrypt.gensalt()).decode(),
+        "status": "pending_kyc",
+        "kyc": {
+            "business_name": (data.get("business_name") or "").strip(),
+            "tax_id": (data.get("tax_id") or "").strip(),
+            "address": (data.get("address") or "").strip(),
+            "city": (data.get("city") or "").strip(),
+            "state": (data.get("state") or "").strip(),
+            "zip_code": (data.get("zip_code") or "").strip(),
+            "bank_info_encrypted": data.get("bank_info") or "",  # frontend can encrypt before sending
+            "id_doc_base64": data.get("id_doc_base64") or "",  # ID front/back as data URL
+            "submitted_at": _dt.utcnow(),
+        },
+        "commission_rate": float(data.get("commission_rate") or 10),
+        "created_at": _dt.utcnow(),
+    }
+    result = await db.app_users.insert_one(user)
+
+    # Notify admins of new landlord application
+    try:
+        from rental.shared import send_rental_push_to_admins
+        await send_rental_push_to_admins(
+            title="🏠 Nuevo Landlord registrado",
+            body=f"{name} · {email} · pendiente KYC",
+            data={"type": "landlord_register", "user_id": str(result.inserted_id)},
+        )
+    except Exception:
+        pass
+
+    # Email admins
+    try:
+        sendgrid_key = _os.getenv("SENDGRID_API_KEY")
+        from_email = _os.getenv("SENDGRID_FROM_EMAIL", "info@rosshouserentals.com")
+        admin_emails = (_os.getenv("RENTAL_ADMIN_EMAILS") or "yoandyross@gmail.com").split(",")
+        if sendgrid_key:
+            import sendgrid
+            from sendgrid.helpers.mail import Mail, Email, To, Content
+            sg = sendgrid.SendGridAPIClient(api_key=sendgrid_key)
+            for ae in [e.strip() for e in admin_emails if e.strip()]:
+                mail = Mail(
+                    from_email=Email(from_email, "Ross House Rentals"),
+                    to_emails=To(ae),
+                    subject=f"🏠 Nuevo landlord pendiente KYC: {name}",
+                    plain_text_content=Content("text/plain", f"Un nuevo landlord se registró:\n\nNombre: {name}\nEmail: {email}\nTeléfono: {phone}\nNegocio: {user['kyc']['business_name']}\n\nRevisar en: https://www.rosshouserentals.com/admin/marketplace")
+                )
+                sg.client.mail.send.post(request_body=mail.get())
+    except Exception as e:
+        logging.warning(f"Landlord register admin email failed: {e}")
+
+    return {"success": True, "user_id": str(result.inserted_id), "status": "pending_kyc",
+            "message": "Tu cuenta fue creada. Te avisaremos cuando se complete la verificación KYC (24-72h)."}
+
+
+@router.post('/admin/landlords/{landlord_id}/kyc-approve')
+async def admin_approve_landlord_kyc(landlord_id: str, request: Request):
+    """Admin: approve a landlord's KYC and activate the account"""
+    import os as _os
+    from datetime import datetime as _dt
+    await auth_admin(request)
+    if not ObjectId.is_valid(landlord_id):
+        raise HTTPException(status_code=400, detail="ID inválido")
+    db = get_db()
+    result = await db.app_users.update_one(
+        {"_id": ObjectId(landlord_id), "role": "landlord"},
+        {"$set": {"status": "active", "kyc.approved_at": _dt.utcnow()}},
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Landlord no encontrado")
+    landlord = await db.app_users.find_one({"_id": ObjectId(landlord_id)})
+
+    # Notify landlord
+    try:
+        sendgrid_key = _os.getenv("SENDGRID_API_KEY")
+        from_email = _os.getenv("SENDGRID_FROM_EMAIL", "info@rosshouserentals.com")
+        if sendgrid_key and landlord.get("email"):
+            import sendgrid
+            from sendgrid.helpers.mail import Mail, Email, To, Content
+            sg = sendgrid.SendGridAPIClient(api_key=sendgrid_key)
+            mail = Mail(
+                from_email=Email(from_email, "Ross House Rentals"),
+                to_emails=To(landlord["email"]),
+                subject="✅ Tu cuenta de Landlord fue aprobada",
+                plain_text_content=Content("text/plain", f"¡Hola {landlord.get('name','')}!\n\nTu cuenta de landlord fue aprobada. Ya puedes publicar propiedades en Ross House Rentals.\n\nIniciar sesión: https://www.rosshouserentals.com"),
+            )
+            mail.add_content(Content("text/html", f"""
+            <div style="font-family:Helvetica,Arial,sans-serif;max-width:520px;margin:auto;background:#0b1220;color:#fff;border-radius:14px;padding:24px;">
+              <div style="background:linear-gradient(135deg,#10b981,#06b6d4);padding:14px;border-radius:10px;text-align:center;"><h2 style="margin:0;color:#fff;">✅ KYC Aprobado</h2></div>
+              <p style="color:#cbd5e1;margin-top:18px;">Hola <strong style="color:#fff;">{landlord.get('name','')}</strong>,</p>
+              <p style="color:#cbd5e1;">¡Buenas noticias! Tu cuenta de landlord fue aprobada. Ya puedes publicar propiedades.</p>
+              <a href="https://www.rosshouserentals.com" style="display:inline-block;margin-top:8px;background:#10b981;color:#fff;padding:12px 20px;border-radius:10px;text-decoration:none;font-weight:bold;">Acceder a mi portal →</a>
+              <p style="color:#64748b;font-size:11px;margin-top:18px;">— Ross House Rentals · Dumas, TX</p>
+            </div>
+            """))
+            sg.client.mail.send.post(request_body=mail.get())
+    except Exception as e:
+        logging.warning(f"KYC approval email failed: {e}")
+
+    return {"success": True, "status": "active"}
+
+
 @router.get('/admin/property-inquiries')
 async def admin_list_inquiries(request: Request):
     """Admin: List all property inquiries"""
