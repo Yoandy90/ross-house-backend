@@ -568,38 +568,139 @@ async def get_maintenance_dashboard(request: Request):
 
 # ==================== ADMIN RENTAL APPLICATIONS ====================
 
+APPLICATION_STATUSES = {"new", "reviewing", "approved", "rejected", "archived"}
+
+
+def _serialize_application(a: dict) -> dict:
+    return {
+        "id": str(a["_id"]),
+        "name": a.get("name", ""),
+        "email": a.get("email", ""),
+        "phone": a.get("phone", ""),
+        "property_interest": a.get("property_interest", ""),
+        "employment": a.get("employment", ""),
+        "monthly_income": a.get("monthly_income", ""),
+        "message": a.get("message", ""),
+        "status": a.get("status", "new"),
+        "admin_notes": a.get("admin_notes", ""),
+        "source": a.get("source", "website"),
+        "created_at": a.get("created_at", "").isoformat() if a.get("created_at") else "",
+        "updated_at": a.get("updated_at", "").isoformat() if a.get("updated_at") else "",
+        "reviewed_by": a.get("reviewed_by", ""),
+    }
+
+
 @router.get('/admin/rental-applications')
 async def list_rental_applications(
     request: Request,
     status: str = "",
+    search: str = "",
     page: int = 1,
     limit: int = 50,
 ):
-    """Admin: List rental applications"""
+    """Admin: List rental applications with filters + stats"""
     user = await auth_admin(request)
-    query = {}
+    page = max(1, int(page or 1))
+    limit = max(1, min(int(limit or 50), 200))
+
+    query: dict = {}
     if status:
         query["status"] = status
-    
-    total = await get_db().rental_applications.count_documents(query)
+    if search:
+        import re as _re
+        rg = {"$regex": _re.escape(search), "$options": "i"}
+        query["$or"] = [
+            {"name": rg}, {"email": rg}, {"phone": rg},
+            {"property_interest": rg}, {"message": rg}, {"employment": rg},
+        ]
+
+    db = get_db()
+    total = await db.rental_applications.count_documents(query)
+    total_pages = max(1, (total + limit - 1) // limit)
+    page = min(page, total_pages) if total > 0 else 1
     skip = (page - 1) * limit
-    cursor = get_db().rental_applications.find(query).sort("created_at", -1).skip(skip).limit(limit)
-    
-    apps = []
-    async for a in cursor:
-        apps.append({
-            "id": str(a["_id"]),
-            "name": a.get("name", ""),
-            "email": a.get("email", ""),
-            "phone": a.get("phone", ""),
-            "property_interest": a.get("property_interest", ""),
-            "employment": a.get("employment", ""),
-            "monthly_income": a.get("monthly_income", ""),
-            "message": a.get("message", ""),
-            "status": a.get("status", "new"),
-            "created_at": a.get("created_at", "").isoformat() if a.get("created_at") else "",
-        })
-    
-    return {"success": True, "applications": apps, "total": total, "page": page}
+    cursor = db.rental_applications.find(query).sort("created_at", -1).skip(skip).limit(limit)
+
+    apps = [_serialize_application(a) async for a in cursor]
+
+    # Stats breakdown (across all applications, ignoring filters except status)
+    stats = {s: 0 for s in APPLICATION_STATUSES}
+    stats["total"] = 0
+    try:
+        async for d in db.rental_applications.aggregate([
+            {"$group": {"_id": "$status", "count": {"$sum": 1}}},
+        ]):
+            k = (d.get("_id") or "new").lower()
+            if k in stats:
+                stats[k] = d.get("count", 0)
+            stats["total"] += d.get("count", 0)
+    except Exception:
+        pass
+
+    return {
+        "success": True,
+        "applications": apps,
+        "total": total,
+        "page": page,
+        "limit": limit,
+        "total_pages": total_pages,
+        "stats": stats,
+    }
+
+
+@router.get('/admin/rental-applications/{app_id}')
+async def get_rental_application(app_id: str, request: Request):
+    """Admin: Fetch a single rental application"""
+    user = await auth_admin(request)
+    if not ObjectId.is_valid(app_id):
+        raise HTTPException(status_code=400, detail="ID inválido")
+    a = await get_db().rental_applications.find_one({"_id": ObjectId(app_id)})
+    if not a:
+        raise HTTPException(status_code=404, detail="Aplicación no encontrada")
+    return {"success": True, "application": _serialize_application(a)}
+
+
+@router.patch('/admin/rental-applications/{app_id}')
+async def update_rental_application(app_id: str, request: Request):
+    """Admin: Update status / notes of a rental application"""
+    user = await auth_admin(request)
+    if not ObjectId.is_valid(app_id):
+        raise HTTPException(status_code=400, detail="ID inválido")
+    data = await request.json()
+
+    update_fields = {"updated_at": datetime.utcnow()}
+    if "status" in data:
+        new_status = (data.get("status") or "").lower().strip()
+        if new_status not in APPLICATION_STATUSES:
+            raise HTTPException(status_code=400, detail=f"Status inválido. Use: {sorted(APPLICATION_STATUSES)}")
+        update_fields["status"] = new_status
+        update_fields["reviewed_by"] = user.get("email") or user.get("name") or ""
+        update_fields["reviewed_at"] = datetime.utcnow()
+    if "admin_notes" in data:
+        update_fields["admin_notes"] = (data.get("admin_notes") or "").strip()
+
+    if len(update_fields) == 1:  # only updated_at
+        raise HTTPException(status_code=400, detail="No hay cambios a aplicar")
+
+    result = await get_db().rental_applications.update_one(
+        {"_id": ObjectId(app_id)}, {"$set": update_fields}
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Aplicación no encontrada")
+
+    a = await get_db().rental_applications.find_one({"_id": ObjectId(app_id)})
+    return {"success": True, "application": _serialize_application(a)}
+
+
+@router.delete('/admin/rental-applications/{app_id}')
+async def delete_rental_application(app_id: str, request: Request):
+    """Admin: Delete a rental application"""
+    user = await auth_admin(request)
+    if not ObjectId.is_valid(app_id):
+        raise HTTPException(status_code=400, detail="ID inválido")
+    result = await get_db().rental_applications.delete_one({"_id": ObjectId(app_id)})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Aplicación no encontrada")
+    return {"success": True, "message": "Aplicación eliminada"}
 
 

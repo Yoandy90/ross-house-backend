@@ -344,22 +344,147 @@ async def public_get_property(property_id: str, request: Request):
 
 @router.post('/public/rental-application')
 async def submit_rental_application(request: Request):
-    """Public endpoint: Receive rental applications from the website"""
+    """Public endpoint: Receive rental applications from the website.
+    
+    Stores application in MongoDB and sends notification emails to admin
+    + acknowledgement email to applicant (via SendGrid if configured).
+    Also pushes a notification to admin devices.
+    """
     data = await request.json()
+    name = (data.get("name") or "").strip()
+    email = (data.get("email") or "").strip()
+    phone = (data.get("phone") or "").strip()
+    property_interest = (data.get("property_interest") or "").strip()
+    employment = (data.get("employment") or "").strip()
+    monthly_income = (data.get("monthly_income") or "").strip()
+    message = (data.get("message") or "").strip()
+
+    if not name or not (email or phone):
+        raise HTTPException(status_code=400, detail="Nombre y al menos un contacto (email o teléfono) son requeridos")
+
     application = {
-        "name": data.get("name", ""),
-        "email": data.get("email", ""),
-        "phone": data.get("phone", ""),
-        "property_interest": data.get("property_interest", ""),
-        "employment": data.get("employment", ""),
-        "monthly_income": data.get("monthly_income", ""),
-        "message": data.get("message", ""),
+        "name": name,
+        "email": email,
+        "phone": phone,
+        "property_interest": property_interest,
+        "employment": employment,
+        "monthly_income": monthly_income,
+        "message": message,
         "status": "new",
         "source": "website",
         "created_at": datetime.utcnow(),
+        "updated_at": datetime.utcnow(),
     }
-    result = await get_db().rental_applications.insert_one(application)
-    return {"success": True, "application_id": str(result.inserted_id), "message": "Application received successfully"}
+    db = get_db()
+    result = await db.rental_applications.insert_one(application)
+    application_id = str(result.inserted_id)
+
+    # ── Notify admins via push notification ──
+    try:
+        await send_rental_push_to_admins(
+            title="📋 Nueva Aplicación de Renta",
+            body=f"{name}" + (f" · {property_interest}" if property_interest else ""),
+            data={"type": "rental_application_new", "application_id": application_id},
+        )
+    except Exception as e:
+        logging.warning(f"⚠️ Push notification failed (rental application): {e}")
+
+    # ── Notify admin via email (best-effort) ──
+    try:
+        import os as _os
+        sendgrid_key = _os.getenv("SENDGRID_API_KEY")
+        from_email = _os.getenv("SENDGRID_FROM_EMAIL", "info@rosshouserentals.com")
+        admin_emails_raw = _os.getenv("RENTAL_ADMIN_EMAILS") or "yoandyross@gmail.com"
+        if not sendgrid_key:
+            cfg = await db.api_config.find_one({"_id": "main"})
+            if cfg:
+                sendgrid_key = cfg.get("sendgrid_api_key") or cfg.get("SENDGRID_API_KEY")
+                from_email = cfg.get("sendgrid_from_email", from_email)
+                admin_emails_raw = cfg.get("rental_admin_emails", admin_emails_raw)
+        if sendgrid_key:
+            import sendgrid
+            from sendgrid.helpers.mail import Mail, Email, To, Content
+            sg = sendgrid.SendGridAPIClient(api_key=sendgrid_key)
+
+            # 1) Notify admins
+            admin_list = [e.strip() for e in (admin_emails_raw or "").split(",") if e.strip()]
+            _msg_html = (message or '<em style="color:#64748b;">(sin mensaje)</em>')
+            _msg_html = _msg_html.replace("\n", "<br/>") if message else _msg_html
+            html_body = f"""
+            <div style="font-family:Helvetica,Arial,sans-serif;max-width:560px;margin:auto;background:#0b1220;color:#fff;border-radius:14px;padding:24px;">
+              <div style="background:linear-gradient(135deg,#3b82f6,#06b6d4);padding:14px;border-radius:10px;text-align:center;">
+                <h2 style="margin:0;color:#fff;">📋 Nueva Aplicación de Renta</h2>
+              </div>
+              <table style="width:100%;margin-top:18px;border-collapse:collapse;color:#cbd5e1;font-size:14px;">
+                <tr><td style="padding:6px 0;color:#94a3b8;">Nombre:</td><td><strong style="color:#fff;">{name}</strong></td></tr>
+                <tr><td style="padding:6px 0;color:#94a3b8;">Email:</td><td>{email or '—'}</td></tr>
+                <tr><td style="padding:6px 0;color:#94a3b8;">Teléfono:</td><td>{phone or '—'}</td></tr>
+                <tr><td style="padding:6px 0;color:#94a3b8;">Interés:</td><td>{property_interest or '—'}</td></tr>
+                <tr><td style="padding:6px 0;color:#94a3b8;">Empleo:</td><td>{employment or '—'}</td></tr>
+                <tr><td style="padding:6px 0;color:#94a3b8;">Ingreso mensual:</td><td>{monthly_income or '—'}</td></tr>
+              </table>
+              <div style="margin-top:14px;padding:12px;background:#111827;border-radius:10px;color:#e2e8f0;font-size:14px;">
+                <strong style="color:#94a3b8;">Mensaje:</strong><br/>{_msg_html}
+              </div>
+              <a href="https://www.rosshouserentals.com/admin/aplicaciones" 
+                 style="display:inline-block;margin-top:18px;background:#3b82f6;color:#fff;padding:12px 20px;border-radius:10px;text-decoration:none;font-weight:bold;">
+                🔎 Revisar en el panel admin
+              </a>
+              <p style="color:#64748b;font-size:11px;margin-top:18px;">Ross House Rentals · Notificación automática</p>
+            </div>
+            """
+            for admin_email in admin_list:
+                try:
+                    mail = Mail(
+                        from_email=Email(from_email, "Ross House Rentals"),
+                        to_emails=To(admin_email),
+                        subject=f"📋 Nueva aplicación: {name}",
+                        plain_text_content=Content("text/plain",
+                            f"Nueva aplicación recibida:\nNombre: {name}\nEmail: {email}\nTeléfono: {phone}\nInterés: {property_interest}\nEmpleo: {employment}\nIngreso: {monthly_income}\nMensaje: {message}\n\nRevisa: https://www.rosshouserentals.com/admin/aplicaciones"),
+                    )
+                    mail.add_content(Content("text/html", html_body))
+                    sg.client.mail.send.post(request_body=mail.get())
+                    logging.info(f"📧 Admin notified about new application ({admin_email})")
+                except Exception as ae:
+                    logging.warning(f"⚠️ Admin email failed ({admin_email}): {ae}")
+
+            # 2) Confirmation to applicant
+            if email:
+                try:
+                    confirm_html = f"""
+                    <div style="font-family:Helvetica,Arial,sans-serif;max-width:560px;margin:auto;background:#0b1220;color:#fff;border-radius:14px;padding:24px;">
+                      <div style="background:linear-gradient(135deg,#10b981,#06b6d4);padding:14px;border-radius:10px;text-align:center;">
+                        <h2 style="margin:0;color:#fff;">✅ Recibimos tu aplicación</h2>
+                      </div>
+                      <p style="color:#cbd5e1;margin-top:18px;">Hola <strong style="color:#fff;">{name}</strong>,</p>
+                      <p style="color:#cbd5e1;">Gracias por aplicar con <strong>Ross House Rentals</strong>. Tu aplicación fue recibida correctamente y será revisada por nuestro equipo en las próximas 24-72 horas.</p>
+                      <div style="margin:14px 0;padding:12px;background:#111827;border-radius:10px;color:#e2e8f0;font-size:13px;">
+                        <div style="color:#94a3b8;margin-bottom:6px;">Resumen:</div>
+                        <div><strong>Propiedad de interés:</strong> {property_interest or '—'}</div>
+                        <div><strong>Email de contacto:</strong> {email}</div>
+                        <div><strong>Teléfono:</strong> {phone or '—'}</div>
+                      </div>
+                      <p style="color:#cbd5e1;">Si tienes alguna pregunta o necesitas adjuntar documentación adicional, simplemente responde a este email.</p>
+                      <p style="color:#64748b;font-size:12px;margin-top:18px;">— Equipo Ross House Rentals · Dumas, TX</p>
+                    </div>
+                    """
+                    mail2 = Mail(
+                        from_email=Email(from_email, "Ross House Rentals"),
+                        to_emails=To(email),
+                        subject="✅ Recibimos tu aplicación de renta — Ross House Rentals",
+                        plain_text_content=Content("text/plain", f"Hola {name},\n\nRecibimos tu aplicación correctamente. Nuestro equipo la revisará en las próximas 24-72 horas y te contactaremos.\n\n— Equipo Ross House Rentals · Dumas, TX"),
+                    )
+                    mail2.add_content(Content("text/html", confirm_html))
+                    sg.client.mail.send.post(request_body=mail2.get())
+                    logging.info(f"📧 Applicant confirmation sent ({email})")
+                except Exception as ce:
+                    logging.warning(f"⚠️ Applicant confirmation failed: {ce}")
+        else:
+            logging.info("ℹ️ SENDGRID_API_KEY no configurado — emails de aplicación omitidos")
+    except Exception as e:
+        logging.warning(f"⚠️ Email notification block failed (rental application): {e}")
+
+    return {"success": True, "application_id": application_id, "message": "Application received successfully"}
 
 
 

@@ -1803,19 +1803,24 @@ async def admin_list_maintenance_requests(
 
     requests_list = []
     async for r in cursor:
+        # Normalize legacy 'open' status to 'pending' for the frontend
+        raw_status = (r.get("status") or "pending").lower()
+        norm_status = "pending" if raw_status == "open" else raw_status
         requests_list.append({
             "id": str(r["_id"]),
+            "_id": str(r["_id"]),  # backward compatibility for legacy frontend
             "tenant_id": r.get("tenant_id", ""),
             "tenant_name": r.get("tenant_name", ""),
             "tenant_email": r.get("tenant_email", ""),
             "tenant_phone": r.get("tenant_phone", ""),
             "property_id": r.get("property_id", ""),
             "property_address": r.get("property_address", ""),
+            "property_name": r.get("property_address", "") or r.get("property_name", ""),
             "title": r.get("title", ""),
             "description": r.get("description", ""),
             "category": r.get("category", ""),
             "priority": r.get("priority", ""),
-            "status": r.get("status", "open"),
+            "status": norm_status,
             "photos": r.get("photos", []) or [],
             "photo_count": len(r.get("photos", []) or []),
             "created_at": r.get("created_at", "").isoformat() if r.get("created_at") else "",
@@ -1825,7 +1830,7 @@ async def admin_list_maintenance_requests(
         })
 
     # Aggregate counts (status breakdown across full filtered set — useful for UI badges)
-    stats = {"open": 0, "in_progress": 0, "completed": 0, "cancelled": 0, "urgent": 0}
+    stats = {"open": 0, "pending": 0, "in_progress": 0, "completed": 0, "cancelled": 0, "urgent": 0}
     try:
         async for d in db.maintenance_requests.aggregate([
             {"$match": query},
@@ -1834,6 +1839,9 @@ async def admin_list_maintenance_requests(
             k = (d.get("_id") or "").lower()
             if k in stats:
                 stats[k] = d.get("count", 0)
+        # Merge legacy 'open' into 'pending' for UI display
+        stats["pending"] = stats.get("pending", 0) + stats.get("open", 0)
+        stats["open"] = stats["pending"]  # legacy alias for older clients
         # Count urgent (across all statuses still in query)
         urgent_q = {**query, "priority": "urgent"}
         stats["urgent"] = await db.maintenance_requests.count_documents(urgent_q)
@@ -1859,7 +1867,14 @@ async def update_maintenance_request(request_id: str, request: Request):
     
     update_fields = {"updated_at": datetime.utcnow()}
     if "status" in data:
-        update_fields["status"] = data["status"]
+        # Normalize 'open' (legacy) → 'pending'
+        new_status = (data.get("status") or "").lower().strip()
+        if new_status == "open":
+            new_status = "pending"
+        update_fields["status"] = new_status
+        # Stamp completed_at when transitioning to completed/resolved
+        if new_status in ("completed", "resolved"):
+            update_fields["completed_at"] = datetime.utcnow()
     if "admin_notes" in data:
         update_fields["admin_notes"] = data["admin_notes"]
     if "assigned_to" in data:
@@ -1873,15 +1888,18 @@ async def update_maintenance_request(request_id: str, request: Request):
         {"$set": update_fields}
     )
     
-    if result.modified_count == 0:
+    if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Solicitud no encontrada")
     
     # ── Send push notification to tenant about status change ──
     if maint_req and "status" in data:
         status_labels = {
             "open": "Abierta",
+            "pending": "Pendiente",
             "in_progress": "En Progreso",
+            "completed": "Completada",
             "resolved": "Resuelta",
+            "cancelled": "Cancelada",
             "closed": "Cerrada",
         }
         status_label = status_labels.get(data["status"], data["status"])
