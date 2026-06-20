@@ -247,11 +247,15 @@ async def _refresh_token_if_needed(conn: dict) -> dict:
     data = {
         "grant_type": "refresh_token",
         "refresh_token": refresh_token,
-        "client_id": XCEL_CLIENT_ID,
-        "client_secret": XCEL_CLIENT_SECRET,
+    }
+    # ESPI requires HTTP Basic Auth (same as auth-code exchange).
+    auth = httpx.BasicAuth(XCEL_CLIENT_ID, XCEL_CLIENT_SECRET)
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/x-www-form-urlencoded",
     }
     async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.post(XCEL_TOKEN_URL, data=data)
+        resp = await client.post(XCEL_TOKEN_URL, data=data, auth=auth, headers=headers)
     if resp.status_code != 200:
         await db.xcel_connections.update_one(
             {"_id": conn["_id"]},
@@ -280,6 +284,28 @@ async def _refresh_token_if_needed(conn: dict) -> dict:
 # ═══════════════════════════════════════════════════════════════
 # ADMIN ENDPOINTS
 # ═══════════════════════════════════════════════════════════════
+
+@router.get("/admin/xcel/audit-log")
+async def xcel_audit_log(request: Request):
+    """Admin: Recent Xcel OAuth/exchange events for diagnosing connection failures."""
+    await auth_admin(request)
+    db = get_db()
+    items = []
+    cursor = db.xcel_audit_log.find().sort("at", -1).limit(50)
+    async for d in cursor:
+        d["_id"] = str(d["_id"])
+        items.append(d)
+    # Also include the count of pending oauth states
+    pending = await db.xcel_oauth_states.count_documents({})
+    connections = await db.xcel_connections.count_documents({})
+    return {
+        "success": True,
+        "audit_entries": len(items),
+        "pending_oauth_states": pending,
+        "active_connections": connections,
+        "items": items,
+    }
+
 
 @router.get("/admin/xcel/status")
 async def xcel_status(request: Request):
@@ -1015,6 +1041,13 @@ async def _exchange_code_and_save(code: str, state: str) -> tuple:
     db = get_db()
     st = await db.xcel_oauth_states.find_one({"state": state})
     if not st:
+        # Log the failed attempt for diagnostics
+        await db.xcel_audit_log.insert_one({
+            "event": "exchange_state_not_found",
+            "state_prefix": (state or "")[:12],
+            "code_prefix": (code or "")[:12],
+            "at": datetime.now(timezone.utc),
+        })
         return False, "Enlace expirado", "El enlace de autorización expiró o ya fue usado. Genera uno nuevo desde el panel."
     created = st["created_at"]
     if created.tzinfo is None:
@@ -1023,20 +1056,58 @@ async def _exchange_code_and_save(code: str, state: str) -> tuple:
         await db.xcel_oauth_states.delete_one({"_id": st["_id"]})
         return False, "Enlace expirado", "Genera un nuevo enlace desde el panel de Energía."
 
+    # ESPI / NAESB spec requires HTTP Basic Auth on the token endpoint.
+    # Some Xcel/ESPI servers silently reject form-body credentials.
+    auth = httpx.BasicAuth(XCEL_CLIENT_ID, XCEL_CLIENT_SECRET)
     data = {
         "grant_type": "authorization_code",
         "code": code,
         "redirect_uri": XCEL_REDIRECT_URI,
-        "client_id": XCEL_CLIENT_ID,
-        "client_secret": XCEL_CLIENT_SECRET,
     }
-    async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.post(XCEL_TOKEN_URL, data=data)
-    if resp.status_code != 200:
-        logger.error(f"Xcel token exchange failed: {resp.status_code} {resp.text[:300]}")
-        return False, "Error al conectar", "Xcel Energy rechazó el intercambio de tokens. Intenta de nuevo o contacta soporte."
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
+    logger.info(f"[Xcel] Token exchange attempt: state={state[:12]}... prop={st.get('property_id')}")
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(XCEL_TOKEN_URL, data=data, auth=auth, headers=headers)
+    except Exception as e:
+        logger.exception(f"[Xcel] Token exchange network error: {e}")
+        await db.xcel_audit_log.insert_one({
+            "event": "exchange_network_error",
+            "state_prefix": state[:12],
+            "property_id": st.get("property_id"),
+            "error": str(e)[:500],
+            "at": datetime.now(timezone.utc),
+        })
+        return False, "Error de red", f"No se pudo contactar Xcel Energy: {str(e)[:200]}"
 
-    tj = resp.json()
+    # Persist full diagnostic record regardless of outcome
+    await db.xcel_audit_log.insert_one({
+        "event": "exchange_response",
+        "state_prefix": state[:12],
+        "property_id": st.get("property_id"),
+        "status_code": resp.status_code,
+        "response_body": resp.text[:2000],
+        "response_headers": dict(resp.headers),
+        "at": datetime.now(timezone.utc),
+    })
+
+    if resp.status_code != 200:
+        logger.error(f"[Xcel] Token exchange failed: {resp.status_code} body={resp.text[:500]}")
+        # Don't delete the state — let admin debug
+        return False, "Error al conectar", (
+            f"Xcel rechazó el intercambio (HTTP {resp.status_code}). "
+            f"Detalle: {resp.text[:200]}. Verifica el audit log en /api/admin/xcel/audit-log."
+        )
+
+    try:
+        tj = resp.json()
+    except Exception:
+        logger.error(f"[Xcel] Token response is not JSON: {resp.text[:300]}")
+        return False, "Respuesta inesperada", "Xcel devolvió una respuesta no-JSON. Revisa el audit log."
+
     now_ts = datetime.now(timezone.utc).timestamp()
     now = datetime.now(timezone.utc)
     doc = {
@@ -1057,6 +1128,7 @@ async def _exchange_code_and_save(code: str, state: str) -> tuple:
         upsert=True,
     )
     await db.xcel_oauth_states.delete_one({"_id": st["_id"]})
+    logger.info(f"[Xcel] ✅ Connection saved for property {st['property_id']} sub={doc['subscription_id']}")
     return True, "¡Conexión exitosa!", "La cuenta de Xcel Energy quedó conectada. El consumo eléctrico aparecerá en el panel de Energía de Ross House Rentals."
 
 
