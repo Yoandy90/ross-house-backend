@@ -304,6 +304,7 @@ async def public_market_listings(
     beds: Optional[int] = None, baths: Optional[int] = None,
     property_type: Optional[str] = None,
     status: Optional[str] = Query(default="active", description="Filter: active, inactive, all"),
+    address: Optional[str] = Query(default=None, description="Optional substring filter on listing address (case-insensitive)"),
 ):
     """Public: browse properties for sale (no auth required). Cached."""
     # Map frontend filter values to Mashvisor's exact type strings
@@ -364,7 +365,122 @@ async def public_market_listings(
             "latitude": p.get("latitude"),
             "longitude": p.get("longitude"),
         })
+
+    # Optional address substring filter (Mashvisor /city/listings does not natively support it)
+    if address:
+        q = address.strip().lower()
+        if q:
+            formatted = [l for l in formatted if q in (l.get("address") or "").lower()]
+            total = len(formatted)
+
     return {"status": "success", "listings": formatted, "total": total, "page": page}
+
+
+@public_router.get("/search-by-address")
+async def public_search_by_address(
+    address: str = Query(..., description="Full street address (e.g. '5025 W Heimer Rd')"),
+    city: str = Query(...),
+    state: str = Query(...),
+    zip_code: Optional[str] = None,
+):
+    """
+    Public: lookup a property by exact address using Mashvisor's /property endpoint.
+    Returns the same `listing` shape as /listings for frontend compatibility,
+    plus a `not_found` status if Mashvisor has no data for that address.
+    """
+    params: dict = {
+        "address": address.strip(),
+        "city": city.strip(),
+        "state": state.upper().strip(),
+    }
+    if zip_code:
+        params["zip_code"] = zip_code.strip()
+
+    try:
+        data = await _mashvisor_get("/property", params=params, cache_category="property_analysis")
+    except Exception as e:
+        logger.warning(f"search-by-address Mashvisor call failed: {e}")
+        return {"status": "error", "listing": None, "message": f"Mashvisor error: {str(e)[:160]}"}
+
+    content = data.get("content") if isinstance(data, dict) else None
+    if not content or not (content.get("id") or content.get("address") or content.get("beds")):
+        return {"status": "not_found", "found": False, "property": None, "listing": None,
+                "message": f"Sin datos para esa dirección en {city}, {state.upper()}"}
+
+    neigh = content.get("neighborhood") if isinstance(content.get("neighborhood"), dict) else {}
+    image_field = content.get("image")
+    if isinstance(image_field, dict):
+        img_url = image_field.get("image") or image_field.get("url") or ""
+    else:
+        img_url = image_field or content.get("image_url", "")
+    img_url = _secure_url(img_url)
+
+    roi = content.get("ROI") if isinstance(content.get("ROI"), dict) else {}
+
+    # Two shapes for backward compatibility:
+    # - `property`: matches mobile's expected keys (zip, home_type, image, last_sale_price)
+    # - `listing`: matches /listings endpoint keys (zip_code, type, image_url, list_price)
+    base_id = str(content.get("id") or f"addr-{abs(hash(address)) % (10**10)}")
+    addr_out = content.get("address") or address
+    city_out = content.get("city") or city
+    state_out = (content.get("state") or state).upper()
+    zip_out = str(content.get("zip") or zip_code or "")
+    beds_out = content.get("beds", 0) or 0
+    baths_out = content.get("baths", 0) or 0
+    sqft_out = content.get("sqft", 0) or 0
+    last_sale = content.get("lastSalePrice") or content.get("list_price", 0) or 0
+    home_type_out = content.get("homeType", "") or ""
+
+    prop_shape = {
+        "id": base_id,
+        "address": addr_out,
+        "city": city_out,
+        "state": state_out,
+        "zip": zip_out,
+        "home_type": home_type_out,
+        "beds": beds_out,
+        "baths": baths_out,
+        "sqft": sqft_out,
+        "list_price": last_sale,
+        "last_sale_price": last_sale,
+        "image": img_url,
+        "latitude": content.get("latitude"),
+        "longitude": content.get("longitude"),
+        "year_built": content.get("yearBuilt"),
+        # Investment metrics (bonus, only for /search-by-address consumers)
+        "traditional_roi": roi.get("traditional_ROI"),
+        "airbnb_roi": roi.get("airbnb_ROI"),
+        "traditional_rental": roi.get("traditional_rental"),
+        "airbnb_rental": roi.get("airbnb_rental"),
+        "neighborhood": neigh.get("name", "") or "",
+    }
+
+    listing_shape = {
+        "id": base_id,
+        "address": addr_out,
+        "city": city_out,
+        "state": state_out,
+        "zip_code": zip_out,
+        "neighborhood": neigh.get("name", "") or "",
+        "type": home_type_out,
+        "beds": beds_out,
+        "baths": baths_out,
+        "sqft": sqft_out,
+        "list_price": last_sale,
+        "image_url": img_url,
+        "status": "active",
+        "days_on_market": 0,
+        "is_foreclosure": 0,
+        "latitude": content.get("latitude"),
+        "longitude": content.get("longitude"),
+    }
+
+    return {
+        "status": "success",
+        "found": True,
+        "property": prop_shape,
+        "listing": listing_shape,
+    }
 
 
 @public_router.get("/overview/{state}/{city}")
