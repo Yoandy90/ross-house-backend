@@ -145,6 +145,8 @@ def _serialize_investment(i: dict) -> dict:
         "subscription_date": i.get("subscription_date", "").isoformat() if i.get("subscription_date") else "",
         "funding_date": i.get("funding_date", "").isoformat() if i.get("funding_date") else "",
         "documents_signed": bool(i.get("documents_signed", False)),
+        "signed_at": i.get("signed_at", "").isoformat() if i.get("signed_at") else "",
+        "signed_by_self": bool(i.get("signed_by_self", False)),
         "notes": i.get("notes", ""),
         "total_distributions_received": i.get("total_distributions_received", 0),
         "created_at": i.get("created_at", "").isoformat() if i.get("created_at") else "",
