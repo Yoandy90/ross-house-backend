@@ -221,6 +221,7 @@ def serialize(doc):
     if not doc:
         return None
     doc['_id'] = str(doc['_id'])
+    doc['id'] = doc['_id']  # alias for downstream code that expects 'id'
     for k, v in doc.items():
         if isinstance(v, ObjectId):
             doc[k] = str(v)

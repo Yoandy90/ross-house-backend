@@ -528,7 +528,9 @@ async def add_investment(deal_id: str, request: Request):
 
     await _recompute_deal_totals(ObjectId(deal_id))
 
-    return {"success": True, "investment": _serialize_investment(investment)}
+    # Re-fetch to return accurate equity_percent (post-recompute)
+    fresh = await db.syndication_investments.find_one({"_id": result.inserted_id})
+    return {"success": True, "investment": _serialize_investment(fresh or investment)}
 
 
 @router.patch('/admin/syndication/investments/{inv_id}')
@@ -991,7 +993,7 @@ async def investor_change_password(request: Request):
     if not new_pw or len(new_pw) < 6:
         raise HTTPException(status_code=400, detail="Nueva contraseña debe tener al menos 6 caracteres")
     db = get_db()
-    u = await db.app_users.find_one({"_id": ObjectId(user["id"])})
+    u = await db.app_users.find_one({"_id": ObjectId(user["_id"])})
     if not u or u.get("password_hash") != _hash_password(old_pw):
         raise HTTPException(status_code=401, detail="Contraseña actual incorrecta")
     await db.app_users.update_one(
@@ -1010,7 +1012,7 @@ async def investor_dashboard(request: Request):
     """Investor dashboard: portfolio summary"""
     user = await auth_investor(request)
     db = get_db()
-    investor_id = ObjectId(user["id"])
+    investor_id = ObjectId(user["_id"])
     inv_cursor = db.syndication_investments.find({"investor_id": investor_id}).sort("created_at", -1)
     investments = []
     total_invested = 0
@@ -1039,7 +1041,7 @@ async def investor_dashboard(request: Request):
     return {
         "success": True,
         "investor": {
-            "id": str(user["id"]),
+            "id": str(user["_id"]),
             "name": user.get("name", ""),
             "email": user.get("email", ""),
         },
@@ -1059,7 +1061,7 @@ async def investor_deals(request: Request):
     """Investor: list deals where I have an investment"""
     user = await auth_investor(request)
     db = get_db()
-    investor_id = ObjectId(user["id"])
+    investor_id = ObjectId(user["_id"])
     deal_ids = await db.syndication_investments.distinct("deal_id", {"investor_id": investor_id})
     if not deal_ids:
         return {"success": True, "deals": []}
@@ -1075,7 +1077,7 @@ async def investor_deal_detail(deal_id: str, request: Request):
     if not ObjectId.is_valid(deal_id):
         raise HTTPException(status_code=400, detail="ID inválido")
     db = get_db()
-    investor_id = ObjectId(user["id"])
+    investor_id = ObjectId(user["_id"])
 
     deal = await db.syndication_deals.find_one({"_id": ObjectId(deal_id)})
     if not deal:
@@ -1126,7 +1128,7 @@ async def investor_download_document(deal_id: str, doc_id: str, request: Request
     if not ObjectId.is_valid(deal_id):
         raise HTTPException(status_code=400, detail="ID inválido")
     db = get_db()
-    investor_id = ObjectId(user["id"])
+    investor_id = ObjectId(user["_id"])
 
     # Verify access — investor must have an investment in this deal
     if user.get("role") != "admin":
@@ -1160,7 +1162,7 @@ async def investor_distributions(request: Request):
     """Investor: list all my distributions"""
     user = await auth_investor(request)
     db = get_db()
-    investor_id = ObjectId(user["id"])
+    investor_id = ObjectId(user["_id"])
     # Find my investment IDs
     inv_ids = [str(i["_id"]) async for i in db.syndication_investments.find({"investor_id": investor_id})]
     if not inv_ids:
