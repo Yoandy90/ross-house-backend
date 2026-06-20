@@ -254,7 +254,6 @@ async def get_my_leases(request: Request):
 
 @router.get('/lease/{lease_id}')
 async def get_lease_detail(lease_id: str, request: Request):
-    """Get full lease details for signing"""
     import re as _re
     user = await auth_marketplace(request)
     user_email = (user.get("email") or "").strip().lower()
@@ -974,6 +973,72 @@ async def generate_contract_pdf(contract_id: str, request: Request):
     pdf_b64 = generate_rental_contract_pdf(contract, config=config, tenant_photo_url=tenant_photo_url)
     filename = f"Lease_Agreement_{contract.get('contract_number', contract_id)}.pdf"
 
+    return {"success": True, "pdf_base64": pdf_b64, "filename": filename}
+
+
+# ─── Tenant-facing Lease PDF (signed contract download) ──────────────────
+@router.get('/lease/{lease_id}/pdf')
+async def tenant_download_lease_pdf(lease_id: str, request: Request):
+    """Tenant: download the PDF of their own signed lease.
+    Returns base64-encoded PDF. Tenant must own the lease.
+    """
+    import re as _re
+    user = await auth_marketplace(request)
+    user_email = (user.get("email") or "").strip().lower()
+    user_id = str(user.get("_id", ""))
+    db = get_db()
+
+    try:
+        oid = ObjectId(lease_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="ID inválido")
+
+    contract = await db.rental_contracts.find_one({"_id": oid})
+    if not contract:
+        raise HTTPException(status_code=404, detail="Contrato no encontrado")
+
+    # Authorization: tenant of this lease or landlord/admin
+    tenant_ids = {user_id}
+    async for t in db.tenants.find({"app_user_id": user_id}):
+        tenant_ids.add(str(t["_id"]))
+    if user_email:
+        async for t in db.tenants.find({
+            "email": {"$regex": f"^{_re.escape(user_email)}$", "$options": "i"}
+        }):
+            tenant_ids.add(str(t["_id"]))
+
+    is_tenant = (
+        (contract.get("tenant_email") or "").lower() == user_email
+        or str(contract.get("tenant_id", "")) in tenant_ids
+    )
+    is_landlord = (str(contract.get("landlord_id", "")) == user_id)
+    is_admin = user.get("role") == "admin"
+    if not (is_tenant or is_landlord or is_admin):
+        raise HTTPException(status_code=403, detail="No tienes acceso a este contrato")
+
+    # Load company config + landlord signature so the PDF is identical to admin export
+    config = await db.rental_config.find_one({"type": "company"}) or {}
+    if not contract.get("admin_signature") or not contract.get("admin_signature", {}).get("image_data"):
+        try:
+            saved_admin_sig = await db.admin_signatures.find_one({"type": "landlord_default"})
+            if saved_admin_sig and saved_admin_sig.get("image_data"):
+                config["saved_admin_signature"] = saved_admin_sig
+        except Exception:
+            pass
+
+    # Pull tenant photo if available
+    tenant_photo_url = None
+    if contract.get("tenant_id"):
+        try:
+            tenant = await db.tenants.find_one({"_id": ObjectId(contract["tenant_id"])})
+            if tenant:
+                tenant_photo_url = tenant.get("photo_url", "")
+        except Exception:
+            pass
+
+    from rental_pdf_service import generate_rental_contract_pdf
+    pdf_b64 = generate_rental_contract_pdf(contract, config=config, tenant_photo_url=tenant_photo_url)
+    filename = f"Lease_Agreement_{contract.get('contract_number', lease_id)}.pdf"
     return {"success": True, "pdf_base64": pdf_b64, "filename": filename}
 
 
