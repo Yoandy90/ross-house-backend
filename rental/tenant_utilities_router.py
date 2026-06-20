@@ -306,9 +306,29 @@ async def scan_utility_bill(request: Request):
     if ',' in image_b64:
         image_b64 = image_b64.split(',')[1]
 
+    # ── 1) Validate the image FIRST (avoid leaking 500s on user-side errors) ──
+    import tempfile
+    import json as _json
+
+    try:
+        img_bytes = base64.b64decode(image_b64, validate=False)
+    except Exception:
+        raise HTTPException(status_code=400, detail="image_base64 inválido (no es base64 válido)")
+
+    if len(img_bytes) == 0:
+        raise HTTPException(status_code=400, detail="Imagen vacía")
+    if len(img_bytes) > 10 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Imagen demasiado grande (>10 MB)")
+
+    # ── 2) Now check the API key (server-side config, not user error) ──
     llm_key = os.getenv('EMERGENT_LLM_KEY') or os.getenv('OPENAI_API_KEY', '')
     if not llm_key:
-        raise HTTPException(status_code=500, detail="No hay API key configurada para AI Vision")
+        logger.error("⚠️ EMERGENT_LLM_KEY / OPENAI_API_KEY no configurado en producción")
+        # 503 = upstream service unavailable (config error, not client error)
+        raise HTTPException(
+            status_code=503,
+            detail="Servicio de OCR no disponible: falta API key en el servidor. Contacta al administrador."
+        )
 
     system_prompt = """You are a utility bill data extractor for Ross House Rentals. 
 Extract the following from the utility bill image and respond ONLY in valid JSON:
@@ -328,20 +348,9 @@ Extract the following from the utility bill image and respond ONLY in valid JSON
 }
 If you cannot extract a field, use null. Always return valid JSON only."""
 
-    # Save base64 to temp file so emergentintegrations can attach it
-    import tempfile
-    import json as _json
-
+    tmp_path = None
     try:
-        # Decode base64 → bytes → tempfile
-        try:
-            img_bytes = base64.b64decode(image_b64, validate=False)
-        except Exception:
-            raise HTTPException(status_code=400, detail="image_base64 inválido (no es base64 válido)")
-
-        if len(img_bytes) > 10 * 1024 * 1024:
-            raise HTTPException(status_code=413, detail="Imagen demasiado grande (>10 MB)")
-
+        # Write to tempfile for emergentintegrations file_contents API
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.jpg')
         tmp.write(img_bytes)
         tmp.close()
@@ -351,7 +360,7 @@ If you cannot extract a field, use null. Always return valid JSON only."""
             from emergentintegrations.llm.chat import LlmChat, UserMessage, FileContentWithMimeType  # type: ignore
         except Exception as ie:
             logger.error(f"emergentintegrations not available: {ie}")
-            raise HTTPException(status_code=500, detail="AI Vision no disponible (emergentintegrations missing)")
+            raise HTTPException(status_code=503, detail="AI Vision no disponible (emergentintegrations missing)")
 
         chat = (
             LlmChat(
@@ -371,20 +380,16 @@ If you cannot extract a field, use null. Always return valid JSON only."""
         )
         raw = (await chat.send_message(user_msg) or "").strip()
 
-        # Cleanup tempfile
-        try:
-            os.remove(tmp_path)
-        except OSError:
-            pass
-
-        # Strip markdown code fences
+        # Strip markdown code fences (LLM commonly wraps in ```json ... ```)
         if raw.startswith("```"):
-            raw = raw.strip("`")
+            # Remove leading fence
+            raw = raw.lstrip("`").lstrip()
+            # Drop optional 'json' tag
             if raw.lower().startswith("json"):
-                raw = raw[4:].strip()
-            # If still has trailing fence
-            if raw.endswith("```"):
-                raw = raw[:-3].strip()
+                raw = raw[4:].lstrip()
+            # Strip trailing fence
+            if "```" in raw:
+                raw = raw.split("```", 1)[0].rstrip()
 
         try:
             extracted = _json.loads(raw)
@@ -396,7 +401,7 @@ If you cannot extract a field, use null. Always return valid JSON only."""
                 "message": "No se pudo extraer datos de la imagen. Intenta con una foto más clara.",
             }
 
-        logger.info(f"✅ Tenant bill scan successful for {user.get('email', '')}: {extracted.get('provider_name', 'unknown')}")
+        logger.info(f"✅ Tenant bill scan ok for {user.get('email', '')}: {extracted.get('provider_name', 'unknown')}")
         return {
             "success": True,
             "extracted_data": extracted,
@@ -407,4 +412,15 @@ If you cannot extract a field, use null. Always return valid JSON only."""
         raise
     except Exception as e:
         logger.exception(f"Scan bill error: {e}")
-        raise HTTPException(status_code=500, detail=f"Error procesando imagen: {str(e)[:200]}")
+        # Graceful fallback — don't crash the mobile app
+        return {
+            "success": False,
+            "extracted_data": {},
+            "message": f"No se pudo procesar la imagen: {str(e)[:120]}",
+        }
+    finally:
+        if tmp_path:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
