@@ -752,7 +752,195 @@ async def admin_update_listing(listing_id: str, request: Request):
         {"$set": update}
     )
 
+    # ── Notify landlord via email + push (best-effort) ──
+    try:
+        await _notify_landlord_listing_review(listing, new_status, data.get("notes", ""))
+    except Exception as e:
+        logging.warning(f"⚠️ Landlord notification failed: {e}")
+
     return {"success": True, "message": f"Listado {new_status}", "status": new_status}
+
+
+async def _notify_landlord_listing_review(listing: dict, new_status: str, notes: str = ""):
+    """Send email + push to the landlord when admin approves/rejects their listing"""
+    import os as _os
+    owner_email = (listing.get("owner_email") or "").strip()
+    owner_name = listing.get("owner_name") or "Propietario"
+    address = listing.get("address", "tu propiedad")
+    city = listing.get("city", "")
+    listing_id = str(listing.get("_id", ""))
+
+    # Push to landlord (if owner_id exists)
+    try:
+        owner_id = listing.get("owner_id")
+        if owner_id:
+            from rental.shared import send_rental_push_to_user
+            emoji = "🎉" if new_status == "approved" else "📋"
+            await send_rental_push_to_user(
+                user_id=str(owner_id),
+                title=f"{emoji} Listing {'aprobado' if new_status == 'approved' else 'rechazado'}",
+                body=f"{address}{', ' + city if city else ''}",
+                data={"type": "marketplace_review", "listing_id": listing_id, "status": new_status},
+            )
+    except Exception as pe:
+        logging.warning(f"Push to landlord failed: {pe}")
+
+    if not owner_email:
+        return
+
+    # Email
+    sendgrid_key = _os.getenv("SENDGRID_API_KEY")
+    from_email = _os.getenv("SENDGRID_FROM_EMAIL", "info@rosshouserentals.com")
+    if not sendgrid_key:
+        cfg = await get_db().api_config.find_one({"_id": "main"})
+        if cfg:
+            sendgrid_key = cfg.get("sendgrid_api_key") or cfg.get("SENDGRID_API_KEY")
+            from_email = cfg.get("sendgrid_from_email", from_email)
+    if not sendgrid_key:
+        logging.info("ℹ️ SENDGRID_API_KEY missing — landlord notify skipped")
+        return
+
+    try:
+        import sendgrid
+        from sendgrid.helpers.mail import Mail, Email, To, Content
+        sg = sendgrid.SendGridAPIClient(api_key=sendgrid_key)
+
+        if new_status == "approved":
+            subject = f"🎉 Tu propiedad fue aprobada — {address}"
+            html = f"""
+            <div style="font-family:Helvetica,Arial,sans-serif;max-width:560px;margin:auto;background:#0b1220;color:#fff;border-radius:14px;padding:24px;">
+              <div style="background:linear-gradient(135deg,#10b981,#06b6d4);padding:14px;border-radius:10px;text-align:center;">
+                <h2 style="margin:0;color:#fff;">🎉 ¡Tu listing fue aprobado!</h2>
+              </div>
+              <p style="color:#cbd5e1;margin-top:18px;">Hola <strong style="color:#fff;">{owner_name}</strong>,</p>
+              <p style="color:#cbd5e1;">¡Buenas noticias! Tu propiedad ya está visible públicamente en Ross House Rentals.</p>
+              <div style="margin:14px 0;padding:14px;background:#111827;border-radius:10px;color:#e2e8f0;font-size:14px;border-left:4px solid #10b981;">
+                <div><strong style="color:#94a3b8;">Propiedad:</strong> {address}</div>
+                {f'<div><strong style="color:#94a3b8;">Ciudad:</strong> {city}</div>' if city else ''}
+                <div><strong style="color:#94a3b8;">Comisión:</strong> {listing.get('commission_rate', 10)}%</div>
+                {f'<div style="margin-top:8px;padding-top:8px;border-top:1px solid #1e293b;"><strong style="color:#94a3b8;">Nota del admin:</strong><br/>{notes}</div>' if notes else ''}
+              </div>
+              <p style="color:#cbd5e1;">Empezarás a recibir consultas (inquiries) de potenciales inquilinos/compradores en tu dashboard.</p>
+              <a href="https://www.rosshouserentals.com" style="display:inline-block;background:#10b981;color:#fff;padding:12px 20px;border-radius:10px;text-decoration:none;font-weight:bold;">Ver mi listing →</a>
+              <p style="color:#64748b;font-size:11px;margin-top:18px;border-top:1px solid #1e293b;padding-top:12px;">— Ross House Rentals · Dumas, TX</p>
+            </div>
+            """
+            plain = f"¡Tu listing fue aprobado!\nPropiedad: {address}\nComisión: {listing.get('commission_rate', 10)}%\n\nYa está visible al público."
+        else:
+            subject = f"📋 Actualización sobre tu propiedad — {address}"
+            html = f"""
+            <div style="font-family:Helvetica,Arial,sans-serif;max-width:560px;margin:auto;background:#0b1220;color:#fff;border-radius:14px;padding:24px;">
+              <div style="background:linear-gradient(135deg,#f59e0b,#dc2626);padding:14px;border-radius:10px;text-align:center;">
+                <h2 style="margin:0;color:#fff;">📋 Revisión de tu listing</h2>
+              </div>
+              <p style="color:#cbd5e1;margin-top:18px;">Hola <strong style="color:#fff;">{owner_name}</strong>,</p>
+              <p style="color:#cbd5e1;">Tu propiedad necesita ajustes antes de que podamos publicarla en Ross House Rentals.</p>
+              <div style="margin:14px 0;padding:14px;background:#111827;border-radius:10px;color:#e2e8f0;font-size:14px;border-left:4px solid #f59e0b;">
+                <div><strong style="color:#94a3b8;">Propiedad:</strong> {address}</div>
+                {f'<div><strong style="color:#94a3b8;">Ciudad:</strong> {city}</div>' if city else ''}
+                {f'<div style="margin-top:10px;padding-top:10px;border-top:1px solid #1e293b;"><strong style="color:#94a3b8;">Motivo / Observaciones:</strong><br/>{notes}</div>' if notes else '<div style="margin-top:10px;color:#94a3b8;">Razones comunes: fotos faltantes o de baja calidad, descripción incompleta, precio fuera de mercado, o información de contacto inválida.</div>'}
+              </div>
+              <p style="color:#cbd5e1;">Puedes editar tu listing y volverá a entrar a revisión automáticamente. Si tienes preguntas, responde directamente a este email.</p>
+              <a href="https://www.rosshouserentals.com" style="display:inline-block;background:#f59e0b;color:#fff;padding:12px 20px;border-radius:10px;text-decoration:none;font-weight:bold;">Editar mi listing →</a>
+              <p style="color:#64748b;font-size:11px;margin-top:18px;border-top:1px solid #1e293b;padding-top:12px;">— Ross House Rentals · Dumas, TX</p>
+            </div>
+            """
+            plain = f"Tu listing necesita ajustes.\nPropiedad: {address}\n{'Notas: ' + notes if notes else 'Edita tu listing en tu portal para corregir y volverá a revisión.'}"
+
+        mail = Mail(
+            from_email=Email(from_email, "Ross House Rentals"),
+            to_emails=To(owner_email),
+            subject=subject,
+            plain_text_content=Content("text/plain", plain),
+        )
+        mail.add_content(Content("text/html", html))
+        sg.client.mail.send.post(request_body=mail.get())
+        logging.info(f"📧 Landlord notified ({owner_email}): listing {new_status}")
+    except Exception as e:
+        logging.warning(f"⚠️ Landlord email failed for {owner_email}: {e}")
+
+
+@router.get('/admin/marketplace-commissions')
+async def admin_marketplace_commissions(request: Request):
+    """Admin: aggregated commissions earned per landlord.
+    Computes total commission based on commission_rate × rent_amount × signed_contracts.
+    """
+    await auth_admin(request)
+    db = get_db()
+
+    # 1) Fetch all landlords
+    landlords_cursor = db.app_users.find({"role": "landlord"})
+    landlords = [l async for l in landlords_cursor]
+
+    rows = []
+    grand_total_revenue = 0
+    grand_total_commission = 0
+
+    for landlord in landlords:
+        owner_id = str(landlord["_id"])
+        # Listings stats
+        all_listings = await db.marketplace_listings.count_documents({"owner_id": owner_id})
+        approved_listings = await db.marketplace_listings.count_documents({"owner_id": owner_id, "status": "approved"})
+        pending_listings = await db.marketplace_listings.count_documents({"owner_id": owner_id, "status": "pending"})
+
+        # Inquiries received (interest)
+        inquiries = await db.property_inquiries.count_documents({"landlord_owner_id": owner_id})
+
+        # Signed contracts for landlord properties (revenue side)
+        # We match contracts where the landlord_id is this landlord OR property comes from
+        # a marketplace listing owned by this landlord
+        property_ids = []
+        async for listing in db.marketplace_listings.find({"owner_id": owner_id, "status": "approved"}):
+            property_ids.append(str(listing["_id"]))
+
+        contract_q = {"$or": [{"landlord_id": owner_id}]}
+        if property_ids:
+            contract_q["$or"].append({"property_id": {"$in": property_ids}})
+
+        signed_contracts = 0
+        total_monthly_rent = 0
+        total_annualized = 0
+        async for c in db.rental_contracts.find({**contract_q, "status": {"$in": ["active", "completed"]}}):
+            signed_contracts += 1
+            rent = float(c.get("rent_amount", 0) or 0)
+            total_monthly_rent += rent
+            total_annualized += rent * 12
+
+        # Commission: commission_rate% of first month's rent (typical real-estate convention)
+        commission_rate = float(landlord.get("commission_rate", 10))
+        commission_earned = (total_monthly_rent * commission_rate) / 100.0
+
+        grand_total_revenue += total_monthly_rent
+        grand_total_commission += commission_earned
+
+        rows.append({
+            "landlord_id": owner_id,
+            "name": landlord.get("name", ""),
+            "email": landlord.get("email", ""),
+            "phone": landlord.get("phone", ""),
+            "commission_rate": commission_rate,
+            "total_listings": all_listings,
+            "approved_listings": approved_listings,
+            "pending_listings": pending_listings,
+            "inquiries_received": inquiries,
+            "signed_contracts": signed_contracts,
+            "total_monthly_rent": round(total_monthly_rent, 2),
+            "total_annualized_rent": round(total_annualized, 2),
+            "commission_earned": round(commission_earned, 2),
+            "joined_at": landlord.get("created_at", "").isoformat() if landlord.get("created_at") else "",
+        })
+
+    rows.sort(key=lambda r: r["commission_earned"], reverse=True)
+    return {
+        "success": True,
+        "landlords": rows,
+        "totals": {
+            "total_landlords": len(rows),
+            "total_monthly_revenue": round(grand_total_revenue, 2),
+            "total_annualized_revenue": round(grand_total_revenue * 12, 2),
+            "total_commission_earned": round(grand_total_commission, 2),
+        },
+    }
 
 
 @router.get('/admin/property-inquiries')
