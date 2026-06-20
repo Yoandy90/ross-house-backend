@@ -173,6 +173,72 @@ async def utility_summary(request: Request):
 
 
 # ═══════════════════════════════════════════════════════════════
+# ADMIN VISIBILITY — list all tenant-scanned utility records
+# ═══════════════════════════════════════════════════════════════
+async def auth_admin_local(request: Request):
+    from rental.shared import auth_admin as _auth
+    return await _auth(request)
+
+
+@router.get('/admin/tenant-utilities')
+async def admin_list_tenant_utilities(
+    request: Request,
+    tenant_id: str = "",
+    provider_type: str = "",
+    period: str = "",
+    page: int = 1,
+    limit: int = 50,
+):
+    """Admin: list all utility records scanned/added by tenants across the portfolio.
+    Useful for the admin OCR dashboard to monitor incoming bills.
+    """
+    await auth_admin_local(request)
+    page = max(1, int(page or 1))
+    limit = max(1, min(int(limit or 50), 200))
+
+    query: dict = {}
+    if tenant_id:
+        query["tenant_id"] = tenant_id
+    if provider_type:
+        query["provider_type"] = provider_type
+    if period:
+        query["period"] = period
+
+    db = get_db()
+    total = await db.tenant_utilities.count_documents(query)
+    skip = (page - 1) * limit
+    cursor = db.tenant_utilities.find(query).sort("created_at", -1).skip(skip).limit(limit)
+    records = []
+    async for r in cursor:
+        records.append({
+            "id": str(r["_id"]),
+            "tenant_id": r.get("tenant_id", ""),
+            "tenant_email": r.get("tenant_email", ""),
+            "provider_id": r.get("provider_id", ""),
+            "provider_name": r.get("provider_name", ""),
+            "provider_type": r.get("provider_type", "other"),
+            "account_number": r.get("account_number", ""),
+            "amount": r.get("amount", 0),
+            "period": r.get("period", ""),
+            "due_date": r.get("due_date", ""),
+            "paid": bool(r.get("paid", False)),
+            "notes": r.get("notes", ""),
+            "extracted_data": r.get("extracted_data", {}),
+            "source": "tenant_scan" if r.get("extracted_data") else "tenant_manual",
+            "created_at": r.get("created_at", "").isoformat() if r.get("created_at") else "",
+        })
+
+    return {
+        "success": True,
+        "records": records,
+        "total": total,
+        "page": page,
+        "limit": limit,
+        "total_pages": max(1, (total + limit - 1) // limit),
+    }
+
+
+# ═══════════════════════════════════════════════════════════════
 # UPDATE UTILITY RECORD
 # ═══════════════════════════════════════════════════════════════
 @router.put('/tenant/utilities/{record_id}')
@@ -224,7 +290,8 @@ async def delete_utility_record(record_id: str, request: Request):
 @router.post('/tenant/utilities/scan')
 async def scan_utility_bill(request: Request):
     """
-    Use GPT-4o Vision to extract data from a utility bill photo.
+    Use GPT-4o Vision (via emergentintegrations + Emergent LLM Key) to
+    extract data from a utility bill photo.
     Expects: { "image_base64": "..." }
     Returns: extracted provider, amount, due date, account number, period.
     """
@@ -242,8 +309,6 @@ async def scan_utility_bill(request: Request):
     llm_key = os.getenv('EMERGENT_LLM_KEY') or os.getenv('OPENAI_API_KEY', '')
     if not llm_key:
         raise HTTPException(status_code=500, detail="No hay API key configurada para AI Vision")
-
-    import httpx
 
     system_prompt = """You are a utility bill data extractor for Ross House Rentals. 
 Extract the following from the utility bill image and respond ONLY in valid JSON:
@@ -263,64 +328,83 @@ Extract the following from the utility bill image and respond ONLY in valid JSON
 }
 If you cannot extract a field, use null. Always return valid JSON only."""
 
+    # Save base64 to temp file so emergentintegrations can attach it
+    import tempfile
+    import json as _json
+
     try:
-        async with httpx.AsyncClient(timeout=45) as client:
-            response = await client.post(
-                "https://api.openai.com/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {llm_key}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": "gpt-4o",
-                    "messages": [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": [
-                            {"type": "text", "text": "Extract all utility bill information from this image."},
-                            {"type": "image_url", "image_url": {
-                                "url": f"data:image/jpeg;base64,{image_b64}",
-                                "detail": "high"
-                            }}
-                        ]}
-                    ],
-                    "max_tokens": 600,
-                    "temperature": 0.1,
-                }
+        # Decode base64 → bytes → tempfile
+        try:
+            img_bytes = base64.b64decode(image_b64, validate=False)
+        except Exception:
+            raise HTTPException(status_code=400, detail="image_base64 inválido (no es base64 válido)")
+
+        if len(img_bytes) > 10 * 1024 * 1024:
+            raise HTTPException(status_code=413, detail="Imagen demasiado grande (>10 MB)")
+
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.jpg')
+        tmp.write(img_bytes)
+        tmp.close()
+        tmp_path = tmp.name
+
+        try:
+            from emergentintegrations.llm.chat import LlmChat, UserMessage, FileContentWithMimeType  # type: ignore
+        except Exception as ie:
+            logger.error(f"emergentintegrations not available: {ie}")
+            raise HTTPException(status_code=500, detail="AI Vision no disponible (emergentintegrations missing)")
+
+        chat = (
+            LlmChat(
+                api_key=llm_key,
+                session_id=f"tenant-scan-{datetime.utcnow().timestamp()}",
+                system_message=system_prompt,
             )
+            .with_model("openai", "gpt-4o")
+            .with_max_tokens(700)
+        )
+        user_msg = UserMessage(
+            text="Extract all utility bill information from this image and respond ONLY with the JSON object.",
+            file_contents=[FileContentWithMimeType(
+                file_path=tmp_path,
+                mime_type="image/jpeg",
+            )],
+        )
+        raw = (await chat.send_message(user_msg) or "").strip()
 
-            if response.status_code == 200:
-                result = response.json()
-                content = result["choices"][0]["message"]["content"]
+        # Cleanup tempfile
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
 
-                # Parse JSON from response
-                import json
-                # Clean markdown code blocks if present
-                if '```json' in content:
-                    content = content.split('```json')[1].split('```')[0]
-                elif '```' in content:
-                    content = content.split('```')[1].split('```')[0]
+        # Strip markdown code fences
+        if raw.startswith("```"):
+            raw = raw.strip("`")
+            if raw.lower().startswith("json"):
+                raw = raw[4:].strip()
+            # If still has trailing fence
+            if raw.endswith("```"):
+                raw = raw[:-3].strip()
 
-                extracted = json.loads(content.strip())
-                logger.info(f"✅ Bill scan successful for {user.get('email', '')}: {extracted.get('provider_name', 'unknown')}")
+        try:
+            extracted = _json.loads(raw)
+        except _json.JSONDecodeError:
+            logger.warning(f"Tenant scan: non-JSON response (first 300 chars): {raw[:300]}")
+            return {
+                "success": False,
+                "extracted_data": {},
+                "message": "No se pudo extraer datos de la imagen. Intenta con una foto más clara.",
+            }
 
-                return {
-                    "success": True,
-                    "extracted_data": extracted,
-                    "message": "Datos extraídos exitosamente"
-                }
-            else:
-                logger.error(f"GPT-4o Vision error {response.status_code}: {response.text[:300]}")
-                raise HTTPException(status_code=500, detail="Error al analizar la imagen")
-
-    except json.JSONDecodeError:
-        logger.error(f"Failed to parse AI response as JSON")
+        logger.info(f"✅ Tenant bill scan successful for {user.get('email', '')}: {extracted.get('provider_name', 'unknown')}")
         return {
-            "success": False,
-            "extracted_data": {},
-            "message": "No se pudo extraer datos de la imagen. Intenta con una foto más clara."
+            "success": True,
+            "extracted_data": extracted,
+            "message": "Datos extraídos exitosamente",
         }
+
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Scan bill error: {e}")
-        raise HTTPException(status_code=500, detail=f"Error procesando imagen: {str(e)}")
+        logger.exception(f"Scan bill error: {e}")
+        raise HTTPException(status_code=500, detail=f"Error procesando imagen: {str(e)[:200]}")
