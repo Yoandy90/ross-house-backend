@@ -160,7 +160,11 @@ async def tenant_section8_status(request: Request):
         "voucher_amount": user.get("section8_voucher_amount", 0),
         "voucher_expiration": user.get("section8_voucher_expiration", ""),
         "notes": user.get("section8_notes", ""),
-        "declared_at": user.get("section8_declared_at").isoformat() if user.get("section8_declared_at") else None,
+        "declared_at": (
+            user.get("section8_declared_at").isoformat()
+            if hasattr(user.get("section8_declared_at"), "isoformat")
+            else (user.get("section8_declared_at") or None)
+        ),
     }
 
 

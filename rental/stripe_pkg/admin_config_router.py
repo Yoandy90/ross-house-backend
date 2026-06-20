@@ -8,6 +8,22 @@ from rental.stripe_pkg.helpers import _get_stripe_config
 router = APIRouter()
 
 
+@router.get('/public/stripe-config')
+async def get_public_stripe_config():
+    """Public endpoint: returns the Stripe publishable key + enabled status.
+
+    The mobile app calls this on launch (StripeWrapper) to initialize the
+    Stripe SDK with the live publishable key. NEVER returns the secret key.
+    """
+    config = await get_db().rental_config.find_one({"type": "company"}) or {}
+    return {
+        "success": True,
+        "stripe_enabled": bool(config.get("stripe_enabled", False)),
+        "publishable_key": config.get("stripe_publishable_key", ""),
+        "stripe_publishable_key": config.get("stripe_publishable_key", ""),
+    }
+
+
 @router.get('/admin/rental-stripe-config')
 async def get_stripe_config(request: Request):
     """Admin: Get Stripe configuration (masked keys) for rental module"""

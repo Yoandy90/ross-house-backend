@@ -75,6 +75,50 @@ async def public_serve_property_file(path: str):
         raise HTTPException(status_code=404, detail=f"Foto no encontrada")
 
 
+@router.get('/public/section8-welcome')
+async def public_section8_welcome():
+    """Public endpoint: Returns Section 8 program info + properties accepting vouchers.
+
+    Used by the mobile app Welcome screen for Section 8 voucher holders.
+    Lists only properties where ``accepts_section_8`` is true.
+    """
+    db = get_db()
+    cursor = db.properties.find({"accepts_section_8": True}).sort("created_at", -1)
+    items = []
+    async for p in cursor:
+        prop = serialize(p)
+        items.append({
+            "id": prop.get("_id"),
+            "address": prop.get("address", ""),
+            "city": prop.get("city", ""),
+            "state": prop.get("state", "TX"),
+            "zip": prop.get("zip", ""),
+            "bedrooms": prop.get("bedrooms", 0),
+            "bathrooms": prop.get("bathrooms", 0),
+            "rent": prop.get("rent_amount", prop.get("rent", 0)),
+            "accepts_section_8": True,
+            "s8_voucher_number": prop.get("s8_voucher_number", ""),
+            "s8_pha_name": prop.get("s8_pha_name", ""),
+            "photos": prop.get("photos", [])[:3] if isinstance(prop.get("photos"), list) else [],
+        })
+    return {
+        "success": True,
+        "count": len(items),
+        "properties": items,
+        "info": {
+            "title": "Programa de Vivienda Sección 8 (HUD)",
+            "description": "Aceptamos vouchers HCV de la Public Housing Authority (PHA).",
+            "benefits": [
+                "Renta cubierta por HUD según tu voucher",
+                "Casas inspeccionadas anualmente bajo estándar HQS",
+                "Sin pagos atrasados — el gobierno paga directo al landlord",
+                "Apoyo bilingüe al inquilino",
+            ],
+            "next_step": "Comparte tu voucher con nosotros para validar elegibilidad.",
+        },
+    }
+
+
 @router.get('/public/properties')
 async def public_list_properties(request: Request):
     """Public endpoint: List all properties (own + approved marketplace)"""
