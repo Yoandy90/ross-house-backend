@@ -167,11 +167,171 @@ async def sign_lease(lease_id: str, request: Request):
 
     await get_db().rental_contracts.update_one({"_id": ObjectId(lease_id)}, {"$set": update})
 
+    # ── Auto-send PDF by email when contract becomes ACTIVE ──
+    final_status = update.get("status", lease.get("status"))
+    if final_status == "active" and lease.get("status") != "active":
+        try:
+            # Reload the full updated contract (with all signatures) for the PDF
+            fresh = await get_db().rental_contracts.find_one({"_id": ObjectId(lease_id)})
+            if fresh:
+                await _email_signed_lease_pdf(fresh)
+        except Exception as e:
+            logging.warning(f"⚠️ Auto-email signed lease PDF failed: {e}")
+
     return {
         "success": True,
-        "new_status": update.get("status", lease.get("status")),
+        "new_status": final_status,
         "message": f"Firma de {signer_role} guardada exitosamente"
     }
+
+
+async def _email_signed_lease_pdf(contract: dict):
+    """Generate the signed lease PDF and email it (as attachment) to tenant + admins.
+    Best-effort: any failure is logged but does not interrupt the signing flow.
+    """
+    import os as _os
+    import base64 as _base64
+    db = get_db()
+
+    # ── 1) Resolve recipients ──
+    tenant_email = (contract.get("tenant_email") or "").strip().lower()
+    if not tenant_email and contract.get("tenant_id"):
+        try:
+            t = await db.tenants.find_one({"_id": ObjectId(contract["tenant_id"])})
+            if t:
+                tenant_email = (t.get("email") or "").strip().lower()
+        except Exception:
+            pass
+
+    admin_emails_raw = _os.getenv("RENTAL_ADMIN_EMAILS") or "yoandyross@gmail.com"
+    admin_list = [e.strip().lower() for e in admin_emails_raw.split(",") if e.strip()]
+    # Support override via _force_recipients (used by admin manual send endpoint)
+    forced = contract.get("_force_recipients") if isinstance(contract, dict) else None
+    if forced:
+        recipients = [r.strip().lower() for r in forced if r.strip()]
+    else:
+        recipients = list({*(admin_list or []), *([tenant_email] if tenant_email else [])})
+    if not recipients:
+        logging.info("ℹ️ No recipients for signed lease email")
+        return
+
+    # ── 2) Generate the PDF ──
+    config = await db.rental_config.find_one({"type": "company"}) or {}
+    if not contract.get("admin_signature") or not contract.get("admin_signature", {}).get("image_data"):
+        try:
+            saved_admin_sig = await db.admin_signatures.find_one({"type": "landlord_default"})
+            if saved_admin_sig and saved_admin_sig.get("image_data"):
+                config["saved_admin_signature"] = saved_admin_sig
+        except Exception:
+            pass
+    tenant_photo_url = None
+    if contract.get("tenant_id"):
+        try:
+            t = await db.tenants.find_one({"_id": ObjectId(contract["tenant_id"])})
+            if t:
+                tenant_photo_url = t.get("photo_url", "")
+        except Exception:
+            pass
+
+    from rental_pdf_service import generate_rental_contract_pdf
+    pdf_b64 = generate_rental_contract_pdf(contract, config=config, tenant_photo_url=tenant_photo_url)
+    if not pdf_b64:
+        logging.warning("PDF generation returned empty")
+        return
+
+    # ── 3) Send via SendGrid with attachment ──
+    sendgrid_key = _os.getenv("SENDGRID_API_KEY")
+    from_email = _os.getenv("SENDGRID_FROM_EMAIL", "info@rosshouserentals.com")
+    if not sendgrid_key:
+        cfg = await db.api_config.find_one({"_id": "main"})
+        if cfg:
+            sendgrid_key = cfg.get("sendgrid_api_key") or cfg.get("SENDGRID_API_KEY")
+            from_email = cfg.get("sendgrid_from_email", from_email)
+    if not sendgrid_key:
+        logging.info("ℹ️ SENDGRID_API_KEY missing — signed lease email skipped")
+        return
+
+    try:
+        import sendgrid
+        from sendgrid.helpers.mail import Mail, Email, To, Content, Attachment, FileContent, FileName, FileType, Disposition
+        sg = sendgrid.SendGridAPIClient(api_key=sendgrid_key)
+
+        contract_number = contract.get("contract_number", str(contract.get("_id", ""))[:8])
+        property_address = contract.get("property_address", "su propiedad")
+        rent = contract.get("rent_amount", 0)
+        start_date = contract.get("start_date", "")
+        if hasattr(start_date, "strftime"):
+            start_date = start_date.strftime("%Y-%m-%d")
+        filename = f"Lease_Agreement_{contract_number}.pdf"
+
+        for recipient in recipients:
+            is_tenant = recipient == tenant_email
+            subject = (
+                f"✅ Tu contrato firmado — {property_address}"
+                if is_tenant
+                else f"✅ Contrato firmado: {contract_number} ({property_address})"
+            )
+
+            if is_tenant:
+                html = f"""
+                <div style="font-family:Helvetica,Arial,sans-serif;max-width:560px;margin:auto;background:#0b1220;color:#fff;border-radius:14px;padding:24px;">
+                  <div style="background:linear-gradient(135deg,#10b981,#06b6d4);padding:14px;border-radius:10px;text-align:center;">
+                    <h2 style="margin:0;color:#fff;">✅ Contrato firmado y activo</h2>
+                  </div>
+                  <p style="color:#cbd5e1;margin-top:18px;">¡Felicidades! Tu contrato de arrendamiento ha sido firmado por todas las partes y está oficialmente activo.</p>
+                  <div style="margin:14px 0;padding:14px;background:#111827;border-radius:10px;color:#e2e8f0;font-size:14px;">
+                    <div><strong style="color:#94a3b8;">Contrato:</strong> {contract_number}</div>
+                    <div><strong style="color:#94a3b8;">Propiedad:</strong> {property_address}</div>
+                    <div><strong style="color:#94a3b8;">Renta mensual:</strong> ${rent:,.2f}</div>
+                    <div><strong style="color:#94a3b8;">Inicio:</strong> {start_date}</div>
+                  </div>
+                  <p style="color:#cbd5e1;">📎 Encontrarás el <strong>PDF completo del contrato firmado adjunto</strong> a este email. Guárdalo para tus registros.</p>
+                  <p style="color:#cbd5e1;font-size:13px;margin-top:14px;">También puedes acceder a tu portal en cualquier momento:</p>
+                  <a href="https://www.rosshouserentals.com/tenant" style="display:inline-block;background:#10b981;color:#fff;padding:12px 20px;border-radius:10px;text-decoration:none;font-weight:bold;">Ir a mi portal →</a>
+                  <p style="color:#64748b;font-size:11px;margin-top:18px;border-top:1px solid #1e293b;padding-top:12px;">— Ross House Rentals · Dumas, TX · (806) 934-2018</p>
+                </div>
+                """
+                plain = f"Contrato firmado y activo.\nContrato: {contract_number}\nPropiedad: {property_address}\nRenta: ${rent:,.2f}\nInicio: {start_date}\n\nEl PDF está adjunto a este email."
+            else:
+                html = f"""
+                <div style="font-family:Helvetica,Arial,sans-serif;max-width:560px;margin:auto;background:#0b1220;color:#fff;border-radius:14px;padding:24px;">
+                  <div style="background:linear-gradient(135deg,#3b82f6,#06b6d4);padding:14px;border-radius:10px;text-align:center;">
+                    <h2 style="margin:0;color:#fff;">📋 Contrato firmado por todas las partes</h2>
+                  </div>
+                  <div style="margin:14px 0;padding:14px;background:#111827;border-radius:10px;color:#e2e8f0;font-size:14px;">
+                    <div><strong style="color:#94a3b8;">Contrato:</strong> {contract_number}</div>
+                    <div><strong style="color:#94a3b8;">Propiedad:</strong> {property_address}</div>
+                    <div><strong style="color:#94a3b8;">Inquilino:</strong> {contract.get('tenant_name','')} ({tenant_email or 'sin email'})</div>
+                    <div><strong style="color:#94a3b8;">Renta:</strong> ${rent:,.2f}/mes</div>
+                    <div><strong style="color:#94a3b8;">Inicio:</strong> {start_date}</div>
+                  </div>
+                  <p style="color:#cbd5e1;font-size:13px;">📎 PDF firmado adjunto.</p>
+                  <a href="https://www.rosshouserentals.com/admin/contratos" style="display:inline-block;background:#3b82f6;color:#fff;padding:12px 20px;border-radius:10px;text-decoration:none;font-weight:bold;">Ver en panel admin →</a>
+                </div>
+                """
+                plain = f"Contrato firmado: {contract_number} en {property_address}. Inquilino: {contract.get('tenant_name','')}. PDF adjunto."
+
+            mail = Mail(
+                from_email=Email(from_email, "Ross House Rentals"),
+                to_emails=To(recipient),
+                subject=subject,
+                plain_text_content=Content("text/plain", plain),
+            )
+            mail.add_content(Content("text/html", html))
+            attachment = Attachment(
+                FileContent(pdf_b64),
+                FileName(filename),
+                FileType("application/pdf"),
+                Disposition("attachment"),
+            )
+            mail.attachment = attachment
+            try:
+                sg.client.mail.send.post(request_body=mail.get())
+                logging.info(f"📧 Signed lease PDF emailed to {recipient}")
+            except Exception as se:
+                logging.warning(f"SendGrid send failed for {recipient}: {se}")
+    except Exception as e:
+        logging.warning(f"⚠️ Signed lease email block failed: {e}")
 
 
 @router.get('/my-leases')
@@ -974,6 +1134,42 @@ async def generate_contract_pdf(contract_id: str, request: Request):
     filename = f"Lease_Agreement_{contract.get('contract_number', contract_id)}.pdf"
 
     return {"success": True, "pdf_base64": pdf_b64, "filename": filename}
+
+
+@router.post('/admin/rental-contracts/{contract_id}/email-pdf')
+async def admin_email_lease_pdf(contract_id: str, request: Request):
+    """Admin: manually send the lease PDF by email to tenant + admins.
+    Useful when admin wants to re-send the signed/draft contract.
+    Optional body: { "recipients": ["custom@email.com", ...] } to override defaults.
+    """
+    await auth_admin(request)
+    try:
+        oid = ObjectId(contract_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="ID inválido")
+    db = get_db()
+    contract = await db.rental_contracts.find_one({"_id": oid})
+    if not contract:
+        raise HTTPException(status_code=404, detail="Contrato no encontrado")
+
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:
+        pass
+    custom_recipients = body.get("recipients") if isinstance(body, dict) else None
+
+    # Optionally override tenant_email so _email_signed_lease_pdf only emails specific recipients
+    if custom_recipients and isinstance(custom_recipients, list):
+        # Temporarily inject recipients via tenant_email + admin env
+        # Simpler: replicate the email function inline with custom recipients
+        contract_with_emails = dict(contract)
+        contract_with_emails["_force_recipients"] = [r for r in custom_recipients if r]
+        await _email_signed_lease_pdf(contract_with_emails)
+    else:
+        await _email_signed_lease_pdf(contract)
+
+    return {"success": True, "message": "Email enviado (revisa spam si no aparece en bandeja)"}
 
 
 # ─── Tenant-facing Lease PDF (signed contract download) ──────────────────
