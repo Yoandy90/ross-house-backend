@@ -914,7 +914,10 @@ async def get_investor(investor_id: str, request: Request):
 
 @router.post('/admin/syndication/investors/{investor_id}/reset-password')
 async def admin_reset_investor_password(investor_id: str, request: Request):
-    """Admin: reset an investor's password (returns the new temp password)"""
+    """Admin: reset an investor's password.
+    Body (optional): { "new_password": "MyPass123" } → uses custom password.
+    If omitted, generates a temporary one and returns it.
+    """
     await auth_admin(request)
     if not ObjectId.is_valid(investor_id):
         raise HTTPException(status_code=400, detail="ID inválido")
@@ -922,12 +925,31 @@ async def admin_reset_investor_password(investor_id: str, request: Request):
     user = await db.app_users.find_one({"_id": ObjectId(investor_id)})
     if not user:
         raise HTTPException(status_code=404, detail="No encontrado")
-    temp_pw = f"Inv{datetime.utcnow().strftime('%y%m%d%H%M')}"
+
+    # Allow custom password via body, fallback to temp generation
+    new_pw = ""
+    try:
+        body = await request.json()
+        if isinstance(body, dict):
+            new_pw = (body.get("new_password") or "").strip()
+    except Exception:
+        pass
+    is_custom = bool(new_pw)
+    if is_custom and len(new_pw) < 6:
+        raise HTTPException(status_code=400, detail="Password mínimo 6 caracteres")
+    if not new_pw:
+        new_pw = f"Inv{datetime.utcnow().strftime('%y%m%d%H%M')}"
+
     await db.app_users.update_one(
         {"_id": ObjectId(investor_id)},
-        {"$set": {"password_hash": _hash_password(temp_pw), "_temp_password": temp_pw}},
+        {"$set": {"password_hash": _hash_password(new_pw), "_temp_password": new_pw if not is_custom else ""}},
     )
-    return {"success": True, "temp_password": temp_pw, "email": user.get("email", "")}
+    return {
+        "success": True,
+        "temp_password": new_pw if not is_custom else None,
+        "custom": is_custom,
+        "email": user.get("email", ""),
+    }
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

@@ -20,7 +20,7 @@ logger = logging.getLogger("mashvisor")
 router = APIRouter(prefix="/admin/market-data", tags=["Market Data"])
 
 MASHVISOR_BASE = "https://mashvisor-api.p.rapidapi.com"
-RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY", "21ea9bf87bmsh34cf3a650404000p1365f9jsn9af040d3e196")
+RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY", "")
 RAPIDAPI_HOST = "mashvisor-api.p.rapidapi.com"
 
 HEADERS = {
@@ -46,6 +46,8 @@ async def _mashvisor_get(path: str, params: dict = None, cache_category: str = "
         return cached
 
     # ── 2. Call Mashvisor API ──
+    if not RAPIDAPI_KEY:
+        raise HTTPException(status_code=503, detail="Mashvisor API no configurada (RAPIDAPI_KEY ausente)")
     async with httpx.AsyncClient(timeout=30.0) as client:
         url = f"{MASHVISOR_BASE}{path}"
         resp = await client.get(url, headers=HEADERS, params=params)

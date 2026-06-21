@@ -523,6 +523,7 @@ async def create_landlord_listing(request: Request):
     }
 
     result = await get_db().marketplace_listings.insert_one(listing)
+    inserted_id = str(result.inserted_id)
 
     # Update landlord's property count
     await get_db().app_users.update_one(
@@ -530,11 +531,104 @@ async def create_landlord_listing(request: Request):
         {"$inc": {"properties_count": 1}}
     )
 
+    # ── Notify admins (push + email) ──
+    try:
+        await _notify_admins_new_listing(listing, inserted_id)
+    except Exception as e:
+        logging.warning(f"⚠️ Admin notification on new listing failed: {e}")
+
     return {
         "success": True,
-        "listing_id": str(result.inserted_id),
+        "listing_id": inserted_id,
         "message": "Propiedad enviada para aprobación"
     }
+
+
+async def _notify_admins_new_listing(listing: dict, listing_id: str):
+    """Send email + push to all admins when a landlord creates a new marketplace listing."""
+    import os as _os
+    address = listing.get("address", "Sin dirección")
+    city = listing.get("city", "")
+    state = listing.get("state", "")
+    rent = listing.get("rent_amount", 0) or listing.get("sale_price", 0)
+    beds = listing.get("bedrooms", 0)
+    baths = listing.get("bathrooms", 0)
+    owner_name = listing.get("owner_name", "Propietario")
+    owner_email = listing.get("owner_email", "")
+    listing_type = listing.get("listing_type", "rent")
+    type_label = "venta" if listing_type == "sale" else "renta"
+
+    # Push
+    try:
+        await send_rental_push_to_admins(
+            title=f"🏠 Nueva propiedad pendiente",
+            body=f"{owner_name}: {address}, {city} (${rent:,.0f}/{type_label})",
+            data={"type": "marketplace_new_listing", "listing_id": listing_id},
+        )
+    except Exception as pe:
+        logging.warning(f"Admin push failed: {pe}")
+
+    # Email
+    sendgrid_key = _os.getenv("SENDGRID_API_KEY")
+    from_email = _os.getenv("SENDGRID_FROM_EMAIL", "info@rosshouserentals.com")
+    if not sendgrid_key:
+        cfg = await get_db().api_config.find_one({"_id": "main"})
+        if cfg:
+            sendgrid_key = cfg.get("sendgrid_api_key") or cfg.get("SENDGRID_API_KEY")
+            from_email = cfg.get("sendgrid_from_email", from_email)
+    if not sendgrid_key:
+        return
+
+    # Gather all admin emails
+    admins = await get_db().app_users.find({"role": "admin"}).to_list(20)
+    admin_emails = [a.get("email") for a in admins if a.get("email")]
+    if not admin_emails:
+        return
+
+    try:
+        import sendgrid
+        from sendgrid.helpers.mail import Mail, Email, To, Content
+        sg = sendgrid.SendGridAPIClient(api_key=sendgrid_key)
+
+        subject = f"🏠 Nueva propiedad pendiente de revisión — {address}"
+        html = f"""
+        <div style="font-family:Helvetica,Arial,sans-serif;max-width:560px;margin:auto;background:#0b1220;color:#fff;border-radius:14px;padding:24px;">
+          <div style="background:linear-gradient(135deg,#3b82f6,#8b5cf6);padding:14px;border-radius:10px;text-align:center;">
+            <h2 style="margin:0;color:#fff;">🏠 Nueva propiedad pendiente</h2>
+          </div>
+          <p style="color:#cbd5e1;margin-top:18px;">Un propietario externo publicó una nueva propiedad y espera tu revisión.</p>
+          <div style="margin:14px 0;padding:14px;background:#111827;border-radius:10px;color:#e2e8f0;font-size:14px;border-left:4px solid #3b82f6;">
+            <div><strong style="color:#94a3b8;">Dirección:</strong> {address}</div>
+            <div><strong style="color:#94a3b8;">Ciudad:</strong> {city}, {state}</div>
+            <div><strong style="color:#94a3b8;">Tipo:</strong> {type_label.capitalize()}</div>
+            <div><strong style="color:#94a3b8;">{('Renta' if listing_type=='rent' else 'Precio')}:</strong> ${rent:,.0f}{'/mes' if listing_type=='rent' else ''}</div>
+            <div><strong style="color:#94a3b8;">Camas / Baños:</strong> {beds} / {baths}</div>
+            <div style="margin-top:10px;padding-top:10px;border-top:1px solid #1e293b;">
+              <strong style="color:#94a3b8;">Propietario:</strong> {owner_name}<br/>
+              <strong style="color:#94a3b8;">Email:</strong> {owner_email}
+            </div>
+          </div>
+          <a href="https://www.rosshouserentals.com/admin/marketplace" style="display:inline-block;background:#3b82f6;color:#fff;padding:12px 20px;border-radius:10px;text-decoration:none;font-weight:bold;">Revisar propiedad →</a>
+          <p style="color:#64748b;font-size:11px;margin-top:18px;border-top:1px solid #1e293b;padding-top:12px;">— Ross House Rentals · Dumas, TX</p>
+        </div>
+        """
+        plain = f"Nueva propiedad pendiente:\n{address}, {city}, {state}\n{owner_name} ({owner_email})\n${rent:,.0f}\n\nRevisar en https://www.rosshouserentals.com/admin/marketplace"
+
+        for admin_email in admin_emails:
+            try:
+                mail = Mail(
+                    from_email=Email(from_email, "Ross House Rentals"),
+                    to_emails=To(admin_email),
+                    subject=subject,
+                    plain_text_content=Content("text/plain", plain),
+                )
+                mail.add_content(Content("text/html", html))
+                sg.client.mail.send.post(request_body=mail.get())
+            except Exception as me:
+                logging.warning(f"Admin email failed for {admin_email}: {me}")
+        logging.info(f"📧 Admin notified about new listing: {address}")
+    except Exception as e:
+        logging.warning(f"⚠️ Admin email batch failed: {e}")
 
 
 @router.get('/landlord/my-listings')
@@ -545,7 +639,7 @@ async def get_landlord_listings(request: Request):
         raise HTTPException(status_code=403, detail="Solo propietarios")
 
     cursor = get_db().marketplace_listings.find(
-        {"owner_id": user.get("_id")}
+        {"owner_id": user.get("_id"), "status": {"$ne": "deleted"}}
     ).sort("created_at", -1)
 
     listings = []
@@ -649,13 +743,15 @@ async def delete_listing_photo(listing_id: str, photo_index: int, request: Reque
 
 @router.put('/landlord/listings/{listing_id}')
 async def update_landlord_listing(listing_id: str, request: Request):
-    """Landlord: Update own listing"""
+    """Landlord: Update own listing.
+    Material changes (price, address, beds, baths, sqft, type) reset status to 'pending' for re-approval.
+    """
     user = await auth_marketplace(request)
     if user.get("role") != "landlord":
         raise HTTPException(status_code=403, detail="Solo propietarios")
 
     listing = await get_db().marketplace_listings.find_one({"_id": ObjectId(listing_id)})
-    if not listing or listing.get("owner_id") != user.get("_id"):
+    if not listing or str(listing.get("owner_id")) != str(user.get("_id")):
         raise HTTPException(status_code=404, detail="Propiedad no encontrada")
 
     data = await request.json()
@@ -663,21 +759,190 @@ async def update_landlord_listing(listing_id: str, request: Request):
     allowed = ["address", "city", "state", "zip_code", "property_type", "listing_type",
                "bedrooms", "bathrooms", "square_feet", "rent_amount", "deposit_amount",
                "sale_price", "description", "features", "photos"]
+    # Material fields that trigger re-approval if changed on an already-approved listing
+    material_fields = {"address", "city", "state", "zip_code", "property_type", "listing_type",
+                       "bedrooms", "bathrooms", "square_feet", "rent_amount", "sale_price"}
+    material_changed = False
     for f in allowed:
         if f in data:
-            update_fields[f] = data[f]
+            new_val = data[f]
+            old_val = listing.get(f)
+            update_fields[f] = new_val
+            if f in material_fields:
+                try:
+                    if str(new_val) != str(old_val):
+                        material_changed = True
+                except Exception:
+                    material_changed = True
     update_fields["updated_at"] = datetime.utcnow()
 
-    # If listing was rejected, re-submit for approval
-    if listing.get("status") == "rejected" and update_fields:
+    # Re-approval logic
+    current_status = listing.get("status", "pending")
+    requires_review = False
+    if current_status == "rejected" and update_fields:
         update_fields["status"] = "pending"
+        requires_review = True
+    elif current_status == "approved" and material_changed:
+        update_fields["status"] = "pending"
+        update_fields["previous_status"] = "approved"
+        update_fields["resubmitted_at"] = datetime.utcnow()
+        requires_review = True
 
     await get_db().marketplace_listings.update_one(
         {"_id": ObjectId(listing_id)},
         {"$set": update_fields}
     )
 
-    return {"success": True, "message": "Propiedad actualizada"}
+    # Notify admins if listing is now pending again
+    if requires_review:
+        try:
+            merged = {**listing, **update_fields}
+            await _notify_admins_new_listing(merged, listing_id)
+        except Exception as e:
+            logging.warning(f"⚠️ Admin re-review notification failed: {e}")
+
+    return {
+        "success": True,
+        "message": "Propiedad actualizada" + (" — pendiente de re-aprobación" if requires_review else ""),
+        "requires_review": requires_review,
+        "status": update_fields.get("status", current_status),
+    }
+
+
+@router.delete('/landlord/listings/{listing_id}')
+async def delete_landlord_listing(listing_id: str, request: Request):
+    """Landlord: Soft-delete own listing (sets status='deleted'). Admin can still see in audit log."""
+    user = await auth_marketplace(request)
+    if user.get("role") != "landlord":
+        raise HTTPException(status_code=403, detail="Solo propietarios")
+
+    if not ObjectId.is_valid(listing_id):
+        raise HTTPException(status_code=400, detail="ID inválido")
+
+    listing = await get_db().marketplace_listings.find_one({"_id": ObjectId(listing_id)})
+    if not listing or str(listing.get("owner_id")) != str(user.get("_id")):
+        raise HTTPException(status_code=404, detail="Propiedad no encontrada")
+
+    # Soft-delete: set status to 'deleted' so it disappears from public + landlord views
+    await get_db().marketplace_listings.update_one(
+        {"_id": ObjectId(listing_id)},
+        {"$set": {
+            "status": "deleted",
+            "deleted_at": datetime.utcnow(),
+            "deleted_by": str(user.get("_id")),
+        }}
+    )
+
+    # Decrement landlord's property count
+    await get_db().app_users.update_one(
+        {"_id": ObjectId(user.get("_id"))},
+        {"$inc": {"properties_count": -1}}
+    )
+
+    # Notify admins via push (audit trail)
+    try:
+        await send_rental_push_to_admins(
+            title="🗑️ Propiedad eliminada por propietario",
+            body=f"{user.get('name', 'Propietario')}: {listing.get('address', '')} — {listing.get('city', '')}",
+            data={"type": "marketplace_deleted", "listing_id": listing_id},
+        )
+    except Exception:
+        pass
+
+    return {"success": True, "message": "Propiedad eliminada"}
+
+
+@router.get('/public/marketplace/listings')
+async def public_marketplace_listings(
+    request: Request,
+):
+    """Public: List all APPROVED marketplace listings published by external landlords.
+    No auth required. Supports filters: state, city, min_rent, max_rent, beds, baths, property_type, listing_type.
+    """
+    qp = request.query_params
+    query = {"status": "approved"}
+
+    if qp.get("state"):
+        query["state"] = qp.get("state", "").upper()
+    if qp.get("city"):
+        # Case-insensitive city match
+        query["city"] = {"$regex": f"^{qp.get('city')}$", "$options": "i"}
+    if qp.get("property_type"):
+        query["property_type"] = qp.get("property_type")
+    if qp.get("listing_type"):
+        query["listing_type"] = qp.get("listing_type")
+    if qp.get("beds"):
+        try:
+            query["bedrooms"] = {"$gte": int(qp.get("beds"))}
+        except ValueError:
+            pass
+    if qp.get("baths"):
+        try:
+            query["bathrooms"] = {"$gte": float(qp.get("baths"))}
+        except ValueError:
+            pass
+
+    rent_filter = {}
+    if qp.get("min_rent"):
+        try:
+            rent_filter["$gte"] = float(qp.get("min_rent"))
+        except ValueError:
+            pass
+    if qp.get("max_rent"):
+        try:
+            rent_filter["$lte"] = float(qp.get("max_rent"))
+        except ValueError:
+            pass
+    if rent_filter:
+        query["rent_amount"] = rent_filter
+
+    try:
+        page = max(1, int(qp.get("page", "1")))
+        page_limit = min(50, max(1, int(qp.get("page_limit", "24"))))
+    except ValueError:
+        page, page_limit = 1, 24
+
+    total = await get_db().marketplace_listings.count_documents(query)
+    cursor = (
+        get_db().marketplace_listings.find(query)
+        .sort("created_at", -1)
+        .skip((page - 1) * page_limit)
+        .limit(page_limit)
+    )
+
+    formatted = []
+    async for l in cursor:
+        ml = serialize(l)
+        formatted.append({
+            "id": ml.get("_id"),
+            "address": ml.get("address", ""),
+            "city": ml.get("city", ""),
+            "state": ml.get("state", ""),
+            "zip_code": ml.get("zip_code", ""),
+            "property_type": ml.get("property_type", "house"),
+            "listing_type": ml.get("listing_type", "rent"),
+            "bedrooms": ml.get("bedrooms", 0),
+            "bathrooms": ml.get("bathrooms", 0),
+            "square_feet": ml.get("square_feet", 0),
+            "rent_amount": ml.get("rent_amount", 0),
+            "sale_price": ml.get("sale_price", 0),
+            "deposit_amount": ml.get("deposit_amount", 0),
+            "description": ml.get("description", ""),
+            "features": ml.get("features", []),
+            "photos": ml.get("photos", []),
+            "image_url": (ml.get("photos") or [None])[0],
+            "owner_name": ml.get("owner_name", ""),
+            "source": "marketplace",
+        })
+
+    return {
+        "success": True,
+        "status": "success",
+        "listings": formatted,
+        "total": total,
+        "page": page,
+        "page_limit": page_limit,
+    }
 
 
 @router.post('/public/property-inquiry')
@@ -868,9 +1133,19 @@ async def admin_marketplace_commissions(request: Request):
     await auth_admin(request)
     db = get_db()
 
+    # Optional ?include_test=1 query to show test users (default: hide)
+    qp = request.query_params
+    include_test = qp.get("include_test", "0") in ("1", "true", "yes")
+    test_email_patterns = ["qa.", "ui.test.", "demo.", "test@", "@test.com", "@example.com", "@rosshouse.test"]
+
     # 1) Fetch all landlords
     landlords_cursor = db.app_users.find({"role": "landlord"})
     landlords = [l async for l in landlords_cursor]
+    if not include_test:
+        def _is_test(em: str) -> bool:
+            em = (em or "").lower()
+            return any(p in em for p in test_email_patterns)
+        landlords = [l for l in landlords if not _is_test(l.get("email", ""))]
 
     rows = []
     grand_total_revenue = 0
@@ -1324,6 +1599,11 @@ async def create_property(request: Request):
         "latitude": float(data['latitude']) if data.get('latitude') else None,
         "longitude": float(data['longitude']) if data.get('longitude') else None,
         "photos": [],  # List of photo storage paths
+        # ─── Owner assignment ───
+        "owner_id": None,
+        "owner_name": "",
+        "owner_email": "",
+        "owner_phone": "",
         # ─── Section 8 / Housing Choice Voucher fields ───
         "section8_accepted": bool(data.get('section8_accepted', False)),
         "section8_pha": data.get('section8_pha', ''),  # e.g., "Amarillo Housing Authority"
@@ -1337,10 +1617,27 @@ async def create_property(request: Request):
     }
 
     result = await get_db().properties.insert_one(property_doc)
+    new_id = str(result.inserted_id)
+
+    # Handle initial owner assignment if provided
+    owner_id_raw = data.get("owner_id")
+    if owner_id_raw and ObjectId.is_valid(owner_id_raw):
+        owner_user = await get_db().app_users.find_one({"_id": ObjectId(owner_id_raw)})
+        if owner_user:
+            await get_db().properties.update_one(
+                {"_id": result.inserted_id},
+                {"$set": {
+                    "owner_id": str(owner_user.get("_id")),
+                    "owner_name": owner_user.get("name", ""),
+                    "owner_email": owner_user.get("email", ""),
+                    "owner_phone": owner_user.get("phone", ""),
+                }}
+            )
+
     return {
         "success": True,
         "message": f"Propiedad {prop_number} creada exitosamente",
-        "property_id": str(result.inserted_id),
+        "property_id": new_id,
         "property_number": prop_number,
     }
 
