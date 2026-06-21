@@ -2092,6 +2092,29 @@ async def rental_dashboard(request: Request):
         p['_id'] = str(p['_id'])
         recent_payments.append(p)
 
+    # ── Maintenance pending (counts: pending/open/in_progress) ──
+    maintenance_pending = await get_db().maintenance_requests.count_documents({
+        "status": {"$in": ["pending", "open", "in_progress", "scheduled"]}
+    })
+
+    # ── Pending payments (due or overdue, not yet completed) ──
+    # Counts both rental_payments with status='pending' and rental_invoices with status='pending'/'overdue'
+    pending_payments_count = await get_db().rental_payments.count_documents({
+        "status": {"$in": ["pending", "overdue", "scheduled"]}
+    })
+    # Also count unpaid invoices
+    pending_invoices_count = 0
+    try:
+        pending_invoices_count = await get_db().rental_invoices.count_documents({
+            "status": {"$in": ["pending", "overdue", "unpaid"]}
+        })
+    except Exception:
+        pass
+    pending_payments_total = pending_payments_count + pending_invoices_count
+
+    # Pending dollar amount (sum of expected_monthly minus monthly_revenue actually paid)
+    pending_amount = max(0, float(expected_monthly) - float(monthly_revenue))
+
     return {
         "success": True,
         "dashboard": {
@@ -2104,6 +2127,7 @@ async def rental_dashboard(request: Request):
                 "yearly": yearly_revenue,
                 "expected_monthly": expected_monthly,
                 "collection_rate": round(collection_rate, 1),
+                "pending_amount": round(pending_amount, 2),
             },
             "expenses": {
                 "monthly": monthly_expenses,
@@ -2119,6 +2143,8 @@ async def rental_dashboard(request: Request):
                 "noi_annual": (expected_monthly * 12) - total_expenses,  # Net Operating Income
                 "cap_rate": round(((expected_monthly * 12 - total_expenses) / estimated_portfolio_value * 100), 2) if estimated_portfolio_value > 0 else 0,
             },
+            "maintenance_pending": maintenance_pending,
+            "pending_payments": pending_payments_total,
             "monthly_trend": monthly_trend,
             "recent_payments": recent_payments,
         }
