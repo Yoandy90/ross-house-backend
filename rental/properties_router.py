@@ -741,6 +741,62 @@ async def delete_listing_photo(listing_id: str, photo_index: int, request: Reque
     return {"success": True, "total": len(photos), "message": "Foto eliminada"}
 
 
+# ─── ADMIN: photo management on ANY marketplace listing ───
+@router.post('/admin/marketplace-listings/{listing_id}/photos')
+async def admin_upload_listing_photos(listing_id: str, request: Request):
+    """Admin: Upload photos to any marketplace listing (no ownership check)."""
+    await auth_admin(request)
+    if not ObjectId.is_valid(listing_id):
+        raise HTTPException(status_code=400, detail="ID inválido")
+    listing = await get_db().marketplace_listings.find_one({"_id": ObjectId(listing_id)})
+    if not listing:
+        raise HTTPException(status_code=404, detail="Listing no encontrado")
+
+    data = await request.json()
+    new_photos = data.get("photos", [])
+    if not isinstance(new_photos, list) or not new_photos:
+        raise HTTPException(status_code=400, detail="Se requiere lista de fotos")
+
+    existing = listing.get("photos", [])
+    MAX_PHOTOS = 10
+    processed = []
+    for photo in new_photos:
+        if len(existing) + len(processed) >= MAX_PHOTOS:
+            break
+        if isinstance(photo, str) and (photo.startswith("data:image/") or photo.startswith("http")):
+            processed.append(photo)
+    if not processed:
+        raise HTTPException(status_code=400, detail="No se procesaron fotos válidas")
+
+    await get_db().marketplace_listings.update_one(
+        {"_id": ObjectId(listing_id)},
+        {"$push": {"photos": {"$each": processed}},
+         "$set": {"updated_at": datetime.utcnow(), "photos_edited_by_admin": True}}
+    )
+    return {"success": True, "added": len(processed), "total": len(existing) + len(processed)}
+
+
+@router.delete('/admin/marketplace-listings/{listing_id}/photos/{photo_index}')
+async def admin_delete_listing_photo(listing_id: str, photo_index: int, request: Request):
+    """Admin: Remove a specific photo from any listing by index."""
+    await auth_admin(request)
+    if not ObjectId.is_valid(listing_id):
+        raise HTTPException(status_code=400, detail="ID inválido")
+    listing = await get_db().marketplace_listings.find_one({"_id": ObjectId(listing_id)})
+    if not listing:
+        raise HTTPException(status_code=404, detail="Listing no encontrado")
+
+    photos = listing.get("photos", [])
+    if photo_index < 0 or photo_index >= len(photos):
+        raise HTTPException(status_code=400, detail="Índice inválido")
+    photos.pop(photo_index)
+    await get_db().marketplace_listings.update_one(
+        {"_id": ObjectId(listing_id)},
+        {"$set": {"photos": photos, "updated_at": datetime.utcnow(), "photos_edited_by_admin": True}}
+    )
+    return {"success": True, "total": len(photos)}
+
+
 @router.put('/landlord/listings/{listing_id}')
 async def update_landlord_listing(listing_id: str, request: Request):
     """Landlord: Update own listing.
