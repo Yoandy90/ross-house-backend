@@ -1026,6 +1026,159 @@ async def admin_update_listing(listing_id: str, request: Request):
     return {"success": True, "message": f"Listado {new_status}", "status": new_status}
 
 
+@router.post('/admin/marketplace-listings')
+async def admin_create_listing(request: Request):
+    """Admin: Create a new marketplace listing on behalf of a landlord.
+    Body: {owner_id*, address*, city*, state*, zip_code, listing_type, property_type, bedrooms, bathrooms, square_feet, rent_amount, sale_price, deposit_amount, description, photos, status?}
+    """
+    await auth_admin(request)
+    data = await request.json()
+
+    owner_id_raw = data.get("owner_id", "").strip() if isinstance(data.get("owner_id"), str) else data.get("owner_id")
+    if not owner_id_raw or not ObjectId.is_valid(str(owner_id_raw)):
+        raise HTTPException(status_code=400, detail="owner_id requerido y válido")
+    address = (data.get("address") or "").strip()
+    city = (data.get("city") or "").strip()
+    if not address or not city:
+        raise HTTPException(status_code=400, detail="Dirección y ciudad son requeridas")
+
+    owner = await get_db().app_users.find_one({"_id": ObjectId(str(owner_id_raw))})
+    if not owner:
+        raise HTTPException(status_code=404, detail="Propietario no encontrado")
+
+    now = datetime.utcnow()
+    listing = {
+        "owner_id": ObjectId(str(owner_id_raw)),
+        "owner_name": owner.get("name", ""),
+        "owner_email": owner.get("email", ""),
+        "owner_phone": owner.get("phone", ""),
+        "address": address,
+        "city": city,
+        "state": (data.get("state") or "TX").upper()[:2],
+        "zip_code": data.get("zip_code", ""),
+        "listing_type": data.get("listing_type", "rent"),
+        "property_type": data.get("property_type", "house"),
+        "bedrooms": int(data.get("bedrooms", 0)),
+        "bathrooms": float(data.get("bathrooms", 0)),
+        "square_feet": int(data.get("square_feet", 0)),
+        "rent_amount": float(data.get("rent_amount", 0)),
+        "sale_price": float(data.get("sale_price", 0)),
+        "deposit_amount": float(data.get("deposit_amount", 0)),
+        "description": data.get("description", ""),
+        "features": data.get("features", []),
+        "photos": data.get("photos", []),
+        "status": data.get("status", "approved"),  # Admin-created defaults to approved
+        "commission_rate": float(data.get("commission_rate", 10)),
+        "created_by_admin": True,
+        "created_at": now,
+        "updated_at": now,
+    }
+    if listing["status"] == "approved":
+        listing["reviewed_at"] = now
+
+    result = await get_db().marketplace_listings.insert_one(listing)
+    new_id = str(result.inserted_id)
+
+    # Increment owner's property count
+    await get_db().app_users.update_one(
+        {"_id": ObjectId(str(owner_id_raw))},
+        {"$inc": {"properties_count": 1}}
+    )
+
+    return {
+        "success": True,
+        "listing_id": new_id,
+        "status": listing["status"],
+        "message": f"Listing creado para {owner.get('name', '')}",
+    }
+
+
+@router.patch('/admin/marketplace-listings/{listing_id}')
+async def admin_edit_listing(listing_id: str, request: Request):
+    """Admin: Edit any field of a marketplace listing (full editorial control).
+    Does NOT trigger re-approval — admin override.
+    """
+    await auth_admin(request)
+    if not ObjectId.is_valid(listing_id):
+        raise HTTPException(status_code=400, detail="ID inválido")
+    listing = await get_db().marketplace_listings.find_one({"_id": ObjectId(listing_id)})
+    if not listing:
+        raise HTTPException(status_code=404, detail="Listing no encontrado")
+
+    data = await request.json()
+    allowed = ["address", "city", "state", "zip_code", "property_type", "listing_type",
+               "bedrooms", "bathrooms", "square_feet", "rent_amount", "deposit_amount",
+               "sale_price", "description", "features", "photos", "status", "commission_rate",
+               "admin_notes"]
+    update = {k: v for k, v in data.items() if k in allowed}
+
+    # If admin changes owner, reassign
+    new_owner_id = data.get("owner_id")
+    if new_owner_id and ObjectId.is_valid(str(new_owner_id)) and str(new_owner_id) != str(listing.get("owner_id", "")):
+        new_owner = await get_db().app_users.find_one({"_id": ObjectId(str(new_owner_id))})
+        if new_owner:
+            update["owner_id"] = ObjectId(str(new_owner_id))
+            update["owner_name"] = new_owner.get("name", "")
+            update["owner_email"] = new_owner.get("email", "")
+            update["owner_phone"] = new_owner.get("phone", "")
+
+    update["updated_at"] = datetime.utcnow()
+    update["edited_by_admin"] = True
+
+    await get_db().marketplace_listings.update_one(
+        {"_id": ObjectId(listing_id)},
+        {"$set": update}
+    )
+    return {"success": True, "message": "Listing actualizado"}
+
+
+@router.delete('/admin/marketplace-listings/{listing_id}')
+async def admin_delete_listing(listing_id: str, request: Request):
+    """Admin: Soft-delete a marketplace listing. Notifies the landlord via push + email."""
+    await auth_admin(request)
+    if not ObjectId.is_valid(listing_id):
+        raise HTTPException(status_code=400, detail="ID inválido")
+    listing = await get_db().marketplace_listings.find_one({"_id": ObjectId(listing_id)})
+    if not listing:
+        raise HTTPException(status_code=404, detail="Listing no encontrado")
+
+    await get_db().marketplace_listings.update_one(
+        {"_id": ObjectId(listing_id)},
+        {"$set": {
+            "status": "deleted",
+            "deleted_at": datetime.utcnow(),
+            "deleted_by_admin": True,
+        }}
+    )
+    # Decrement owner's property count
+    owner_id = listing.get("owner_id")
+    if owner_id:
+        try:
+            await get_db().app_users.update_one(
+                {"_id": owner_id if isinstance(owner_id, ObjectId) else ObjectId(str(owner_id))},
+                {"$inc": {"properties_count": -1}}
+            )
+        except Exception:
+            pass
+
+    # Notify landlord
+    try:
+        owner_email = listing.get("owner_email", "")
+        owner_id_str = str(listing.get("owner_id", ""))
+        from rental.shared import send_rental_push_to_user
+        if owner_id_str:
+            await send_rental_push_to_user(
+                user_id=owner_id_str,
+                title="📋 Propiedad retirada",
+                body=f"Tu propiedad '{listing.get('address', '')}' fue retirada por el administrador.",
+                data={"type": "marketplace_admin_delete", "listing_id": listing_id},
+            )
+    except Exception as e:
+        logging.warning(f"Admin-delete landlord notification failed: {e}")
+
+    return {"success": True, "message": "Listing eliminado"}
+
+
 async def _notify_landlord_listing_review(listing: dict, new_status: str, notes: str = ""):
     """Send email + push to the landlord when admin approves/rejects their listing"""
     import os as _os
