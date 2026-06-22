@@ -970,13 +970,18 @@ async def property_inquiry(request: Request):
 
 @router.get('/admin/marketplace-listings')
 async def admin_list_marketplace(request: Request):
-    """Admin: List all marketplace listings with filters"""
+    """Admin: List all marketplace listings with filters.
+    By default hides deleted listings. Pass ?include_deleted=1 to include them.
+    """
     await auth_admin(request)
     status_filter = request.query_params.get("status", "all")
+    include_deleted = request.query_params.get("include_deleted", "0") in ("1", "true", "yes")
 
     query = {}
     if status_filter != "all":
         query["status"] = status_filter
+    elif not include_deleted:
+        query["status"] = {"$ne": "deleted"}
 
     cursor = get_db().marketplace_listings.find(query).sort("created_at", -1)
     listings = []
