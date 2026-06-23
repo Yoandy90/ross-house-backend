@@ -280,3 +280,191 @@ async def unenroll_from_rent_reporting(request: Request):
         "success": True,
         "message": "Tu inscripción ha sido cancelada"
     }
+
+
+# ─────────────────────────────────────────────────────────────────
+#  ADMIN: Credit Builder management
+# ─────────────────────────────────────────────────────────────────
+
+from rental.shared import auth_admin
+from bson import ObjectId
+
+
+@router.get('/admin/credit-builder/enrollments')
+async def admin_list_enrollments(request: Request):
+    """List all credit builder enrollments with user info + stats."""
+    await auth_admin(request)
+    db = get_db()
+    enrollments = await db.credit_builder_enrollments.find({}).sort("enrolled_at", -1).to_list(500)
+
+    out = []
+    active_count = paused_count = cancelled_count = reports_this_month = 0
+    now = datetime.utcnow()
+    month_start = datetime(now.year, now.month, 1)
+
+    for e in enrollments:
+        eid = str(e.get("_id"))
+        user_id = e.get("user_id")
+        user = None
+        if user_id:
+            try:
+                user = await db.app_users.find_one({"_id": ObjectId(str(user_id))})
+            except Exception:
+                user = await db.app_users.find_one({"_id": user_id})
+        status = e.get("status", "active")
+        if status == "active": active_count += 1
+        elif status == "paused": paused_count += 1
+        elif status == "cancelled": cancelled_count += 1
+
+        payments = e.get("payments", [])
+        last_report = None
+        for p in payments:
+            pdate = p.get("reported_at")
+            if isinstance(pdate, datetime) and pdate >= month_start:
+                reports_this_month += 1
+                break
+        if payments:
+            la = payments[-1].get("reported_at")
+            last_report = la.isoformat() if isinstance(la, datetime) else str(la)
+
+        out.append({
+            "id": eid,
+            "user_id": str(user_id) if user_id else "",
+            "user_name": user.get("name", "") if user else "",
+            "user_email": user.get("email", "") if user else "",
+            "user_phone": user.get("phone", "") if user else "",
+            "status": status,
+            "enrolled_at": e.get("enrolled_at").isoformat() if isinstance(e.get("enrolled_at"), datetime) else str(e.get("enrolled_at", "")),
+            "bureaus": e.get("bureaus", []),
+            "payments_count": len(payments),
+            "last_report": last_report,
+            "credit_score": e.get("credit_score"),
+            "notes": e.get("admin_notes", ""),
+        })
+
+    return {
+        "success": True,
+        "enrollments": out,
+        "stats": {
+            "total": len(out),
+            "active": active_count,
+            "paused": paused_count,
+            "cancelled": cancelled_count,
+            "reports_this_month": reports_this_month,
+        }
+    }
+
+
+@router.get('/admin/credit-builder/enrollments/{enrollment_id}')
+async def admin_get_enrollment(enrollment_id: str, request: Request):
+    """Detailed enrollment with full payment history."""
+    await auth_admin(request)
+    if not ObjectId.is_valid(enrollment_id):
+        raise HTTPException(status_code=400, detail="ID inválido")
+    db = get_db()
+    e = await db.credit_builder_enrollments.find_one({"_id": ObjectId(enrollment_id)})
+    if not e:
+        raise HTTPException(status_code=404, detail="Inscripción no encontrada")
+    user_id = e.get("user_id")
+    user = None
+    if user_id:
+        try:
+            user = await db.app_users.find_one({"_id": ObjectId(str(user_id))})
+        except Exception:
+            user = await db.app_users.find_one({"_id": user_id})
+    e["_id"] = str(e["_id"])
+    return {
+        "success": True,
+        "enrollment": e,
+        "user": ({
+            "id": str(user.get("_id")),
+            "name": user.get("name", ""),
+            "email": user.get("email", ""),
+            "phone": user.get("phone", ""),
+        } if user else None),
+    }
+
+
+@router.patch('/admin/credit-builder/enrollments/{enrollment_id}')
+async def admin_update_enrollment(enrollment_id: str, request: Request):
+    """Update enrollment: status (active/paused/cancelled), credit_score, admin_notes."""
+    await auth_admin(request)
+    if not ObjectId.is_valid(enrollment_id):
+        raise HTTPException(status_code=400, detail="ID inválido")
+    db = get_db()
+    data = await request.json()
+    update = {}
+    if "status" in data and data["status"] in ("active", "paused", "cancelled"):
+        update["status"] = data["status"]
+    if "credit_score" in data:
+        try: update["credit_score"] = int(data["credit_score"])
+        except Exception: pass
+    if "admin_notes" in data:
+        update["admin_notes"] = str(data["admin_notes"])
+    update["updated_at"] = datetime.utcnow()
+    await db.credit_builder_enrollments.update_one({"_id": ObjectId(enrollment_id)}, {"$set": update})
+    return {"success": True, "message": "Inscripción actualizada"}
+
+
+@router.post('/admin/credit-builder/enrollments/{enrollment_id}/report')
+async def admin_report_payment(enrollment_id: str, request: Request):
+    """🔴 MOCKED: Simulates submitting a rent payment report to credit bureaus.
+    Real bureau API integration pending — replace mock_response when ready.
+    Body: { amount, period, notes? }
+    """
+    await auth_admin(request)
+    if not ObjectId.is_valid(enrollment_id):
+        raise HTTPException(status_code=400, detail="ID inválido")
+    db = get_db()
+    e = await db.credit_builder_enrollments.find_one({"_id": ObjectId(enrollment_id)})
+    if not e:
+        raise HTTPException(status_code=404, detail="Inscripción no encontrada")
+    if e.get("status") != "active":
+        raise HTTPException(status_code=400, detail="Solo activas pueden reportar")
+
+    data = await request.json()
+    amount = float(data.get("amount", 0))
+    period_label = data.get("period", datetime.utcnow().strftime("%Y-%m"))
+    bureaus = e.get("bureaus", ["Equifax", "TransUnion", "Experian"])
+    notes = data.get("notes", "")
+
+    mock_response = {
+        "mocked": True,
+        "submitted_at": datetime.utcnow().isoformat(),
+        "bureaus": bureaus,
+        "confirmation_ids": {b: f"MOCK-{b[:3].upper()}-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}" for b in bureaus},
+        "status": "accepted",
+        "estimated_score_impact": "+5 to +15 points (mocked)",
+    }
+
+    payment_record = {
+        "amount": amount,
+        "period": period_label,
+        "reported_at": datetime.utcnow(),
+        "reported_by_admin": True,
+        "bureaus": bureaus,
+        "bureau_response": mock_response,
+        "notes": notes,
+    }
+    await db.credit_builder_enrollments.update_one(
+        {"_id": ObjectId(enrollment_id)},
+        {"$push": {"payments": payment_record},
+         "$set": {"last_reported_at": datetime.utcnow(), "updated_at": datetime.utcnow()}}
+    )
+
+    return {
+        "success": True,
+        "message": "Reporte enviado a burós (MOCKED — sin API real)",
+        "report": {**payment_record, "reported_at": payment_record["reported_at"].isoformat()},
+    }
+
+
+@router.delete('/admin/credit-builder/enrollments/{enrollment_id}')
+async def admin_delete_enrollment(enrollment_id: str, request: Request):
+    await auth_admin(request)
+    if not ObjectId.is_valid(enrollment_id):
+        raise HTTPException(status_code=400, detail="ID inválido")
+    res = await get_db().credit_builder_enrollments.delete_one({"_id": ObjectId(enrollment_id)})
+    if res.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="No encontrada")
+    return {"success": True, "message": "Inscripción eliminada"}
