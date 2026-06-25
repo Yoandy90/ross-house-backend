@@ -27,34 +27,43 @@ from .shared import get_db, auth_admin, auth_tenant, auth_marketplace, serialize
 logger = logging.getLogger("xcel_energy")
 router = APIRouter()
 
-XCEL_CLIENT_ID = os.environ.get("XCEL_CLIENT_ID", "")
-XCEL_CLIENT_SECRET = os.environ.get("XCEL_CLIENT_SECRET", "")
-XCEL_AUTH_URL = os.environ.get(
+def _clean_env(name: str, default: str = "") -> str:
+    """Return os.environ[name] with whitespace/newlines stripped.
+    Prevents bugs like a multi-line paste in the Railway UI accidentally
+    concatenating the next variable into this one's value (which happened
+    with XCEL_REDIRECT_URI on 2026-06-25 — the value contained a newline
+    followed by 'XCEL_ADMIN_SCOPE=FB=34_35', breaking the OAuth URL)."""
+    return (os.environ.get(name, default) or default).strip()
+
+
+XCEL_CLIENT_ID = _clean_env("XCEL_CLIENT_ID")
+XCEL_CLIENT_SECRET = _clean_env("XCEL_CLIENT_SECRET")
+XCEL_AUTH_URL = _clean_env(
     "XCEL_AUTH_URL",
     "https://myenergy.xcelenergy.com/greenbutton-connect/gbc/espi/1_1/oauth/authorize",
 )
-XCEL_TOKEN_URL = os.environ.get(
+XCEL_TOKEN_URL = _clean_env(
     "XCEL_TOKEN_URL",
     "https://myenergy.xcelenergy.com/greenbutton-connect/gbc/espi/1_1/oauth/token",
 )
-XCEL_API_BASE = os.environ.get(
+XCEL_API_BASE = _clean_env(
     "XCEL_API_BASE",
     "https://myenergy.xcelenergy.com/greenbutton-connect/gbc/espi/1_1/resource",
 )
-XCEL_REDIRECT_URI = os.environ.get("XCEL_REDIRECT_URI", "")
+XCEL_REDIRECT_URI = _clean_env("XCEL_REDIRECT_URI")
 # Scope for the authorization_code (customer) flow. Per NAESB v3.3 the scope
 # is typically a custom string like "FB=4_5_15_16_17_18_19_20_21_22_23_24_25;..."
 # that Xcel emails to the Service Provider after approval. Configurable via env.
-XCEL_SCOPE = os.environ.get("XCEL_SCOPE", "")
+XCEL_SCOPE = _clean_env("XCEL_SCOPE")
 # Scope for the client_credentials flow used to call ReadServiceStatus and
 # the Authorization resource. Per the GBC Vendor Startup Guide this MUST be
 # "FB=34_35" (see "Client Credentials Grant" section of the guide).
-XCEL_ADMIN_SCOPE = os.environ.get("XCEL_ADMIN_SCOPE", "FB=34_35")
+XCEL_ADMIN_SCOPE = _clean_env("XCEL_ADMIN_SCOPE", "FB=34_35")
 # Application Information ID + Registration Token are issued by Xcel when the
 # Service Provider is approved. They allow calling the ApplicationInformation
 # resource directly (no customer auth needed) — useful as a smoke test.
-XCEL_APPLICATION_ID = os.environ.get("XCEL_APPLICATION_ID", "")
-XCEL_REGISTRATION_TOKEN = os.environ.get("XCEL_REGISTRATION_TOKEN", "")
+XCEL_APPLICATION_ID = _clean_env("XCEL_APPLICATION_ID")
+XCEL_REGISTRATION_TOKEN = _clean_env("XCEL_REGISTRATION_TOKEN")
 
 ESPI_NS = "http://naesb.org/espi"
 ATOM_NS = "http://www.w3.org/2005/Atom"
