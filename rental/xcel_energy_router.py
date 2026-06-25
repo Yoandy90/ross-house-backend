@@ -50,6 +50,11 @@ XCEL_SCOPE = os.environ.get("XCEL_SCOPE", "")
 # the Authorization resource. Per the GBC Vendor Startup Guide this MUST be
 # "FB=34_35" (see "Client Credentials Grant" section of the guide).
 XCEL_ADMIN_SCOPE = os.environ.get("XCEL_ADMIN_SCOPE", "FB=34_35")
+# Application Information ID + Registration Token are issued by Xcel when the
+# Service Provider is approved. They allow calling the ApplicationInformation
+# resource directly (no customer auth needed) — useful as a smoke test.
+XCEL_APPLICATION_ID = os.environ.get("XCEL_APPLICATION_ID", "")
+XCEL_REGISTRATION_TOKEN = os.environ.get("XCEL_REGISTRATION_TOKEN", "")
 
 ESPI_NS = "http://naesb.org/espi"
 ATOM_NS = "http://www.w3.org/2005/Atom"
@@ -359,6 +364,8 @@ async def xcel_status(request: Request):
         "api_base": XCEL_API_BASE,
         "scope_customer": XCEL_SCOPE or "(empty — set XCEL_SCOPE)",
         "scope_admin": XCEL_ADMIN_SCOPE,
+        "application_id": XCEL_APPLICATION_ID or "(empty)",
+        "registration_token_set": bool(XCEL_REGISTRATION_TOKEN),
         "notification_url": f"{os.environ.get('PUBLIC_BACKEND_URL','').rstrip('/')}/api/greenbutton/notify",
         "connections_total": total,
         "connections_active": active,
@@ -387,6 +394,41 @@ async def xcel_read_service_status(request: Request):
         "status_code": resp.status_code,
         "body_preview": resp.text[:1000],
         "url_called": url,
+    }
+
+
+@router.get("/admin/xcel/application-information")
+async def xcel_application_information(request: Request):
+    """Smoke test: fetch the ApplicationInformation resource using the
+    Registration Token provided by Xcel when the Service Provider is approved.
+
+    Per the GBC Vendor Startup Guide, this resource describes the Service
+    Provider's configuration (client_id, redirect_uri, notification_uri,
+    scopes, etc.) as Xcel has it on file. If this call succeeds → credentials
+    and registration are valid.
+
+    Requires env vars: XCEL_APPLICATION_ID + XCEL_REGISTRATION_TOKEN.
+    """
+    await auth_admin(request)
+    if not XCEL_APPLICATION_ID:
+        raise HTTPException(status_code=400, detail="Falta XCEL_APPLICATION_ID en el environment")
+    if not XCEL_REGISTRATION_TOKEN:
+        raise HTTPException(status_code=400, detail="Falta XCEL_REGISTRATION_TOKEN en el environment")
+
+    url = f"{XCEL_API_BASE.rstrip('/')}/ApplicationInformation/{XCEL_APPLICATION_ID}"
+    headers = {
+        "Authorization": f"Bearer {XCEL_REGISTRATION_TOKEN}",
+        "Accept": "application/atom+xml",
+    }
+    async with httpx.AsyncClient(timeout=20) as client:
+        resp = await client.get(url, headers=headers)
+
+    return {
+        "ok": resp.status_code == 200,
+        "status_code": resp.status_code,
+        "url_called": url,
+        "body_preview": resp.text[:2000],
+        "headers": dict(resp.headers),
     }
 
 
