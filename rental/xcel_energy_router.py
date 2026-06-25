@@ -1198,6 +1198,39 @@ def _fallback_tips(insights: dict) -> list:
 def _result_html(title: str, message: str, ok: bool) -> str:
     color = "#16A34A" if ok else "#DC2626"
     icon = "✓" if ok else "✕"
+    # Deep link to bring the user back into the Expo app (scheme registered
+    # in /app/rosslending-app/app.json → "scheme": "rossrentals").
+    # Same scheme works for iOS + Android. Falls back to TestFlight/App Store
+    # links if the app is not installed.
+    deep_link = "rossrentals://services"
+    cta_section = ""
+    if ok:
+        cta_section = f"""
+<a id="back-to-app" href="{deep_link}"
+   style="display:inline-block;margin-top:24px;padding:14px 28px;border-radius:12px;
+          background:linear-gradient(135deg,#ED1B33,#B91530);color:#fff;
+          font-weight:600;text-decoration:none;font-size:15px;
+          box-shadow:0 8px 24px rgba(237,27,51,0.3)">
+  Volver a Ross House Rentals
+</a>
+<p id="manual-hint" style="display:none;color:#94A3B8;font-size:12px;margin-top:14px">
+  Si no se abrió la app automáticamente, vuelve a ella manualmente desde tu pantalla de inicio.
+</p>
+<script>
+  // Try to deep-link automatically as soon as the page loads. If the app is
+  // installed, iOS/Android will switch to it immediately. Otherwise the user
+  // sees the visible button + manual hint.
+  (function() {{
+    setTimeout(function() {{
+      try {{ window.location.href = "{deep_link}"; }} catch (e) {{}}
+      setTimeout(function() {{
+        var hint = document.getElementById('manual-hint');
+        if (hint) hint.style.display = 'block';
+      }}, 1500);
+    }}, 600);
+  }})();
+</script>"""
+
     return f"""<!DOCTYPE html>
 <html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{title}</title></head>
@@ -1206,6 +1239,7 @@ def _result_html(title: str, message: str, ok: bool) -> str:
 <div style="width:72px;height:72px;border-radius:50%;background:{color};display:flex;align-items:center;justify-content:center;margin:0 auto 20px;font-size:36px">{icon}</div>
 <h1 style="font-size:22px;margin:0 0 10px">{title}</h1>
 <p style="color:#94A3B8;font-size:15px;line-height:1.5">{message}</p>
+{cta_section}
 <p style="color:#475569;font-size:13px;margin-top:24px">Ross House Rentals LLC · Xcel Energy Green Button</p>
 </div></body></html>"""
 
