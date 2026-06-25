@@ -28,12 +28,15 @@ logger = logging.getLogger("xcel_energy")
 router = APIRouter()
 
 def _clean_env(name: str, default: str = "") -> str:
-    """Return os.environ[name] with whitespace/newlines stripped.
-    Prevents bugs like a multi-line paste in the Railway UI accidentally
-    concatenating the next variable into this one's value (which happened
-    with XCEL_REDIRECT_URI on 2026-06-25 — the value contained a newline
-    followed by 'XCEL_ADMIN_SCOPE=FB=34_35', breaking the OAuth URL)."""
-    return (os.environ.get(name, default) or default).strip()
+    """Return os.environ[name] sanitized: trims whitespace AND truncates at
+    the first newline. Prevents bugs like a multi-line paste in the Railway
+    UI accidentally concatenating the next variable into this one's value
+    (which happened with XCEL_REDIRECT_URI on 2026-06-25 — the value
+    contained 'https://...\\nXCEL_ADMIN_SCOPE=FB=34_35' and broke the
+    OAuth URL)."""
+    raw = os.environ.get(name, default) or default
+    # Take only the first line (before any \n, \r) and strip surrounding ws
+    return raw.splitlines()[0].strip() if raw else ""
 
 
 XCEL_CLIENT_ID = _clean_env("XCEL_CLIENT_ID")
