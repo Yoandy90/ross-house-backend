@@ -42,10 +42,20 @@ XCEL_API_BASE = os.environ.get(
     "https://myenergy.xcelenergy.com/greenbutton-connect/gbc/espi/1_1/resource",
 )
 XCEL_REDIRECT_URI = os.environ.get("XCEL_REDIRECT_URI", "")
+# Scope for the authorization_code (customer) flow. Per NAESB v3.3 the scope
+# is typically a custom string like "FB=4_5_15_16_17_18_19_20_21_22_23_24_25;..."
+# that Xcel emails to the Service Provider after approval. Configurable via env.
 XCEL_SCOPE = os.environ.get("XCEL_SCOPE", "")
+# Scope for the client_credentials flow used to call ReadServiceStatus and
+# the Authorization resource. Per the GBC Vendor Startup Guide this MUST be
+# "FB=34_35" (see "Client Credentials Grant" section of the guide).
+XCEL_ADMIN_SCOPE = os.environ.get("XCEL_ADMIN_SCOPE", "FB=34_35")
 
 ESPI_NS = "http://naesb.org/espi"
 ATOM_NS = "http://www.w3.org/2005/Atom"
+
+# In-memory cache of the client_credentials token (one per process is enough).
+_CLIENT_TOKEN_CACHE: dict = {"access_token": None, "expires_at": 0}
 
 
 def _is_configured() -> bool:
@@ -282,8 +292,36 @@ async def _refresh_token_if_needed(conn: dict) -> dict:
 
 
 # ═══════════════════════════════════════════════════════════════
-# ADMIN ENDPOINTS
+# CLIENT CREDENTIALS TOKEN (for ReadServiceStatus / Authorization)
 # ═══════════════════════════════════════════════════════════════
+
+async def _get_client_credentials_token() -> str:
+    """Get (and cache) a client_credentials access token. Per the GBC Vendor
+    Startup Guide, this is required for ReadServiceStatus and to read the
+    Authorization resource. Scope = FB=34_35.
+    """
+    now = datetime.now(timezone.utc).timestamp()
+    if _CLIENT_TOKEN_CACHE["access_token"] and now < _CLIENT_TOKEN_CACHE["expires_at"] - 60:
+        return _CLIENT_TOKEN_CACHE["access_token"]
+
+    if not (XCEL_CLIENT_ID and XCEL_CLIENT_SECRET):
+        raise HTTPException(status_code=500, detail="Faltan XCEL_CLIENT_ID / XCEL_CLIENT_SECRET")
+
+    auth = httpx.BasicAuth(XCEL_CLIENT_ID, XCEL_CLIENT_SECRET)
+    data = {"grant_type": "client_credentials", "scope": XCEL_ADMIN_SCOPE}
+    headers = {"Accept": "application/json", "Content-Type": "application/x-www-form-urlencoded"}
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.post(XCEL_TOKEN_URL, data=data, auth=auth, headers=headers)
+    if resp.status_code != 200:
+        logger.error(f"[Xcel] client_credentials failed: {resp.status_code} {resp.text[:300]}")
+        raise HTTPException(
+            status_code=502,
+            detail=f"Xcel rechazó client_credentials (HTTP {resp.status_code}): {resp.text[:200]}",
+        )
+    tj = resp.json()
+    _CLIENT_TOKEN_CACHE["access_token"] = tj.get("access_token")
+    _CLIENT_TOKEN_CACHE["expires_at"] = now + int(tj.get("expires_in", 3600))
+    return _CLIENT_TOKEN_CACHE["access_token"]
 
 @router.get("/admin/xcel/audit-log")
 async def xcel_audit_log(request: Request):
@@ -316,8 +354,39 @@ async def xcel_status(request: Request):
     return {
         "configured": _is_configured(),
         "redirect_uri": XCEL_REDIRECT_URI,
+        "auth_url": XCEL_AUTH_URL,
+        "token_url": XCEL_TOKEN_URL,
+        "api_base": XCEL_API_BASE,
+        "scope_customer": XCEL_SCOPE or "(empty — set XCEL_SCOPE)",
+        "scope_admin": XCEL_ADMIN_SCOPE,
+        "notification_url": f"{os.environ.get('PUBLIC_BACKEND_URL','').rstrip('/')}/api/greenbutton/notify",
         "connections_total": total,
         "connections_active": active,
+    }
+
+
+@router.get("/admin/xcel/read-service-status")
+async def xcel_read_service_status(request: Request):
+    """Call Xcel's ReadServiceStatus endpoint using client_credentials.
+
+    The GBC Vendor Startup Guide lists this as one of the first calls a
+    Service Provider should make to verify the integration is alive before
+    requesting customer data. Returns the raw response for diagnostics.
+    """
+    await auth_admin(request)
+    try:
+        token = await _get_client_credentials_token()
+    except HTTPException as e:
+        return {"ok": False, "stage": "token", "detail": e.detail}
+    url = f"{XCEL_API_BASE.rstrip('/')}/ReadServiceStatus"
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/atom+xml"}
+    async with httpx.AsyncClient(timeout=20) as client:
+        resp = await client.get(url, headers=headers)
+    return {
+        "ok": resp.status_code == 200,
+        "status_code": resp.status_code,
+        "body_preview": resp.text[:1000],
+        "url_called": url,
     }
 
 
@@ -422,7 +491,17 @@ async def xcel_delete_connection(request: Request, conn_id: str):
 
 @router.post("/admin/xcel/connections/{conn_id}/sync")
 async def xcel_sync_connection(request: Request, conn_id: str):
-    """Fetch usage data from Xcel for a connection and store kWh readings."""
+    """Trigger an asynchronous Batch download from Xcel for a connection.
+
+    Per the GBC Vendor Startup Guide, the Batch resource is asynchronous:
+      1. POST to /Batch/Subscription/{subscription_id} → HTTP 202 Accepted
+      2. Xcel queues the request and (when ready) calls our Notification URL
+         with a payload pointing to the ready file_id.
+      3. Our Notification handler downloads the XML via /Batch/{file_id}.
+
+    This endpoint only initiates step 1. The data ingestion happens
+    asynchronously when Xcel calls back. Returns 202 to mirror Xcel's behavior.
+    """
     await auth_admin(request)
     db = get_db()
     conn = await db.xcel_connections.find_one({"_id": ObjectId(conn_id)})
@@ -434,24 +513,81 @@ async def xcel_sync_connection(request: Request, conn_id: str):
     if not sub_id:
         raise HTTPException(status_code=400, detail="La conexión no tiene subscription_id; reautoriza en Xcel")
 
-    headers = {"Authorization": f"Bearer {conn['access_token']}", "Accept": "application/atom+xml"}
+    headers = {
+        "Authorization": f"Bearer {conn['access_token']}",
+        "Accept": "application/atom+xml",
+    }
     url = f"{XCEL_API_BASE.rstrip('/')}/Batch/Subscription/{sub_id}"
 
     async with httpx.AsyncClient(timeout=60) as client:
-        resp = await client.get(url, headers=headers)
-    if resp.status_code != 200:
+        # NAESB v3.3 Batch is async — POST returns 202 + Location header pointing
+        # to a future file. The data arrives later via Notification webhook.
+        resp = await client.post(url, headers=headers)
+
+    now = datetime.now(timezone.utc)
+    await db.xcel_audit_log.insert_one({
+        "event": "batch_request",
+        "property_id": conn["property_id"],
+        "subscription_id": sub_id,
+        "status_code": resp.status_code,
+        "location_header": resp.headers.get("Location"),
+        "response_body": resp.text[:1000],
+        "at": now,
+    })
+
+    # 202 Accepted is the EXPECTED success path
+    if resp.status_code in (200, 202):
         await db.xcel_connections.update_one(
             {"_id": conn["_id"]},
-            {"$set": {"last_error": f"HTTP {resp.status_code}: {resp.text[:300]}",
-                      "updated_at": datetime.now(timezone.utc)}},
+            {"$set": {
+                "last_batch_request_at": now,
+                "last_batch_status": resp.status_code,
+                "last_batch_location": resp.headers.get("Location"),
+                "last_error": None,
+                "status": "active",
+                "updated_at": now,
+            }},
         )
-        raise HTTPException(status_code=502, detail=f"Xcel respondió {resp.status_code} al pedir datos")
+        # If the server happened to return data synchronously, ingest it
+        if resp.status_code == 200 and resp.text and resp.text.strip().startswith("<"):
+            await _ingest_espi_xml(conn["property_id"], resp.text, source="sync_inline")
+            return {
+                "success": True,
+                "status_code": 200,
+                "mode": "synchronous",
+                "message": "Datos recibidos en línea (sin notification webhook).",
+            }
+        return {
+            "success": True,
+            "status_code": 202,
+            "mode": "asynchronous",
+            "message": (
+                "Solicitud aceptada por Xcel. Los datos llegarán a la "
+                "Notification URL cuando estén listos."
+            ),
+            "location": resp.headers.get("Location"),
+        }
 
-    parsed = parse_espi_feed(resp.text)
-    property_id = conn["property_id"]
+    # Real error
+    await db.xcel_connections.update_one(
+        {"_id": conn["_id"]},
+        {"$set": {
+            "last_error": f"Batch request HTTP {resp.status_code}: {resp.text[:300]}",
+            "updated_at": now,
+        }},
+    )
+    raise HTTPException(
+        status_code=502,
+        detail=f"Xcel respondió {resp.status_code} al solicitar el Batch: {resp.text[:200]}",
+    )
+
+
+async def _ingest_espi_xml(property_id: str, xml_text: str, source: str = "notification"):
+    """Parse an ESPI XML payload and persist daily kWh + billing summaries."""
+    db = get_db()
     now = datetime.now(timezone.utc)
+    parsed = parse_espi_feed(xml_text)
 
-    # Aggregate interval readings into daily kWh and upsert
     daily: dict = {}
     for r in parsed["interval_readings"]:
         day = datetime.fromtimestamp(r["start_epoch"], tz=timezone.utc).strftime("%Y-%m-%d")
@@ -463,8 +599,6 @@ async def xcel_sync_connection(request: Request, conn_id: str):
              "$setOnInsert": {"created_at": now}},
             upsert=True,
         )
-
-    # Store billing summaries
     for s in parsed["usage_summaries"]:
         period_start = datetime.fromtimestamp(s["start_epoch"], tz=timezone.utc)
         await db.xcel_usage_summaries.update_one(
@@ -478,13 +612,12 @@ async def xcel_sync_connection(request: Request, conn_id: str):
             }, "$setOnInsert": {"created_at": now}},
             upsert=True,
         )
-
     await db.xcel_connections.update_one(
-        {"_id": conn["_id"]},
-        {"$set": {"last_sync": now, "last_error": None, "status": "active", "updated_at": now}},
+        {"property_id": property_id},
+        {"$set": {"last_sync": now, "last_sync_source": source,
+                  "last_error": None, "status": "active", "updated_at": now}},
     )
     return {
-        "success": True,
         "interval_readings": len(parsed["interval_readings"]),
         "days_updated": len(daily),
         "summaries": len(parsed["usage_summaries"]),
@@ -1166,17 +1299,107 @@ async def greenbutton_exchange(payload: dict):
 @router.post("/xcel/notify")
 @router.post("/greenbutton/notify")
 async def xcel_notify(request: Request):
-    """Public Notification URL: Xcel posts here when new data is available.
-    Registered in the Xcel portal as /api/greenbutton/notify."""
+    """Public Notification URL — Xcel POSTs here when a Batch is ready.
+
+    Per the GBC Vendor Startup Guide, when Xcel finishes preparing a Batch
+    XML file it calls our Notification URL with an Atom feed pointing to the
+    ready resource. The body looks like:
+
+        <?xml version="1.0" encoding="UTF-8"?>
+        <ns1:BatchList xmlns:ns1="http://naesb.org/espi">
+          <ns1:resources>
+            https://.../Batch/Subscription/{sub_id}?file_id=XYZ
+          </ns1:resources>
+        </ns1:BatchList>
+
+    We extract the resource URL(s), download with our client_credentials
+    token and ingest the ESPI XML into MongoDB.
+    """
     db = get_db()
-    body = (await request.body())[:10000].decode("utf-8", errors="replace")
-    await db.xcel_notifications.insert_one({
-        "received_at": datetime.now(timezone.utc),
+    raw = await request.body()
+    body = raw[:20000].decode("utf-8", errors="replace")
+    now = datetime.now(timezone.utc)
+
+    notif_doc = {
+        "received_at": now,
         "body": body,
         "processed": False,
-    })
-    logger.info("Xcel Green Button notification received")
-    return {"status": "ok"}
+        "resources_found": [],
+        "ingest_results": [],
+        "errors": [],
+    }
+
+    # Extract one or more <resources>URL</resources> entries.
+    resource_urls = []
+    try:
+        root = ET.fromstring(body)
+        for r in root.iter():
+            if r.tag.endswith("resources") and r.text and r.text.strip().startswith("http"):
+                resource_urls.append(r.text.strip())
+    except ET.ParseError:
+        # Fall back to a regex sweep so we still attempt processing
+        import re as _re
+        resource_urls = _re.findall(r"https?://[^\s<>\"']+/Batch/[^\s<>\"']+", body)
+
+    notif_doc["resources_found"] = resource_urls
+
+    if not resource_urls:
+        await db.xcel_notifications.insert_one(notif_doc)
+        logger.warning(f"[Xcel] Notification received but no resource URLs found. Body={body[:300]}")
+        return {"status": "ok", "resources_found": 0,
+                "message": "No resource URLs found in notification body"}
+
+    # Process each resource URL: download XML, ingest into Mongo.
+    try:
+        client_token = await _get_client_credentials_token()
+    except HTTPException as e:
+        notif_doc["errors"].append(f"client_credentials_failed: {e.detail}")
+        await db.xcel_notifications.insert_one(notif_doc)
+        logger.error(f"[Xcel] Cannot obtain client_credentials token: {e.detail}")
+        return {"status": "error", "detail": str(e.detail)}
+
+    headers = {"Authorization": f"Bearer {client_token}", "Accept": "application/atom+xml"}
+    async with httpx.AsyncClient(timeout=60) as client:
+        for url in resource_urls:
+            try:
+                resp = await client.get(url, headers=headers)
+                if resp.status_code != 200:
+                    notif_doc["errors"].append(
+                        f"download_failed {resp.status_code} for {url}: {resp.text[:200]}"
+                    )
+                    continue
+                # Resolve the property_id from the URL (Subscription/{sub_id})
+                sub_match = None
+                if "Subscription/" in url:
+                    sub_match = url.split("Subscription/", 1)[1].split("/")[0].split("?")[0]
+                property_id = None
+                if sub_match:
+                    conn = await db.xcel_connections.find_one({"subscription_id": sub_match})
+                    if conn:
+                        property_id = conn["property_id"]
+                if not property_id:
+                    notif_doc["errors"].append(
+                        f"property_lookup_failed sub={sub_match} for {url}"
+                    )
+                    continue
+                result = await _ingest_espi_xml(property_id, resp.text, source="notification_webhook")
+                notif_doc["ingest_results"].append({"url": url, "property_id": property_id, **result})
+            except Exception as e:
+                notif_doc["errors"].append(f"download_exception for {url}: {str(e)[:200]}")
+
+    notif_doc["processed"] = True
+    await db.xcel_notifications.insert_one(notif_doc)
+
+    logger.info(
+        f"[Xcel] Notification processed: resources={len(resource_urls)} "
+        f"ingested={len(notif_doc['ingest_results'])} errors={len(notif_doc['errors'])}"
+    )
+    return {
+        "status": "ok",
+        "resources_found": len(resource_urls),
+        "ingested": len(notif_doc["ingest_results"]),
+        "errors": len(notif_doc["errors"]),
+    }
 
 
 @router.get("/xcel/notify")
