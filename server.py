@@ -193,6 +193,7 @@ try:
     from rental.vault_router import router as vault_router
     from rental.reports_router import router as reports_router
     from rental.syndication_router import router as syndication_router
+    from rental.tenant_leads_router import router as tenant_leads_router
 
     app.include_router(auth_router, prefix="/api")
     app.include_router(properties_router, prefix="/api")
@@ -222,6 +223,7 @@ try:
     app.include_router(vault_router, prefix="/api")
     app.include_router(reports_router, prefix="/api")
     app.include_router(syndication_router, prefix="/api")
+    app.include_router(tenant_leads_router, prefix="/api")
 
     logger.info("  ✅ Credit Builder Router")
     logger.info("  ✅ Consent Forms Router")

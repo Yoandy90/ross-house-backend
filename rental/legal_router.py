@@ -146,6 +146,234 @@ Para preguntas sobre privacidad:
 - 📧 info@rosshouserentals.com
 """
 
+DEFAULT_COOKIES_ES = """# Política de Cookies
+
+**Última actualización: Junio 2026**
+
+## 1. ¿Qué son las cookies?
+Las cookies son pequeños archivos de texto almacenados en su dispositivo cuando visita nuestro sitio web.
+
+## 2. Cookies que utilizamos
+- **Estrictamente necesarias:** Para el funcionamiento del sitio (sesión, autenticación, CSRF).
+- **Funcionales:** Recuerdan sus preferencias (idioma, modo oscuro).
+- **Analíticas:** Estadísticas anónimas de uso para mejorar el servicio.
+- **No usamos** cookies publicitarias ni de marketing de terceros.
+
+## 3. Control de cookies
+Puede deshabilitar cookies desde su navegador, pero algunas funciones de la App pueden no funcionar correctamente.
+
+## 4. Cookies de terceros
+- **Stripe:** Para procesamiento seguro de pagos.
+- **Google Maps (opcional):** Para mostrar ubicaciones de propiedades.
+
+## 5. Cambios a esta política
+Actualizaremos esta política cuando incorporemos nuevas cookies o servicios.
+
+## 6. Contacto
+- 📞 (806) 934-2018
+- 📧 privacy@rosshouserentals.com
+"""
+
+DEFAULT_COOKIES_EN = """# Cookie Policy
+
+**Last updated: June 2026**
+
+## 1. What are cookies?
+Cookies are small text files stored on your device when you visit our website.
+
+## 2. Cookies we use
+- **Strictly necessary:** For site operation (session, authentication, CSRF).
+- **Functional:** Remember your preferences (language, dark mode).
+- **Analytics:** Anonymous usage statistics to improve the service.
+- **We do NOT use** third-party advertising or marketing cookies.
+
+## 3. Cookie control
+You can disable cookies in your browser, but some App features may not work correctly.
+
+## 4. Third-party cookies
+- **Stripe:** For secure payment processing.
+- **Google Maps (optional):** To display property locations.
+
+## 5. Changes to this policy
+We will update this policy when we incorporate new cookies or services.
+
+## 6. Contact
+- 📞 (806) 934-2018
+- 📧 privacy@rosshouserentals.com
+"""
+
+DEFAULT_ACCOUNT_DELETION_ES = """# Cómo Eliminar tu Cuenta — Preguntas Frecuentes
+
+**Última actualización: Junio 2026**
+
+> ℹ️ La eliminación de cuenta se realiza **directamente dentro de la app**. Para acceder a esta opción debes estar **registrado e iniciado sesión**.
+
+## ❓ ¿Cómo elimino mi cuenta?
+1. Abre la app **Ross House Rentals** en tu iPhone o Android.
+2. Inicia sesión con tu correo o teléfono.
+3. Ve a **Perfil → Eliminar mi Cuenta**.
+4. Confirma escribiendo la palabra **ELIMINAR** y toca el botón rojo.
+5. Tu cuenta será eliminada inmediatamente.
+
+## ❓ ¿Qué pasa si no puedo iniciar sesión?
+Si perdiste acceso a tu cuenta y deseas eliminarla, envíanos un correo a **privacy@rosshouserentals.com** con:
+- Asunto: **Solicitud de Eliminación de Cuenta**
+- Tu nombre completo
+- Correo electrónico o teléfono registrado en la app
+- Motivo (opcional)
+
+Procesaremos tu solicitud en un máximo de **30 días**.
+
+## ❓ ¿Qué datos se eliminan?
+- Información personal de tu perfil
+- Métodos de pago guardados (tarjetas, ACH)
+- Solicitudes de mantenimiento y mensajes
+- Tokens de notificaciones push
+
+## ❓ ¿Qué datos se conservan?
+Por obligación legal (IRS, ley de Texas, FCRA):
+- Registros financieros — hasta **7 años**
+- Contratos de arrendamiento — hasta **3 años después** del fin del contrato
+- Verificaciones de antecedentes — destruidas en 30 días
+
+## ❓ ¿Es reversible?
+No. Una vez eliminada, no podemos restaurar la cuenta. Asegúrate de descargar cualquier recibo o documento que necesites conservar.
+
+## ❓ ¿Tengo contratos activos?
+Si tienes un contrato de arrendamiento vigente, **debes esperar** a que termine antes de eliminar tu cuenta.
+
+## 📞 Contacto
+- 📧 **privacy@rosshouserentals.com**
+- 📞 (806) 934-2018
+- 📍 305 Bruce Ave, Dumas, TX 79029
+"""
+
+DEFAULT_ACCOUNT_DELETION_EN = """# How to Delete Your Account — Frequently Asked Questions
+
+**Last updated: June 2026**
+
+> ℹ️ Account deletion is performed **directly inside the app**. To access this option you must be **registered and signed in**.
+
+## ❓ How do I delete my account?
+1. Open the **Ross House Rentals** app on your iPhone or Android.
+2. Sign in with your email or phone.
+3. Go to **Profile → Delete My Account**.
+4. Confirm by typing the word **DELETE** and tap the red button.
+5. Your account will be removed immediately.
+
+## ❓ What if I can't sign in?
+If you lost access to your account and wish to delete it, email us at **privacy@rosshouserentals.com** with:
+- Subject: **Account Deletion Request**
+- Your full name
+- Email or phone number registered in the app
+- Reason (optional)
+
+We will process your request within **30 days**.
+
+## ❓ What data is deleted?
+- Personal profile information
+- Saved payment methods (cards, ACH)
+- Maintenance requests and messages
+- Push notification tokens
+
+## ❓ What data is kept?
+For legal obligations (IRS, Texas law, FCRA):
+- Financial records — up to **7 years**
+- Lease agreements — up to **3 years after** the lease ends
+- Background checks — destroyed within 30 days
+
+## ❓ Is this reversible?
+No. Once deleted, we cannot restore the account. Make sure to download any receipts or documents you need to keep.
+
+## ❓ Do I have active leases?
+If you have an active lease agreement, you **must wait** until it ends before deleting your account.
+
+## 📞 Contact
+- 📧 **privacy@rosshouserentals.com**
+- 📞 (806) 934-2018
+- 📍 305 Bruce Ave, Dumas, TX 79029
+"""
+
+DEFAULT_PRIVACY_EN = """# Privacy Policy
+
+**Última actualización: Junio 2026**
+
+En cumplimiento con la **Guideline 5.1.1(v) de App Store**, esta página explica cómo solicitar la eliminación de su cuenta de Ross House Rentals.
+
+## 1. Eliminar desde la App
+1. Inicie sesión en la App.
+2. Vaya a **Perfil → Configuración → Eliminar Cuenta**.
+3. Confirme con su PIN o contraseña.
+4. Su cuenta y datos personales se eliminarán dentro de **30 días**.
+
+## 2. Eliminar por correo electrónico
+Envíe un correo a **privacy@rosshouserentals.com** con:
+- Asunto: "Solicitud de Eliminación de Cuenta"
+- Nombre completo, correo registrado y motivo (opcional)
+
+Procesaremos su solicitud en un máximo de **30 días**.
+
+## 3. Datos que se eliminan
+- Información personal de su perfil.
+- Métodos de pago (tarjetas / ACH).
+- Solicitudes de mantenimiento, mensajes y notificaciones.
+- Tokens de notificaciones push.
+
+## 4. Datos que se conservan (obligación legal)
+- Registros financieros: hasta **7 años** (requerido por el IRS).
+- Contratos de arrendamiento: hasta **3 años después** del fin del contrato (ley de Texas).
+- Verificaciones de antecedentes: destruidas en 30 días.
+
+## 5. Antes de eliminar
+- Asegúrese de que **no tiene contratos de arrendamiento activos**.
+- Descargue cualquier recibo o documento que necesite conservar.
+
+## 6. Contacto
+- 📞 (806) 934-2018
+- 📧 privacy@rosshouserentals.com
+- 📍 305 Bruce Ave, Dumas, TX 79029
+"""
+
+DEFAULT_ACCOUNT_DELETION_EN = """# Account Deletion
+
+**Last updated: June 2026**
+
+In compliance with **App Store Guideline 5.1.1(v)**, this page explains how to request the deletion of your Ross House Rentals account.
+
+## 1. Delete from the App
+1. Log in to the App.
+2. Go to **Profile → Settings → Delete Account**.
+3. Confirm with your PIN or password.
+4. Your account and personal data will be deleted within **30 days**.
+
+## 2. Delete by email
+Send an email to **privacy@rosshouserentals.com** with:
+- Subject: "Account Deletion Request"
+- Your full name, registered email, and reason (optional)
+
+We will process your request within **30 days**.
+
+## 3. Data that will be deleted
+- Personal profile information.
+- Payment methods (cards / ACH).
+- Maintenance requests, messages, and notifications.
+- Push notification tokens.
+
+## 4. Data we are required to retain (legal obligation)
+- Financial records: up to **7 years** (required by IRS).
+- Lease agreements: up to **3 years after** the lease ends (Texas law).
+- Background checks: destroyed within 30 days.
+
+## 5. Before deleting
+- Make sure you have **no active lease agreements**.
+- Download any receipts or documents you need to keep.
+
+## 6. Contact
+- 📞 (806) 934-2018
+- 📧 privacy@rosshouserentals.com
+- 📍 305 Bruce Ave, Dumas, TX 79029
+"""
+
 DEFAULT_PRIVACY_EN = """# Privacy Policy
 
 **Last updated: June 2026**
@@ -203,16 +431,32 @@ async def _ensure_legal_docs():
     """Seed default legal documents if they don't exist."""
     db = get_db()
     existing = await db.legal_documents.find_one({"_id": "legal_config"})
+    defaults = {
+        "terms_es": DEFAULT_TERMS_ES.strip(),
+        "terms_en": DEFAULT_TERMS_EN.strip(),
+        "privacy_es": DEFAULT_PRIVACY_ES.strip(),
+        "privacy_en": DEFAULT_PRIVACY_EN.strip(),
+        "cookies_es": DEFAULT_COOKIES_ES.strip(),
+        "cookies_en": DEFAULT_COOKIES_EN.strip(),
+        "account_deletion_es": DEFAULT_ACCOUNT_DELETION_ES.strip(),
+        "account_deletion_en": DEFAULT_ACCOUNT_DELETION_EN.strip(),
+    }
     if not existing:
         await db.legal_documents.insert_one({
             "_id": "legal_config",
-            "terms_es": DEFAULT_TERMS_ES.strip(),
-            "terms_en": DEFAULT_TERMS_EN.strip(),
-            "privacy_es": DEFAULT_PRIVACY_ES.strip(),
-            "privacy_en": DEFAULT_PRIVACY_EN.strip(),
+            **defaults,
             "updated_at": datetime.utcnow(),
         })
         logging.info("✅ Legal documents seeded with defaults")
+    else:
+        # Backfill any missing fields (e.g. cookies / account_deletion in older deployments)
+        missing = {k: v for k, v in defaults.items() if k not in existing or not existing.get(k)}
+        if missing:
+            await db.legal_documents.update_one(
+                {"_id": "legal_config"},
+                {"$set": {**missing, "updated_at": datetime.utcnow()}}
+            )
+            logging.info(f"✅ Legal documents backfilled: {list(missing.keys())}")
 
 
 # ── Public endpoint (no auth) ────────────────────────────────────────────────
@@ -225,7 +469,7 @@ async def get_legal_documents(request: Request):
 
     doc = await db.legal_documents.find_one({"_id": "legal_config"})
     if not doc:
-        return {"success": True, "terms_es": "", "terms_en": "", "privacy_es": "", "privacy_en": ""}
+        return {"success": True, "terms_es": "", "terms_en": "", "privacy_es": "", "privacy_en": "", "cookies_es": "", "cookies_en": "", "account_deletion_es": "", "account_deletion_en": ""}
 
     return {
         "success": True,
@@ -233,6 +477,10 @@ async def get_legal_documents(request: Request):
         "terms_en": doc.get("terms_en", ""),
         "privacy_es": doc.get("privacy_es", ""),
         "privacy_en": doc.get("privacy_en", ""),
+        "cookies_es": doc.get("cookies_es", ""),
+        "cookies_en": doc.get("cookies_en", ""),
+        "account_deletion_es": doc.get("account_deletion_es", ""),
+        "account_deletion_en": doc.get("account_deletion_en", ""),
         "updated_at": doc.get("updated_at", "").isoformat() if isinstance(doc.get("updated_at"), datetime) else str(doc.get("updated_at", "")),
     }
 
@@ -254,6 +502,10 @@ async def admin_get_legal_documents(request: Request):
             "terms_en": doc.get("terms_en", ""),
             "privacy_es": doc.get("privacy_es", ""),
             "privacy_en": doc.get("privacy_en", ""),
+            "cookies_es": doc.get("cookies_es", ""),
+            "cookies_en": doc.get("cookies_en", ""),
+            "account_deletion_es": doc.get("account_deletion_es", ""),
+            "account_deletion_en": doc.get("account_deletion_en", ""),
             "updated_at": doc.get("updated_at", "").isoformat() if isinstance(doc.get("updated_at"), datetime) else str(doc.get("updated_at", "")),
         }
     }
@@ -261,13 +513,13 @@ async def admin_get_legal_documents(request: Request):
 
 @router.put('/admin/legal-documents')
 async def admin_update_legal_documents(request: Request):
-    """Admin: Update legal documents (terms and/or privacy, ES and/or EN)."""
+    """Admin: Update legal documents (terms, privacy, cookies, account_deletion - ES and/or EN)."""
     await auth_admin(request)
     db = get_db()
     data = await request.json()
 
     update = {"updated_at": datetime.utcnow()}
-    for field in ["terms_es", "terms_en", "privacy_es", "privacy_en"]:
+    for field in ["terms_es", "terms_en", "privacy_es", "privacy_en", "cookies_es", "cookies_en", "account_deletion_es", "account_deletion_en"]:
         if field in data:
             update[field] = data[field]
 
