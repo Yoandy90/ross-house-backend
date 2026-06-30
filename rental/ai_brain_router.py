@@ -206,6 +206,13 @@ async def build_business_snapshot(db) -> Dict[str, Any]:
     except Exception as e:
         snap["service_providers"] = {"error": str(e)}
 
+    # Visitor Intelligence — live website traffic
+    try:
+        from .visitor_analytics_router import get_traffic_snapshot
+        snap["traffic"] = await get_traffic_snapshot(db)
+    except Exception as e:
+        snap["traffic"] = {"error": str(e)}
+
     return snap
 
 

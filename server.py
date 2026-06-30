@@ -197,6 +197,7 @@ try:
     from rental.service_providers_router import router as service_providers_router
     from rental.ai_brain_router import router as ai_brain_router
     from rental.chatbot_router import router as chatbot_router
+    from rental.visitor_analytics_router import router as visitor_analytics_router
 
     app.include_router(auth_router, prefix="/api")
     app.include_router(properties_router, prefix="/api")
@@ -230,6 +231,7 @@ try:
     app.include_router(service_providers_router, prefix="/api")
     app.include_router(ai_brain_router, prefix="/api")
     app.include_router(chatbot_router, prefix="/api")
+    app.include_router(visitor_analytics_router, prefix="/api")
 
     logger.info("  ✅ Credit Builder Router")
     logger.info("  ✅ Consent Forms Router")
