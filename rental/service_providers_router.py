@@ -409,6 +409,142 @@ async def admin_provider_stats(request: Request):
     return {"success": True, "total": total, "by_status": by_status, "by_service": by_service}
 
 
+# ─── Share link (SMS / Email) — for recruiting more contractors ──────────────
+
+@router.post('/admin/service-providers/share-link')
+async def admin_share_recruit_link(request: Request):
+    """Send the public provider signup URL via SMS or Email.
+
+    Body:
+      { channel: 'sms' | 'email',
+        to: string,                    # phone or email
+        lang?: 'es' | 'en'   (default es),
+        message?: string,              # optional custom body
+        campaign?: string              # optional UTM campaign label }
+    """
+    await auth_admin(request)
+    body = await request.json()
+    channel = (body.get('channel') or '').lower()
+    to = (body.get('to') or '').strip()
+    lang = body.get('lang') or 'es'
+    campaign = (body.get('campaign') or 'recruit').strip().replace(' ', '_').lower()
+    custom = (body.get('message') or '').strip()
+
+    if channel not in ('sms', 'email'):
+        raise HTTPException(400, "channel must be 'sms' or 'email'")
+    if not to:
+        raise HTTPException(400, "to is required")
+
+    base = 'https://www.rosshouserentals.com/proveedores'
+    if lang == 'en':
+        base = 'https://www.rosshouserentals.com/proveedores/en'
+    link = f"{base}?utm_source={channel}&utm_medium=referral&utm_campaign={campaign}"
+
+    if channel == 'sms':
+        if not custom:
+            if lang == 'es':
+                custom = (f"👷‍♂️ Ross House Rentals te invita a su red de proveedores en Dumas TX. "
+                          f"Sin contrato, trabajos directos. Regístrate gratis: {link}")
+            else:
+                custom = (f"👷‍♂️ Ross House Rentals invites you to join its provider network in Dumas, TX. "
+                          f"No contract, direct jobs. Sign up free: {link}")
+        else:
+            if link not in custom:
+                custom = custom.rstrip() + " " + link
+        ok = await _send_sms(to, custom)
+    else:
+        # Email
+        subject_es = "¿Eres contratista? Únete a Ross House Rentals (Dumas TX)"
+        subject_en = "Are you a contractor? Join Ross House Rentals (Dumas TX)"
+        subject = subject_es if lang == 'es' else subject_en
+        if lang == 'es':
+            html = f"""
+            <div style="font-family:system-ui,Arial,sans-serif;max-width:560px;margin:0 auto;">
+              <div style="background:linear-gradient(135deg,#1e293b,#f59e0b);padding:32px 24px;border-radius:12px 12px 0 0;color:white;text-align:center;">
+                <div style="font-size:48px;">👷‍♂️</div>
+                <h1 style="margin:8px 0 4px;font-size:24px;">Únete a nuestra red de proveedores</h1>
+                <p style="opacity:.9;margin:0;font-size:14px;">Ross House Rentals · Dumas, TX</p>
+              </div>
+              <div style="background:white;padding:24px;border:1px solid #e2e8f0;border-top:0;">
+                <p style="font-size:15px;color:#334155;line-height:1.6;margin:0 0 16px;">
+                  {custom or 'Buscamos plomeros, electricistas, jardineros, pintores, albañiles y handyman para nuestra red de propiedades en Dumas y el Texas Panhandle.'}
+                </p>
+                <ul style="font-size:14px;color:#475569;padding-left:18px;line-height:1.8;">
+                  <li>✅ Registro 100% <strong>gratis</strong></li>
+                  <li>✅ <strong>Sin contrato</strong>, sin compromiso</li>
+                  <li>✅ Pagos rápidos al terminar el trabajo</li>
+                  <li>✅ Trabajos directos en tu zona</li>
+                </ul>
+                <div style="text-align:center;margin:24px 0 12px;">
+                  <a href="{link}" style="display:inline-block;background:#f59e0b;color:white;text-decoration:none;font-weight:700;padding:14px 28px;border-radius:10px;font-size:15px;">
+                    Registrarme como proveedor →
+                  </a>
+                </div>
+                <p style="font-size:11px;color:#94a3b8;text-align:center;margin:0;">O copia este enlace: {link}</p>
+              </div>
+              <div style="text-align:center;padding:14px;color:#94a3b8;font-size:11px;">
+                Ross House Rentals LLC · (806) 934-2018 · info@rosshouserentals.com
+              </div>
+            </div>
+            """
+            plain = (custom or 'Únete a nuestra red de proveedores en Dumas TX.') + f"\n\n{link}"
+        else:
+            html = f"""
+            <div style="font-family:system-ui,Arial,sans-serif;max-width:560px;margin:0 auto;">
+              <div style="background:linear-gradient(135deg,#1e293b,#f59e0b);padding:32px 24px;border-radius:12px 12px 0 0;color:white;text-align:center;">
+                <div style="font-size:48px;">👷‍♂️</div>
+                <h1 style="margin:8px 0 4px;font-size:24px;">Join our provider network</h1>
+                <p style="opacity:.9;margin:0;font-size:14px;">Ross House Rentals · Dumas, TX</p>
+              </div>
+              <div style="background:white;padding:24px;border:1px solid #e2e8f0;border-top:0;">
+                <p style="font-size:15px;color:#334155;line-height:1.6;margin:0 0 16px;">
+                  {custom or 'We are looking for plumbers, electricians, gardeners, painters, masons and handymen for our rental network in Dumas and the Texas Panhandle.'}
+                </p>
+                <ul style="font-size:14px;color:#475569;padding-left:18px;line-height:1.8;">
+                  <li>✅ 100% <strong>free</strong> signup</li>
+                  <li>✅ <strong>No contract</strong>, no commitment</li>
+                  <li>✅ Fast payment when the job is done</li>
+                  <li>✅ Direct work in your area</li>
+                </ul>
+                <div style="text-align:center;margin:24px 0 12px;">
+                  <a href="{link}" style="display:inline-block;background:#f59e0b;color:white;text-decoration:none;font-weight:700;padding:14px 28px;border-radius:10px;font-size:15px;">
+                    Sign up as a provider →
+                  </a>
+                </div>
+                <p style="font-size:11px;color:#94a3b8;text-align:center;margin:0;">Or copy this link: {link}</p>
+              </div>
+              <div style="text-align:center;padding:14px;color:#94a3b8;font-size:11px;">
+                Ross House Rentals LLC · (806) 934-2018 · info@rosshouserentals.com
+              </div>
+            </div>
+            """
+            plain = (custom or 'Join our provider network in Dumas TX.') + f"\n\n{link}"
+        ok = await _send_email(to, subject, plain, html_body=html)
+
+    # Log the share for tracking
+    try:
+        db = get_db()
+        await db.provider_recruit_shares.insert_one({
+            "_id": str(uuid.uuid4()),
+            "channel": channel,
+            "to": to,
+            "lang": lang,
+            "campaign": campaign,
+            "link": link,
+            "ok": bool(ok),
+            "sent_at": datetime.utcnow(),
+        })
+    except Exception:
+        pass
+
+    if not ok:
+        raise HTTPException(500, f"No se pudo enviar el {channel}. Verifica las credenciales o el destino.")
+    return {"success": True, "channel": channel, "to": to, "link": link}
+
+
+
+
+
 @router.get('/admin/service-providers')
 async def admin_list_providers(
     request: Request,
