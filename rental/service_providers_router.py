@@ -22,12 +22,14 @@ import re
 import uuid
 from datetime import datetime
 from typing import Optional, List, Dict, Any
+from bson import ObjectId
+
 
 from fastapi import APIRouter, Request, HTTPException, Query
 from fastapi.responses import Response
 from pydantic import BaseModel, Field, validator
 
-from .shared import get_db, auth_admin, serialize
+from .shared import get_db, auth_admin, auth_tenant_flex, serialize
 from ._provider_email_templates import (
     admin_new_provider_html,
     welcome_provider_html,
@@ -1051,3 +1053,253 @@ async def admin_payment_stats(request: Request):
         "paid_this_month": paid_this_month,
         "by_method": by_method,
     }
+
+# =============================================================
+#  TENANT-FACING ENDPOINTS (private directory, auth required)
+# =============================================================
+# Tenants can browse active providers and request help — but
+# Ross House remains the intermediary. We never expose direct
+# email/phone of the provider; all contact goes through admin.
+
+
+def _public_provider_card(p: Dict[str, Any]) -> Dict[str, Any]:
+    """Build a tenant-safe view of a provider (no PII like email/phone).
+
+    Returns only: id, name, company_name, services, service_areas,
+    languages, bio (truncated), years_experience, has_insurance,
+    rating, completed_jobs, billing_type, hourly_rate, project rates,
+    work_photos (up to 4), is_featured, website (if exists).
+    """
+    bio = (p.get('bio') or '')[:280]
+    return {
+        '_id': str(p.get('_id') or p.get('id') or ''),
+        'name': p.get('name') or '',
+        'company_name': p.get('company_name') or '',
+        'services': p.get('services') or [],
+        'service_areas': p.get('service_areas') or [],
+        'languages': p.get('languages') or [],
+        'bio': bio,
+        'years_experience': p.get('years_experience') or 0,
+        'has_insurance': bool(p.get('has_insurance')),
+        'rating': float(p.get('rating') or 0),
+        'completed_jobs': int(p.get('completed_jobs') or 0),
+        'billing_type': p.get('billing_type') or 'per_hour',
+        'hourly_rate': p.get('hourly_rate') or 0,
+        'project_rate_min': p.get('project_rate_min') or 0,
+        'project_rate_max': p.get('project_rate_max') or 0,
+        'work_photos': (p.get('work_photos') or [])[:4],
+        'is_featured': bool(p.get('is_featured')),
+        'website': p.get('website') or '',
+    }
+
+
+@router.get('/tenant/service-providers')
+async def tenant_list_providers(
+    request: Request,
+    service: Optional[str] = None,
+    search: Optional[str] = None,
+    limit: int = 60,
+):
+    """List active/verified providers visible to authenticated tenants."""
+    _ = await auth_tenant_flex(request)  # auth gate
+    db = get_db()
+
+    query: Dict[str, Any] = {
+        'status': {'$in': ['active', 'pending_review']},  # show pending too so list isn't empty
+    }
+    if service:
+        query['services'] = service
+    if search:
+        s = search.strip()
+        query['$or'] = [
+            {'name': {'$regex': s, '$options': 'i'}},
+            {'company_name': {'$regex': s, '$options': 'i'}},
+            {'bio': {'$regex': s, '$options': 'i'}},
+        ]
+
+    # Sort: featured > rating > completed jobs > created_at desc
+    cursor = db.service_providers.find(query).sort([
+        ('is_featured', -1),
+        ('rating', -1),
+        ('completed_jobs', -1),
+        ('created_at', -1),
+    ]).limit(min(limit, 120))
+
+    providers = [_public_provider_card(p) async for p in cursor]
+    return {'success': True, 'total': len(providers), 'providers': providers}
+
+
+@router.get('/tenant/service-providers/services')
+async def tenant_provider_services_catalog(request: Request):
+    """Return list of service categories with counts of active providers per category.
+
+    Used to build the filter sidebar in the tenant portal.
+    """
+    _ = await auth_tenant_flex(request)
+    db = get_db()
+
+    pipeline = [
+        {'$match': {'status': {'$in': ['active', 'pending_review']}}},
+        {'$unwind': '$services'},
+        {'$group': {'_id': '$services', 'count': {'$sum': 1}}},
+        {'$sort': {'count': -1}},
+    ]
+    counts = {doc['_id']: doc['count'] async for doc in db.service_providers.aggregate(pipeline)}
+
+    catalog = [
+        {'id': sid, 'es': es, 'en': en, 'count': counts.get(sid, 0)}
+        for sid, es, en in [
+            ('plumber', 'Plomero', 'Plumber'),
+            ('electrician', 'Electricista', 'Electrician'),
+            ('hvac', 'HVAC / Aire', 'HVAC'),
+            ('mason', 'Albañil', 'Mason'),
+            ('painter', 'Pintor', 'Painter'),
+            ('gardener', 'Jardinero', 'Gardener'),
+            ('cleaner', 'Limpieza', 'Cleaning'),
+            ('locksmith', 'Cerrajero', 'Locksmith'),
+            ('roofer', 'Techos', 'Roofer'),
+            ('appliance_repair', 'Electrodomésticos', 'Appliance repair'),
+            ('pest_control', 'Control de plagas', 'Pest control'),
+            ('handyman', 'Mantenimiento general', 'Handyman'),
+            ('flooring', 'Pisos', 'Flooring'),
+            ('drywall', 'Tablaroca', 'Drywall'),
+            ('tile', 'Azulejos', 'Tile'),
+            ('concrete', 'Concreto', 'Concrete'),
+            ('fence', 'Cercas', 'Fencing'),
+            ('pool', 'Piscinas', 'Pools'),
+            ('security', 'Seguridad', 'Security'),
+            ('other', 'Otro', 'Other'),
+        ]
+    ]
+    return {'success': True, 'services': catalog}
+
+
+class TenantHelpRequest(BaseModel):
+    provider_id: Optional[str] = None  # preferred provider, may be None
+    service: Optional[str] = None       # e.g. plumber
+    title: str = Field(min_length=4, max_length=140)
+    description: str = Field(min_length=10, max_length=2000)
+    priority: str = Field(default='medium', pattern='^(low|medium|high|urgent)$')
+    contact_preference: str = Field(default='phone', pattern='^(phone|email|whatsapp)$')
+
+
+@router.post('/tenant/service-providers/request-help')
+async def tenant_request_help(payload: TenantHelpRequest, request: Request):
+    """Create a maintenance request from the tenant directory.
+
+    Ross House remains the intermediary — we do NOT expose the
+    provider directly. We log the tenant's preferred provider (if
+    given) and notify admin via email/SMS to dispatch.
+    """
+    tenant = await auth_tenant_flex(request)
+    db = get_db()
+
+    preferred_provider_name = None
+    preferred_provider = None
+    if payload.provider_id:
+        try:
+            preferred_provider = await db.service_providers.find_one({'_id': ObjectId(payload.provider_id)})
+        except Exception:
+            preferred_provider = None
+        if preferred_provider:
+            preferred_provider_name = preferred_provider.get('name') or preferred_provider.get('company_name')
+
+    # Resolve tenant context (name, phone, address)
+    tenant_name = tenant.get('name') or tenant.get('full_name') or 'Inquilino'
+    tenant_phone = tenant.get('phone') or ''
+    tenant_email = tenant.get('email') or ''
+    property_address = tenant.get('property_address') or tenant.get('address') or ''
+
+    # Find associated active contract/property for address if missing
+    if not property_address:
+        try:
+            contract = await db.rental_contracts.find_one({
+                'tenant_id': tenant.get('_id'),
+                'status': {'$in': ['active', 'signed']},
+            })
+            if contract:
+                property_address = contract.get('property_address') or ''
+        except Exception:
+            pass
+
+    # Create the maintenance request document
+    mreq = {
+        'tenant_id': tenant.get('_id'),
+        'tenant_name': tenant_name,
+        'tenant_phone': tenant_phone,
+        'tenant_email': tenant_email,
+        'property_address': property_address,
+        'title': payload.title,
+        'description': payload.description,
+        'priority': payload.priority,
+        'category': payload.service or 'general',
+        'status': 'pending',
+        'source': 'tenant_directory',
+        'preferred_provider_id': payload.provider_id,
+        'preferred_provider_name': preferred_provider_name,
+        'contact_preference': payload.contact_preference,
+        'created_at': datetime.utcnow(),
+        'updated_at': datetime.utcnow(),
+    }
+    result = await db.maintenance_requests.insert_one(mreq)
+    new_id = str(result.inserted_id)
+
+    # Build alert payload (text + HTML) to admin
+    settings = await _get_settings(db)
+    admin_email = settings.get('notify_admin_email')
+
+    pref_line = f"Proveedor preferido: {preferred_provider_name}\n" if preferred_provider_name else ''
+    subj = f"🛠️ Solicitud de ayuda desde portal inquilino: {payload.title}"
+    body = (
+        f"El inquilino {tenant_name} pidió ayuda desde el directorio privado.\n\n"
+        f"Servicio: {payload.service or '(no especificado)'}\n"
+        f"Prioridad: {payload.priority}\n"
+        f"Dirección: {property_address or '(no registrada)'}\n"
+        f"Inquilino: {tenant_name}  ·  {tenant_phone}  ·  {tenant_email}\n"
+        f"{pref_line}"
+        f"\n--- Descripción ---\n{payload.description}\n\n"
+        f"Revisa y despacha desde:\nhttps://www.rosshouserentals.com/admin/mantenimiento"
+    )
+
+    html = (
+        f"<div style=\"font-family:Helvetica,Arial,sans-serif;line-height:1.6;color:#0f172a;max-width:600px;margin:0 auto;padding:24px;\">"
+        f"<div style=\"background:#0d1a2e;color:#fbbf24;padding:18px 24px;border-radius:14px 14px 0 0;font-weight:800;font-size:18px;\">"
+        f"🛠️ Solicitud de ayuda — Portal Inquilino"
+        f"</div>"
+        f"<div style=\"background:#ffffff;border:1px solid #e2e8f0;border-top:none;padding:20px 24px;border-radius:0 0 14px 14px;\">"
+        f"<p style=\"margin:0 0 12px 0;\"><strong>{tenant_name}</strong> solicitó ayuda desde el directorio privado.</p>"
+        f"<table style=\"width:100%;border-collapse:collapse;font-size:14px;\">"
+        f"<tr><td style=\"padding:6px 0;color:#64748b;width:42%;\">Servicio</td><td style=\"padding:6px 0;font-weight:600;\">{payload.service or '(no especificado)'}</td></tr>"
+        f"<tr><td style=\"padding:6px 0;color:#64748b;\">Prioridad</td><td style=\"padding:6px 0;font-weight:600;\">{payload.priority.upper()}</td></tr>"
+        f"<tr><td style=\"padding:6px 0;color:#64748b;\">Dirección</td><td style=\"padding:6px 0;font-weight:600;\">{property_address or '—'}</td></tr>"
+        f"<tr><td style=\"padding:6px 0;color:#64748b;\">Tel inquilino</td><td style=\"padding:6px 0;font-weight:600;\"><a href=\"tel:{tenant_phone}\" style=\"color:#d97706;text-decoration:none;\">{tenant_phone or '—'}</a></td></tr>"
+        f"<tr><td style=\"padding:6px 0;color:#64748b;\">Email inquilino</td><td style=\"padding:6px 0;font-weight:600;\"><a href=\"mailto:{tenant_email}\" style=\"color:#d97706;text-decoration:none;\">{tenant_email or '—'}</a></td></tr>"
+        + (f"<tr><td style=\"padding:6px 0;color:#64748b;\">Proveedor preferido</td><td style=\"padding:6px 0;font-weight:700;color:#d97706;\">{preferred_provider_name}</td></tr>" if preferred_provider_name else '')
+        + f"</table>"
+        f"<div style=\"margin-top:16px;padding:14px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;\">"
+        f"<div style=\"font-size:11px;font-weight:800;color:#d97706;text-transform:uppercase;letter-spacing:1px;margin-bottom:6px;\">Descripción</div>"
+        f"<div style=\"font-size:14px;line-height:1.6;color:#0f172a;white-space:pre-wrap;\">{payload.description}</div>"
+        f"</div>"
+        f"<div style=\"margin-top:18px;text-align:center;\">"
+        f"<a href=\"https://www.rosshouserentals.com/admin/mantenimiento\" style=\"display:inline-block;padding:12px 24px;background:#f59e0b;color:#fff;font-weight:700;text-decoration:none;border-radius:10px;\">Abrir Panel Admin</a>"
+        f"</div>"
+        f"</div></div>"
+    )
+
+    try:
+        if admin_email and settings.get('email_enabled'):
+            await _send_email(admin_email, subj, body, html_body=html)
+        if settings.get('sms_enabled'):
+            admin_phone = settings.get('notify_admin_phone')
+            if admin_phone:
+                sms = f"Ross House: Inquilino {tenant_name} pidió {payload.service or 'ayuda'} en {property_address or 'su unidad'} ({payload.priority}). Ver: rosshouserentals.com/admin/mantenimiento"
+                await _send_sms(admin_phone, sms)
+    except Exception as e:
+        logger.exception(f"[providers/tenant] notify admin failed: {e}")
+
+    return {
+        'success': True,
+        'request_id': new_id,
+        'message': 'Solicitud enviada. Te contactaremos pronto.',
+    }
+
