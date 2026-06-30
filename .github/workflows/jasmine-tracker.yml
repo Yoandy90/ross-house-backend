@@ -1,0 +1,47 @@
+✅ Pasos correctos:
+1. Abre el repo principal: 👉 https://github.com/Yoandy90/ross-house-backend
+
+2. Arriba a la derecha verás el botón "Add file" (junto a "Code" verde). Click ahí → selecciona "+ Create new file".
+
+3. En el campo "Name your file" (arriba) escribe exactamente esto, con las barras /:
+
+.github/workflows/jasmine-tracker.yml
+⚡ Tip clave: GitHub auto-crea las carpetas .github/ y workflows/ cuando escribes el nombre con barras. Verás cómo se forma una "ruta tipo migas de pan" arriba a medida que escribes los /.
+
+4. En el editor grande de abajo, pega el contenido completo del YAML:
+
+name: Jasmine Email Tracker
+
+# Monitorea el email enviado a Joe Kuruvila (joe3359@gmail.com) y notifica
+# a yoandyross@gmail.com cuando hay aperturas, clicks u otros eventos nuevos.
+# Estado persistido en MongoDB collection `email_trackers` (idempotente).
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'   # Cada 30 minutos
+  workflow_dispatch:          # permite correrlo manualmente desde la pestaña Actions
+
+jobs:
+  track:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pymongo sendgrid python-dotenv requests
+
+      - name: Run tracker
+        env:
+          SENDGRID_API_KEY:    ${{ secrets.SENDGRID_API_KEY }}
+          SENDGRID_FROM_EMAIL: ${{ secrets.SENDGRID_FROM_EMAIL }}
+          MONGO_URL:           ${{ secrets.MONGO_URL }}
+        run: python scripts/jasmine_email_tracker.py
