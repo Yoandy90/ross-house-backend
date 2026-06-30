@@ -532,7 +532,55 @@ async def public_create_lead(request: Request, payload: TenantLeadCreate):
     except Exception as e:
         logger.exception(f"[tenant_leads] notification failed: {e}")
 
+    # Auto-score lead (Phase 2 AI Brain)
+    try:
+        from .lead_scoring import score_and_persist
+        await score_and_persist(db, lead_data['_id'])
+    except Exception as e:
+        logger.warning(f"[tenant_leads] auto-scoring failed: {e}")
+
     return {"success": True, "message": "Lead registered", "is_new": is_new, "id": lead_data['_id']}
+
+
+# ============================================================
+# Lead Scoring endpoints (Phase 2 AI Brain)
+# ============================================================
+
+@router.post('/admin/tenant-leads/{lead_id}/score')
+async def admin_score_lead(request: Request, lead_id: str):
+    """Recompute the score for a specific lead using Claude Sonnet 4.5."""
+    await auth_admin(request)
+    db = get_db()
+    from .lead_scoring import score_and_persist
+    result = await score_and_persist(db, lead_id)
+    if not result:
+        raise HTTPException(404, "Lead not found")
+    return {"success": True, "lead_id": lead_id, **result}
+
+
+@router.post('/admin/tenant-leads/score-all')
+async def admin_score_all_leads(request: Request):
+    """Score every lead that doesn't have a score yet (or rescore all if force=1)."""
+    await auth_admin(request)
+    db = get_db()
+    from .lead_scoring import score_and_persist
+    qs = request.query_params
+    force = qs.get('force') in ('1', 'true', 'yes')
+    query: Dict[str, Any] = {} if force else {"score": {"$exists": False}}
+    scored = 0
+    failed = 0
+    cursor = db.tenant_leads.find(query).sort("created_at", -1).limit(200)
+    async for lead in cursor:
+        try:
+            r = await score_and_persist(db, lead["_id"])
+            if r:
+                scored += 1
+            else:
+                failed += 1
+        except Exception as e:
+            logger.warning(f"[score-all] failed on {lead.get('_id')}: {e}")
+            failed += 1
+    return {"success": True, "scored": scored, "failed": failed, "forced": force}
 
 
 @router.get('/public/tenant-leads/check')

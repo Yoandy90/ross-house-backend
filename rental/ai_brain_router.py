@@ -35,6 +35,21 @@ from .shared import get_db, auth_admin
 
 router = APIRouter(prefix="/admin/ai-brain", tags=["AI Brain"])
 
+# Compatibility shim — server.py imports this. The newer AI Brain V2 admin
+# uses the standalone Claude flow, but we keep a reference for cross-module
+# integrations (chat AI suggestions still rely on the legacy brain).
+_ai_brain_ref = None
+
+
+def set_ai_brain(brain) -> None:
+    """Attach legacy RossHouseAIBrain instance for cross-module access."""
+    global _ai_brain_ref
+    _ai_brain_ref = brain
+
+
+def get_ai_brain():
+    return _ai_brain_ref
+
 MODEL_PROVIDER = "anthropic"
 MODEL_NAME = "claude-sonnet-4-5-20250929"
 CONVERSATIONS_COLL = "ai_conversations"
@@ -212,10 +227,44 @@ Eres un asistente ejecutivo experto en bienes raíces residenciales, administrac
 - Usa **markdown** (negritas, listas, tablas) para legibilidad
 - Idioma: responde en el idioma del último mensaje del usuario (ES o EN)
 
+# 🔧 ACCIONES (PERMISO DE EJECUCIÓN — Phase 2)
+Ahora tienes permiso para PROPONER acciones que modifican datos. NO las ejecutas tú: Yoandy las aprueba primero en el panel admin.
+
+Cuando Yoandy te diga "envía un email a X", "actualiza el estado del lead Y", "marca como contactado", "agrega una nota", "notifica a leads sobre la propiedad Z" o "rescore al lead W", incluye al final de tu mensaje un bloque ACTION así:
+
+<ACTION>
+{
+  "type": "send_email_to_lead",
+  "summary": "Enviar email de seguimiento a María Pérez (lead abc123)",
+  "payload": {
+    "lead_id": "abc123",
+    "subject": "Seguimiento de tu interés en Ross House",
+    "body": "Hola María, ..."
+  }
+}
+</ACTION>
+
+Tipos permitidos (USA EXACTAMENTE estos nombres):
+1. **send_email_to_lead** — payload: { lead_id, subject, body }
+2. **update_lead_status** — payload: { lead_id, status } (status ∈ new|contacted|qualified|applied|rented|rejected)
+3. **add_lead_note** — payload: { lead_id, note }
+4. **update_lead_priority** — payload: { lead_id, priority } (priority ∈ low|medium|high)
+5. **notify_property_match** — payload: { property_id, lead_ids?, message?, email?, sms? }
+6. **rescore_lead** — payload: { lead_id }
+7. **send_briefing_now** — payload: { recipient_email? }
+
+Reglas para ACTIONS:
+- Puedes proponer múltiples bloques en una sola respuesta (uno por acción).
+- Usa SIEMPRE el `lead_id` o `property_id` exacto del snapshot. Si no lo tienes, primero pídelo o búscalo, no inventes IDs.
+- Antes del bloque, explica brevemente qué vas a hacer y por qué.
+- Después del bloque, dile a Yoandy: "Esta acción quedará pendiente de tu aprobación en el panel ✅"
+- Si NO te piden ejecutar nada concreto, NO uses bloques ACTION. Solo informa.
+
 # Lo que NO debes hacer
-- NO ejecutas acciones que modifican datos. Solo redactas drafts.
 - NO inventes datos que no estén en el snapshot
+- NO uses lead_id o property_id que no aparezcan en el snapshot
 - NO des asesoría legal/financiera vinculante — sugiere consultar profesional cuando aplique
+- NO confirmes "ya está hecho" — siempre di "queda pendiente de aprobación"
 
 # Contexto del negocio
 - **Empresa:** Ross House Rentals LLC (Dumas, TX 79029)
@@ -312,6 +361,20 @@ async def chat_stream(body: ChatRequest, db=Depends(get_db), admin=Depends(auth_
                       "last_message": full_response[:200]},
              "$inc": {"message_count": 2}},
         )
+
+        # Extract <ACTION> blocks and persist as pending actions (Phase 2)
+        try:
+            from .ai_actions import extract_actions, store_pending_actions
+            _, action_proposals = extract_actions(full_response)
+            if action_proposals:
+                stored = await store_pending_actions(
+                    db, conversation_id, action_proposals,
+                    proposed_by=str(admin.get("email", "ai")),
+                )
+                yield f"data: {json.dumps({'type': 'actions_proposed', 'count': len(stored), 'actions': [{'id': s['_id'], 'type': s['action_type'], 'summary': s['summary']} for s in stored]})}\n\n"
+        except Exception as ae:
+            logger.warning(f"ai_brain action extraction failed: {ae}")
+
         yield f"data: {json.dumps({'type': 'done'})}\n\n"
 
     return StreamingResponse(
@@ -341,6 +404,42 @@ async def delete_conversation(conv_id: str, db=Depends(get_db), admin=Depends(au
     await db[CONVERSATIONS_COLL].delete_one({"_id": conv_id})
     await db[MESSAGES_COLL].delete_many({"conversation_id": conv_id})
     return {"ok": True}
+
+
+# ─── PENDING ACTIONS (Phase 2 AI Brain — Write/Execution Permissions) ────────
+
+@router.get("/pending-actions")
+async def list_pending_actions_endpoint(
+    status: Optional[str] = None,
+    conversation_id: Optional[str] = None,
+    limit: int = 100,
+    db=Depends(get_db), admin=Depends(auth_admin),
+):
+    from .ai_actions import list_pending_actions
+    actions = await list_pending_actions(db, conversation_id=conversation_id, status=status, limit=limit)
+    return {"actions": actions, "total": len(actions)}
+
+
+@router.post("/pending-actions/{action_id}/approve")
+async def approve_action_endpoint(action_id: str, db=Depends(get_db), admin=Depends(auth_admin)):
+    from .ai_actions import execute_action
+    try:
+        result = await execute_action(db, action_id, approver=str(admin.get("email", "admin")))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True, "action": result}
+
+
+@router.post("/pending-actions/{action_id}/reject")
+async def reject_action_endpoint(action_id: str, body: Dict[str, Any] = Body(default={}),
+                                  db=Depends(get_db), admin=Depends(auth_admin)):
+    from .ai_actions import reject_action
+    reason = (body or {}).get("reason", "")
+    try:
+        result = await reject_action(db, action_id, decider=str(admin.get("email", "admin")), reason=reason)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True, "action": result}
 
 
 @router.post("/marketing/generate")
