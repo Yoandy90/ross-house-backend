@@ -28,6 +28,11 @@ from fastapi.responses import Response
 from pydantic import BaseModel, Field, validator
 
 from .shared import get_db, auth_admin, serialize
+from ._provider_email_templates import (
+    admin_new_provider_html,
+    welcome_provider_html,
+    dispatch_job_html,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -58,12 +63,14 @@ class ServiceProviderCreate(BaseModel):
     phone: str = Field(min_length=10, max_length=20)
     services: List[str] = Field(min_items=1, max_items=10)
     service_areas: Optional[List[str]] = None  # ZIPs e.g. ["79029", "79045"]
+    billing_type: str = Field(default='per_hour', pattern='^(per_hour|per_job|both)$')
     hourly_rate: Optional[float] = None
     project_rate_min: Optional[float] = None
     project_rate_max: Optional[float] = None
     has_insurance: bool = False
     insurance_provider: Optional[str] = None
     license_number: Optional[str] = None
+    license_documents: Optional[List[str]] = None  # base64 data URLs (license, insurance certs, etc.)
     years_experience: Optional[int] = Field(default=None, ge=0, le=80)
     languages: List[str] = Field(default_factory=lambda: ['en'])
     bio: Optional[str] = None
@@ -260,7 +267,7 @@ def _format_template(tpl: str, provider: Dict[str, Any]) -> str:
 # Email / SMS helpers (reused pattern)
 # ============================================================
 
-async def _send_email(to_email: str, subject: str, body: str) -> bool:
+async def _send_email(to_email: str, subject: str, body: str, html_body: Optional[str] = None) -> bool:
     try:
         api_key = os.environ.get('SENDGRID_API_KEY')
         from_email = os.environ.get('SENDGRID_FROM_EMAIL', 'info@rosshouserentals.com')
@@ -268,11 +275,12 @@ async def _send_email(to_email: str, subject: str, body: str) -> bool:
             return False
         from sendgrid import SendGridAPIClient
         from sendgrid.helpers.mail import Mail
-        html_body = body.replace('\n', '<br>')
+        if html_body is None:
+            html_body = f"<div style='font-family:Helvetica,Arial,sans-serif;line-height:1.6;color:#1a1a1a;'>{body.replace(chr(10), '<br>')}</div>"
         msg = Mail(
             from_email=from_email, to_emails=to_email, subject=subject,
             plain_text_content=body,
-            html_content=f"<div style='font-family:Helvetica,Arial,sans-serif;line-height:1.6;color:#1a1a1a;'>{html_body}</div>",
+            html_content=html_body,
         )
         sg = SendGridAPIClient(api_key)
         resp = sg.send(msg)
@@ -341,50 +349,21 @@ async def public_register_provider(request: Request, payload: ServiceProviderCre
         await db.service_providers.insert_one(data)
         is_new = True
 
-    # Welcome notifications
+    # Welcome notifications (premium HTML)
     lang = data.get('language_pref', 'es')
     try:
         if settings.get('email_enabled'):
-            subj_key = f'welcome_email_subject_{lang}'
-            body_key = f'welcome_email_body_{lang}'
-            subj = settings.get(subj_key) or DEFAULT_PROVIDER_SETTINGS[subj_key]
-            body = settings.get(body_key) or DEFAULT_PROVIDER_SETTINGS[body_key]
-            await _send_email(data['email'], _format_template(subj, data), _format_template(body, data))
+            tpl = welcome_provider_html(data, lang)
+            await _send_email(data['email'], tpl['subject'], tpl['text'], html_body=tpl['html'])
         if settings.get('sms_enabled'):
             sms_key = f'welcome_sms_{lang}'
             sms_tpl = settings.get(sms_key) or DEFAULT_PROVIDER_SETTINGS[sms_key]
             await _send_sms(data['phone'], _format_template(sms_tpl, data))
-        # Admin alert
+        # Admin alert (premium HTML)
         admin_email = settings.get('notify_admin_email')
         if is_new and admin_email:
-            labels = SERVICE_LABELS_ES
-            services_str = ', '.join([labels.get(s, s) for s in (data.get('services') or [])])
-            subj_admin = f"🛠️ Nuevo proveedor: {data['name']} — {services_str}"
-            body_admin = f"""Nuevo proveedor registrado en Ross House Rentals:
-
-Nombre: {data['name']}
-Empresa: {data.get('company_name') or '-'}
-Email: {data['email']}
-Teléfono: {data['phone']}
-Servicios: {services_str}
-Zonas: {', '.join(data.get('service_areas') or []) or '-'}
-Tarifa por hora: ${data.get('hourly_rate') or '-'}
-Años de experiencia: {data.get('years_experience') or '-'}
-Seguro: {'Sí' if data.get('has_insurance') else 'No'}
-Licencia: {data.get('license_number') or '-'}
-Idiomas: {', '.join(data.get('languages') or [])}
-Web: {data.get('website') or '-'}
-
-Bio:
-{data.get('bio') or '-'}
-
-Referencias:
-{data.get('references_text') or '-'}
-
-Ver/aprobar en admin:
-https://www.rosshouserentals.com/admin/proveedores
-"""
-            await _send_email(admin_email, subj_admin, body_admin)
+            tpl_admin = admin_new_provider_html(data, 'es')
+            await _send_email(admin_email, tpl_admin['subject'], tpl_admin['text'], html_body=tpl_admin['html'])
     except Exception as e:
         logger.exception(f"[providers] notification failed: {e}")
 
@@ -756,52 +735,24 @@ async def admin_dispatch_maintenance(request: Request):
     tenant = mreq.get('tenant_name') or ''
     phone = mreq.get('tenant_phone') or ''
 
+    # Build premium HTML dispatch email
+    job_payload = {
+        'title': title, 'property_address': addr, 'description': description,
+        'priority': priority, 'tenant_name': tenant, 'tenant_phone': phone,
+    }
+    tpl = dispatch_job_html(p, job_payload, extra_note=extra_note, lang=lang)
+    subject = tpl['subject']
+    body = tpl['text']
+    html_body = tpl['html']
+
     if lang == 'es':
-        subject = f"🛠️ Trabajo: {title} — {addr}"
-        body = f"""Hola {p.get('name')},
-
-Tenemos un trabajo de mantenimiento que coincide con tus servicios:
-
-📋 Detalle: {title}
-🏠 Dirección: {addr}
-⚡ Prioridad: {priority}
-👤 Inquilino: {tenant}
-📞 Contacto: {phone}
-
-Descripción:
-{description}
-
-{extra_note}
-
-Por favor responde a este correo o llámanos al (806) 934-2018 si puedes tomar el trabajo.
-
-— Ross House Rentals"""
         sms_body = f"Ross House: Trabajo disponible en {addr} — {title} ({priority}). Inquilino: {tenant} {phone}. Responde si puedes tomarlo. (806) 934-2018"
     else:
-        subject = f"🛠️ Job: {title} — {addr}"
-        body = f"""Hi {p.get('name')},
-
-We have a maintenance job matching your services:
-
-📋 Job: {title}
-🏠 Address: {addr}
-⚡ Priority: {priority}
-👤 Tenant: {tenant}
-📞 Contact: {phone}
-
-Description:
-{description}
-
-{extra_note}
-
-Please reply to this email or call (806) 934-2018 if you can take the job.
-
-— Ross House Rentals"""
         sms_body = f"Ross House: Job available at {addr} — {title} ({priority}). Tenant: {tenant} {phone}. Reply if you can take it. (806) 934-2018"
 
     email_sent = sms_sent = False
     if via_email and settings.get('email_enabled'):
-        email_sent = await _send_email(p['email'], subject, body)
+        email_sent = await _send_email(p['email'], subject, body, html_body=html_body)
     if via_sms and settings.get('sms_enabled'):
         sms_sent = await _send_sms(p['phone'], sms_body)
 
