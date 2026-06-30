@@ -61,6 +61,14 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"   ⚠️ Mashvisor Cache indexes deferred: {e}")
 
+    # Ensure Admin 2FA indexes
+    try:
+        from rental.admin_2fa_router import ensure_indexes as admin_2fa_indexes
+        await admin_2fa_indexes(db)
+        logger.info("   ✅ Admin 2FA indexes ready")
+    except Exception as e:
+        logger.warning(f"   ⚠️ Admin 2FA indexes deferred: {e}")
+
     # Start property/contract sync cron job in the background
     sync_task = None
     try:
@@ -198,6 +206,7 @@ try:
     from rental.ai_brain_router import router as ai_brain_router
     from rental.chatbot_router import router as chatbot_router
     from rental.visitor_analytics_router import router as visitor_analytics_router
+    from rental.admin_2fa_router import router as admin_2fa_router, ensure_indexes as admin_2fa_indexes
 
     app.include_router(auth_router, prefix="/api")
     app.include_router(properties_router, prefix="/api")
@@ -232,6 +241,11 @@ try:
     app.include_router(ai_brain_router, prefix="/api")
     app.include_router(chatbot_router, prefix="/api")
     app.include_router(visitor_analytics_router, prefix="/api")
+    app.include_router(admin_2fa_router, prefix="/api")
+    try:
+        await admin_2fa_indexes(db)
+    except Exception as _e:
+        logger.warning(f"admin_2fa_indexes failed: {_e}")
 
     logger.info("  ✅ Credit Builder Router")
     logger.info("  ✅ Consent Forms Router")

@@ -81,6 +81,7 @@ class ServiceProviderCreate(BaseModel):
     work_photos: Optional[List[str]] = None  # base64 or URLs
     language_pref: str = Field(default='es', pattern='^(es|en)$')
     source: Optional[str] = 'web'
+    captcha_token: Optional[str] = None  # Cloudflare Turnstile
 
     @validator('email')
     def _email(cls, v):
@@ -315,6 +316,10 @@ async def _send_sms(to_phone: str, body: str) -> bool:
 
 @router.post('/public/service-providers')
 async def public_register_provider(request: Request, payload: ServiceProviderCreate):
+    # CAPTCHA gate (anti-bot)
+    from .turnstile_helper import verify_turnstile_token
+    await verify_turnstile_token(payload.captcha_token, request)
+
     db = get_db()
     existing = await db.service_providers.find_one({"email": payload.email})
     settings = await _get_settings(db)

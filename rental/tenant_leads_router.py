@@ -51,6 +51,7 @@ class TenantLeadCreate(BaseModel):
     language_pref: str = Field(default='es', pattern='^(es|en)$')
     notes: Optional[str] = None  # additional comments from user
     source: Optional[str] = 'web'
+    captcha_token: Optional[str] = None  # Cloudflare Turnstile token
 
     @validator('email')
     def validate_email(cls, v):
@@ -493,6 +494,10 @@ def _match_lead_to_property(lead: Dict[str, Any], prop: Dict[str, Any]) -> bool:
 
 @router.post('/public/tenant-leads')
 async def public_create_lead(request: Request, payload: TenantLeadCreate):
+    # CAPTCHA gate (anti-bot)
+    from .turnstile_helper import verify_turnstile_token
+    await verify_turnstile_token(payload.captcha_token, request)
+
     db = get_db()
 
     # Dedup: if same email + phone exists in last 30 days, just refresh entry

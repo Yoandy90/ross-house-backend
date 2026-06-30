@@ -153,6 +153,11 @@ async def marketplace_register(request: Request):
     check_rate_limit(client_ip, "register")
     
     data = await request.json()
+
+    # CAPTCHA gate (anti-bot)
+    from rental.turnstile_helper import verify_turnstile_token
+    await verify_turnstile_token(data.get("captcha_token"), request)
+
     name = data.get("name", "").strip()
     email = data.get("email", "").strip().lower()
     phone = data.get("phone", "").strip()
@@ -341,6 +346,11 @@ async def forgot_password(request: Request):
     check_rate_limit(client_ip, "forgot-password")
     
     data = await request.json()
+
+    # CAPTCHA gate (anti-bot — protects Twilio SMS budget)
+    from rental.turnstile_helper import verify_turnstile_token
+    await verify_turnstile_token(data.get("captcha_token"), request)
+
     email = data.get("email", "").strip().lower()
 
     if not email:
@@ -462,6 +472,11 @@ async def rental_phone_send_otp(request: Request):
     """Send a 6-digit OTP code via SMS for Ross House Rentals users"""
     import random, os
     body = await request.json()
+
+    # CAPTCHA gate (anti-bot — protects Twilio SMS budget)
+    from rental.turnstile_helper import verify_turnstile_token
+    await verify_turnstile_token(body.get("captcha_token"), request)
+
     raw_phone = body.get('phone', '').strip()
     country_code = body.get('country_code', '+1')
     
