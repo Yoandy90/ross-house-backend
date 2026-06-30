@@ -225,6 +225,76 @@ async def _ensure_once(db):
         _indexes_ready = True
 
 
+def _apply_filters(query: Dict[str, Any], country: Optional[str], device: Optional[str]) -> Dict[str, Any]:
+    """Apply global country/device filters to a Mongo session query."""
+    if country:
+        query["country_code"] = country.upper()
+    if device:
+        query["device"] = device
+    return query
+
+
+async def _filtered_session_ids(db, since: datetime,
+                                 country: Optional[str], device: Optional[str]) -> Optional[List[str]]:
+    """Return the list of session_ids matching country/device filter, or None if
+    no filter is active (caller can skip the extra join)."""
+    if not country and not device:
+        return None
+    q: Dict[str, Any] = {"first_seen": {"$gte": since}, "is_bot": {"$ne": True}}
+    _apply_filters(q, country, device)
+    ids = await db.visitor_sessions.distinct("_id", q)
+    return ids
+
+
+async def _send_new_country_alert(geo: Dict[str, Any], ip: str, ua: str) -> None:
+    """Email the admin when a brand-new country appears in our visitor data."""
+    cc = geo.get("country_code") or "??"
+    country = geo.get("country") or "Desconocido"
+    city = geo.get("city") or "—"
+    # Flag emoji
+    flag = "🌐"
+    if cc and len(cc) == 2:
+        try:
+            base = 0x1f1e6
+            flag = chr(base + (ord(cc[0].upper()) - 65)) + chr(base + (ord(cc[1].upper()) - 65))
+        except Exception:
+            pass
+    subject = f"🌍 Nuevo país detectado: {flag} {country}"
+    html = f"""
+    <div style="font-family: system-ui, sans-serif; max-width: 560px; margin: 0 auto;">
+      <div style="background: linear-gradient(135deg,#0f172a,#10b981); color: white; padding: 24px; border-radius: 12px 12px 0 0;">
+        <div style="font-size:42px;">{flag}</div>
+        <h1 style="margin:8px 0 4px;font-size:20px;">¡Tienes un visitante de un nuevo país!</h1>
+        <p style="opacity:.85;margin:0;font-size:13px;">Ross House Rentals · Visitor Intelligence</p>
+      </div>
+      <div style="background:white;padding:20px 24px;border:1px solid #e2e8f0;border-top:0;border-radius:0 0 12px 12px;">
+        <table style="width:100%;font-size:13px;color:#334155;">
+          <tr><td style="padding:6px 0;color:#64748b;">País</td>      <td style="text-align:right;font-weight:600;">{country} ({cc})</td></tr>
+          <tr><td style="padding:6px 0;color:#64748b;">Ciudad</td>    <td style="text-align:right;font-weight:600;">{city}</td></tr>
+          <tr><td style="padding:6px 0;color:#64748b;">Región</td>    <td style="text-align:right;">{geo.get('region') or '—'}</td></tr>
+          <tr><td style="padding:6px 0;color:#64748b;">Timezone</td>  <td style="text-align:right;">{geo.get('timezone') or '—'}</td></tr>
+        </table>
+        <p style="margin:18px 0 0;font-size:12px;color:#64748b;">Es la primera vez (en los últimos 90 días) que alguien visita el sitio desde este país. ¡Considera si vale la pena adaptar campañas o el idioma!</p>
+        <a href="https://www.rosshouserentals.com/admin/analytics"
+           style="display:inline-block;margin-top:14px;background:#0f172a;color:white;text-decoration:none;padding:10px 16px;border-radius:8px;font-size:13px;font-weight:600;">
+          Ver dashboard →
+        </a>
+      </div>
+    </div>
+    """
+    plain = f"Nuevo país detectado: {country} ({cc}). Ciudad: {city}. Ver: https://www.rosshouserentals.com/admin/analytics"
+    try:
+        from .ai_brain_router import send_email_branded
+        await send_email_branded("yoandyross@gmail.com", subject, html, plain)
+    except Exception:
+        # fallback to tenant_leads helper
+        try:
+            from .tenant_leads_router import _send_email
+            await _send_email("yoandyross@gmail.com", subject, plain)
+        except Exception as e:
+            logger.warning(f"[visitor] fallback email send failed: {e}")
+
+
 def _client_ip(request: Request) -> str:
     # Trust X-Forwarded-For (Railway/Vercel add it). Take first non-empty.
     xff = request.headers.get("x-forwarded-for") or request.headers.get("cf-connecting-ip")
@@ -305,6 +375,21 @@ async def track_session(payload: TrackSessionPayload, request: Request):
 
     geo = await _lookup_geo(db, ip)
     sid = payload.session_id or hashlib.sha256(f"{visitor_id}:{_now().timestamp()}".encode()).hexdigest()[:24]
+
+    # ─── New-country alert: notify admin if country is new (not seen in 90d) ───
+    cc = (geo.get("country_code") or "").upper()
+    if cc and cc not in ("LO",):
+        cutoff = _now() - timedelta(days=90)
+        prior = await db.visitor_sessions.find_one(
+            {"country_code": cc, "first_seen": {"$gte": cutoff}, "is_bot": {"$ne": True}},
+            projection={"_id": 1},
+        )
+        if not prior:
+            try:
+                await _send_new_country_alert(geo, ip, ua)
+            except Exception as ne:
+                logger.warning(f"[visitor] new-country alert failed: {ne}")
+
     doc = {
         "_id": sid,
         "session_id": sid,
@@ -434,6 +519,8 @@ async def admin_live(request: Request):
             "country": s.get("country"),
             "country_code": s.get("country_code"),
             "city": s.get("city"),
+            "lat": s.get("lat"),
+            "lon": s.get("lon"),
             "device": s.get("device"),
             "browser": s.get("browser"),
             "os": s.get("os"),
@@ -447,7 +534,8 @@ async def admin_live(request: Request):
 
 
 @router.get("/admin/analytics/overview")
-async def admin_overview(request: Request, range: str = "7d"):
+async def admin_overview(request: Request, range: str = "7d",
+                          country: Optional[str] = None, device: Optional[str] = None):
     await auth_admin(request)
     db = get_db()
     await _ensure_once(db)
@@ -458,6 +546,7 @@ async def admin_overview(request: Request, range: str = "7d"):
         match: Dict[str, Any] = {"first_seen": {"$gte": start}, "is_bot": {"$ne": True}}
         if end:
             match["first_seen"]["$lt"] = end
+        _apply_filters(match, country, device)
         pipeline = [
             {"$match": match},
             {"$group": {
@@ -513,35 +602,68 @@ async def admin_overview(request: Request, range: str = "7d"):
 
 
 @router.get("/admin/analytics/timeline")
-async def admin_timeline(request: Request, range: str = "7d", granularity: str = "hour"):
+async def admin_timeline(request: Request, range: str = "7d", granularity: str = "hour",
+                          country: Optional[str] = None, device: Optional[str] = None,
+                          compare: int = 0):
     await auth_admin(request)
     db = get_db()
     await _ensure_once(db)
     since = _range_to_dt(range)
-    # Choose bucket size
     bucket = "%Y-%m-%dT%H:00:00Z" if granularity == "hour" else "%Y-%m-%dT00:00:00Z"
-    pipeline = [
-        {"$match": {"ts": {"$gte": since}, "type": "page"}},
-        {"$group": {
-            "_id": {"$dateToString": {"format": bucket, "date": "$ts"}},
-            "pages": {"$sum": 1},
-            "visitors": {"$addToSet": "$visitor_id"},
-            "sessions": {"$addToSet": "$session_id"},
-        }},
-        {"$project": {"ts": "$_id", "pages": 1, "visitors": {"$size": "$visitors"}, "sessions": {"$size": "$sessions"}, "_id": 0}},
-        {"$sort": {"ts": 1}},
-    ]
-    res = await db.visitor_events.aggregate(pipeline).to_list(None)
-    return {"timeline": res, "granularity": granularity}
+    sess_ids = await _filtered_session_ids(db, since, country, device)
+
+    async def _bucketed(start: datetime, end: Optional[datetime] = None) -> List[Dict[str, Any]]:
+        match: Dict[str, Any] = {"ts": {"$gte": start}, "type": "page"}
+        if end:
+            match["ts"]["$lt"] = end
+        if sess_ids is not None and (country or device):
+            # Recompute session_ids for the previous-period match below if needed
+            match["session_id"] = {"$in": sess_ids}
+        pipeline = [
+            {"$match": match},
+            {"$group": {
+                "_id": {"$dateToString": {"format": bucket, "date": "$ts"}},
+                "pages": {"$sum": 1},
+                "visitors": {"$addToSet": "$visitor_id"},
+                "sessions": {"$addToSet": "$session_id"},
+            }},
+            {"$project": {"ts": "$_id", "pages": 1, "visitors": {"$size": "$visitors"}, "sessions": {"$size": "$sessions"}, "_id": 0}},
+            {"$sort": {"ts": 1}},
+        ]
+        return await db.visitor_events.aggregate(pipeline).to_list(None)
+
+    res = await _bucketed(since)
+    out: Dict[str, Any] = {"timeline": res, "granularity": granularity}
+    if compare:
+        # Same-length previous period
+        prev_since = since - (datetime.now(timezone.utc) - since)
+        prev_sess_ids = await _filtered_session_ids(db, prev_since, country, device)
+        # rebuild for previous window
+        match: Dict[str, Any] = {"ts": {"$gte": prev_since, "$lt": since}, "type": "page"}
+        if prev_sess_ids is not None and (country or device):
+            match["session_id"] = {"$in": prev_sess_ids}
+        prev_pipeline = [
+            {"$match": match},
+            {"$group": {"_id": {"$dateToString": {"format": bucket, "date": "$ts"}}, "pages": {"$sum": 1}}},
+            {"$project": {"ts": "$_id", "pages": 1, "_id": 0}},
+            {"$sort": {"ts": 1}},
+        ]
+        out["previous"] = await db.visitor_events.aggregate(prev_pipeline).to_list(None)
+    return out
 
 
 @router.get("/admin/analytics/top-pages")
-async def admin_top_pages(request: Request, range: str = "7d", limit: int = 20):
+async def admin_top_pages(request: Request, range: str = "7d", limit: int = 20,
+                           country: Optional[str] = None, device: Optional[str] = None):
     await auth_admin(request)
     db = get_db()
     since = _range_to_dt(range)
+    sess_ids = await _filtered_session_ids(db, since, country, device)
+    match: Dict[str, Any] = {"ts": {"$gte": since}, "type": "page"}
+    if sess_ids is not None:
+        match["session_id"] = {"$in": sess_ids}
     pipeline = [
-        {"$match": {"ts": {"$gte": since}, "type": "page"}},
+        {"$match": match},
         {"$group": {
             "_id": "$path",
             "views": {"$sum": 1},
@@ -560,6 +682,144 @@ async def admin_top_pages(request: Request, range: str = "7d", limit: int = 20):
     ]
     rows = await db.visitor_events.aggregate(pipeline).to_list(None)
     return {"top_pages": rows}
+
+
+@router.get("/admin/analytics/funnel")
+async def admin_funnel(request: Request, range: str = "7d",
+                        country: Optional[str] = None, device: Optional[str] = None):
+    await auth_admin(request)
+    db = get_db()
+    since = _range_to_dt(range)
+    base_q: Dict[str, Any] = {"first_seen": {"$gte": since}, "is_bot": {"$ne": True}}
+    _apply_filters(base_q, country, device)
+    total = await db.visitor_sessions.count_documents(base_q)
+    sess_ids = await _filtered_session_ids(db, since, country, device)
+
+    prop_q: Dict[str, Any] = {"ts": {"$gte": since}, "type": "page", "path": {"$regex": "^/propiedades/"}}
+    chat_q: Dict[str, Any] = {"ts": {"$gte": since}, "type": "event", "event_name": "chatbot_open"}
+    if sess_ids is not None:
+        prop_q["session_id"] = {"$in": sess_ids}
+        chat_q["session_id"] = {"$in": sess_ids}
+    saw_property = await db.visitor_events.distinct("session_id", prop_q)
+    used_chatbot = await db.visitor_events.distinct("session_id", chat_q)
+
+    lead_q = dict(base_q)
+    lead_q["lead_id"] = {"$ne": None}
+    leads = await db.visitor_sessions.count_documents(lead_q)
+    return {
+        "steps": [
+            {"name": "Visit",        "value": total},
+            {"name": "Saw property", "value": len(saw_property)},
+            {"name": "Used chatbot", "value": len(used_chatbot)},
+            {"name": "Became lead",  "value": leads},
+        ]
+    }
+
+
+@router.get("/admin/analytics/heatmap")
+async def admin_heatmap(request: Request, range: str = "30d",
+                         country: Optional[str] = None, device: Optional[str] = None):
+    """Day-of-week × hour-of-day heatmap.
+
+    Returns a 7×24 matrix of pageview counts plus the row/col totals.
+    """
+    await auth_admin(request)
+    db = get_db()
+    range_str = range  # keep param value, avoid shadowing builtin
+    since = _range_to_dt(range_str)
+    sess_ids = await _filtered_session_ids(db, since, country, device)
+    match: Dict[str, Any] = {"ts": {"$gte": since}, "type": "page"}
+    if sess_ids is not None:
+        match["session_id"] = {"$in": sess_ids}
+    pipeline = [
+        {"$match": match},
+        {"$group": {
+            "_id": {
+                "dow":  {"$dayOfWeek": "$ts"},
+                "hour": {"$hour":      "$ts"},
+            },
+            "count": {"$sum": 1},
+        }},
+    ]
+    import builtins
+    rng = builtins.range
+    rows = await db.visitor_events.aggregate(pipeline).to_list(None)
+    matrix = [[0] * 24 for _ in rng(7)]
+    for r in rows:
+        mongo_dow = r["_id"]["dow"]
+        dow = (mongo_dow - 2) % 7
+        hour = r["_id"]["hour"]
+        if 0 <= dow < 7 and 0 <= hour < 24:
+            matrix[dow][hour] = r["count"]
+    row_totals = [sum(row) for row in matrix]
+    col_totals = [sum(matrix[d][h] for d in rng(7)) for h in rng(24)]
+    peak = max((c for row in matrix for c in row), default=0)
+    return {"matrix": matrix, "row_totals": row_totals,
+            "col_totals": col_totals, "peak": peak, "range": range_str,
+            "labels_days": ["Lun", "Mar", "Mié", "Jue", "Vie", "Sáb", "Dom"]}
+
+
+# ── Goals (Phase 2 improvements) ─────────────────────────────────────────────
+
+# Preset goals shipped with the dashboard. Frontend can extend via /goals POST.
+PRESET_GOALS: List[Dict[str, Any]] = [
+    {"id": "chatbot_open",  "name": "Chatbot abierto",    "type": "event",
+     "match": {"event_name": "chatbot_open"},          "target": 50,  "emoji": "💬"},
+    {"id": "view_property", "name": "Ver propiedad",      "type": "page",
+     "match": {"path_regex": "^/propiedades/"},        "target": 200, "emoji": "🏠"},
+    {"id": "waitlist_join", "name": "Inscripción waitlist","type": "page",
+     "match": {"path_regex": "^/interesados"},         "target": 30,  "emoji": "📝"},
+    {"id": "lead_capture",  "name": "Lead capturado",     "type": "lead",
+     "match": {},                                        "target": 10,  "emoji": "🎯"},
+    {"id": "invest_view",   "name": "Visitas /invest",    "type": "page",
+     "match": {"path_regex": "^/invest"},              "target": 25,  "emoji": "💎"},
+]
+
+
+@router.get("/admin/analytics/goals")
+async def admin_goals(request: Request, range: str = "30d",
+                       country: Optional[str] = None, device: Optional[str] = None):
+    """Returns each preset goal with current period count, target and progress %."""
+    await auth_admin(request)
+    db = get_db()
+    since = _range_to_dt(range)
+    sess_ids = await _filtered_session_ids(db, since, country, device)
+
+    out = []
+    for g in PRESET_GOALS:
+        match = g.get("match") or {}
+        value = 0
+        try:
+            if g["type"] == "event":
+                q: Dict[str, Any] = {"ts": {"$gte": since}, "type": "event",
+                                      "event_name": match.get("event_name")}
+                if sess_ids is not None:
+                    q["session_id"] = {"$in": sess_ids}
+                value = len(await db.visitor_events.distinct("session_id", q))
+            elif g["type"] == "page":
+                q = {"ts": {"$gte": since}, "type": "page",
+                     "path": {"$regex": match.get("path_regex", "")}}
+                if sess_ids is not None:
+                    q["session_id"] = {"$in": sess_ids}
+                value = len(await db.visitor_events.distinct("session_id", q))
+            elif g["type"] == "lead":
+                q = {"first_seen": {"$gte": since}, "is_bot": {"$ne": True},
+                     "lead_id": {"$ne": None}}
+                _apply_filters(q, country, device)
+                value = await db.visitor_sessions.count_documents(q)
+        except Exception as e:
+            logger.warning(f"[goals] {g['id']} failed: {e}")
+        target = g.get("target") or 0
+        progress = int(min(100, round((value / target) * 100))) if target > 0 else 0
+        out.append({
+            "id": g["id"], "name": g["name"], "emoji": g.get("emoji"),
+            "type": g["type"], "value": value, "target": target,
+            "progress": progress,
+        })
+    return {"goals": out, "range": range, "since": _iso(since)}
+
+
+
 
 
 @router.get("/admin/analytics/sources")
@@ -639,71 +899,6 @@ async def admin_devices(request: Request, range: str = "7d"):
         "browsers": await _group("browser"),
         "os":       await _group("os"),
     }
-
-
-@router.get("/admin/analytics/funnel")
-async def admin_funnel(request: Request, range: str = "7d"):
-    await auth_admin(request)
-    db = get_db()
-    since = _range_to_dt(range)
-    total = await db.visitor_sessions.count_documents({"first_seen": {"$gte": since}, "is_bot": {"$ne": True}})
-    saw_property = await db.visitor_events.distinct(
-        "session_id", {"ts": {"$gte": since}, "type": "page", "path": {"$regex": "^/propiedades/"}}
-    )
-    used_chatbot = await db.visitor_events.distinct(
-        "session_id", {"ts": {"$gte": since}, "type": "event", "event_name": "chatbot_open"}
-    )
-    leads = await db.visitor_sessions.count_documents({"first_seen": {"$gte": since},
-                                                        "is_bot": {"$ne": True},
-                                                        "lead_id": {"$ne": None}})
-    return {
-        "steps": [
-            {"name": "Visit",        "value": total},
-            {"name": "Saw property", "value": len(saw_property)},
-            {"name": "Used chatbot", "value": len(used_chatbot)},
-            {"name": "Became lead",  "value": leads},
-        ]
-    }
-
-
-@router.get("/admin/analytics/heatmap")
-async def admin_heatmap(request: Request, range: str = "30d"):
-    """Day-of-week × hour-of-day heatmap.
-
-    Returns a 7×24 matrix of pageview counts plus the row/col totals.
-    """
-    await auth_admin(request)
-    db = get_db()
-    range_str = range  # keep param value, avoid shadowing builtin
-    since = _range_to_dt(range_str)
-    pipeline = [
-        {"$match": {"ts": {"$gte": since}, "type": "page"}},
-        {"$group": {
-            "_id": {
-                "dow":  {"$dayOfWeek": "$ts"},   # 1 (Sun) – 7 (Sat)
-                "hour": {"$hour":      "$ts"},
-            },
-            "count": {"$sum": 1},
-        }},
-    ]
-    import builtins
-    rng = builtins.range  # explicit reference (defensive)
-    rows = await db.visitor_events.aggregate(pipeline).to_list(None)
-    # Mongo $dayOfWeek: 1=Sun,2=Mon,...,7=Sat. We want Mon=0..Sun=6
-    matrix = [[0] * 24 for _ in rng(7)]
-    for r in rows:
-        mongo_dow = r["_id"]["dow"]
-        # convert 1..7 (Sun..Sat) -> 0..6 (Mon..Sun)
-        dow = (mongo_dow - 2) % 7
-        hour = r["_id"]["hour"]
-        if 0 <= dow < 7 and 0 <= hour < 24:
-            matrix[dow][hour] = r["count"]
-    row_totals = [sum(row) for row in matrix]
-    col_totals = [sum(matrix[d][h] for d in rng(7)) for h in rng(24)]
-    peak = max((c for row in matrix for c in row), default=0)
-    return {"matrix": matrix, "row_totals": row_totals,
-            "col_totals": col_totals, "peak": peak, "range": range_str,
-            "labels_days": ["Lun", "Mar", "Mié", "Jue", "Vie", "Sáb", "Dom"]}
 
 
 @router.get("/admin/analytics/sessions/export.csv")
