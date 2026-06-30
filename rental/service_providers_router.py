@@ -614,11 +614,52 @@ async def admin_match_for_maintenance(request: Request, request_id: str):
     category = mreq.get('category') or mreq.get('title') or 'general'
     matching_services = _maintenance_to_services(category)
 
+    # Look up property zip if available (for ZIP-based prioritization)
+    prop_zip = None
+    try:
+        addr = mreq.get('property_address') or ''
+        m = re.search(r'\b(\d{5})(?:-\d{4})?\b', str(addr))
+        if m:
+            prop_zip = m.group(1)
+        # Also try via properties collection if property_id is set
+        if not prop_zip and mreq.get('property_id'):
+            try:
+                from bson import ObjectId as _OID
+                pid = mreq['property_id']
+                pdoc = None
+                try:
+                    pdoc = await db.properties.find_one({"_id": _OID(pid)})
+                except Exception:
+                    pass
+                if not pdoc:
+                    pdoc = await db.properties.find_one({"_id": pid})
+                if pdoc:
+                    prop_zip = pdoc.get('zip') or pdoc.get('zip_code') or pdoc.get('postal_code')
+            except Exception:
+                pass
+    except Exception:
+        prop_zip = None
+
     # Find active providers offering any of the matching services
     q = {"status": "active", "services": {"$in": matching_services}}
     providers = []
-    async for p in db.service_providers.find(q).sort([("is_featured", -1), ("rating", -1)]).limit(50):
-        providers.append(serialize(p))
+    async for p in db.service_providers.find(q).sort([("is_featured", -1), ("rating", -1)]).limit(80):
+        provider_obj = serialize(p)
+        # ZIP-based score: 1 if provider lists this zip OR has no area filter (serves everywhere); 0 if has areas but doesn't include it
+        areas = p.get('service_areas') or []
+        if prop_zip and areas:
+            provider_obj['matches_zip'] = str(prop_zip) in [str(z) for z in areas]
+        elif not areas:
+            provider_obj['matches_zip'] = None  # serves all areas
+        else:
+            provider_obj['matches_zip'] = None
+        providers.append(provider_obj)
+
+    # Sort: zip-match first (True > None > False), then keep featured/rating order
+    def _zip_key(p):
+        m = p.get('matches_zip')
+        return 0 if m is True else (1 if m is None else 2)
+    providers.sort(key=_zip_key)
 
     return {
         "success": True,
@@ -629,6 +670,7 @@ async def admin_match_for_maintenance(request: Request, request_id: str):
             "priority": mreq.get('priority', ''),
             "description": mreq.get('description', ''),
             "property_address": mreq.get('property_address', ''),
+            "property_zip": prop_zip,
             "tenant_name": mreq.get('tenant_name', ''),
             "tenant_phone": mreq.get('tenant_phone', ''),
         },
