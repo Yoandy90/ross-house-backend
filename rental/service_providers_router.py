@@ -549,6 +549,215 @@ async def admin_rate_provider(request: Request, provider_id: str, payload: Ratin
     return {"success": True, "average_rating": round(avg, 2), "total_ratings": len(history)}
 
 
+# Maps maintenance categories from tenant_router → service_provider services
+MAINT_CATEGORY_TO_SERVICE = {
+    'plumbing': ['plumber', 'handyman'],
+    'plomeria': ['plumber', 'handyman'],
+    'electrical': ['electrician', 'handyman'],
+    'electrica': ['electrician', 'handyman'],
+    'electricidad': ['electrician', 'handyman'],
+    'hvac': ['hvac'],
+    'aire_acondicionado': ['hvac'],
+    'aire': ['hvac'],
+    'appliance': ['appliance_repair', 'handyman'],
+    'electrodomesticos': ['appliance_repair', 'handyman'],
+    'general': ['handyman'],
+    'structural': ['mason', 'handyman'],
+    'estructural': ['mason', 'handyman'],
+    'painting': ['painter'],
+    'pintura': ['painter'],
+    'roof': ['roofer'],
+    'techo': ['roofer'],
+    'pest': ['pest_control'],
+    'plagas': ['pest_control'],
+    'lock': ['locksmith'],
+    'cerradura': ['locksmith'],
+    'flooring': ['flooring', 'tile'],
+    'piso': ['flooring', 'tile'],
+    'fence': ['fence', 'handyman'],
+    'cerca': ['fence', 'handyman'],
+    'garden': ['gardener'],
+    'jardin': ['gardener'],
+    'cleaning': ['cleaner'],
+    'limpieza': ['cleaner'],
+    'pool': ['pool'],
+    'piscina': ['pool'],
+}
+
+
+def _maintenance_to_services(category: str) -> List[str]:
+    if not category:
+        return ['handyman']
+    key = str(category).strip().lower()
+    return MAINT_CATEGORY_TO_SERVICE.get(key, ['handyman'])
+
+
+@router.get('/admin/service-providers/match-for-maintenance/{request_id}')
+async def admin_match_for_maintenance(request: Request, request_id: str):
+    """Suggest active providers that match a maintenance request's category."""
+    await auth_admin(request)
+    db = get_db()
+    # Look up the maintenance request
+    from bson import ObjectId
+    try:
+        oid = ObjectId(request_id)
+    except Exception:
+        oid = None
+    mreq = None
+    if oid:
+        mreq = await db.maintenance_requests.find_one({"_id": oid})
+    if not mreq:
+        mreq = await db.maintenance_requests.find_one({"_id": request_id})
+    if not mreq:
+        raise HTTPException(404, "Maintenance request not found")
+
+    category = mreq.get('category') or mreq.get('title') or 'general'
+    matching_services = _maintenance_to_services(category)
+
+    # Find active providers offering any of the matching services
+    q = {"status": "active", "services": {"$in": matching_services}}
+    providers = []
+    async for p in db.service_providers.find(q).sort([("is_featured", -1), ("rating", -1)]).limit(50):
+        providers.append(serialize(p))
+
+    return {
+        "success": True,
+        "maintenance_request": {
+            "id": str(mreq.get('_id')),
+            "title": mreq.get('title', ''),
+            "category": category,
+            "priority": mreq.get('priority', ''),
+            "description": mreq.get('description', ''),
+            "property_address": mreq.get('property_address', ''),
+            "tenant_name": mreq.get('tenant_name', ''),
+            "tenant_phone": mreq.get('tenant_phone', ''),
+        },
+        "matching_services": matching_services,
+        "matched_providers": providers,
+        "count": len(providers),
+    }
+
+
+@router.post('/admin/service-providers/dispatch-maintenance')
+async def admin_dispatch_maintenance(request: Request):
+    """Dispatch a maintenance request to a provider with auto-composed message."""
+    await auth_admin(request)
+    data = await request.json()
+    provider_id = data.get('provider_id')
+    request_id = data.get('request_id')
+    extra_note = data.get('extra_note', '')
+    via_email = data.get('via_email', True)
+    via_sms = data.get('via_sms', True)
+
+    if not (provider_id and request_id):
+        raise HTTPException(400, "provider_id and request_id required")
+
+    db = get_db()
+    p = await db.service_providers.find_one({"_id": provider_id})
+    if not p:
+        raise HTTPException(404, "Provider not found")
+
+    # Look up maintenance request (try ObjectId then string)
+    from bson import ObjectId
+    mreq = None
+    try:
+        mreq = await db.maintenance_requests.find_one({"_id": ObjectId(request_id)})
+    except Exception:
+        pass
+    if not mreq:
+        mreq = await db.maintenance_requests.find_one({"_id": request_id})
+    if not mreq:
+        raise HTTPException(404, "Maintenance request not found")
+
+    settings = await _get_settings(db)
+    lang = p.get('language_pref', 'es')
+
+    addr = mreq.get('property_address') or '—'
+    title = mreq.get('title') or 'Mantenimiento'
+    description = mreq.get('description') or ''
+    priority = mreq.get('priority') or 'medium'
+    tenant = mreq.get('tenant_name') or ''
+    phone = mreq.get('tenant_phone') or ''
+
+    if lang == 'es':
+        subject = f"🛠️ Trabajo: {title} — {addr}"
+        body = f"""Hola {p.get('name')},
+
+Tenemos un trabajo de mantenimiento que coincide con tus servicios:
+
+📋 Detalle: {title}
+🏠 Dirección: {addr}
+⚡ Prioridad: {priority}
+👤 Inquilino: {tenant}
+📞 Contacto: {phone}
+
+Descripción:
+{description}
+
+{extra_note}
+
+Por favor responde a este correo o llámanos al (806) 934-2018 si puedes tomar el trabajo.
+
+— Ross House Rentals"""
+        sms_body = f"Ross House: Trabajo disponible en {addr} — {title} ({priority}). Inquilino: {tenant} {phone}. Responde si puedes tomarlo. (806) 934-2018"
+    else:
+        subject = f"🛠️ Job: {title} — {addr}"
+        body = f"""Hi {p.get('name')},
+
+We have a maintenance job matching your services:
+
+📋 Job: {title}
+🏠 Address: {addr}
+⚡ Priority: {priority}
+👤 Tenant: {tenant}
+📞 Contact: {phone}
+
+Description:
+{description}
+
+{extra_note}
+
+Please reply to this email or call (806) 934-2018 if you can take the job.
+
+— Ross House Rentals"""
+        sms_body = f"Ross House: Job available at {addr} — {title} ({priority}). Tenant: {tenant} {phone}. Reply if you can take it. (806) 934-2018"
+
+    email_sent = sms_sent = False
+    if via_email and settings.get('email_enabled'):
+        email_sent = await _send_email(p['email'], subject, body)
+    if via_sms and settings.get('sms_enabled'):
+        sms_sent = await _send_sms(p['phone'], sms_body)
+
+    # Log on provider record
+    entry = {
+        "type": "maintenance_dispatch",
+        "sent_at": datetime.utcnow(),
+        "subject": subject,
+        "message": body,
+        "job_id": str(mreq.get('_id')),
+        "email": email_sent,
+        "sms": sms_sent,
+    }
+    await db.service_providers.update_one(
+        {"_id": provider_id},
+        {"$push": {"dispatch_history": entry}, "$inc": {"total_jobs": 1}, "$set": {"updated_at": datetime.utcnow()}}
+    )
+
+    # Tag the maintenance ticket with assigned provider
+    await db.maintenance_requests.update_one(
+        {"_id": mreq['_id']},
+        {"$set": {
+            "assigned_provider_id": provider_id,
+            "assigned_provider_name": p.get('name'),
+            "assigned_provider_phone": p.get('phone'),
+            "assigned_at": datetime.utcnow(),
+            "updated_at": datetime.utcnow(),
+        }}
+    )
+
+    return {"success": True, "email_sent": email_sent, "sms_sent": sms_sent, "provider": serialize(p)}
+
+
 # ============================================================
 # Settings
 # ============================================================
