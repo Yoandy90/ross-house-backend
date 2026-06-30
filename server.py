@@ -195,6 +195,7 @@ try:
     from rental.syndication_router import router as syndication_router
     from rental.tenant_leads_router import router as tenant_leads_router
     from rental.service_providers_router import router as service_providers_router
+    from rental.ai_brain_router import router as ai_brain_router
 
     app.include_router(auth_router, prefix="/api")
     app.include_router(properties_router, prefix="/api")
@@ -226,6 +227,7 @@ try:
     app.include_router(syndication_router, prefix="/api")
     app.include_router(tenant_leads_router, prefix="/api")
     app.include_router(service_providers_router, prefix="/api")
+    app.include_router(ai_brain_router, prefix="/api")
 
     logger.info("  ✅ Credit Builder Router")
     logger.info("  ✅ Consent Forms Router")
