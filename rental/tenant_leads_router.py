@@ -161,8 +161,16 @@ def _format_template(tpl: str, lead: Dict[str, Any]) -> str:
     )
 
 
-async def _send_email(to_email: str, subject: str, body: str) -> bool:
-    """Send transactional email via SendGrid."""
+async def _send_email(to_email: str, subject: str, body: str, html: Optional[str] = None) -> bool:
+    """Send transactional email via SendGrid.
+
+    Args:
+        to_email: recipient
+        subject: email subject
+        body: plain-text body (used as fallback + when html is None)
+        html: optional pre-rendered HTML content. If provided, used as-is.
+              If None, plain body is wrapped in a basic HTML div.
+    """
     try:
         api_key = os.environ.get('SENDGRID_API_KEY')
         from_email = os.environ.get('SENDGRID_FROM_EMAIL', 'info@rosshouserentals.com')
@@ -171,14 +179,16 @@ async def _send_email(to_email: str, subject: str, body: str) -> bool:
             return False
         from sendgrid import SendGridAPIClient
         from sendgrid.helpers.mail import Mail
-        # Wrap plain-text in basic HTML
-        html_body = body.replace('\n', '<br>')
+        if html is None:
+            # Fallback: wrap plain-text in basic HTML
+            html_body = body.replace('\n', '<br>')
+            html = f"<div style='font-family:Helvetica,Arial,sans-serif;line-height:1.6;color:#1a1a1a;'>{html_body}</div>"
         msg = Mail(
-            from_email=from_email,
+            from_email=(from_email, 'Ross House Rentals'),
             to_emails=to_email,
             subject=subject,
             plain_text_content=body,
-            html_content=f"<div style='font-family:Helvetica,Arial,sans-serif;line-height:1.6;color:#1a1a1a;'>{html_body}</div>",
+            html_content=html,
         )
         sg = SendGridAPIClient(api_key)
         resp = sg.send(msg)
@@ -186,6 +196,119 @@ async def _send_email(to_email: str, subject: str, body: str) -> bool:
     except Exception as e:
         logger.exception(f"[tenant_leads] email send failed: {e}")
         return False
+
+
+# ============================================================
+# Branded email HTML template (Ross House Rentals — navy + amber)
+# Matches _provider_email_templates.py style with Gmail dark-mode hardening
+# ============================================================
+def _render_branded_email(
+    title: str,
+    eyebrow: str,
+    content_html: str,
+    *,
+    cta_label: Optional[str] = None,
+    cta_url: Optional[str] = None,
+    accent_color: str = "#fbbf24",
+) -> str:
+    """Wraps content in the official Ross House Rentals branded shell.
+
+    title: large heading inside the card
+    eyebrow: small amber label above title (e.g. 'Lista de espera · Bienvenido')
+    content_html: pre-rendered HTML for the body
+    cta_label/cta_url: optional CTA button
+    """
+    site = "https://www.rosshouserentals.com"
+    phone = "(806) 934-2018"
+    address = "Dumas, TX"
+    name = "Ross House Rentals"
+
+    cta_block = ""
+    if cta_label and cta_url:
+        cta_block = f"""
+        <div style="text-align:center;margin:24px 0 8px 0;">
+          <a href="{cta_url}" style="display:inline-block;background:#f59e0b;color:#ffffff;text-decoration:none;font-weight:700;padding:14px 28px;border-radius:10px;font-size:15px;box-shadow:0 4px 12px rgba(245,158,11,0.3);">
+            {cta_label} &rarr;
+          </a>
+        </div>
+        """
+
+    return f"""<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<meta name="color-scheme" content="light only">
+<meta name="supported-color-schemes" content="light only">
+<title>{title}</title>
+<style>
+  :root {{ color-scheme: light only; supported-color-schemes: light only; }}
+  u + .body .gmail-dark-bg {{ background-color: #0d1a2e !important; }}
+  u + .body .gmail-dark-text {{ color: #ffffff !important; }}
+  u + .body .gmail-amber {{ color: {accent_color} !important; }}
+  [data-ogsc] .gmail-dark-bg {{ background-color: #0d1a2e !important; }}
+  [data-ogsc] .gmail-dark-text {{ color: #ffffff !important; }}
+  [data-ogsc] .gmail-amber {{ color: {accent_color} !important; }}
+  [data-ogsb] .gmail-dark-bg {{ background-color: #0d1a2e !important; }}
+  @media only screen and (max-width: 520px) {{
+    .rh-header-cell {{ padding: 22px 20px !important; }}
+    .rh-header-table, .rh-header-table tbody, .rh-header-table tr, .rh-header-table td {{ display: block !important; width: 100% !important; }}
+    .rh-header-brand-cell {{ padding-bottom: 14px !important; text-align: left !important; }}
+    .rh-header-phone-cell {{ text-align: left !important; padding-top: 4px !important; }}
+    .rh-content-cell {{ padding: 24px 20px 12px 20px !important; }}
+    .rh-footer-cell {{ padding: 22px 20px !important; }}
+  }}
+</style>
+</head>
+<body class="body" style="margin:0;padding:0;background:#f1f5f9;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:#0f172a;">
+<span style="display:none!important;opacity:0;color:transparent;height:0;width:0;overflow:hidden;">{title}</span>
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" bgcolor="#f1f5f9" style="background:#f1f5f9;padding:24px 12px;">
+  <tr><td align="center">
+    <table role="presentation" width="640" cellpadding="0" cellspacing="0" border="0" bgcolor="#ffffff" style="max-width:640px;width:100%;background:#ffffff;border-radius:16px;overflow:hidden;box-shadow:0 4px 24px rgba(15,23,42,0.08);">
+
+      <!-- Header -->
+      <tr><td bgcolor="#0d1a2e" class="gmail-dark-bg rh-header-cell" style="background-color:#0d1a2e;padding:28px 32px;">
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" class="rh-header-table">
+          <tr>
+            <td class="rh-header-brand-cell" style="vertical-align:middle;">
+              <div style="display:inline-block;background-color:#3b2a06;border:1px solid #b45309;padding:5px 12px;border-radius:999px;">
+                <font color="{accent_color}" face="Helvetica,Arial,sans-serif"><span class="gmail-amber" style="font-size:11px;font-weight:700;color:{accent_color};letter-spacing:0.5px;text-transform:uppercase;">{eyebrow}</span></font>
+              </div>
+              <div style="margin-top:10px;line-height:1.2;">
+                <font color="#ffffff" face="Helvetica,Arial,sans-serif"><span class="gmail-dark-text" style="font-size:22px;font-weight:800;color:#ffffff;">🏠 {name}</span></font>
+              </div>
+            </td>
+            <td align="right" class="rh-header-phone-cell" style="vertical-align:middle;white-space:nowrap;">
+              <a href="tel:+18069342018" style="text-decoration:none;background-color:#1e3050;padding:8px 12px;border-radius:999px;border:1px solid #334e74;display:inline-block;white-space:nowrap;">
+                <font color="#ffffff" face="Helvetica,Arial,sans-serif"><span class="gmail-dark-text" style="color:#ffffff;font-size:13px;font-weight:600;white-space:nowrap;">📞 {phone}</span></font>
+              </a>
+            </td>
+          </tr>
+        </table>
+      </td></tr>
+
+      <!-- Content -->
+      <tr><td bgcolor="#ffffff" class="rh-content-cell" style="padding:32px 32px 20px 32px;background-color:#ffffff;">
+        <div style="font-size:13px;font-weight:700;color:#d97706;text-transform:uppercase;letter-spacing:1px;">{eyebrow}</div>
+        <h1 style="font-size:24px;font-weight:800;color:#0f172a;margin:8px 0 16px 0;line-height:1.25;">{title}</h1>
+        <div style="font-size:15px;color:#334155;line-height:1.65;">
+          {content_html}
+        </div>
+        {cta_block}
+      </td></tr>
+
+      <!-- Footer -->
+      <tr><td bgcolor="#f8fafc" class="rh-footer-cell" style="background-color:#f8fafc;padding:24px 32px;border-top:1px solid #e2e8f0;">
+        <div style="font-size:12px;color:#64748b;line-height:1.6;text-align:center;">
+          <strong style="color:#0f172a;">{name}</strong> · {address} · <a href="tel:+18069342018" style="color:#d97706;text-decoration:none;">{phone}</a><br>
+          <a href="{site}" style="color:#d97706;text-decoration:none;">{site}</a>
+        </div>
+      </td></tr>
+    </table>
+  </td></tr>
+</table>
+</body>
+</html>"""
 
 
 async def _send_sms(to_phone: str, body: str) -> bool:
@@ -213,7 +336,52 @@ async def _send_welcome(lead: Dict[str, Any], settings: Dict[str, Any]):
     if settings.get('email_enabled'):
         subj = settings.get(f'welcome_email_subject_{lang}') or DEFAULT_SETTINGS[f'welcome_email_subject_{lang}']
         body = settings.get(f'welcome_email_body_{lang}') or DEFAULT_SETTINGS[f'welcome_email_body_{lang}']
-        await _send_email(lead['email'], _format_template(subj, lead), _format_template(body, lead))
+        subject_rendered = _format_template(subj, lead)
+        body_rendered = _format_template(body, lead)
+
+        # Build rich branded HTML
+        eyebrow = "Lista de Espera · ¡Bienvenido!" if lang == 'es' else "Waitlist · Welcome!"
+        title = "¡Estás en la lista!" if lang == 'es' else "You're on the list!"
+        intro = (
+            f"Hola <strong>{lead.get('name', '')}</strong>," if lang == 'es'
+            else f"Hi <strong>{lead.get('name', '')}</strong>,"
+        )
+        message_html = body_rendered.replace('\n\n', '</p><p style="margin:12px 0;">').replace('\n', '<br>')
+
+        # Lead preferences summary card
+        budget = f"${lead.get('max_budget', 0):,.0f}"
+        prefs_label = "Tus preferencias" if lang == 'es' else "Your preferences"
+        beds_label = "habitaciones" if lang == 'es' else "bedrooms"
+        budget_label = "presupuesto" if lang == 'es' else "budget"
+        move_label = "fecha de mudanza" if lang == 'es' else "move-in date"
+        move_value = lead.get('move_in_date') or ('Flexible' if lang == 'es' else 'Flexible')
+
+        prefs_card = f"""
+        <div style="margin:18px 0;padding:16px 18px;background:#f8fafc;border-left:4px solid #f59e0b;border-radius:10px;">
+          <div style="font-size:12px;font-weight:700;color:#78350f;text-transform:uppercase;letter-spacing:1px;margin-bottom:8px;">{prefs_label}</div>
+          <table cellpadding="0" cellspacing="0" border="0" style="font-size:14px;color:#334155;">
+            <tr><td style="padding:3px 0;color:#64748b;width:140px;">🛏️ {beds_label.capitalize()}:</td><td style="padding:3px 0;font-weight:600;color:#0f172a;">{lead.get('bedrooms_wanted', '?')}+</td></tr>
+            <tr><td style="padding:3px 0;color:#64748b;">💰 {budget_label.capitalize()}:</td><td style="padding:3px 0;font-weight:600;color:#0f172a;">{budget}/mo</td></tr>
+            <tr><td style="padding:3px 0;color:#64748b;">📅 {move_label.capitalize()}:</td><td style="padding:3px 0;font-weight:600;color:#0f172a;">{move_value}</td></tr>
+          </table>
+        </div>
+        """
+
+        content_html = f"""
+          <p style="margin:0 0 12px 0;">{intro}</p>
+          <p style="margin:0 0 12px 0;">{message_html}</p>
+          {prefs_card}
+        """
+
+        cta_label = "Ver propiedades disponibles" if lang == 'es' else "View available properties"
+        html = _render_branded_email(
+            title=title,
+            eyebrow=eyebrow,
+            content_html=content_html,
+            cta_label=cta_label,
+            cta_url="https://www.rosshouserentals.com/propiedades",
+        )
+        await _send_email(lead['email'], subject_rendered, body_rendered, html=html)
     if settings.get('sms_enabled'):
         sms_tpl = settings.get(f'welcome_sms_{lang}') or DEFAULT_SETTINGS[f'welcome_sms_{lang}']
         await _send_sms(lead['phone'], _format_template(sms_tpl, lead))
@@ -224,6 +392,8 @@ async def _notify_admin_new_lead(lead: Dict[str, Any], settings: Dict[str, Any])
     if not admin_email:
         return
     subj = f"🆕 Nuevo lead: {lead['name']} ({lead['bedrooms_wanted']} hab. / ${lead['max_budget']:,.0f})"
+
+    # Plain text version (fallback for clients that block HTML)
     body = f"""Nuevo prospecto en la lista de espera de Ross House Rentals:
 
 Nombre: {lead['name']}
@@ -242,10 +412,65 @@ Idioma: {lead.get('language_pref', 'es').upper()}
 Notas del prospecto:
 {lead.get('notes') or '-'}
 
-Ver/gestionar en el admin panel:
-https://www.rosshouserentals.com/admin/interesados
+Ver/gestionar: https://www.rosshouserentals.com/admin/interesados
 """
-    await _send_email(admin_email, subj, body)
+
+    # Build the rich HTML version
+    pets_label = ('Sí — ' + (lead.get('pet_details') or '(sin detalles)')) if lead.get('has_pets') else 'No'
+    notes_text = lead.get('notes') or '—'
+
+    def _row(emoji: str, label: str, value: str, highlight: bool = False) -> str:
+        v_style = "color:#0f172a;font-weight:700;" if highlight else "color:#0f172a;font-weight:600;"
+        return f"""
+        <tr>
+          <td style="padding:6px 10px 6px 0;color:#64748b;font-size:13px;white-space:nowrap;width:160px;">{emoji} {label}</td>
+          <td style="padding:6px 0;font-size:14px;{v_style}">{value}</td>
+        </tr>
+        """
+
+    info_table = "".join([
+        _row("👤", "Nombre:", lead['name'], highlight=True),
+        _row("📧", "Email:", f'<a href="mailto:{lead["email"]}" style="color:#1e40af;text-decoration:none;">{lead["email"]}</a>'),
+        _row("📞", "Teléfono:", f'<a href="tel:{lead["phone"]}" style="color:#1e40af;text-decoration:none;">{lead["phone"]}</a>'),
+        _row("🛏️", "Habitaciones:", f"{lead['bedrooms_wanted']}+ habitaciones"),
+        _row("💰", "Presupuesto:", f"${lead['max_budget']:,.0f}/mes", highlight=True),
+        _row("📅", "Mudanza:", lead.get('move_in_date') or 'Flexible'),
+        _row("👨‍👩‍👧", "Hogar:", f"{lead.get('household_size', 1)} personas"),
+        _row("🐾", "Mascotas:", pets_label),
+        _row("💼", "Empleo:", lead.get('employment_status') or '—'),
+        _row("💵", "Ingreso:", f"${lead.get('monthly_income', 0):,.0f}/mes" if lead.get('monthly_income') else '—'),
+        _row("🏠", "Situación:", lead.get('current_situation') or '—'),
+        _row("🌐", "Idioma:", lead.get('language_pref', 'es').upper()),
+    ])
+
+    notes_block = f"""
+    <div style="margin-top:18px;padding:14px 16px;background:#fffbeb;border-left:4px solid #f59e0b;border-radius:8px;font-size:13px;color:#78350f;line-height:1.6;">
+      <strong>📝 Notas del prospecto:</strong><br>
+      {notes_text.replace(chr(10), '<br>') if notes_text != '—' else '<em>Sin notas adicionales</em>'}
+    </div>
+    """ if notes_text != '—' else ""
+
+    content_html = f"""
+      <p style="margin:0 0 14px 0;color:#334155;">
+        Un nuevo prospecto se acaba de registrar en la lista de espera. Revisa los detalles abajo y contáctalo lo antes posible para maximizar la conversión.
+      </p>
+      <div style="background:#ffffff;border:1px solid #e2e8f0;border-radius:12px;padding:14px 18px;margin-top:8px;">
+        <table cellpadding="0" cellspacing="0" border="0" style="width:100%;">
+          {info_table}
+        </table>
+      </div>
+      {notes_block}
+    """
+
+    html = _render_branded_email(
+        title=f"Nuevo prospecto: {lead['name']}",
+        eyebrow="🆕 Lead · Lista de espera",
+        content_html=content_html,
+        cta_label="Ver y gestionar en el admin panel",
+        cta_url="https://www.rosshouserentals.com/admin/interesados",
+    )
+
+    await _send_email(admin_email, subj, body, html=html)
 
 
 def _match_lead_to_property(lead: Dict[str, Any], prop: Dict[str, Any]) -> bool:
