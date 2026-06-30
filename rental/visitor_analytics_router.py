@@ -666,6 +666,102 @@ async def admin_funnel(request: Request, range: str = "7d"):
     }
 
 
+@router.get("/admin/analytics/heatmap")
+async def admin_heatmap(request: Request, range: str = "30d"):
+    """Day-of-week × hour-of-day heatmap.
+
+    Returns a 7×24 matrix of pageview counts plus the row/col totals.
+    """
+    await auth_admin(request)
+    db = get_db()
+    range_str = range  # keep param value, avoid shadowing builtin
+    since = _range_to_dt(range_str)
+    pipeline = [
+        {"$match": {"ts": {"$gte": since}, "type": "page"}},
+        {"$group": {
+            "_id": {
+                "dow":  {"$dayOfWeek": "$ts"},   # 1 (Sun) – 7 (Sat)
+                "hour": {"$hour":      "$ts"},
+            },
+            "count": {"$sum": 1},
+        }},
+    ]
+    import builtins
+    rng = builtins.range  # explicit reference (defensive)
+    rows = await db.visitor_events.aggregate(pipeline).to_list(None)
+    # Mongo $dayOfWeek: 1=Sun,2=Mon,...,7=Sat. We want Mon=0..Sun=6
+    matrix = [[0] * 24 for _ in rng(7)]
+    for r in rows:
+        mongo_dow = r["_id"]["dow"]
+        # convert 1..7 (Sun..Sat) -> 0..6 (Mon..Sun)
+        dow = (mongo_dow - 2) % 7
+        hour = r["_id"]["hour"]
+        if 0 <= dow < 7 and 0 <= hour < 24:
+            matrix[dow][hour] = r["count"]
+    row_totals = [sum(row) for row in matrix]
+    col_totals = [sum(matrix[d][h] for d in rng(7)) for h in rng(24)]
+    peak = max((c for row in matrix for c in row), default=0)
+    return {"matrix": matrix, "row_totals": row_totals,
+            "col_totals": col_totals, "peak": peak, "range": range_str,
+            "labels_days": ["Lun", "Mar", "Mié", "Jue", "Vie", "Sáb", "Dom"]}
+
+
+@router.get("/admin/analytics/sessions/export.csv")
+async def admin_sessions_export(
+    request: Request, range: str = "30d",
+    country: Optional[str] = None, device: Optional[str] = None,
+    has_lead: Optional[bool] = None,
+):
+    await auth_admin(request)
+    db = get_db()
+    from fastapi.responses import StreamingResponse
+    import csv
+    from io import StringIO
+    since = _range_to_dt(range)
+    q: Dict[str, Any] = {"first_seen": {"$gte": since}, "is_bot": {"$ne": True}}
+    if country:
+        q["country_code"] = country.upper()
+    if device:
+        q["device"] = device
+    if has_lead is True:
+        q["lead_id"] = {"$ne": None}
+    elif has_lead is False:
+        q["lead_id"] = None
+
+    async def _gen():
+        buf = StringIO()
+        writer = csv.writer(buf)
+        writer.writerow([
+            "session_id", "first_seen", "last_seen", "country", "city",
+            "device", "browser", "os", "pages", "events",
+            "referrer", "landing_path", "lead_id",
+        ])
+        yield buf.getvalue()
+        buf.seek(0)
+        buf.truncate(0)
+        cursor = db.visitor_sessions.find(q).sort("first_seen", -1).limit(5000)
+        async for s in cursor:
+            writer.writerow([
+                s.get("_id"),
+                _iso(s.get("first_seen")) if isinstance(s.get("first_seen"), datetime) else s.get("first_seen"),
+                _iso(s.get("last_seen")) if isinstance(s.get("last_seen"), datetime) else s.get("last_seen"),
+                s.get("country") or "", s.get("city") or "",
+                s.get("device") or "", s.get("browser") or "", s.get("os") or "",
+                s.get("pages_count", 0), s.get("events_count", 0),
+                s.get("referrer_host") or "", s.get("landing_path") or "",
+                s.get("lead_id") or "",
+            ])
+            yield buf.getvalue()
+            buf.seek(0)
+            buf.truncate(0)
+
+    return StreamingResponse(
+        _gen(),
+        media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename=visitor_sessions_{range}.csv"},
+    )
+
+
 @router.get("/admin/analytics/sessions")
 async def admin_sessions_list(
     request: Request, range: str = "7d", limit: int = 50, skip: int = 0,
