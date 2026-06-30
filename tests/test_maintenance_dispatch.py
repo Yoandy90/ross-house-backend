@@ -448,3 +448,158 @@ class TestEndToEndJourney:
                 admin_client.delete(f"{BASE_URL}/api/admin/tenant-leads/{lead_id}", timeout=30)
             except Exception:
                 pass
+
+
+
+# ----------------------------------------------------------------------
+# NEW: ZIP-based prioritization for match-for-maintenance
+# ----------------------------------------------------------------------
+def _register_provider(public_client, admin_client, services, service_areas, label):
+    """Create + activate a provider with the given service_areas (list of ZIPs).
+    Returns (provider_id, email). service_areas patched directly via Mongo since
+    the public registration endpoint may not accept that field.
+    """
+    ts = int(time.time() * 1000)
+    email = f"e2e.zip.{label}.{ts}@example.com"
+    r = public_client.post(
+        f"{BASE_URL}/api/public/service-providers",
+        json={
+            "name": f"E2E ZIP {label}",
+            "email": email,
+            "phone": "8065550100",
+            "services": services,
+            "language_pref": "en",
+        },
+        timeout=30,
+    )
+    assert r.status_code == 200, r.text
+    pid = r.json()["id"]
+
+    # Activate
+    r2 = admin_client.patch(
+        f"{BASE_URL}/api/admin/service-providers/{pid}",
+        json={"status": "active"},
+        timeout=30,
+    )
+    assert r2.status_code == 200, r2.text
+    return pid, email
+
+
+@pytest.fixture(scope="class")
+def zip_providers(public_client, admin_client, mongo_db):
+    """Three plumber providers:
+      A: service_areas=['79029']  (matches_zip=True for 79029)
+      B: service_areas=['79045']  (matches_zip=False for 79029)
+      C: service_areas=[]         (matches_zip=None — serves everywhere)
+    """
+    pid_a, _ = _register_provider(public_client, admin_client, ["plumber"], ["79029"], "A")
+    pid_b, _ = _register_provider(public_client, admin_client, ["plumber"], ["79045"], "B")
+    pid_c, _ = _register_provider(public_client, admin_client, ["plumber"], [], "C")
+
+    # Patch service_areas directly in Mongo to guarantee the values
+    mongo_db.service_providers.update_one({"_id": pid_a}, {"$set": {"service_areas": ["79029"]}})
+    mongo_db.service_providers.update_one({"_id": pid_b}, {"$set": {"service_areas": ["79045"]}})
+    mongo_db.service_providers.update_one({"_id": pid_c}, {"$set": {"service_areas": []}})
+
+    yield {"A": pid_a, "B": pid_b, "C": pid_c}
+
+    for pid in (pid_a, pid_b, pid_c):
+        try:
+            admin_client.delete(f"{BASE_URL}/api/admin/service-providers/{pid}", timeout=30)
+        except Exception:
+            pass
+
+
+class TestZipBasedPrioritization:
+    def test_zip_match_orders_a_before_c_before_b(self, admin_client, mongo_db, zip_providers):
+        """Test 1: A(79029) > C(no-area) > B(79045) when property is in 79029."""
+        rid = _seed_maintenance(
+            mongo_db,
+            category="plumbing",
+            property_address="123 Main St, Dumas, TX 79029",
+        )
+        try:
+            r = admin_client.get(
+                f"{BASE_URL}/api/admin/service-providers/match-for-maintenance/{rid}",
+                timeout=30,
+            )
+            assert r.status_code == 200, r.text
+            body = r.json()
+            mreq = body.get("maintenance_request") or {}
+            assert mreq.get("property_zip") == "79029", \
+                f"expected property_zip='79029', got {mreq.get('property_zip')}"
+
+            providers = body.get("matched_providers") or []
+            # Pull only the three providers under test (other test data may exist)
+            ids_in_order = [p.get("_id") or p.get("id") for p in providers]
+            idx = {pid: i for i, pid in enumerate(ids_in_order)}
+            a_idx = idx.get(zip_providers["A"])
+            b_idx = idx.get(zip_providers["B"])
+            c_idx = idx.get(zip_providers["C"])
+            assert a_idx is not None, f"Provider A missing from results: {ids_in_order}"
+            assert b_idx is not None, f"Provider B missing from results: {ids_in_order}"
+            assert c_idx is not None, f"Provider C missing from results: {ids_in_order}"
+            assert a_idx < c_idx < b_idx, (
+                f"Expected A < C < B, got positions A={a_idx}, C={c_idx}, B={b_idx}; "
+                f"ids_in_order={ids_in_order}"
+            )
+
+            # Also assert matches_zip values
+            by_id = {p.get("_id") or p.get("id"): p for p in providers}
+            assert by_id[zip_providers["A"]].get("matches_zip") is True
+            assert by_id[zip_providers["B"]].get("matches_zip") is False
+            assert by_id[zip_providers["C"]].get("matches_zip") is None
+        finally:
+            mongo_db.maintenance_requests.delete_one({"_id": rid})
+
+    def test_address_without_zip_returns_null_property_zip(self, admin_client, mongo_db, zip_providers):
+        """Test 2: property_address without ZIP → property_zip=null; sort still works."""
+        rid = _seed_maintenance(
+            mongo_db,
+            category="plumbing",
+            property_address="Some Street",
+        )
+        try:
+            r = admin_client.get(
+                f"{BASE_URL}/api/admin/service-providers/match-for-maintenance/{rid}",
+                timeout=30,
+            )
+            assert r.status_code == 200, r.text
+            body = r.json()
+            mreq = body.get("maintenance_request") or {}
+            assert mreq.get("property_zip") in (None, ""), \
+                f"expected property_zip None/empty, got {mreq.get('property_zip')!r}"
+
+            providers = body.get("matched_providers") or []
+            assert len(providers) > 0, "expected providers to still be returned"
+            # When prop_zip is None, branch is `elif not areas: None` else `None` → all None
+            for p in providers:
+                m = p.get("matches_zip")
+                # Allowed to be None (or False if implementation treats empty zip as no-match)
+                assert m in (None, False), \
+                    f"with no property_zip, matches_zip must be None or False, got {m!r} on {p.get('_id')}"
+        finally:
+            mongo_db.maintenance_requests.delete_one({"_id": rid})
+
+    def test_matches_zip_field_present_on_every_provider(self, admin_client, mongo_db, zip_providers):
+        """Test 3: matches_zip field is present on every provider and is in {True, False, None}."""
+        rid = _seed_maintenance(
+            mongo_db,
+            category="plumbing",
+            property_address="999 Anywhere Rd, Dumas TX 79029",
+        )
+        try:
+            r = admin_client.get(
+                f"{BASE_URL}/api/admin/service-providers/match-for-maintenance/{rid}",
+                timeout=30,
+            )
+            assert r.status_code == 200, r.text
+            providers = r.json().get("matched_providers") or []
+            assert len(providers) > 0
+            for p in providers:
+                assert "matches_zip" in p, \
+                    f"matches_zip missing on provider {p.get('_id') or p.get('id')}"
+                assert p["matches_zip"] in (True, False, None), \
+                    f"matches_zip must be True/False/None, got {p['matches_zip']!r}"
+        finally:
+            mongo_db.maintenance_requests.delete_one({"_id": rid})

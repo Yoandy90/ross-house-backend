@@ -133,6 +133,41 @@ class RatingPayload(BaseModel):
     job_id: Optional[str] = None
 
 
+VALID_PAYMENT_METHODS = ['cash', 'check', 'zelle', 'cashapp', 'venmo', 'stripe_ach', 'stripe_card', 'wire', 'paypal', 'other']
+VALID_PAYMENT_STATUSES = ['pending', 'paid', 'cancelled']
+
+
+class PaymentCreate(BaseModel):
+    amount: float = Field(gt=0)
+    method: str
+    reference: Optional[str] = None  # check number, last 4, transaction id, etc.
+    job_id: Optional[str] = None  # link to maintenance request
+    job_description: Optional[str] = None
+    status: str = Field(default='paid')
+    paid_at: Optional[str] = None  # ISO date, defaults to now
+    notes: Optional[str] = None
+    notify_provider: bool = True  # send email/SMS confirmation
+
+    @validator('method')
+    def _method(cls, v):
+        if v not in VALID_PAYMENT_METHODS:
+            raise ValueError(f'Invalid method. Use: {VALID_PAYMENT_METHODS}')
+        return v
+
+    @validator('status')
+    def _status(cls, v):
+        if v not in VALID_PAYMENT_STATUSES:
+            raise ValueError(f'Invalid status. Use: {VALID_PAYMENT_STATUSES}')
+        return v
+
+
+class PaymentUpdate(BaseModel):
+    status: Optional[str] = None
+    amount: Optional[float] = None
+    notes: Optional[str] = None
+    reference: Optional[str] = None
+
+
 # ============================================================
 # Defaults
 # ============================================================
@@ -819,3 +854,249 @@ async def update_provider_settings(request: Request, payload: ProviderSettings):
     update['updated_at'] = datetime.utcnow()
     await db.provider_settings.update_one({"_id": "config"}, {"$set": update}, upsert=True)
     return {"success": True, "settings": await _get_settings(db)}
+
+
+# ============================================================
+# Payments to Providers
+# ============================================================
+
+PAYMENT_METHOD_LABELS_ES = {
+    'cash': '💵 Efectivo', 'check': '📝 Cheque', 'zelle': '🏦 Zelle',
+    'cashapp': '💵 CashApp', 'venmo': '💜 Venmo', 'stripe_ach': '🏦 Stripe ACH',
+    'stripe_card': '💳 Stripe Card', 'wire': '🌐 Transferencia', 'paypal': '🅿️ PayPal', 'other': '📦 Otro',
+}
+PAYMENT_METHOD_LABELS_EN = {
+    'cash': '💵 Cash', 'check': '📝 Check', 'zelle': '🏦 Zelle',
+    'cashapp': '💵 CashApp', 'venmo': '💜 Venmo', 'stripe_ach': '🏦 Stripe ACH',
+    'stripe_card': '💳 Stripe Card', 'wire': '🌐 Wire', 'paypal': '🅿️ PayPal', 'other': '📦 Other',
+}
+
+
+@router.post('/admin/service-providers/{provider_id}/payments')
+async def admin_create_payment(request: Request, provider_id: str, payload: PaymentCreate):
+    """Record a payment to a provider (cash, check, Zelle, CashApp, etc.)."""
+    await auth_admin(request)
+    db = get_db()
+    p = await db.service_providers.find_one({"_id": provider_id})
+    if not p:
+        raise HTTPException(404, "Provider not found")
+
+    paid_at = datetime.utcnow()
+    if payload.paid_at:
+        try:
+            paid_at = datetime.fromisoformat(payload.paid_at.replace('Z', '+00:00'))
+        except Exception:
+            pass
+
+    payment = {
+        "_id": str(uuid.uuid4()),
+        "provider_id": provider_id,
+        "provider_name": p.get('name'),
+        "amount": payload.amount,
+        "method": payload.method,
+        "reference": payload.reference or '',
+        "job_id": payload.job_id,
+        "job_description": payload.job_description or '',
+        "status": payload.status,
+        "paid_at": paid_at,
+        "notes": payload.notes or '',
+        "created_at": datetime.utcnow(),
+        "updated_at": datetime.utcnow(),
+    }
+    await db.provider_payments.insert_one(payment)
+
+    # Update aggregate on provider
+    if payload.status == 'paid':
+        await db.service_providers.update_one(
+            {"_id": provider_id},
+            {"$inc": {"total_paid": payload.amount, "total_payments": 1},
+             "$set": {"last_paid_at": paid_at, "updated_at": datetime.utcnow()}}
+        )
+
+    # Notify provider
+    if payload.notify_provider:
+        settings = await _get_settings(db)
+        lang = p.get('language_pref', 'es')
+        labels = PAYMENT_METHOD_LABELS_ES if lang == 'es' else PAYMENT_METHOD_LABELS_EN
+        method_lbl = labels.get(payload.method, payload.method)
+
+        if lang == 'es':
+            subject = f"💰 Pago recibido — Ross House Rentals ${payload.amount:,.2f}"
+            body = f"""Hola {p.get('name')},
+
+Hemos registrado un pago a tu favor:
+
+💰 Monto: ${payload.amount:,.2f}
+💳 Método: {method_lbl}
+{f'📋 Trabajo: {payload.job_description}' if payload.job_description else ''}
+{f'🔖 Referencia: {payload.reference}' if payload.reference else ''}
+📅 Fecha: {paid_at.strftime('%d/%m/%Y')}
+
+Estado: {'PAGADO ✅' if payload.status == 'paid' else 'PENDIENTE ⏳'}
+
+{payload.notes or ''}
+
+— Ross House Rentals"""
+            sms_body = f"Ross House: Pago de ${payload.amount:,.2f} ({method_lbl}) registrado. {'PAGADO' if payload.status == 'paid' else 'PENDIENTE'}."
+        else:
+            subject = f"💰 Payment recorded — Ross House Rentals ${payload.amount:,.2f}"
+            body = f"""Hi {p.get('name')},
+
+We recorded a payment to you:
+
+💰 Amount: ${payload.amount:,.2f}
+💳 Method: {method_lbl}
+{f'📋 Job: {payload.job_description}' if payload.job_description else ''}
+{f'🔖 Reference: {payload.reference}' if payload.reference else ''}
+📅 Date: {paid_at.strftime('%m/%d/%Y')}
+
+Status: {'PAID ✅' if payload.status == 'paid' else 'PENDING ⏳'}
+
+{payload.notes or ''}
+
+— Ross House Rentals"""
+            sms_body = f"Ross House: Payment of ${payload.amount:,.2f} ({method_lbl}) recorded. {'PAID' if payload.status == 'paid' else 'PENDING'}."
+
+        if settings.get('email_enabled'):
+            await _send_email(p['email'], subject, body)
+        if settings.get('sms_enabled'):
+            await _send_sms(p['phone'], sms_body)
+
+    return {"success": True, "payment": serialize(payment)}
+
+
+@router.get('/admin/service-providers/{provider_id}/payments')
+async def admin_list_provider_payments(request: Request, provider_id: str):
+    await auth_admin(request)
+    db = get_db()
+    items = [serialize(d) async for d in db.provider_payments.find({"provider_id": provider_id}).sort([("paid_at", -1)])]
+    total_paid = sum(p['amount'] for p in items if p.get('status') == 'paid')
+    total_pending = sum(p['amount'] for p in items if p.get('status') == 'pending')
+    return {
+        "success": True, "payments": items,
+        "count": len(items),
+        "total_paid": total_paid,
+        "total_pending": total_pending,
+    }
+
+
+@router.get('/admin/provider-payments')
+async def admin_list_all_payments(
+    request: Request,
+    method: Optional[str] = None,
+    status: Optional[str] = None,
+    from_date: Optional[str] = None,
+    to_date: Optional[str] = None,
+    limit: int = Query(default=500, le=2000),
+):
+    """Cross-provider payment ledger with filters and totals."""
+    await auth_admin(request)
+    db = get_db()
+    q: Dict[str, Any] = {}
+    if method:
+        q['method'] = method
+    if status:
+        q['status'] = status
+    if from_date or to_date:
+        rng: Dict[str, Any] = {}
+        if from_date:
+            try:
+                rng['$gte'] = datetime.fromisoformat(from_date.replace('Z', '+00:00'))
+            except Exception:
+                pass
+        if to_date:
+            try:
+                rng['$lte'] = datetime.fromisoformat(to_date.replace('Z', '+00:00'))
+            except Exception:
+                pass
+        if rng:
+            q['paid_at'] = rng
+    items = [serialize(d) async for d in db.provider_payments.find(q).sort([("paid_at", -1)]).limit(limit)]
+    total_paid = sum(p['amount'] for p in items if p.get('status') == 'paid')
+    total_pending = sum(p['amount'] for p in items if p.get('status') == 'pending')
+    by_method: Dict[str, float] = {}
+    for p in items:
+        if p.get('status') == 'paid':
+            by_method[p['method']] = by_method.get(p['method'], 0) + p['amount']
+    return {
+        "success": True, "payments": items, "count": len(items),
+        "total_paid": total_paid, "total_pending": total_pending,
+        "by_method": by_method,
+    }
+
+
+@router.patch('/admin/provider-payments/{payment_id}')
+async def admin_update_payment(request: Request, payment_id: str, payload: PaymentUpdate):
+    await auth_admin(request)
+    db = get_db()
+    existing = await db.provider_payments.find_one({"_id": payment_id})
+    if not existing:
+        raise HTTPException(404, "Payment not found")
+    update: Dict[str, Any] = {"updated_at": datetime.utcnow()}
+    for f in ['notes', 'reference', 'amount']:
+        v = getattr(payload, f)
+        if v is not None:
+            update[f] = v
+    if payload.status:
+        if payload.status not in VALID_PAYMENT_STATUSES:
+            raise HTTPException(400, f"Invalid status. Use: {VALID_PAYMENT_STATUSES}")
+        update['status'] = payload.status
+        # If transitioning to/from paid, adjust provider aggregates
+        old_status = existing.get('status')
+        amt = float(existing.get('amount', 0))
+        if old_status != 'paid' and payload.status == 'paid':
+            await db.service_providers.update_one(
+                {"_id": existing['provider_id']},
+                {"$inc": {"total_paid": amt}, "$set": {"last_paid_at": datetime.utcnow()}}
+            )
+        elif old_status == 'paid' and payload.status != 'paid':
+            await db.service_providers.update_one(
+                {"_id": existing['provider_id']},
+                {"$inc": {"total_paid": -amt}}
+            )
+    await db.provider_payments.update_one({"_id": payment_id}, {"$set": update})
+    return {"success": True, "payment": serialize(await db.provider_payments.find_one({"_id": payment_id}))}
+
+
+@router.delete('/admin/provider-payments/{payment_id}')
+async def admin_delete_payment(request: Request, payment_id: str):
+    await auth_admin(request)
+    db = get_db()
+    existing = await db.provider_payments.find_one({"_id": payment_id})
+    if not existing:
+        raise HTTPException(404, "Payment not found")
+    await db.provider_payments.delete_one({"_id": payment_id})
+    if existing.get('status') == 'paid':
+        await db.service_providers.update_one(
+            {"_id": existing['provider_id']},
+            {"$inc": {"total_paid": -float(existing.get('amount', 0))}}
+        )
+    return {"success": True}
+
+
+@router.get('/admin/provider-payments/stats')
+async def admin_payment_stats(request: Request):
+    await auth_admin(request)
+    db = get_db()
+    now = datetime.utcnow()
+    month_start = datetime(now.year, now.month, 1)
+    total_paid_all = 0
+    total_pending = 0
+    paid_this_month = 0
+    by_method: Dict[str, float] = {}
+    async for p in db.provider_payments.find({}):
+        amt = float(p.get('amount', 0))
+        if p.get('status') == 'paid':
+            total_paid_all += amt
+            by_method[p['method']] = by_method.get(p['method'], 0) + amt
+            if p.get('paid_at') and p['paid_at'] >= month_start:
+                paid_this_month += amt
+        elif p.get('status') == 'pending':
+            total_pending += amt
+    return {
+        "success": True,
+        "total_paid_all_time": total_paid_all,
+        "total_pending": total_pending,
+        "paid_this_month": paid_this_month,
+        "by_method": by_method,
+    }
