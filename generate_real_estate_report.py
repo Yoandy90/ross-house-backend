@@ -907,7 +907,7 @@ def send_email_with_pdf(pdf_bytes, to_email="yoandyross@gmail.com"):
     )
 
     sg_key = os.environ.get("SENDGRID_API_KEY")
-    from_email = os.environ.get("SENDGRID_FROM_EMAIL", "info@rosstaxpreparation.com")
+    from_email = os.environ.get("SENDGRID_FROM_EMAIL", "info@rosshouserentals.com")
 
     if not sg_key:
         print("ERROR: SENDGRID_API_KEY not found in environment")

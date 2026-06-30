@@ -857,7 +857,7 @@ __________ (phone)
 # ======== SEND EMAIL ========
 def send_all(paths, recipient):
     api_key = os.getenv("SENDGRID_API_KEY")
-    from_email = os.getenv("SENDGRID_FROM_EMAIL", "info@rosstaxpreparation.com")
+    from_email = os.getenv("SENDGRID_FROM_EMAIL", "info@rosshouserentals.com")
     if not api_key:
         raise SystemExit("Missing SENDGRID_API_KEY")
 

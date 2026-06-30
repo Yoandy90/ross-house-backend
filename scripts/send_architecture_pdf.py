@@ -31,7 +31,7 @@ from sendgrid.helpers.mail import (
 MD_PATH = Path("/app/memory/ROSS_HOUSE_ARCHITECTURE.md")
 PDF_PATH = Path("/app/memory/ROSS_HOUSE_ARCHITECTURE.pdf")
 TO_EMAIL = os.environ.get("ARCH_TO_EMAIL", "yoandyross@gmail.com")
-FROM_EMAIL = os.environ.get("SENDGRID_FROM_EMAIL", "info@rosstaxpreparation.com")
+FROM_EMAIL = os.environ.get("SENDGRID_FROM_EMAIL", "info@rosshouserentals.com")
 SENDGRID_KEY = os.environ["SENDGRID_API_KEY"]
 
 

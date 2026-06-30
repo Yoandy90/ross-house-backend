@@ -1026,7 +1026,7 @@ def build_lp_onepager_pdf(path: str) -> None:
 # =====================================================================
 def send_email(attachments_paths: list, recipient: str) -> None:
     api_key = os.getenv("SENDGRID_API_KEY")
-    from_email = os.getenv("SENDGRID_FROM_EMAIL", "info@rosstaxpreparation.com")
+    from_email = os.getenv("SENDGRID_FROM_EMAIL", "info@rosshouserentals.com")
     if not api_key:
         raise SystemExit("Missing SENDGRID_API_KEY")
 

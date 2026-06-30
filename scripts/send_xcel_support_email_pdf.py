@@ -19,7 +19,7 @@ from sendgrid.helpers.mail import (
 
 PDF_PATH = Path("/app/memory/XCEL_SUPPORT_EMAIL.pdf")
 TO_EMAIL = os.environ.get("ARCH_TO_EMAIL", "yoandyross@gmail.com")
-FROM_EMAIL = os.environ.get("SENDGRID_FROM_EMAIL", "info@rosstaxpreparation.com")
+FROM_EMAIL = os.environ.get("SENDGRID_FROM_EMAIL", "info@rosshouserentals.com")
 SENDGRID_KEY = os.environ["SENDGRID_API_KEY"]
 
 SUBJECT_LINE = "SAML SSO blank page — Service Provider Client ID 9dcf7385177c67119581"

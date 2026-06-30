@@ -524,7 +524,7 @@ def send_email_with_pdf(pdf_content: bytes, recipient_email: str):
     """Send the PDF via SendGrid"""
     
     api_key = os.environ.get("SENDGRID_API_KEY")
-    from_email = os.environ.get("SENDGRID_FROM_EMAIL", "info@rosstaxpreparation.com")
+    from_email = os.environ.get("SENDGRID_FROM_EMAIL", "info@rosshouserentals.com")
     
     if not api_key:
         raise ValueError("SENDGRID_API_KEY not found")

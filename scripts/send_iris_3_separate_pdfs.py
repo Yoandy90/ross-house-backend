@@ -502,7 +502,7 @@ def build_email_draft(path: str) -> None:
 # ─── SEND EMAIL WITH 3 ATTACHMENTS ───────────────────────────────────────
 def send_email(pdf_paths: list, recipient: str) -> None:
     api_key = os.getenv("SENDGRID_API_KEY")
-    from_email = os.getenv("SENDGRID_FROM_EMAIL", "info@rosstaxpreparation.com")
+    from_email = os.getenv("SENDGRID_FROM_EMAIL", "info@rosshouserentals.com")
     if not api_key:
         raise SystemExit("Missing SENDGRID_API_KEY")
 

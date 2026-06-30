@@ -420,7 +420,7 @@ def build_excel(path):
 
 def send_email(paths, recipient):
     api_key = os.getenv("SENDGRID_API_KEY")
-    from_email = os.getenv("SENDGRID_FROM_EMAIL", "info@rosstaxpreparation.com")
+    from_email = os.getenv("SENDGRID_FROM_EMAIL", "info@rosshouserentals.com")
     html = """
     <div style="font-family:-apple-system,Segoe UI,sans-serif;max-width:680px;margin:0 auto;padding:24px;background:#f8fafc;">
       <div style="background:#fff;border-radius:12px;padding:28px;box-shadow:0 4px 12px rgba(0,0,0,0.06);">
