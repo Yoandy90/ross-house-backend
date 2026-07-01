@@ -69,6 +69,14 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"   ⚠️ Admin 2FA indexes deferred: {e}")
 
+    # Ensure Analytics AI cache indexes
+    try:
+        from rental.analytics_ai_router import ensure_indexes as _ai_ix
+        await _ai_ix(db)
+        logger.info("   ✅ Analytics AI indexes ready")
+    except Exception as e:
+        logger.warning(f"   ⚠️ Analytics AI indexes deferred: {e}")
+
     # Start property/contract sync cron job in the background
     sync_task = None
     try:
@@ -207,6 +215,7 @@ try:
     from rental.chatbot_router import router as chatbot_router
     from rental.visitor_analytics_router import router as visitor_analytics_router
     from rental.admin_2fa_router import router as admin_2fa_router, ensure_indexes as admin_2fa_indexes
+    from rental.analytics_ai_router import router as analytics_ai_router, ensure_indexes as analytics_ai_indexes
 
     app.include_router(auth_router, prefix="/api")
     app.include_router(properties_router, prefix="/api")
@@ -242,7 +251,8 @@ try:
     app.include_router(chatbot_router, prefix="/api")
     app.include_router(visitor_analytics_router, prefix="/api")
     app.include_router(admin_2fa_router, prefix="/api")
-    # admin_2fa_indexes() is awaited inside lifespan startup (see top of file).
+    app.include_router(analytics_ai_router, prefix="/api")
+    # ensure_indexes() awaited inside lifespan startup.
 
     logger.info("  ✅ Credit Builder Router")
     logger.info("  ✅ Consent Forms Router")
