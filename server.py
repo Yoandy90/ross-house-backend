@@ -242,10 +242,7 @@ try:
     app.include_router(chatbot_router, prefix="/api")
     app.include_router(visitor_analytics_router, prefix="/api")
     app.include_router(admin_2fa_router, prefix="/api")
-    try:
-        await admin_2fa_indexes(db)
-    except Exception as _e:
-        logger.warning(f"admin_2fa_indexes failed: {_e}")
+    # admin_2fa_indexes() is awaited inside lifespan startup (see top of file).
 
     logger.info("  ✅ Credit Builder Router")
     logger.info("  ✅ Consent Forms Router")
