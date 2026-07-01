@@ -154,9 +154,9 @@ async def marketplace_register(request: Request):
     
     data = await request.json()
 
-    # CAPTCHA gate (anti-bot)
+    # CAPTCHA gate (anti-bot) — optional for mobile app (which can't render Turnstile)
     from rental.turnstile_helper import verify_turnstile_token
-    await verify_turnstile_token(data.get("captcha_token"), request)
+    await verify_turnstile_token(data.get("captcha_token"), request, optional=True)
 
     name = data.get("name", "").strip()
     email = data.get("email", "").strip().lower()
@@ -347,9 +347,9 @@ async def forgot_password(request: Request):
     
     data = await request.json()
 
-    # CAPTCHA gate (anti-bot — protects Twilio SMS budget)
+    # CAPTCHA gate (anti-bot — protects Twilio SMS budget) — optional for mobile app
     from rental.turnstile_helper import verify_turnstile_token
-    await verify_turnstile_token(data.get("captcha_token"), request)
+    await verify_turnstile_token(data.get("captcha_token"), request, optional=True)
 
     email = data.get("email", "").strip().lower()
 
@@ -473,9 +473,11 @@ async def rental_phone_send_otp(request: Request):
     import random, os
     body = await request.json()
 
-    # CAPTCHA gate (anti-bot — protects Twilio SMS budget)
+    # CAPTCHA gate (anti-bot — protects Twilio SMS budget).
+    # OPTIONAL because the iOS/Android mobile app cannot render a Turnstile
+    # widget. Web callers still send a token which is validated normally.
     from rental.turnstile_helper import verify_turnstile_token
-    await verify_turnstile_token(body.get("captcha_token"), request)
+    await verify_turnstile_token(body.get("captcha_token"), request, optional=True)
 
     raw_phone = body.get('phone', '').strip()
     country_code = body.get('country_code', '+1')

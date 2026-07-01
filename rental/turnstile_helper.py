@@ -43,12 +43,22 @@ def _is_enabled() -> bool:
     return val not in ("0", "false", "no", "off", "")
 
 
-async def verify_turnstile_token(token: str | None, request: Request) -> bool:
-    """Verify a Turnstile token against Cloudflare. Raises HTTPException on failure."""
+async def verify_turnstile_token(token: str | None, request: Request, optional: bool = False) -> bool:
+    """Verify a Turnstile token against Cloudflare. Raises HTTPException on failure.
+
+    Args:
+        token: The Turnstile token from the client.
+        request: Current FastAPI request (used for remote IP).
+        optional: If True and token is empty/None, allow the request through.
+                  Use this for endpoints called by BOTH the mobile app (which
+                  cannot render a Turnstile widget) AND the web frontend.
+    """
     if not _is_enabled():
         return True
 
     if not token:
+        if optional:
+            return True
         raise HTTPException(status_code=400, detail="Captcha requerido")
 
     secret = os.getenv("TURNSTILE_SECRET_KEY", _DEFAULT_TEST_SECRET).strip() or _DEFAULT_TEST_SECRET
