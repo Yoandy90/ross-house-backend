@@ -449,6 +449,130 @@ async def reject_action_endpoint(action_id: str, body: Dict[str, Any] = Body(def
     return {"ok": True, "action": result}
 
 
+# ─── BUSINESS INSIGHTS (Phase 3a — AI Brain Insights Dashboard) ──────────
+@router.get("/business-insights")
+async def business_insights(
+    refresh: int = 0,
+    db=Depends(get_db),
+    admin=Depends(auth_admin),
+):
+    """LLM-generated executive brief of the whole business (properties,
+    tenants, leases ending, revenue, delinquencies) using Claude Sonnet 4.5.
+    Cached 30 min in ai_insights_cache."""
+    import hashlib
+    CACHE_COLL = "ai_business_insights_cache"
+    snap = await build_business_snapshot(db)
+    ctx_hash = hashlib.sha256(json.dumps(snap, sort_keys=True, default=str).encode()).hexdigest()[:24]
+
+    if not refresh:
+        cached = await db[CACHE_COLL].find_one({"_id": ctx_hash})
+        if cached and (datetime.now(timezone.utc) - cached["created_at"].replace(tzinfo=timezone.utc)).total_seconds() < 1800:
+            return {**cached["payload"], "cached": True}
+
+    api_key = os.environ.get("EMERGENT_LLM_KEY")
+    if not api_key:
+        return _fallback_business_insights(snap)
+
+    try:
+        from emergentintegrations.llm.chat import LlmChat, UserMessage
+        system_prompt = (
+            "Eres el CFO/COO virtual de Ross House Rentals (renta de casas en Amarillo/Dumas, TX). "
+            "Analizas los datos operativos del negocio y das un briefing ejecutivo accionable "
+            "en español, tono profesional pero directo. Nunca inventes cifras. "
+            "Devuelve SOLO JSON válido:\n"
+            "{\n"
+            '  "headline": "titular ejecutivo 8-14 palabras",\n'
+            '  "verdict": "positive"|"neutral"|"warning",\n'
+            '  "summary": "3 frases claras sobre estado del negocio hoy",\n'
+            '  "kpi_cards": [{"label":"Ocupación","value":"78%","hint":"…","tone":"positive|warning|neutral"}, …3-5 items],\n'
+            '  "opportunities": [{"emoji":"💰","title":"…","detail":"…","impact":"$X/mes"}, …2-4 items],\n'
+            '  "risks": [{"emoji":"⚠️","title":"…","detail":"…"}, …0-3 items],\n'
+            '  "actions_recommended": [{"priority":"high|med|low","action":"…","reason":"…"}, …2-4 items]\n'
+            "}"
+        )
+        user_prompt = f"Analiza estos datos y devuelve el JSON:\n```json\n{json.dumps(snap, ensure_ascii=False, default=str, indent=2)[:12000]}\n```"
+
+        chat = LlmChat(
+            api_key=api_key,
+            session_id=f"business_insights_{uuid4()}",
+            system_message=system_prompt,
+        ).with_model(MODEL_PROVIDER, MODEL_NAME)
+
+        raw = await chat.send_message(UserMessage(text=user_prompt))
+        text = str(raw or "").strip()
+        if text.startswith("```"):
+            text = text.split("```", 2)
+            text = text[1] if len(text) > 1 else text[0]
+            if text.startswith("json"):
+                text = text[4:]
+            text = text.strip("` \n")
+        try:
+            parsed = json.loads(text)
+        except Exception:
+            first = text.find("{"); last = text.rfind("}")
+            parsed = json.loads(text[first:last + 1]) if first >= 0 and last > first else {}
+
+        parsed.setdefault("headline", "Estado del negocio")
+        parsed.setdefault("verdict", "neutral")
+        parsed.setdefault("summary", "")
+        parsed.setdefault("kpi_cards", [])
+        parsed.setdefault("opportunities", [])
+        parsed.setdefault("risks", [])
+        parsed.setdefault("actions_recommended", [])
+
+        payload = {
+            "snapshot": snap,
+            "insights": parsed,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "model": MODEL_NAME,
+            "source": "claude",
+        }
+        try:
+            await db[CACHE_COLL].update_one(
+                {"_id": ctx_hash},
+                {"$set": {"_id": ctx_hash, "payload": payload, "created_at": datetime.now(timezone.utc)}},
+                upsert=True,
+            )
+        except Exception as e:
+            logger.warning(f"[business-insights] cache write: {e}")
+        return {**payload, "cached": False}
+    except Exception as e:
+        logger.exception(f"[business-insights] LLM fail: {e}")
+        return _fallback_business_insights(snap) | {"error": str(e)[:150]}
+
+
+def _fallback_business_insights(snap: Dict[str, Any]) -> Dict[str, Any]:
+    props = snap.get("properties") or {}
+    occ = props.get("occupancy_rate_pct") or 0
+    rented = props.get("monthly_rent_actual") or 0
+    total = props.get("monthly_rent_potential") or 0
+    verdict = "positive" if occ >= 80 else "warning" if occ < 50 else "neutral"
+    return {
+        "snapshot": snap,
+        "insights": {
+            "headline": f"Ocupación {occ}% · Ingreso ${rented:,.0f}/mes",
+            "verdict": verdict,
+            "summary": (
+                f"El portafolio tiene {props.get('total', 0)} propiedades con {occ}% de ocupación. "
+                f"Ingreso mensual actual: ${rented:,.0f} de ${total:,.0f} potencial."
+            ),
+            "kpi_cards": [
+                {"label": "Ocupación", "value": f"{occ}%", "hint": "Casas rentadas", "tone": "positive" if occ >= 80 else "warning"},
+                {"label": "Ingreso mensual", "value": f"${rented:,.0f}", "hint": "Real cobrado", "tone": "positive"},
+                {"label": "Potencial", "value": f"${total:,.0f}", "hint": "Si todas rentadas", "tone": "neutral"},
+                {"label": "Propiedades", "value": f"{props.get('total', 0)}", "hint": "Total portafolio", "tone": "neutral"},
+            ],
+            "opportunities": [],
+            "risks": [],
+            "actions_recommended": [],
+        },
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "model": "rule-based",
+        "source": "fallback",
+    }
+
+
+
 @router.post("/marketing/generate")
 async def generate_marketing(body: MarketingRequest, db=Depends(get_db), admin=Depends(auth_admin)):
     api_key = os.environ.get("EMERGENT_LLM_KEY")
