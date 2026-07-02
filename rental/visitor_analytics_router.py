@@ -609,7 +609,9 @@ async def admin_timeline(request: Request, range: str = "7d", granularity: str =
     db = get_db()
     await _ensure_once(db)
     since = _range_to_dt(range)
-    bucket = "%Y-%m-%dT%H:00:00Z" if granularity == "hour" else "%Y-%m-%dT00:00:00Z"
+    bucket = "%Y-%m-%dT%H:00:00" if granularity == "hour" else "%Y-%m-%d"
+    # Bucket in Central Time (America/Chicago) so days align with Dumas TX local time
+    tz = "America/Chicago"
     sess_ids = await _filtered_session_ids(db, since, country, device)
 
     async def _bucketed(start: datetime, end: Optional[datetime] = None) -> List[Dict[str, Any]]:
@@ -622,7 +624,7 @@ async def admin_timeline(request: Request, range: str = "7d", granularity: str =
         pipeline = [
             {"$match": match},
             {"$group": {
-                "_id": {"$dateToString": {"format": bucket, "date": "$ts"}},
+                "_id": {"$dateToString": {"format": bucket, "date": "$ts", "timezone": tz}},
                 "pages": {"$sum": 1},
                 "visitors": {"$addToSet": "$visitor_id"},
                 "sessions": {"$addToSet": "$session_id"},
@@ -633,7 +635,7 @@ async def admin_timeline(request: Request, range: str = "7d", granularity: str =
         return await db.visitor_events.aggregate(pipeline).to_list(None)
 
     res = await _bucketed(since)
-    out: Dict[str, Any] = {"timeline": res, "granularity": granularity}
+    out: Dict[str, Any] = {"timeline": res, "granularity": granularity, "timezone": tz}
     if compare:
         # Same-length previous period
         prev_since = since - (datetime.now(timezone.utc) - since)
@@ -644,7 +646,7 @@ async def admin_timeline(request: Request, range: str = "7d", granularity: str =
             match["session_id"] = {"$in": prev_sess_ids}
         prev_pipeline = [
             {"$match": match},
-            {"$group": {"_id": {"$dateToString": {"format": bucket, "date": "$ts"}}, "pages": {"$sum": 1}}},
+            {"$group": {"_id": {"$dateToString": {"format": bucket, "date": "$ts", "timezone": tz}}, "pages": {"$sum": 1}}},
             {"$project": {"ts": "$_id", "pages": 1, "_id": 0}},
             {"$sort": {"ts": 1}},
         ]
@@ -735,8 +737,9 @@ async def admin_heatmap(request: Request, range: str = "30d",
         {"$match": match},
         {"$group": {
             "_id": {
-                "dow":  {"$dayOfWeek": "$ts"},
-                "hour": {"$hour":      "$ts"},
+                # Bucket by Central Time (Dumas, TX) so day/hour align with local
+                "dow":  {"$dayOfWeek": {"date": "$ts", "timezone": "America/Chicago"}},
+                "hour": {"$hour":      {"date": "$ts", "timezone": "America/Chicago"}},
             },
             "count": {"$sum": 1},
         }},
