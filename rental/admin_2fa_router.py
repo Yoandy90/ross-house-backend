@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import os
 import logging
+import re
 import random
 import secrets
 import hashlib
@@ -207,7 +208,7 @@ async def admin_login_step1(request: Request):
     await verify_turnstile_token(captcha_token, request)
 
     db = get_db()
-    user = await db.app_users.find_one({"email": {"$regex": f"^{email}$", "$options": "i"}})
+    user = await db.app_users.find_one({"email": {"$regex": f"^{re.escape(email)}$", "$options": "i"}})
     if not user or user.get("role") != "admin":
         # Generic message to avoid user enumeration.
         raise HTTPException(status_code=401, detail="Credenciales inválidas")

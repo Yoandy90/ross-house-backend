@@ -259,10 +259,10 @@ async def marketplace_login(request: Request):
         raise HTTPException(status_code=400, detail="Contraseña o teléfono es requerido")
 
     # Find user
-    user = await get_db().app_users.find_one({"email": {"$regex": f"^{email}$", "$options": "i"}})
+    user = await get_db().app_users.find_one({"email": {"$regex": f"^{re.escape(email)}$", "$options": "i"}})
     if not user:
         # Fallback: check tenants collection
-        tenant = await get_db().tenants.find_one({"email": {"$regex": f"^{email}$", "$options": "i"}})
+        tenant = await get_db().tenants.find_one({"email": {"$regex": f"^{re.escape(email)}$", "$options": "i"}})
         if not tenant:
             raise HTTPException(status_code=401, detail="Credenciales inválidas")
         user_id = str(tenant["_id"])
@@ -310,7 +310,7 @@ async def marketplace_login(request: Request):
     }
 
     # Fallback: check tenants collection (backward compat)
-    tenant = await get_db().tenants.find_one({"email": {"$regex": f"^{email}$", "$options": "i"}})
+    tenant = await get_db().tenants.find_one({"email": {"$regex": f"^{re.escape(email)}$", "$options": "i"}})
     if tenant:
         stored_phone = tenant.get("phone", "").replace("-", "").replace(" ", "").replace("(", "").replace(")", "")
         if phone != stored_phone and phone != stored_phone[-4:]:
@@ -356,7 +356,7 @@ async def forgot_password(request: Request):
     if not email:
         raise HTTPException(status_code=400, detail="Email es requerido")
 
-    user = await get_db().app_users.find_one({"email": {"$regex": f"^{email}$", "$options": "i"}})
+    user = await get_db().app_users.find_one({"email": {"$regex": f"^{re.escape(email)}$", "$options": "i"}})
     if not user:
         return {"success": True, "message": "Si el email está registrado, recibirás un código por SMS."}
 
@@ -416,7 +416,7 @@ async def reset_password(request: Request):
 
     hashed = hash_password(new_password)
     await get_db().app_users.update_one(
-        {"email": {"$regex": f"^{email}$", "$options": "i"}},
+        {"email": {"$regex": f"^{re.escape(email)}$", "$options": "i"}},
         {"$set": {"password_hash": hashed, "updated_at": datetime.utcnow()}}
     )
 
@@ -487,8 +487,20 @@ async def rental_phone_send_otp(request: Request):
     
     if len(digits) < 10:
         raise HTTPException(status_code=400, detail='Número de teléfono inválido')
-    
-    # Rate limit: max 5 OTP per phone per 10 minutes
+
+    # SEC-004: per-IP rate limit (protects Twilio budget + prevents SMS bombing
+    # of arbitrary victim numbers). Max 8 SMS from same IP per 15 min.
+    client_ip = request.client.host if request.client else 'unknown'
+    fifteen_min_ago = datetime.utcnow() - timedelta(minutes=15)
+    ip_recent = await get_db().phone_otps.count_documents({
+        'ip_address': client_ip,
+        'source': 'rental',
+        'created_at': {'$gte': fifteen_min_ago},
+    })
+    if ip_recent >= 8:
+        raise HTTPException(status_code=429, detail='Too many SMS requests from this device. Try again later.')
+
+    # Per-phone rate limit: max 5 OTP per phone per 10 minutes
     ten_min_ago = datetime.utcnow() - timedelta(minutes=10)
     recent_otps = await get_db().phone_otps.count_documents({
         'phone': phone,
@@ -508,6 +520,7 @@ async def rental_phone_send_otp(request: Request):
         'expires_at': expires_at,
         'created_at': now,
         'verified': False,
+        'ip_address': client_ip,
         'attempts': 0,
         'source': 'rental',
     })

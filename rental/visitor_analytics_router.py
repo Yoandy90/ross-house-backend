@@ -931,6 +931,17 @@ async def admin_sessions_export(
     elif has_lead is False:
         q["lead_id"] = None
 
+    def _csv_safe(v):
+        """Neutralize CSV formula injection (SEC-003).
+        Excel/Google Sheets execute cells starting with = + - @ TAB CR as formulas.
+        Prefix such cells with a single quote to render as plain text."""
+        if v is None:
+            return ""
+        s = str(v)
+        if s and s[0] in ("=", "+", "-", "@", "\t", "\r"):
+            return "'" + s
+        return s
+
     async def _gen():
         buf = StringIO()
         writer = csv.writer(buf)
@@ -945,14 +956,14 @@ async def admin_sessions_export(
         cursor = db.visitor_sessions.find(q).sort("first_seen", -1).limit(5000)
         async for s in cursor:
             writer.writerow([
-                s.get("_id"),
-                _iso(s.get("first_seen")) if isinstance(s.get("first_seen"), datetime) else s.get("first_seen"),
-                _iso(s.get("last_seen")) if isinstance(s.get("last_seen"), datetime) else s.get("last_seen"),
-                s.get("country") or "", s.get("city") or "",
-                s.get("device") or "", s.get("browser") or "", s.get("os") or "",
+                _csv_safe(s.get("_id")),
+                _iso(s.get("first_seen")) if isinstance(s.get("first_seen"), datetime) else _csv_safe(s.get("first_seen")),
+                _iso(s.get("last_seen"))  if isinstance(s.get("last_seen"),  datetime) else _csv_safe(s.get("last_seen")),
+                _csv_safe(s.get("country")), _csv_safe(s.get("city")),
+                _csv_safe(s.get("device")), _csv_safe(s.get("browser")), _csv_safe(s.get("os")),
                 s.get("pages_count", 0), s.get("events_count", 0),
-                s.get("referrer_host") or "", s.get("landing_path") or "",
-                s.get("lead_id") or "",
+                _csv_safe(s.get("referrer_host")), _csv_safe(s.get("landing_path")),
+                _csv_safe(s.get("lead_id")),
             ])
             yield buf.getvalue()
             buf.seek(0)
