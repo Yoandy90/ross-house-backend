@@ -225,6 +225,7 @@ try:
     from rental.admin_2fa_router import router as admin_2fa_router, ensure_indexes as admin_2fa_indexes
     from rental.analytics_ai_router import router as analytics_ai_router, ensure_indexes as analytics_ai_indexes
     from rental.lease_renewals_router import router as lease_renewals_router, ensure_indexes as lease_renewals_indexes
+    from rental.pm_waitlist_router import router as pm_waitlist_router
 
     app.include_router(auth_router, prefix="/api")
     app.include_router(properties_router, prefix="/api")
@@ -262,6 +263,7 @@ try:
     app.include_router(admin_2fa_router, prefix="/api")
     app.include_router(analytics_ai_router, prefix="/api")
     app.include_router(lease_renewals_router, prefix="/api")
+    app.include_router(pm_waitlist_router, prefix="/api")
     # ensure_indexes() awaited inside lifespan startup.
 
     logger.info("  ✅ Credit Builder Router")
