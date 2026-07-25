@@ -47,18 +47,17 @@ async def tenant_create_stripe_payment(request: Request):
         raise HTTPException(status_code=400, detail="Ya existe un pago registrado para este mes")
 
     # ─── Amount resolution (avoid double-counting late fee) ──────────────
-    # New client behavior: sends rent_amount (base) + late_fee separately, so
-    # the source of truth is rent_amount + late_fee.
-    # Legacy client behavior: sends amount as the FULL total (incl. late fee).
-    if "rent_amount" in data:
-        amount = float(data.get("rent_amount") or 0)
-        late_fee = float(data.get("late_fee") or 0)
-        total = amount + late_fee
+    # SECURITY: the base rent is ALWAYS taken from the contract server-side —
+    # never trusted from the client — so a tenant cannot underpay by sending a
+    # smaller rent_amount. Only the late_fee is read from the request.
+    contract_rent = float(contract.get("rent_amount") or 0)
+    late_fee = float(data.get("late_fee") or 0)
+    if contract_rent > 0:
+        amount = contract_rent
     else:
-        # Fallback for older clients: treat `amount` as the full total
-        total = float(data.get("amount") or contract.get("rent_amount") or 0)
-        amount = total
-        late_fee = 0.0
+        # Contract has no rent on file → fall back to client value (legacy data)
+        amount = float(data.get("rent_amount") or data.get("amount") or 0)
+    total = amount + late_fee
 
     if total <= 0:
         raise HTTPException(status_code=400, detail="Monto inválido")

@@ -29,11 +29,11 @@ async def stripe_connect_webhook(request: Request):
         webhook_secret = config.get('stripe_webhook_secret', '')
 
     if not webhook_secret:
-        logging.warning("⚠️ Stripe webhook secret not configured, processing without verification")
-        try:
-            event = json.loads(payload)
-        except Exception:
-            raise HTTPException(status_code=400, detail="Invalid payload")
+        # SECURITY: refuse to process unsigned webhooks. Without signature
+        # verification anyone could forge a 'payment succeeded' event and mark
+        # rent as paid. Fail closed instead of trusting the payload.
+        logging.error("❌ Stripe webhook secret not configured — rejecting unsigned webhook")
+        raise HTTPException(status_code=503, detail="Webhook not configured (missing STRIPE_WEBHOOK_SECRET)")
     else:
         try:
             import stripe
@@ -169,6 +169,63 @@ async def stripe_connect_webhook(request: Request):
                     logging.info(f"✅ Created new completed rental_payment for PI {pi_id} ({receipt_number})")
         except Exception as link_err:
             logging.exception(f"⚠️ Failed to link Stripe PI to rental_payments: {link_err}")
+
+    # ── checkout.session.completed: payment-link payment finished ──
+    elif event_type == 'checkout.session.completed':
+        try:
+            sess = event_data if isinstance(event_data, dict) else event_data.__dict__
+            sess_get = sess.get if isinstance(sess, dict) else (lambda k, d=None: getattr(event_data, k, d))
+            meta = sess_get('metadata', {}) or {}
+            plink_id = sess_get('payment_link', '')
+            customer_id = sess_get('customer', '')
+            amount_total = (sess_get('amount_total', 0) or 0) / 100
+            now = datetime.utcnow()
+
+            # Mark our payment_links record as paid
+            if plink_id:
+                await get_db().payment_links.update_one(
+                    {"stripe_payment_link_id": plink_id},
+                    {"$set": {"status": "paid", "paid_at": now,
+                              "stripe_customer_id": customer_id,
+                              "amount_paid": amount_total, "updated_at": now}},
+                )
+
+            # Save the card REFERENCE into the Vault (never the full PAN/CVV — PCI)
+            import stripe as _stripe
+            pm_ref = None
+            try:
+                pi_id = sess_get('payment_intent', '')
+                if pi_id:
+                    pi = _stripe.PaymentIntent.retrieve(pi_id, expand=['payment_method'])
+                    pm = pi.payment_method
+                    if pm and getattr(pm, 'card', None):
+                        pm_ref = pm
+            except Exception as e:
+                logging.warning(f"payment-link: could not expand payment_method: {e}")
+
+            if pm_ref is not None:
+                card = pm_ref.card
+                existing = await get_db().payment_methods.find_one({"stripe_payment_method_id": pm_ref.id})
+                if not existing:
+                    await get_db().payment_methods.insert_one({
+                        "type": "card",
+                        "user_id": meta.get('tenant_id', '') if hasattr(meta, 'get') else '',
+                        "user_name": meta.get('tenant_name', '') if hasattr(meta, 'get') else '',
+                        "user_email": sess_get('customer_details', {}).get('email', '') if isinstance(sess_get('customer_details', {}), dict) else '',
+                        "card_brand": (card.brand or '').title(),
+                        "card_last4": card.last4,
+                        "card_exp": f"{card.exp_month:02d}/{str(card.exp_year)[-2:]}",
+                        "stripe_payment_method_id": pm_ref.id,
+                        "stripe_customer_id": customer_id,
+                        "is_default": False,
+                        "is_active_for_autopay": False,
+                        "source": "payment_link",
+                        "reference": meta.get('reference', '') if hasattr(meta, 'get') else '',
+                        "created_at": now,
+                    })
+                    logging.info(f"🔐 Vault: saved card reference ····{card.last4} from payment link")
+        except Exception as pl_err:
+            logging.exception(f"⚠️ Failed to process checkout.session.completed: {pl_err}")
 
     # ── Log all events for audit ──
     try:

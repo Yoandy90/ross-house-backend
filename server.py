@@ -113,6 +113,15 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"   ⚠️ Autopay cron not started: {e}")
 
+    # Start app-adoption re-engagement email cron (weekly)
+    reengage_task = None
+    try:
+        from rental.app_adoption_reengage_cron import reengagement_loop
+        reengage_task = asyncio.create_task(reengagement_loop())
+        logger.info("   ✅ App-adoption re-engagement cron scheduled")
+    except Exception as e:
+        logger.warning(f"   ⚠️ Re-engagement cron not started: {e}")
+
     yield
 
     # Graceful shutdown of cron
@@ -120,6 +129,13 @@ async def lifespan(app: FastAPI):
         sync_task.cancel()
         try:
             await sync_task
+        except Exception:
+            pass
+
+    if reengage_task and not reengage_task.done():
+        reengage_task.cancel()
+        try:
+            await reengage_task
         except Exception:
             pass
 
@@ -215,6 +231,8 @@ try:
     from rental.property_entity_router import router as property_entity_router
     from rental.utility_ocr_router import router as utility_ocr_router
     from rental.vault_router import router as vault_router
+    from rental.payment_links_router import router as payment_links_router
+    from rental.vault_cards_router import router as vault_cards_router
     from rental.reports_router import router as reports_router
     from rental.syndication_router import router as syndication_router
     from rental.tenant_leads_router import router as tenant_leads_router
@@ -226,6 +244,8 @@ try:
     from rental.analytics_ai_router import router as analytics_ai_router, ensure_indexes as analytics_ai_indexes
     from rental.lease_renewals_router import router as lease_renewals_router, ensure_indexes as lease_renewals_indexes
     from rental.pm_waitlist_router import router as pm_waitlist_router
+    from rental.app_adoption_router import router as app_adoption_router
+    from rental.social_poster_router import router as social_poster_router
 
     app.include_router(auth_router, prefix="/api")
     app.include_router(properties_router, prefix="/api")
@@ -253,6 +273,8 @@ try:
     app.include_router(property_entity_router, prefix="/api")
     app.include_router(utility_ocr_router, prefix="/api")
     app.include_router(vault_router, prefix="/api")
+    app.include_router(payment_links_router, prefix="/api")
+    app.include_router(vault_cards_router, prefix="/api")
     app.include_router(reports_router, prefix="/api")
     app.include_router(syndication_router, prefix="/api")
     app.include_router(tenant_leads_router, prefix="/api")
@@ -264,6 +286,8 @@ try:
     app.include_router(analytics_ai_router, prefix="/api")
     app.include_router(lease_renewals_router, prefix="/api")
     app.include_router(pm_waitlist_router, prefix="/api")
+    app.include_router(app_adoption_router, prefix="/api")
+    app.include_router(social_poster_router, prefix="/api")
     # ensure_indexes() awaited inside lifespan startup.
 
     logger.info("  ✅ Credit Builder Router")
@@ -312,11 +336,32 @@ async def upload_image(
     authorization: str = Header(None)
 ):
     """Upload an image and return the URL. Used for receipts, photos, etc."""
-    
-    # Basic auth check (optional - can be stricter)
-    if not authorization:
+
+    # SECURITY: validate the bearer token instead of accepting any non-empty
+    # string. Prevents unauthenticated 10MB uploads. Accepts any valid token
+    # signed with our JWT secret (tenant, marketplace or admin).
+    if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Authorization header required")
-    
+    import jwt as _jwt
+    _token = authorization.split(" ", 1)[1].strip()
+    _secrets = [
+        os.environ.get("TENANT_JWT_SECRET"),
+        os.environ.get("JWT_SECRET_KEY"),
+        os.environ.get("JWT_SECRET"),
+    ]
+    _valid = False
+    for _sec in _secrets:
+        if not _sec:
+            continue
+        try:
+            _jwt.decode(_token, _sec, algorithms=["HS256"])
+            _valid = True
+            break
+        except Exception:
+            continue
+    if not _valid:
+        raise HTTPException(status_code=401, detail="Token inválido")
+
     # Validate file type
     allowed_types = ["image/jpeg", "image/png", "image/gif", "image/webp", "image/heic", "application/pdf"]
     content_type = file.content_type or "application/octet-stream"

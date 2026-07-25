@@ -16,6 +16,7 @@ derived from the SECRET_KEY for development.
 import os
 import logging
 import hashlib
+import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -30,21 +31,28 @@ from .shared import get_db, auth_admin, serialize
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
-VAULT_JWT_SECRET = os.environ.get("VAULT_JWT_SECRET") or os.environ.get("JWT_SECRET", "vault-dev-secret")
+# SECURITY: no weak/known fallback. If VAULT_JWT_SECRET is not configured we
+# generate a strong random secret per-process — vault session tokens cannot be
+# forged from anything in the source tree. (Consequence: a process restart
+# invalidates outstanding 30-min vault sessions, which is acceptable.)
+VAULT_JWT_SECRET = os.environ.get("VAULT_JWT_SECRET") or secrets.token_urlsafe(48)
 VAULT_TOKEN_TTL_MIN = 30
 VAULT_AUDIT_COLL = "vault_audit_log"
 
 
 def _get_fernet() -> Fernet:
-    """Derive a stable Fernet key from VAULT_ENCRYPTION_KEY env (or SECRET_KEY)."""
+    """Fernet cipher for at-rest encryption of payment data.
+
+    SECURITY: the key MUST come from the VAULT_ENCRYPTION_KEY environment
+    variable. There is deliberately NO source-derived fallback — otherwise a
+    leaked repo/backup would be enough to decrypt stored bank/card data.
+    """
     raw_key = os.environ.get("VAULT_ENCRYPTION_KEY")
     if not raw_key:
-        # Derive from SECRET_KEY/JWT_SECRET — stable across restarts
-        seed = os.environ.get("SECRET_KEY") or os.environ.get("JWT_SECRET") or "ross-vault-dev-2026"
-        digest = hashlib.sha256(seed.encode()).digest()
-        # Fernet keys must be url-safe base64-encoded 32 bytes
-        import base64
-        raw_key = base64.urlsafe_b64encode(digest).decode()
+        raise HTTPException(
+            status_code=503,
+            detail="Baúl no configurado: falta VAULT_ENCRYPTION_KEY en el environment.",
+        )
     return Fernet(raw_key.encode() if isinstance(raw_key, str) else raw_key)
 
 
@@ -56,7 +64,10 @@ def _get_legacy_fernet() -> Optional[Fernet]:
     Tries env LEGACY_ENCRYPTION_KEY first, then falls back to the well-known
     key from the legacy backend/.env.
     """
-    legacy_key = os.environ.get("LEGACY_ENCRYPTION_KEY") or "Z74AYJ9mWLyG9BSctwl0l7OhGQVbHGgWM0viuoFdWoU="
+    legacy_key = os.environ.get("LEGACY_ENCRYPTION_KEY")
+    if not legacy_key:
+        logger.warning("LEGACY_ENCRYPTION_KEY not set — legacy card decryption disabled")
+        return None
     try:
         return Fernet(legacy_key.encode())
     except Exception as e:
@@ -209,6 +220,19 @@ async def vault_unlock(request: Request):
     if not pin_hash:
         raise HTTPException(status_code=400, detail="No hay PIN configurado. Configúralo primero.")
 
+    # SECURITY: enforce lockout BEFORE checking the PIN (was checked after,
+    # which meant the 5-attempt lock never actually blocked brute-force).
+    locked_until = config.get("vault_locked_until")
+    if locked_until:
+        if locked_until.tzinfo is None:
+            locked_until = locked_until.replace(tzinfo=timezone.utc)
+        if locked_until > datetime.now(timezone.utc):
+            await _audit(db, admin.get("email", ""), "unlock_blocked_locked")
+            raise HTTPException(
+                status_code=429,
+                detail=f"Demasiados intentos fallidos. Espera hasta {locked_until.strftime('%H:%M UTC')}",
+            )
+
     try:
         ok = bcrypt.checkpw(pin.encode(), pin_hash.encode())
     except Exception:
@@ -222,12 +246,14 @@ async def vault_unlock(request: Request):
         if attempts >= 5:
             update["vault_locked_until"] = datetime.now(timezone.utc) + timedelta(minutes=15)
         await db.rental_config.update_one({"type": "company"}, {"$set": update})
-        raise HTTPException(status_code=403, detail="PIN incorrecto")
+        remaining = max(0, 5 - attempts)
+        raise HTTPException(status_code=403, detail=f"PIN incorrecto. Intentos restantes: {remaining}")
 
-    # Check lockout
-    locked_until = config.get("vault_locked_until")
-    if locked_until and locked_until > datetime.now(timezone.utc):
-        raise HTTPException(status_code=429, detail=f"Demasiados intentos fallidos. Espera hasta {locked_until.strftime('%H:%M')}")
+    # Success → reset the failed-attempt counter and any lockout
+    await db.rental_config.update_one(
+        {"type": "company"},
+        {"$set": {"vault_failed_attempts": 0, "vault_locked_until": None}},
+    )
 
     # Issue token
     payload = {

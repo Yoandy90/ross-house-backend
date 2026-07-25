@@ -71,6 +71,28 @@ XCEL_REGISTRATION_TOKEN = _clean_env("XCEL_REGISTRATION_TOKEN")
 ESPI_NS = "http://naesb.org/espi"
 ATOM_NS = "http://www.w3.org/2005/Atom"
 
+# SECURITY (SSRF guard): the notification webhook is unauthenticated and fetches
+# URLs taken from the request body while attaching our live Xcel bearer token.
+# We ONLY fetch URLs whose host is an official Xcel Green Button host, so an
+# attacker cannot make the server call arbitrary/internal endpoints or exfiltrate
+# the bearer token to a host they control.
+_XCEL_ALLOWED_HOSTS = {
+    "myenergy.xcelenergy.com",
+    "wsservices.xcelenergy.com",
+}
+
+
+def _is_allowed_xcel_url(url: str) -> bool:
+    from urllib.parse import urlparse
+    try:
+        p = urlparse(url)
+    except Exception:
+        return False
+    if p.scheme != "https":
+        return False
+    host = (p.hostname or "").lower()
+    return host in _XCEL_ALLOWED_HOSTS or host.endswith(".xcelenergy.com")
+
 # In-memory cache of the client_credentials token (one per process is enough).
 _CLIENT_TOKEN_CACHE: dict = {"access_token": None, "expires_at": 0}
 
@@ -541,6 +563,77 @@ async def xcel_delete_connection(request: Request, conn_id: str):
     if res.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Conexión no encontrada")
     return {"success": True}
+
+
+@router.post("/admin/xcel/connections/manual")
+async def xcel_manual_connection(request: Request):
+    """Register a connection with tokens obtained from the Xcel VENDOR PORTAL.
+
+    Per Xcel support (Jul 2026): the customer authorizes us FROM their own
+    Xcel My Account (Usage & Cost → 'Green Button Connect' → select meter →
+    select 'Ross House Rent'). After that, the customer appears in our Vendor
+    Portal ('GBC Customers' tab), where a vendor-customer access token can be
+    generated. This endpoint stores that token so syncs can run.
+
+    Body: {property_id, subscription_id, access_token, refresh_token?,
+           expires_in?, customer_email?, customer_name?}
+    """
+    admin = await auth_admin(request)
+    data = await request.json()
+    property_id = (data.get("property_id") or "").strip()
+    subscription_id = str(data.get("subscription_id") or "").strip()
+    access_token = (data.get("access_token") or "").strip()
+    refresh_token = (data.get("refresh_token") or "").strip()
+
+    if not property_id or not access_token:
+        raise HTTPException(status_code=400, detail="property_id y access_token son requeridos")
+
+    db = get_db()
+    prop = None
+    try:
+        prop = await db.properties.find_one({"_id": ObjectId(property_id)})
+    except Exception:
+        prop = await db.properties.find_one({"_id": property_id})
+    if not prop:
+        raise HTTPException(status_code=404, detail="Propiedad no encontrada")
+
+    now = datetime.now(timezone.utc)
+    expires_in = int(data.get("expires_in") or 3600)
+    doc = {
+        "property_id": str(prop["_id"]),
+        "access_token": access_token,
+        "refresh_token": refresh_token or None,
+        "access_token_expires_at": now.timestamp() + expires_in,
+        "subscription_id": subscription_id or None,
+        "customer_email": (data.get("customer_email") or "").strip() or None,
+        "customer_name": (data.get("customer_name") or "").strip() or None,
+        "status": "active",
+        "source": "vendor_portal_manual",
+        "created_by": admin.get("email", ""),
+        "last_error": None,
+        "updated_at": now,
+    }
+    existing = await db.xcel_connections.find_one({"property_id": str(prop["_id"])})
+    if existing:
+        await db.xcel_connections.update_one({"_id": existing["_id"]}, {"$set": doc})
+        conn_id = str(existing["_id"])
+    else:
+        doc["created_at"] = now
+        res = await db.xcel_connections.insert_one(doc)
+        conn_id = str(res.inserted_id)
+
+    await db.xcel_audit_log.insert_one({
+        "event": "manual_connection_registered",
+        "property_id": str(prop["_id"]),
+        "subscription_id": subscription_id,
+        "by": admin.get("email", ""),
+        "at": now,
+    })
+    return {
+        "success": True,
+        "connection_id": conn_id,
+        "message": "Conexión registrada. Usa 'Sincronizar' para solicitar los datos a Xcel.",
+    }
 
 
 @router.post("/admin/xcel/connections/{conn_id}/sync")
@@ -1361,8 +1454,11 @@ async def xcel_oauth_callback(request: Request):
     error = request.query_params.get("error")
 
     if error:
+        # SECURITY: escape the reflected value to prevent XSS.
+        import html
+        safe_error = html.escape(str(error))[:200]
         return HTMLResponse(_result_html("Autorización cancelada",
-                                         f"Xcel Energy reportó: {error}. Puedes cerrar esta ventana e intentarlo de nuevo.", False))
+                                         f"Xcel Energy reportó: {safe_error}. Puedes cerrar esta ventana e intentarlo de nuevo.", False))
     if not code or not state:
         return HTMLResponse(_result_html("Solicitud inválida", "Faltan parámetros de autorización.", False), status_code=400)
 
@@ -1428,6 +1524,14 @@ async def xcel_notify(request: Request):
         # Fall back to a regex sweep so we still attempt processing
         import re as _re
         resource_urls = _re.findall(r"https?://[^\s<>\"']+/Batch/[^\s<>\"']+", body)
+
+    # SECURITY (SSRF guard): drop any URL that is not an official Xcel host
+    # before we fetch it with our bearer token.
+    rejected = [u for u in resource_urls if not _is_allowed_xcel_url(u)]
+    resource_urls = [u for u in resource_urls if _is_allowed_xcel_url(u)]
+    if rejected:
+        notif_doc["errors"].append(f"rejected_non_xcel_urls: {rejected[:5]}")
+        logger.warning(f"[Xcel] Notification contained non-Xcel URLs (blocked): {rejected[:5]}")
 
     notif_doc["resources_found"] = resource_urls
 
