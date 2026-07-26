@@ -12,6 +12,51 @@ from rental.stripe_pkg.helpers import _get_stripe_config
 router = APIRouter()
 
 
+async def _notify_admin(subject: str, message: str):
+    """Best-effort admin notification (email via SendGrid + SMS via Twilio).
+    Never raises — webhook processing must not fail because of a notification."""
+    db = get_db()
+    api_cfg = await db.api_config.find_one({'_id': 'main'}) or {}
+    company_cfg = await db.rental_config.find_one({'type': 'company'}) or {}
+
+    # ── Email ──
+    try:
+        sendgrid_key = os.getenv('SENDGRID_API_KEY') or api_cfg.get('sendgrid_api_key', '')
+        from_email = os.getenv('SENDGRID_FROM_EMAIL') or api_cfg.get('sendgrid_from_email', 'info@rosshouserentals.com')
+        recipients = {e for e in ['yoandyross@gmail.com', company_cfg.get('email', '')] if e}
+        if sendgrid_key and recipients:
+            import sendgrid
+            from sendgrid.helpers.mail import Mail, Email, To, Content
+            sg = sendgrid.SendGridAPIClient(api_key=sendgrid_key)
+            for rcpt in recipients:
+                mail = Mail(
+                    from_email=Email(from_email, "Ross House Rentals"),
+                    to_emails=To(rcpt),
+                    subject=subject,
+                    plain_text_content=Content("text/plain", message),
+                )
+                sg.client.mail.send.post(request_body=mail.get())
+            logging.info(f"📧 Admin notificado por email: {subject}")
+    except Exception as e:
+        logging.warning(f"⚠️ No se pudo enviar email de notificación: {e}")
+
+    # ── SMS ──
+    try:
+        twilio_sid = os.getenv('TWILIO_ACCOUNT_SID') or api_cfg.get('twilio_account_sid', '')
+        twilio_token = os.getenv('TWILIO_AUTH_TOKEN') or api_cfg.get('twilio_auth_token', '')
+        twilio_phone = os.getenv('TWILIO_PHONE_NUMBER') or api_cfg.get('twilio_phone_number', '')
+        admin_phone = api_cfg.get('company_phone') or company_cfg.get('phone', '')
+        if twilio_sid and twilio_token and twilio_phone and admin_phone:
+            digits = ''.join(filter(str.isdigit, admin_phone))
+            to_phone = f'+1{digits[-10:]}' if len(digits) >= 10 else admin_phone
+            from twilio.rest import Client
+            Client(twilio_sid, twilio_token).messages.create(
+                body=f"{subject}\n{message}"[:1500], from_=twilio_phone, to=to_phone)
+            logging.info(f"📱 Admin notificado por SMS ({to_phone[-4:]})")
+    except Exception as e:
+        logging.warning(f"⚠️ No se pudo enviar SMS de notificación: {e}")
+
+
 @router.post('/stripe/connect-webhook')
 async def stripe_connect_webhook(request: Request):
     """
@@ -192,6 +237,9 @@ async def stripe_connect_webhook(request: Request):
             # Mark our payment_links record. For async methods (ACH) the
             # 'completed' event arrives with payment_status='unpaid' while the
             # debit clears → mark as 'processing' until async_payment_succeeded.
+            reference = (meta.get('reference', '') if hasattr(meta, 'get') else '') or 'sin referencia'
+            cust_details_n = sess_get('customer_details', {}) or {}
+            payer_email = cust_details_n.get('email', '') if isinstance(cust_details_n, dict) else ''
             if plink_id:
                 if payment_status == 'paid':
                     link_update = {"status": "paid", "paid_at": now}
@@ -203,6 +251,20 @@ async def stripe_connect_webhook(request: Request):
                               "stripe_customer_id": customer_id,
                               "amount_paid": amount_total, "updated_at": now}},
                 )
+
+            # Notify admin about the payment status
+            if event_type == 'checkout.session.async_payment_succeeded':
+                await _notify_admin(
+                    f"✅ Pago ACH COMPENSADO — ${amount_total:,.2f}",
+                    f"El pago ACH de ${amount_total:,.2f} ({reference}) compensó exitosamente.\nPagador: {payer_email}\nEl dinero está en camino a tu cuenta Stripe.")
+            elif payment_status == 'paid':
+                await _notify_admin(
+                    f"✅ Pago recibido — ${amount_total:,.2f}",
+                    f"Pago completado de ${amount_total:,.2f} ({reference}).\nPagador: {payer_email}\nMétodo de pago guardado en el Baúl.")
+            else:
+                await _notify_admin(
+                    f"🕓 Pago ACH iniciado — ${amount_total:,.2f}",
+                    f"Se inició un pago ACH de ${amount_total:,.2f} ({reference}).\nPagador: {payer_email}\nCompensará en ~4 días hábiles. Te avisaré cuando compense o rebote.")
 
             # Save the payment-method REFERENCE into the Vault — card OR bank
             # (never the full PAN/CVV/account number — PCI)
@@ -263,12 +325,20 @@ async def stripe_connect_webhook(request: Request):
         try:
             sess_get = event_data.get if isinstance(event_data, dict) else (lambda k, d=None: getattr(event_data, k, d))
             plink_id = sess_get('payment_link', '')
+            meta_f = sess_get('metadata', {}) or {}
+            amount_f = (sess_get('amount_total', 0) or 0) / 100
+            cust_f = sess_get('customer_details', {}) or {}
             if plink_id:
                 await get_db().payment_links.update_one(
                     {"stripe_payment_link_id": plink_id},
                     {"$set": {"status": "failed", "updated_at": datetime.utcnow()}},
                 )
                 logging.warning(f"❌ Payment link {plink_id}: async payment FAILED (ACH bounced)")
+            await _notify_admin(
+                f"❌ Pago ACH REBOTÓ — ${amount_f:,.2f}",
+                f"El pago ACH de ${amount_f:,.2f} ({(meta_f.get('reference','') if hasattr(meta_f,'get') else '') or 'sin referencia'}) FALLÓ (fondos insuficientes o cuenta inválida).\n"
+                f"Pagador: {cust_f.get('email','') if isinstance(cust_f, dict) else ''}\n"
+                f"Contacta al cliente para reintentar el pago.")
         except Exception as e:
             logging.exception(f"⚠️ Failed to process async_payment_failed: {e}")
 
