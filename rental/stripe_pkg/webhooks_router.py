@@ -22,31 +22,36 @@ async def stripe_connect_webhook(request: Request):
     payload = await request.body()
     sig_header = request.headers.get('stripe-signature', '')
 
-    # Get webhook secret from env or DB config
-    webhook_secret = os.getenv('STRIPE_WEBHOOK_SECRET', '')
-    if not webhook_secret:
-        config = await _get_stripe_config()
-        webhook_secret = config.get('stripe_webhook_secret', '')
+    # Get webhook secret(s): try BOTH the env var and the DB config value.
+    # (If the env var in Railway is stale/wrong, the DB secret still validates.)
+    config = await _get_stripe_config()
+    secrets = [s for s in (
+        os.getenv('STRIPE_WEBHOOK_SECRET', ''),
+        config.get('stripe_webhook_secret', ''),
+    ) if s]
 
-    if not webhook_secret:
+    if not secrets:
         # SECURITY: refuse to process unsigned webhooks. Without signature
         # verification anyone could forge a 'payment succeeded' event and mark
         # rent as paid. Fail closed instead of trusting the payload.
         logging.error("❌ Stripe webhook secret not configured — rejecting unsigned webhook")
         raise HTTPException(status_code=503, detail="Webhook not configured (missing STRIPE_WEBHOOK_SECRET)")
-    else:
+
+    import stripe
+    stripe.api_key = config.get("stripe_secret_key", "")
+    event = None
+    last_err = None
+    for secret in secrets:
         try:
-            import stripe
-            config = await _get_stripe_config()
-            stripe.api_key = config.get("stripe_secret_key", "")
-            event = stripe.Webhook.construct_event(
-                payload, sig_header, webhook_secret
-            )
+            event = stripe.Webhook.construct_event(payload, sig_header, secret)
+            break
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid payload")
         except Exception as e:
-            logging.error(f"❌ Stripe webhook signature verification failed: {e}")
-            raise HTTPException(status_code=400, detail=f"Webhook error: {str(e)}")
+            last_err = e
+    if event is None:
+        logging.error(f"❌ Stripe webhook signature verification failed: {last_err}")
+        raise HTTPException(status_code=400, detail=f"Webhook error: {str(last_err)}")
 
     event_type = event.get('type', '') if isinstance(event, dict) else event.type
     event_data = event.get('data', {}).get('object', {}) if isinstance(event, dict) else event.data.object
@@ -170,27 +175,37 @@ async def stripe_connect_webhook(request: Request):
         except Exception as link_err:
             logging.exception(f"⚠️ Failed to link Stripe PI to rental_payments: {link_err}")
 
-    # ── checkout.session.completed: payment-link payment finished ──
-    elif event_type == 'checkout.session.completed':
+    # ── checkout.session.completed / async_payment_succeeded:
+    #    payment-link payment finished (cards are instant; ACH completes days
+    #    later via checkout.session.async_payment_succeeded) ──
+    elif event_type in ('checkout.session.completed', 'checkout.session.async_payment_succeeded'):
         try:
             sess = event_data if isinstance(event_data, dict) else event_data.__dict__
             sess_get = sess.get if isinstance(sess, dict) else (lambda k, d=None: getattr(event_data, k, d))
             meta = sess_get('metadata', {}) or {}
             plink_id = sess_get('payment_link', '')
             customer_id = sess_get('customer', '')
+            payment_status = sess_get('payment_status', '')  # 'paid' | 'unpaid'
             amount_total = (sess_get('amount_total', 0) or 0) / 100
             now = datetime.utcnow()
 
-            # Mark our payment_links record as paid
+            # Mark our payment_links record. For async methods (ACH) the
+            # 'completed' event arrives with payment_status='unpaid' while the
+            # debit clears → mark as 'processing' until async_payment_succeeded.
             if plink_id:
+                if payment_status == 'paid':
+                    link_update = {"status": "paid", "paid_at": now}
+                else:
+                    link_update = {"status": "processing"}
                 await get_db().payment_links.update_one(
                     {"stripe_payment_link_id": plink_id},
-                    {"$set": {"status": "paid", "paid_at": now,
+                    {"$set": {**link_update,
                               "stripe_customer_id": customer_id,
                               "amount_paid": amount_total, "updated_at": now}},
                 )
 
-            # Save the card REFERENCE into the Vault (never the full PAN/CVV — PCI)
+            # Save the payment-method REFERENCE into the Vault — card OR bank
+            # (never the full PAN/CVV/account number — PCI)
             import stripe as _stripe
             pm_ref = None
             try:
@@ -198,23 +213,19 @@ async def stripe_connect_webhook(request: Request):
                 if pi_id:
                     pi = _stripe.PaymentIntent.retrieve(pi_id, expand=['payment_method'])
                     pm = pi.payment_method
-                    if pm and getattr(pm, 'card', None):
+                    if pm and (getattr(pm, 'card', None) or getattr(pm, 'us_bank_account', None)):
                         pm_ref = pm
             except Exception as e:
                 logging.warning(f"payment-link: could not expand payment_method: {e}")
 
             if pm_ref is not None:
-                card = pm_ref.card
                 existing = await get_db().payment_methods.find_one({"stripe_payment_method_id": pm_ref.id})
                 if not existing:
-                    await get_db().payment_methods.insert_one({
-                        "type": "card",
+                    cust_details = sess_get('customer_details', {}) or {}
+                    base_doc = {
                         "user_id": meta.get('tenant_id', '') if hasattr(meta, 'get') else '',
                         "user_name": meta.get('tenant_name', '') if hasattr(meta, 'get') else '',
-                        "user_email": sess_get('customer_details', {}).get('email', '') if isinstance(sess_get('customer_details', {}), dict) else '',
-                        "card_brand": (card.brand or '').title(),
-                        "card_last4": card.last4,
-                        "card_exp": f"{card.exp_month:02d}/{str(card.exp_year)[-2:]}",
+                        "user_email": cust_details.get('email', '') if isinstance(cust_details, dict) else '',
                         "stripe_payment_method_id": pm_ref.id,
                         "stripe_customer_id": customer_id,
                         "is_default": False,
@@ -222,10 +233,44 @@ async def stripe_connect_webhook(request: Request):
                         "source": "payment_link",
                         "reference": meta.get('reference', '') if hasattr(meta, 'get') else '',
                         "created_at": now,
-                    })
-                    logging.info(f"🔐 Vault: saved card reference ····{card.last4} from payment link")
+                    }
+                    if getattr(pm_ref, 'card', None):
+                        card = pm_ref.card
+                        await get_db().payment_methods.insert_one({
+                            **base_doc,
+                            "type": "card",
+                            "card_brand": (card.brand or '').title(),
+                            "card_last4": card.last4,
+                            "card_exp": f"{card.exp_month:02d}/{str(card.exp_year)[-2:]}",
+                        })
+                        logging.info(f"🔐 Vault: saved card reference ····{card.last4} from payment link")
+                    else:
+                        bank = pm_ref.us_bank_account
+                        await get_db().payment_methods.insert_one({
+                            **base_doc,
+                            "type": "bank",
+                            "bank_name": (bank.bank_name or '').title(),
+                            "account_last4": bank.last4,
+                            "last4": bank.last4,
+                            "account_type": bank.account_type or "checking",
+                        })
+                        logging.info(f"🔐 Vault: saved bank (ACH) reference {bank.bank_name} ····{bank.last4} from payment link")
         except Exception as pl_err:
-            logging.exception(f"⚠️ Failed to process checkout.session.completed: {pl_err}")
+            logging.exception(f"⚠️ Failed to process {event_type}: {pl_err}")
+
+    # ── checkout.session.async_payment_failed: ACH debit bounced ──
+    elif event_type == 'checkout.session.async_payment_failed':
+        try:
+            sess_get = event_data.get if isinstance(event_data, dict) else (lambda k, d=None: getattr(event_data, k, d))
+            plink_id = sess_get('payment_link', '')
+            if plink_id:
+                await get_db().payment_links.update_one(
+                    {"stripe_payment_link_id": plink_id},
+                    {"$set": {"status": "failed", "updated_at": datetime.utcnow()}},
+                )
+                logging.warning(f"❌ Payment link {plink_id}: async payment FAILED (ACH bounced)")
+        except Exception as e:
+            logging.exception(f"⚠️ Failed to process async_payment_failed: {e}")
 
     # ── Log all events for audit ──
     try:
