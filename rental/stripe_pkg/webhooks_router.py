@@ -252,22 +252,7 @@ async def stripe_connect_webhook(request: Request):
                               "amount_paid": amount_total, "updated_at": now}},
                 )
 
-            # Notify admin about the payment status
-            if event_type == 'checkout.session.async_payment_succeeded':
-                await _notify_admin(
-                    f"✅ Pago ACH COMPENSADO — ${amount_total:,.2f}",
-                    f"El pago ACH de ${amount_total:,.2f} ({reference}) compensó exitosamente.\nPagador: {payer_email}\nEl dinero está en camino a tu cuenta Stripe.")
-            elif payment_status == 'paid':
-                await _notify_admin(
-                    f"✅ Pago recibido — ${amount_total:,.2f}",
-                    f"Pago completado de ${amount_total:,.2f} ({reference}).\nPagador: {payer_email}\nMétodo de pago guardado en el Baúl.")
-            else:
-                await _notify_admin(
-                    f"🕓 Pago ACH iniciado — ${amount_total:,.2f}",
-                    f"Se inició un pago ACH de ${amount_total:,.2f} ({reference}).\nPagador: {payer_email}\nCompensará en ~4 días hábiles. Te avisaré cuando compense o rebote.")
-
-            # Save the payment-method REFERENCE into the Vault — card OR bank
-            # (never the full PAN/CVV/account number — PCI)
+            # Fetch the payment method FIRST (needed for vault + notification detail)
             import stripe as _stripe
             pm_ref = None
             try:
@@ -280,6 +265,38 @@ async def stripe_connect_webhook(request: Request):
             except Exception as e:
                 logging.warning(f"payment-link: could not expand payment_method: {e}")
 
+            # Build payer detail line: bank + account holder type → dispute risk
+            pay_detail = ""
+            if pm_ref is not None and getattr(pm_ref, 'us_bank_account', None):
+                _b = pm_ref.us_bank_account
+                _holder = (_b.account_holder_type or '').lower()
+                if _holder == 'company':
+                    _risk = "Cuenta de EMPRESA 🏢 — ventana de reclamo: solo 2 días hábiles (bajo riesgo)"
+                elif _holder == 'individual':
+                    _risk = "Cuenta PERSONAL 👤 — ventana de reclamo: hasta 60 días (mantén contrato/factura)"
+                else:
+                    _risk = "Tipo de titular no reportado"
+                pay_detail = f"\nBanco: {(_b.bank_name or '').title()} ····{_b.last4} ({_b.account_type or 'checking'})\n{_risk}"
+            elif pm_ref is not None and getattr(pm_ref, 'card', None):
+                _c = pm_ref.card
+                pay_detail = f"\nTarjeta: {(_c.brand or '').title()} ····{_c.last4}"
+
+            # Notify admin about the payment status
+            if event_type == 'checkout.session.async_payment_succeeded':
+                await _notify_admin(
+                    f"✅ Pago ACH COMPENSADO — ${amount_total:,.2f}",
+                    f"El pago ACH de ${amount_total:,.2f} ({reference}) compensó exitosamente.\nPagador: {payer_email}{pay_detail}\nEl dinero está en camino a tu cuenta Stripe.")
+            elif payment_status == 'paid':
+                await _notify_admin(
+                    f"✅ Pago recibido — ${amount_total:,.2f}",
+                    f"Pago completado de ${amount_total:,.2f} ({reference}).\nPagador: {payer_email}{pay_detail}\nMétodo de pago guardado en el Baúl.")
+            else:
+                await _notify_admin(
+                    f"🕓 Pago ACH iniciado — ${amount_total:,.2f}",
+                    f"Se inició un pago ACH de ${amount_total:,.2f} ({reference}).\nPagador: {payer_email}{pay_detail}\nCompensará en ~4 días hábiles. Te avisaré cuando compense o rebote.")
+
+            # Save the payment-method REFERENCE into the Vault — card OR bank
+            # (never the full PAN/CVV/account number — PCI)
             if pm_ref is not None:
                 existing = await get_db().payment_methods.find_one({"stripe_payment_method_id": pm_ref.id})
                 if not existing:
@@ -315,6 +332,8 @@ async def stripe_connect_webhook(request: Request):
                             "account_last4": bank.last4,
                             "last4": bank.last4,
                             "account_type": bank.account_type or "checking",
+                            "account_holder_type": bank.account_holder_type or "",
+                            "account_holder_name": getattr(pm_ref.billing_details, 'name', '') or '',
                         })
                         logging.info(f"🔐 Vault: saved bank (ACH) reference {bank.bank_name} ····{bank.last4} from payment link")
         except Exception as pl_err:
