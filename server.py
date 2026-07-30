@@ -236,6 +236,7 @@ try:
     from rental.reports_router import router as reports_router
     from rental.syndication_router import router as syndication_router
     from rental.tenant_leads_router import router as tenant_leads_router
+    from rental.newsletter_router import router as newsletter_router
     from rental.service_providers_router import router as service_providers_router
     from rental.ai_brain_router import router as ai_brain_router
     from rental.chatbot_router import router as chatbot_router
@@ -278,6 +279,7 @@ try:
     app.include_router(reports_router, prefix="/api")
     app.include_router(syndication_router, prefix="/api")
     app.include_router(tenant_leads_router, prefix="/api")
+    app.include_router(newsletter_router, prefix="/api")
     app.include_router(service_providers_router, prefix="/api")
     app.include_router(ai_brain_router, prefix="/api")
     app.include_router(chatbot_router, prefix="/api")
