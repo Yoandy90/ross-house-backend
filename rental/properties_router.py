@@ -7,7 +7,7 @@ import base64
 from datetime import datetime, timedelta
 from typing import Optional, List
 from bson import ObjectId
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request, BackgroundTasks
 from fastapi.responses import Response
 
 from rental.shared import (
@@ -1781,7 +1781,7 @@ async def list_properties(request: Request):
 
 
 @router.post('/admin/properties')
-async def create_property(request: Request):
+async def create_property(request: Request, background_tasks: BackgroundTasks):
     """Create a new property"""
     user = await auth_admin(request)
     data = await request.json()
@@ -1833,6 +1833,11 @@ async def create_property(request: Request):
     result = await get_db().properties.insert_one(property_doc)
     new_id = str(result.inserted_id)
 
+    # Auto-announce to newsletter subscribers if published as available
+    if property_doc.get('status') == 'available':
+        from rental.newsletter_router import announce_property_available
+        background_tasks.add_task(announce_property_available, new_id)
+
     # Handle initial owner assignment if provided
     owner_id_raw = data.get("owner_id")
     if owner_id_raw and ObjectId.is_valid(owner_id_raw):
@@ -1853,6 +1858,7 @@ async def create_property(request: Request):
         "message": f"Propiedad {prop_number} creada exitosamente",
         "property_id": new_id,
         "property_number": prop_number,
+        "newsletter_queued": property_doc.get('status') == 'available',
     }
 
 
@@ -1937,6 +1943,12 @@ async def update_property(property_id: str, request: Request):
     update_fields['updated_at'] = now
 
     await get_db().properties.update_one({"_id": ObjectId(property_id)}, {"$set": update_fields})
+
+    # Auto-announce to newsletter subscribers when transitioning to 'available'
+    if 'status' in data and data['status'] == 'available' and prop.get('status') != 'available':
+        from rental.newsletter_router import announce_property_available
+        background_tasks.add_task(announce_property_available, property_id)
+
     return {"success": True, "message": "Propiedad actualizada"}
 
 

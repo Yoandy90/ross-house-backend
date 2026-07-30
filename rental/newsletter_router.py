@@ -40,7 +40,7 @@ async def _sendgrid():
     return key, from_email
 
 
-def _campaign_html(subject: str, message: str, unsubscribe_url: str | None) -> str:
+def _campaign_html(subject: str, message: str, unsubscribe_url: str | None, extra_html: str = '') -> str:
     body_html = message.replace('\n', '<br>')
     unsub = (
         f'<p style="font-size:11px;color:#94a3b8;margin-top:24px">'
@@ -56,6 +56,7 @@ def _campaign_html(subject: str, message: str, unsubscribe_url: str | None) -> s
       </div>
       <div style="padding:28px;border:1px solid #e2e8f0;border-top:none;border-radius:0 0 12px 12px">
         <h2 style="color:#0f172a;font-size:17px;margin:0 0 14px">{subject}</h2>
+        {extra_html}
         <div style="color:#334155;font-size:14px;line-height:1.6">{body_html}</div>
         <p style="margin-top:24px;font-size:12px;color:#64748b">
           Ross House Rentals LLC · Dumas, TX · (806) 934-2018 ·
@@ -182,7 +183,7 @@ async def admin_delete_subscriber(sub_id: str, request: Request):
     return {"success": True}
 
 
-async def _run_campaign(campaign_id: str, subject: str, message: str, audience: str):
+async def _run_campaign(campaign_id: str, subject: str, message: str, audience: str, extra_html: str = ''):
     """Background task: send the blast and update campaign stats."""
     db = get_db()
     sg_key, from_email = await _sendgrid()
@@ -210,7 +211,7 @@ async def _run_campaign(campaign_id: str, subject: str, message: str, audience: 
             if r.get('unsub_token') else None
         )
         ok = await _send_one(sg_key, from_email, r['email'], subject,
-                             _campaign_html(subject, message, unsub_url))
+                             _campaign_html(subject, message, unsub_url, extra_html))
         sent += 1 if ok else 0
         failed += 0 if ok else 1
 
@@ -255,3 +256,85 @@ async def admin_list_campaigns(request: Request, limit: int = 50):
     await auth_admin(request)
     camps = await get_db().newsletter_campaigns.find().sort("created_at", -1).limit(limit).to_list(limit)
     return {"success": True, "campaigns": [serialize(c) for c in camps]}
+
+
+# ═══════════════════ AUTO-CAMPAÑA: propiedad disponible ═══════════════════
+
+ANNOUNCE_COOLDOWN_DAYS = 14
+
+
+async def announce_property_available(property_id: str):
+    """Auto-send a newsletter campaign when a property becomes available.
+    Skips if the property was already announced in the last 14 days."""
+    from bson import ObjectId
+    db = get_db()
+    try:
+        prop = await db.properties.find_one({"_id": ObjectId(property_id)})
+    except Exception:
+        prop = None
+    if not prop or prop.get('status') != 'available':
+        return
+
+    # Dedup: don't spam if the status is toggled repeatedly
+    last = prop.get('newsletter_announced_at')
+    if last and (datetime.utcnow() - last).days < ANNOUNCE_COOLDOWN_DAYS:
+        logger.info(f"[newsletter] property {property_id} already announced {last} — skipping")
+        return
+
+    name = prop.get('name') or prop.get('address') or 'Nueva propiedad'
+    address = prop.get('address', '')
+    city = prop.get('city', 'Dumas')
+    rent = float(prop.get('rent_amount') or 0)
+    beds = prop.get('bedrooms', '')
+    baths = prop.get('bathrooms', '')
+    sqft = prop.get('square_feet', 0)
+
+    # Property photo (first one)
+    photo_html = ''
+    photos = prop.get('photos') or []
+    if photos and isinstance(photos[0], str):
+        clean = photos[0]
+        if clean.startswith('ross-rentals/'):
+            clean = clean[len('ross-rentals/'):]
+        photo_url = f"https://www.rosshouserentals.com/api/public/property-file/{clean}"
+        photo_html = f'<img src="{photo_url}" alt="{name}" style="width:100%;border-radius:12px;margin-bottom:14px" />'
+
+    sqft_txt = f" · {sqft} sqft" if sqft else ""
+    extra_html = f"""
+    {photo_html}
+    <div style="background:#f0fdfa;border:1px solid #99f6e4;border-radius:12px;padding:16px;margin-bottom:16px">
+      <div style="font-size:16px;font-weight:bold;color:#0f172a">{name}</div>
+      <div style="font-size:13px;color:#475569;margin-top:2px">📍 {address}, {city}, TX</div>
+      <div style="font-size:13px;color:#475569;margin-top:2px">🛏 {beds} hab · 🛁 {baths} baños{sqft_txt}</div>
+      <div style="font-size:22px;font-weight:bold;color:#0d9488;margin-top:8px">${rent:,.0f}<span style="font-size:13px;color:#64748b;font-weight:normal">/mes</span></div>
+      <a href="https://www.rosshouserentals.com/#properties"
+         style="display:inline-block;margin-top:12px;background:#0d9488;color:#fff;font-weight:bold;font-size:13px;padding:10px 22px;border-radius:10px;text-decoration:none">
+        Ver propiedad y aplicar →
+      </a>
+    </div>
+    """
+    subject = f"🏡 ¡Nueva casa disponible en {city}! — {name} · ${rent:,.0f}/mes"
+    message = (
+        "Acaba de quedar disponible esta propiedad y quisimos avisarte primero a ti.\n"
+        "Las casas en Dumas se rentan rápido — si te interesa, aplica hoy mismo o "
+        "contáctanos al (806) 934-2018."
+    )
+
+    campaign_id = str(uuid.uuid4())
+    await db.newsletter_campaigns.insert_one({
+        "_id": campaign_id,
+        "subject": subject,
+        "message": message,
+        "audience": "newsletter",
+        "status": "sending",
+        "sent": 0, "failed": 0, "total_recipients": 0,
+        "auto": True,
+        "property_id": property_id,
+        "created_by": "auto:property_available",
+        "created_at": datetime.utcnow(),
+    })
+    await db.properties.update_one(
+        {"_id": prop["_id"]},
+        {"$set": {"newsletter_announced_at": datetime.utcnow()}},
+    )
+    await _run_campaign(campaign_id, subject, message, "newsletter", extra_html)

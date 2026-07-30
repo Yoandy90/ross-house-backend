@@ -140,6 +140,31 @@ async def update_payment_methods(request: Request):
     }
 
 
+@router.get('/admin/security/stripe-3ds')
+async def get_stripe_3ds(request: Request):
+    """Get 3D Secure enforcement setting (default: disabled)."""
+    await auth_admin(request)
+    config = await _get_stripe_config()
+    return {"success": True, "enabled": bool(config.get('stripe_3ds_enabled', False))}
+
+
+@router.put('/admin/security/stripe-3ds')
+async def set_stripe_3ds(request: Request):
+    """Enable/disable 3D Secure (request_three_d_secure=any) on card payments."""
+    admin = await auth_admin(request)
+    data = await request.json()
+    enabled = bool(data.get('enabled', False))
+    await get_db().rental_config.update_one(
+        {"type": "company"},
+        {"$set": {"stripe_3ds_enabled": enabled,
+                  "stripe_3ds_updated_at": datetime.utcnow(),
+                  "stripe_3ds_updated_by": admin.get('email', '')}},
+        upsert=True,
+    )
+    return {"success": True, "enabled": enabled,
+            "message": f"3D Secure {'activado' if enabled else 'desactivado'}"}
+
+
 @router.get('/admin/stripe/test-connection')
 async def admin_test_stripe_connection(request: Request):
     """Admin: Test if Stripe keys are valid"""

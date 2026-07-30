@@ -142,6 +142,10 @@ async def tenant_create_stripe_payment(request: Request):
             intent_params["metadata"]["commission_rate"] = str(commission_rate)
             intent_params["metadata"]["owner_stripe_account"] = owner_stripe_account
 
+        # 3D Secure enforcement (admin toggle in Seguridad)
+        if config.get("stripe_3ds_enabled"):
+            intent_params["payment_method_options"] = {"card": {"request_three_d_secure": "any"}}
+
         intent = stripe.PaymentIntent.create(**intent_params)
 
         # Create an Ephemeral Key so the mobile PaymentSheet can list/manage
