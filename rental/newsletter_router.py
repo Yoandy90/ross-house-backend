@@ -258,6 +258,19 @@ async def admin_list_campaigns(request: Request, limit: int = 50):
     return {"success": True, "campaigns": [serialize(c) for c in camps]}
 
 
+# ═══════════════════ RESUMEN SEMANAL (digest) ═══════════════════
+
+@router.post('/admin/newsletter/weekly-digest/send')
+async def admin_send_weekly_digest(request: Request):
+    """Manually trigger the weekly metrics digest email (also runs auto every Monday 8AM CT)."""
+    await auth_admin(request)
+    from rental.weekly_digest_cron import send_weekly_digest
+    result = await send_weekly_digest(get_db())
+    if not result.get('success'):
+        raise HTTPException(status_code=502, detail=result.get('error', 'Error enviando digest'))
+    return result
+
+
 # ═══════════════════ AUTO-CAMPAÑA: propiedad disponible ═══════════════════
 
 ANNOUNCE_COOLDOWN_DAYS = 14

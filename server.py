@@ -122,6 +122,15 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"   ⚠️ Re-engagement cron not started: {e}")
 
+    # Start weekly metrics digest cron (Monday 8AM CT)
+    digest_task = None
+    try:
+        from rental.weekly_digest_cron import weekly_digest_loop
+        digest_task = asyncio.create_task(weekly_digest_loop())
+        logger.info("   ✅ Weekly digest cron scheduled")
+    except Exception as e:
+        logger.warning(f"   ⚠️ Weekly digest cron not started: {e}")
+
     yield
 
     # Graceful shutdown of cron
@@ -136,6 +145,13 @@ async def lifespan(app: FastAPI):
         reengage_task.cancel()
         try:
             await reengage_task
+        except Exception:
+            pass
+
+    if digest_task and not digest_task.done():
+        digest_task.cancel()
+        try:
+            await digest_task
         except Exception:
             pass
 
