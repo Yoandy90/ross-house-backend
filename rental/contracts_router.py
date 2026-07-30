@@ -2946,40 +2946,67 @@ async def list_property_photos(property_id: str, request: Request):
     ).sort("uploaded_at", -1).to_list(100)
     
     result_photos = [serialize(p) for p in photos]
-    
-    # Fallback: If property_photos collection is empty, build list from property.photos array
-    if not result_photos:
-        prop = await get_db().properties.find_one({"_id": ObjectId(property_id)})
-        if prop and prop.get("photos"):
-            for i, path_or_url in enumerate(prop["photos"]):
-                if isinstance(path_or_url, str) and path_or_url:
-                    storage_path = path_or_url
-                    # Build a clean URL path
-                    clean_path = path_or_url
-                    if clean_path.startswith("ross-rentals/"):
-                        clean_path = clean_path[len("ross-rentals/"):]
-                    result_photos.append({
-                        "_id": f"legacy_{i}",
-                        "file_id": f"legacy_{i}",
-                        "property_id": property_id,
-                        "storage_path": storage_path,
-                        "url": f"/api/public/property-file/{clean_path}",
-                        "filename": path_or_url.split("/")[-1] if "/" in path_or_url else path_or_url,
-                        "caption": "",
-                        "is_legacy": True,
-                    })
-    
+
+    # Merge legacy entries from property.photos array not tracked in property_photos
+    prop = await get_db().properties.find_one({"_id": ObjectId(property_id)})
+    if prop and prop.get("photos"):
+        known_paths = {p.get("storage_path") for p in result_photos}
+        deleted_docs = await get_db().property_photos.find(
+            {"property_id": property_id, "is_deleted": True}
+        ).to_list(200)
+        known_paths |= {d.get("storage_path") for d in deleted_docs}
+        for i, path_or_url in enumerate(prop["photos"]):
+            if isinstance(path_or_url, str) and path_or_url and path_or_url not in known_paths:
+                # Build a clean URL path
+                clean_path = path_or_url
+                if clean_path.startswith("ross-rentals/"):
+                    clean_path = clean_path[len("ross-rentals/"):]
+                result_photos.append({
+                    "_id": f"legacy_{i}",
+                    "file_id": f"legacy_{i}",
+                    "property_id": property_id,
+                    "storage_path": path_or_url,
+                    "url": f"/api/public/property-file/{clean_path}",
+                    "filename": path_or_url.split("/")[-1] if "/" in path_or_url else path_or_url,
+                    "caption": "",
+                    "is_legacy": True,
+                })
+
     return {"success": True, "photos": result_photos}
 
 
 @router.delete('/admin/properties/{property_id}/photos/{file_id}')
 async def delete_property_photo(property_id: str, file_id: str, request: Request):
-    """Soft-delete a property photo"""
+    """Delete a property photo (handles legacy array-only photos too)"""
     user = await auth_admin(request)
-    await get_db().property_photos.update_one(
+    db = get_db()
+
+    # Legacy photo: exists only in property.photos array — remove by index
+    if file_id.startswith('legacy_'):
+        try:
+            idx = int(file_id.split('_', 1)[1])
+        except ValueError:
+            raise HTTPException(status_code=400, detail="ID de foto inválido")
+        prop = await db.properties.find_one({"_id": ObjectId(property_id)})
+        photos_arr = (prop or {}).get("photos", [])
+        if not (0 <= idx < len(photos_arr)):
+            raise HTTPException(status_code=404, detail="Foto no encontrada")
+        photos_arr.pop(idx)
+        await db.properties.update_one(
+            {"_id": ObjectId(property_id)}, {"$set": {"photos": photos_arr}}
+        )
+        return {"success": True, "message": "Foto eliminada"}
+
+    doc = await db.property_photos.find_one({"file_id": file_id, "property_id": property_id})
+    await db.property_photos.update_one(
         {"file_id": file_id, "property_id": property_id},
         {"$set": {"is_deleted": True}}
     )
+    # Also remove from the property's photos array (used for card thumbnails)
+    if doc and doc.get("storage_path"):
+        await db.properties.update_one(
+            {"_id": ObjectId(property_id)}, {"$pull": {"photos": doc["storage_path"]}}
+        )
     return {"success": True, "message": "Foto eliminada"}
 
 
