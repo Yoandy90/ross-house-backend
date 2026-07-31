@@ -2873,6 +2873,36 @@ async def update_contract_addendums(contract_id: str, request: Request):
 # PHASE 2: PROPERTY PHOTOS & MOVE-IN/OUT CHECKLISTS
 # ═══════════════════════════════════════════════════════════════════════════════
 
+MAX_PHOTO_DIMENSION = 1920   # px — largest edge for web/app display
+PHOTO_JPEG_QUALITY = 82
+
+
+def _optimize_property_photo(file_bytes: bytes, content_type: str):
+    """Auto-optimize an uploaded property photo:
+    - Fix orientation (EXIF rotate) and strip metadata
+    - Resize to max 1920px on the longest edge (keeps aspect ratio, no crop)
+    - Re-encode as progressive JPEG q82
+    Returns (bytes, content_type, was_optimized)."""
+    try:
+        import io
+        from PIL import Image, ImageOps
+        im = Image.open(io.BytesIO(file_bytes))
+        im = ImageOps.exif_transpose(im)
+        if im.mode not in ('RGB',):
+            im = im.convert('RGB')
+        if max(im.size) > MAX_PHOTO_DIMENSION:
+            im.thumbnail((MAX_PHOTO_DIMENSION, MAX_PHOTO_DIMENSION), Image.LANCZOS)
+        out = io.BytesIO()
+        im.save(out, 'JPEG', quality=PHOTO_JPEG_QUALITY, optimize=True, progressive=True)
+        optimized = out.getvalue()
+        if len(optimized) < len(file_bytes):
+            return optimized, 'image/jpeg', True
+        return file_bytes, content_type, False
+    except Exception as e:
+        logger.warning(f"Photo optimization skipped: {e}")
+        return file_bytes, content_type, False
+
+
 @router.post('/admin/properties/{property_id}/photos')
 async def upload_property_photo(property_id: str, request: Request):
     """Upload a photo for a property via base64"""
@@ -2900,6 +2930,16 @@ async def upload_property_photo(property_id: str, request: Request):
         file_bytes = base64.b64decode(image_data)
     except Exception:
         raise HTTPException(status_code=400, detail="Datos de imagen inválidos")
+
+    if len(file_bytes) > 25 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="La imagen excede 25MB")
+
+    # Auto-optimize: EXIF rotate, resize to 1920px max, progressive JPEG
+    original_size = len(file_bytes)
+    file_bytes, content_type, was_optimized = _optimize_property_photo(file_bytes, content_type)
+    if was_optimized:
+        filename = (filename.rsplit('.', 1)[0] if '.' in filename else filename) + '.jpg'
+        logger.info(f"📸 Photo optimized: {original_size/1024:.0f}KB → {len(file_bytes)/1024:.0f}KB ({filename})")
 
     if len(file_bytes) > 10 * 1024 * 1024:
         raise HTTPException(status_code=400, detail="La imagen excede 10MB")
