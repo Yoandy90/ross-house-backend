@@ -2875,12 +2875,47 @@ async def update_contract_addendums(contract_id: str, request: Request):
 
 MAX_PHOTO_DIMENSION = 1920   # px — largest edge for web/app display
 PHOTO_JPEG_QUALITY = 82
+WATERMARK_TEXT = 'rosshouserentals.com'
+
+
+def _apply_watermark(im):
+    """Subtle semi-transparent brand watermark, bottom-right corner."""
+    from PIL import Image, ImageDraw, ImageFont
+    W, H = im.size
+    size = max(16, int(W * 0.026))
+    font = None
+    for path in (
+        '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf',
+        '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
+    ):
+        try:
+            font = ImageFont.truetype(path, size)
+            break
+        except Exception:
+            continue
+    if font is None:
+        try:
+            font = ImageFont.load_default(size=size)
+        except Exception:
+            font = ImageFont.load_default()
+
+    overlay = Image.new('RGBA', im.size, (0, 0, 0, 0))
+    d = ImageDraw.Draw(overlay)
+    bbox = d.textbbox((0, 0), WATERMARK_TEXT, font=font)
+    tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    pad = max(12, int(W * 0.016))
+    x = W - tw - pad - bbox[0]
+    y = H - th - pad - bbox[1]
+    d.text((x + 2, y + 2), WATERMARK_TEXT, font=font, fill=(0, 0, 0, 100))   # sombra
+    d.text((x, y), WATERMARK_TEXT, font=font, fill=(255, 255, 255, 160))     # texto
+    return Image.alpha_composite(im.convert('RGBA'), overlay).convert('RGB')
 
 
 def _optimize_property_photo(file_bytes: bytes, content_type: str):
     """Auto-optimize an uploaded property photo:
     - Fix orientation (EXIF rotate) and strip metadata
     - Resize to max 1920px on the longest edge (keeps aspect ratio, no crop)
+    - Subtle brand watermark bottom-right
     - Re-encode as progressive JPEG q82
     Returns (bytes, content_type, was_optimized)."""
     try:
@@ -2892,12 +2927,13 @@ def _optimize_property_photo(file_bytes: bytes, content_type: str):
             im = im.convert('RGB')
         if max(im.size) > MAX_PHOTO_DIMENSION:
             im.thumbnail((MAX_PHOTO_DIMENSION, MAX_PHOTO_DIMENSION), Image.LANCZOS)
+        try:
+            im = _apply_watermark(im)
+        except Exception as we:
+            logger.warning(f"Watermark skipped: {we}")
         out = io.BytesIO()
         im.save(out, 'JPEG', quality=PHOTO_JPEG_QUALITY, optimize=True, progressive=True)
-        optimized = out.getvalue()
-        if len(optimized) < len(file_bytes):
-            return optimized, 'image/jpeg', True
-        return file_bytes, content_type, False
+        return out.getvalue(), 'image/jpeg', True
     except Exception as e:
         logger.warning(f"Photo optimization skipped: {e}")
         return file_bytes, content_type, False
