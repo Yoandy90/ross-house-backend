@@ -1836,7 +1836,9 @@ async def create_property(request: Request, background_tasks: BackgroundTasks):
     # Auto-announce to newsletter subscribers if published as available
     if property_doc.get('status') == 'available':
         from rental.newsletter_router import announce_property_available
+        from rental.social_poster_router import auto_generate_property_post
         background_tasks.add_task(announce_property_available, new_id)
+        background_tasks.add_task(auto_generate_property_post, new_id)
 
     # Handle initial owner assignment if provided
     owner_id_raw = data.get("owner_id")
@@ -1947,7 +1949,9 @@ async def update_property(property_id: str, request: Request):
     # Auto-announce to newsletter subscribers when transitioning to 'available'
     if 'status' in data and data['status'] == 'available' and prop.get('status') != 'available':
         from rental.newsletter_router import announce_property_available
+        from rental.social_poster_router import auto_generate_property_post
         background_tasks.add_task(announce_property_available, property_id)
+        background_tasks.add_task(auto_generate_property_post, property_id)
 
     return {"success": True, "message": "Propiedad actualizada"}
 

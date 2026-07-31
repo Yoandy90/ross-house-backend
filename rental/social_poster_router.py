@@ -169,21 +169,23 @@ class GeneratePayload(BaseModel):
     include_cta: bool = True
 
 
-@router.post("/generate")
-async def generate_variations(payload: GeneratePayload, request: Request):
-    """Generate 5 post variations using Claude Sonnet 4.5."""
-    await auth_admin(request)
-    db = get_db()
-
+async def generate_post_variations(db, intent: str, property_id: str = None,
+                                    custom_context: str = '', tone: str = 'friendly',
+                                    include_hashtags: bool = True, include_cta: bool = True,
+                                    n: int = 5) -> list:
+    """Core AI generation — returns list of post variations. Raises on failure."""
     api_key = os.environ.get("EMERGENT_LLM_KEY")
     if not api_key:
-        raise HTTPException(status_code=503, detail="EMERGENT_LLM_KEY no configurada en el backend")
+        cfg = await db.api_config.find_one({'_id': 'main'}) or {}
+        api_key = cfg.get('EMERGENT_LLM_KEY', '')
+    if not api_key:
+        raise RuntimeError("EMERGENT_LLM_KEY no configurada en el backend")
 
     # Optionally pull property data
     property_ctx = ""
-    if payload.property_id:
+    if property_id:
         try:
-            prop = await db.rental_properties.find_one({"_id": ObjectId(payload.property_id)})
+            prop = await db.properties.find_one({"_id": ObjectId(property_id)})
         except Exception:
             prop = None
         if prop:
@@ -194,7 +196,7 @@ async def generate_variations(payload: GeneratePayload, request: Request):
                 f"- Baños: {prop.get('bathrooms', '?')}\n"
                 f"- Renta mensual: ${prop.get('rent_amount', 0):,}\n"
                 f"- Depósito: ${prop.get('deposit_amount', 0):,}\n"
-                f"- Sqft: {prop.get('sqft', '?')}\n"
+                f"- Sqft: {prop.get('square_feet') or prop.get('sqft', '?')}\n"
                 f"- Estado: {prop.get('status', 'disponible')}\n"
             )
 
@@ -212,7 +214,7 @@ async def generate_variations(payload: GeneratePayload, request: Request):
             "ayudándose, no a reclutamiento corporativo. Link: rosshouserentals.com/proveedores"
         ),
     }
-    intent_desc = intent_map.get(payload.intent, payload.intent)
+    intent_desc = intent_map.get(intent, intent)
 
     tone_map = {
         "friendly": "cercano, cálido, como amigo hispano",
@@ -220,7 +222,7 @@ async def generate_variations(payload: GeneratePayload, request: Request):
         "professional": "profesional pero accesible",
         "informal": "muy relajado, con emojis, tipo mensaje de whatsapp",
     }
-    tone_desc = tone_map.get(payload.tone, payload.tone)
+    tone_desc = tone_map.get(tone, tone)
 
     system_prompt = (
         "Eres un experto en marketing digital para Ross House Rentals LLC, una empresa "
@@ -232,7 +234,7 @@ async def generate_variations(payload: GeneratePayload, request: Request):
         "{\n"
         '  "variations": [\n'
         '    {"headline": "...", "body": "...", "cta": "...", "hashtags": ["...", "..."]},\n'
-        "    ...5 items en total...\n"
+        f"    ...{n} items en total...\n"
         "  ]\n"
         "}\n"
         "Cada variación debe:\n"
@@ -247,49 +249,60 @@ async def generate_variations(payload: GeneratePayload, request: Request):
     user_prompt = (
         f"Objetivo del post: {intent_desc}\n"
         f"Tono deseado: {tone_desc}\n"
-        f"Incluir hashtags: {payload.include_hashtags}\n"
-        f"Incluir call-to-action con link: {payload.include_cta}\n"
+        f"Incluir hashtags: {include_hashtags}\n"
+        f"Incluir call-to-action con link: {include_cta}\n"
         f"URL de la empresa (para CTA): https://www.rosshouserentals.com\n"
         f"Teléfono: (806) 934-2018\n"
         f"{property_ctx}\n"
-        f"Contexto adicional del admin: {payload.custom_context or '(ninguno)'}\n\n"
-        "Genera 5 variaciones y devuelve el JSON."
+        f"Contexto adicional del admin: {custom_context or '(ninguno)'}\n\n"
+        f"Genera {n} variaciones y devuelve el JSON."
     )
 
+    from emergentintegrations.llm.chat import LlmChat, UserMessage
+    chat = LlmChat(
+        api_key=api_key,
+        session_id=f"social_gen_{uuid4()}",
+        system_message=system_prompt,
+    ).with_model(MODEL_PROVIDER, MODEL_NAME)
+
+    raw = await chat.send_message(UserMessage(text=user_prompt))
+    text = str(raw or "").strip()
+
+    # Strip code fences if present
+    if text.startswith("```"):
+        parts = text.split("```", 2)
+        text = parts[1] if len(parts) > 1 else parts[0]
+        if text.startswith("json"):
+            text = text[4:]
+        text = text.strip("` \n")
+
+    import json
+    parsed = json.loads(text)
+    variations = parsed.get("variations", [])
+    if not isinstance(variations, list) or not variations:
+        raise ValueError("AI returned no variations")
+
+    # Add composed_text field for easy copy-paste
+    for v in variations:
+        body_txt = v.get("body", "").strip()
+        cta = v.get("cta", "").strip()
+        tags = v.get("hashtags", [])
+        tag_line = " ".join([f"#{t.lstrip('#')}" for t in tags]) if tags else ""
+        v["composed_text"] = "\n\n".join(filter(None, [body_txt, cta, tag_line]))
+        v["char_count"] = len(v["composed_text"])
+    return variations
+
+
+@router.post("/generate")
+async def generate_variations(payload: GeneratePayload, request: Request):
+    """Generate 5 post variations using AI."""
+    await auth_admin(request)
+    db = get_db()
     try:
-        from emergentintegrations.llm.chat import LlmChat, UserMessage
-        chat = LlmChat(
-            api_key=api_key,
-            session_id=f"social_gen_{uuid4()}",
-            system_message=system_prompt,
-        ).with_model(MODEL_PROVIDER, MODEL_NAME)
-
-        raw = await chat.send_message(UserMessage(text=user_prompt))
-        text = str(raw or "").strip()
-
-        # Strip code fences if present
-        if text.startswith("```"):
-            parts = text.split("```", 2)
-            text = parts[1] if len(parts) > 1 else parts[0]
-            if text.startswith("json"):
-                text = text[4:]
-            text = text.strip("` \n")
-
-        import json
-        parsed = json.loads(text)
-        variations = parsed.get("variations", [])
-        if not isinstance(variations, list) or not variations:
-            raise ValueError("AI returned no variations")
-
-        # Add composed_text field for easy copy-paste
-        for v in variations:
-            body_txt = v.get("body", "").strip()
-            cta = v.get("cta", "").strip()
-            tags = v.get("hashtags", [])
-            tag_line = " ".join([f"#{t.lstrip('#')}" for t in tags]) if tags else ""
-            v["composed_text"] = "\n\n".join(filter(None, [body_txt, cta, tag_line]))
-            v["char_count"] = len(v["composed_text"])
-
+        variations = await generate_post_variations(
+            db, payload.intent, payload.property_id, payload.custom_context or '',
+            payload.tone, payload.include_hashtags, payload.include_cta,
+        )
         return {
             "status": "success",
             "variations": variations,
@@ -299,6 +312,76 @@ async def generate_variations(payload: GeneratePayload, request: Request):
     except Exception as e:
         logger.exception(f"[social] AI generation failed: {e}")
         raise HTTPException(status_code=500, detail=f"Error al generar: {str(e)}")
+
+
+async def auto_generate_property_post(property_id: str):
+    """Auto-generate FB post drafts when a property becomes available.
+    Saves them to social_post_drafts and emails them to the admin ready to paste."""
+    db = get_db()
+    try:
+        prop = await db.properties.find_one({"_id": ObjectId(property_id)})
+    except Exception:
+        prop = None
+    if not prop or prop.get('status') != 'available':
+        return
+    try:
+        variations = await generate_post_variations(
+            db, 'rental_listing', property_id,
+            custom_context='La casa acaba de quedar DISPONIBLE hoy. Frescura y urgencia.',
+            n=3,
+        )
+    except Exception as e:
+        logger.exception(f"[social] auto-generation failed for {property_id}: {e}")
+        return
+
+    await db.social_post_drafts.insert_one({
+        "property_id": property_id,
+        "address": prop.get('address', ''),
+        "variations": variations,
+        "auto": True,
+        "created_at": datetime.now(timezone.utc),
+    })
+
+    # Email the drafts to the admin, ready to copy-paste
+    try:
+        from rental.newsletter_router import _sendgrid, _send_one
+        sg_key, from_email = await _sendgrid()
+        if sg_key:
+            blocks = ""
+            for i, v in enumerate(variations, 1):
+                body = v.get('composed_text', '').replace('\n', '<br>')
+                blocks += f"""
+                <div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:12px;padding:16px;margin-bottom:14px">
+                  <div style="font-size:11px;font-weight:bold;color:#0891b2;margin-bottom:6px">OPCIÓN {i} — {v.get('headline','')}</div>
+                  <div style="font-size:13px;color:#334155;line-height:1.6">{body}</div>
+                </div>"""
+            html = f"""
+            <div style="font-family:Arial,Helvetica,sans-serif;max-width:620px;margin:0 auto">
+              <h2 style="color:#0f172a">📣 Posts de Facebook listos — {prop.get('address','')}</h2>
+              <p style="color:#475569;font-size:13px">Tu propiedad quedó <b>disponible</b> y la IA generó estas 3 opciones de post.
+              Copia la que más te guste, adjunta las fotos (ya llevan tu marca de agua) y publícala en los grupos de Facebook.</p>
+              {blocks}
+              <p style="font-size:12px;color:#64748b">También puedes generar más variaciones en
+              <a href="https://www.rosshouserentals.com/admin/marketing/social-poster" style="color:#0891b2">Admin → Marketing → Social Poster</a>.</p>
+            </div>"""
+            company = await db.rental_config.find_one({'type': 'company'}) or {}
+            for rcpt in {e for e in ['yoandyross@gmail.com', company.get('email', '')] if e}:
+                await _send_one(sg_key, from_email, rcpt,
+                                f"📣 3 posts de Facebook listos — {prop.get('address','')} disponible",
+                                html)
+            logger.info(f"[social] auto-drafts emailed for {property_id}")
+    except Exception as e:
+        logger.warning(f"[social] draft email failed: {e}")
+
+
+@router.get("/drafts")
+async def list_drafts(request: Request, limit: int = 20):
+    """Auto-generated post drafts (newest first)."""
+    await auth_admin(request)
+    drafts = await get_db().social_post_drafts.find().sort("created_at", -1).limit(limit).to_list(limit)
+    for d in drafts:
+        d["_id"] = str(d["_id"])
+    return {"status": "success", "drafts": drafts}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -364,7 +447,7 @@ async def list_available_properties(request: Request):
     """Quick list of available rental properties for the property_id selector."""
     await auth_admin(request)
     db = get_db()
-    props = await db.rental_properties.find(
+    props = await db.properties.find(
         {"status": {"$in": ["available", "disponible", "vacant"]}}
     ).to_list(50)
     return {
