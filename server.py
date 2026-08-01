@@ -131,6 +131,15 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"   ⚠️ Weekly digest cron not started: {e}")
 
+    # Start property tax reminder cron (Dec 1 & Jan 15, 9AM CT)
+    tax_task = None
+    try:
+        from rental.tax_reminder_cron import tax_reminder_loop
+        tax_task = asyncio.create_task(tax_reminder_loop())
+        logger.info("   ✅ Tax reminder cron scheduled")
+    except Exception as e:
+        logger.warning(f"   ⚠️ Tax reminder cron not started: {e}")
+
     yield
 
     # Graceful shutdown of cron
@@ -152,6 +161,13 @@ async def lifespan(app: FastAPI):
         digest_task.cancel()
         try:
             await digest_task
+        except Exception:
+            pass
+
+    if tax_task and not tax_task.done():
+        tax_task.cancel()
+        try:
+            await tax_task
         except Exception:
             pass
 
@@ -253,6 +269,7 @@ try:
     from rental.syndication_router import router as syndication_router
     from rental.tenant_leads_router import router as tenant_leads_router
     from rental.newsletter_router import router as newsletter_router
+    from rental.tax_reminder_cron import router as tax_reminder_router
     from rental.service_providers_router import router as service_providers_router
     from rental.ai_brain_router import router as ai_brain_router
     from rental.chatbot_router import router as chatbot_router
@@ -296,6 +313,7 @@ try:
     app.include_router(syndication_router, prefix="/api")
     app.include_router(tenant_leads_router, prefix="/api")
     app.include_router(newsletter_router, prefix="/api")
+    app.include_router(tax_reminder_router, prefix="/api")
     app.include_router(service_providers_router, prefix="/api")
     app.include_router(ai_brain_router, prefix="/api")
     app.include_router(chatbot_router, prefix="/api")
