@@ -15,7 +15,7 @@ encrypted via the separate /tenant/bank-accounts/add flow.
 """
 import os
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from fastapi import APIRouter, Request, HTTPException
 from bson import ObjectId
@@ -69,7 +69,6 @@ async def create_payment_link(request: Request):
         raise HTTPException(status_code=400, detail="La referencia es requerida")
 
     import stripe as stripe_lib
-    stripe_lib.api_key = await _get_stripe_sk()
     db = get_db()
 
     tenant_name = ""
@@ -92,7 +91,101 @@ async def create_payment_link(request: Request):
         "source": "vault_payment_link",
     }
 
+    # ── Multi-procesador: si el procesador activo es Square/Clover, crear
+    #    el checkout hospedado con ese procesador en lugar de Stripe ──
+    from .payment_processors_router import get_active_processor, create_hosted_checkout
+    active_name, _ = await get_active_processor()
+    if active_name in ("square", "clover"):
+        result = await create_hosted_checkout(
+            amount_cents=amount_cents, reference=reference,
+            customer_email=customer_email)
+        doc = {
+            "reference": reference,
+            "description": description,
+            "amount": amount,
+            "currency": "usd",
+            "tenant_id": tenant_id or None,
+            "tenant_name": tenant_name or None,
+            "customer_email": customer_email or None,
+            "processor": active_name,
+            "external_id": result.get("external_id", ""),
+            "url": result.get("url", ""),
+            "status": "active",
+            "paid_at": None,
+            "created_by": admin.get("email", ""),
+            "created_at": datetime.now(timezone.utc),
+        }
+        res = await db.payment_links.insert_one(doc)
+        return {
+            "success": True,
+            "id": str(res.inserted_id),
+            "url": result.get("url", ""),
+            "processor": active_name,
+            "reference": reference,
+            "amount": amount,
+            "message": f"Link de pago creado con {active_name.title()}. Cópialo y envíalo al cliente.",
+        }
+
     try:
+        stripe_lib.api_key = await _get_stripe_sk()
+
+        # ── 3D Secure OBLIGATORIO: si está activo, usamos Checkout Session
+        #    (Payment Links no soporta forzar 3DS). request_three_d_secure="any"
+        #    solicita 3DS a TODAS las tarjetas → liability shift al banco emisor.
+        #    Evidencia del resultado se captura en el webhook (three_d_secure). ──
+        from .payment_processors_router import get_three_ds_settings
+        three_ds = await get_three_ds_settings()
+        if three_ds.get("stripe", True):
+            session = stripe_lib.checkout.Session.create(
+                mode="payment",
+                line_items=[{
+                    "price_data": {
+                        "currency": "usd",
+                        "unit_amount": amount_cents,
+                        "product_data": {"name": reference[:250]},
+                    },
+                    "quantity": 1,
+                }],
+                payment_method_types=["card"],
+                payment_method_options={
+                    "card": {"request_three_d_secure": "any"},
+                },
+                customer_creation="always",
+                customer_email=customer_email or None,
+                payment_intent_data={"setup_future_usage": "off_session", "metadata": metadata},
+                metadata=metadata,
+                success_url="https://www.rosshouserentals.com/pago-exitoso?session_id={CHECKOUT_SESSION_ID}",
+                cancel_url="https://www.rosshouserentals.com/",
+                expires_at=int((datetime.now(timezone.utc) + timedelta(hours=24)).timestamp()),
+            )
+            doc = {
+                "reference": reference,
+                "description": description,
+                "amount": amount,
+                "currency": "usd",
+                "tenant_id": tenant_id or None,
+                "tenant_name": tenant_name or None,
+                "customer_email": customer_email or None,
+                "stripe_checkout_session_id": session.id,
+                "three_ds_required": True,
+                "url": session.url,
+                "status": "active",
+                "paid_at": None,
+                "expires_at": datetime.now(timezone.utc) + timedelta(hours=24),
+                "created_by": admin.get("email", ""),
+                "created_at": datetime.now(timezone.utc),
+            }
+            res = await db.payment_links.insert_one(doc)
+            return {
+                "success": True,
+                "id": str(res.inserted_id),
+                "url": session.url,
+                "reference": reference,
+                "amount": amount,
+                "three_ds_required": True,
+                "message": "Link de pago creado con 3D Secure OBLIGATORIO (válido 24h). Cópialo y envíalo al cliente.",
+            }
+
         product = stripe_lib.Product.create(name=reference[:250], metadata=metadata)
         price = stripe_lib.Price.create(
             product=product.id, unit_amount=amount_cents, currency="usd"

@@ -70,6 +70,20 @@ BOT_RE = re.compile(
 )
 
 MOBILE_RE  = re.compile(r"(?i)(mobile|android|iphone|ipod)")
+
+# Referral-spam / scraper domains: sessions from these referrers are flagged is_bot
+# (they inflate traffic but never convert — root cause of the fake traffic spikes)
+SPAM_REF_RE = re.compile(
+    r"(?i)(polymeta|searchezee|simmani|boardreader|semalt|buttons-for-website|"
+    r"best-seo-offer|7makemoneyonline|floating-share-buttons|traffic2cash|"
+    r"free-share-buttons|event-tracking|success-seo|videos-for-your-business|"
+    r"buy-cheap-online|dailyrank|rankscanner|uptimebot|seokicks|dataprovider)"
+)
+
+
+def _is_spam_referrer(host) -> bool:
+    return bool(host and SPAM_REF_RE.search(host))
+
 TABLET_RE  = re.compile(r"(?i)(tablet|ipad)")
 
 BROWSER_PATTERNS = [
@@ -208,6 +222,9 @@ async def _ensure_indexes(db):
         await db.visitor_events.create_index([("ts", 1)],
             expireAfterSeconds=90 * 24 * 3600)  # 90d TTL
         await db.visitor_sessions.create_index([("last_seen", -1)])
+        await db.visitor_sessions.create_index([("is_bot", 1), ("first_seen", -1)])
+        await db.visitor_sessions.create_index([("first_seen", -1)])
+        await db.visitor_events.create_index([("type", 1), ("ts", -1)])
         await db.visitor_sessions.create_index("session_id", unique=True)
         await db.visitor_sessions.create_index("visitor_id")
         await db.geo_cache.create_index([("expires_at", 1)], expireAfterSeconds=0)
@@ -349,6 +366,7 @@ async def track_session(payload: TrackSessionPayload, request: Request):
     visitor_id = _hash_ip(ip)
     ua_info = _parse_user_agent(ua)
     ref = _extract_referrer(payload.referrer or "")
+    is_spam = _is_spam_referrer(ref.get("referrer_host"))
 
     # UTM extraction (from landing path if present)
     utm = {"utm_source": None, "utm_medium": None, "utm_campaign": None}
@@ -378,7 +396,7 @@ async def track_session(payload: TrackSessionPayload, request: Request):
 
     # ─── New-country alert: notify admin if country is new (not seen in 90d) ───
     cc = (geo.get("country_code") or "").upper()
-    if cc and cc not in ("LO",):
+    if cc and cc not in ("LO",) and not is_spam:
         cutoff = _now() - timedelta(days=90)
         prior = await db.visitor_sessions.find_one(
             {"country_code": cc, "first_seen": {"$gte": cutoff}, "is_bot": {"$ne": True}},
@@ -398,7 +416,8 @@ async def track_session(payload: TrackSessionPayload, request: Request):
         "last_seen": _now(),
         "pages_count": 0,
         "events_count": 0,
-        "is_bot": False,
+        "is_bot": is_spam,
+        "bot_reason": "spam_referrer" if is_spam else None,
         "user_agent": ua[:500],
         "lang": payload.lang,
         "screen_w": payload.screen_w,
@@ -431,6 +450,8 @@ async def track_page(payload: TrackPagePayload, request: Request):
         sess = await db.visitor_sessions.find_one({"_id": payload.session_id})
         if not sess:
             return {"ok": False}
+    if sess.get("is_bot"):
+        return {"ok": True, "ignored": "bot_session"}
     now = _now()
     await db.visitor_events.insert_one({
         "_id": hashlib.sha256(f"{payload.session_id}:{now.timestamp()}:page:{payload.path}".encode()).hexdigest()[:24],
@@ -461,6 +482,8 @@ async def track_event(payload: TrackEventPayload, request: Request):
     sess = await db.visitor_sessions.find_one({"_id": payload.session_id})
     if not sess:
         return {"ok": False, "reason": "no_session"}
+    if sess.get("is_bot"):
+        return {"ok": True, "ignored": "bot_session"}
     now = _now()
     await db.visitor_events.insert_one({
         "_id": hashlib.sha256(f"{payload.session_id}:{now.timestamp()}:event:{payload.name}".encode()).hexdigest()[:24],
@@ -487,7 +510,7 @@ async def track_heartbeat(payload: HeartbeatPayload, request: Request):
     if _is_bot(ua):
         return {"ok": True, "ignored": "bot"}
     res = await db.visitor_sessions.update_one(
-        {"_id": payload.session_id},
+        {"_id": payload.session_id, "is_bot": {"$ne": True}},
         {"$set": {"last_seen": _now(), "current_path": (payload.path or "")[:500]}},
     )
     return {"ok": res.matched_count > 0}
@@ -557,7 +580,12 @@ async def admin_overview(request: Request, range: str = "7d",
                 "events":   {"$sum": "$events_count"},
                 "leads":    {"$sum": {"$cond": [{"$ifNull": ["$lead_id", False]}, 1, 0]}},
                 "bounces":  {"$sum": {"$cond": [{"$lte": ["$pages_count", 1]}, 1, 0]}},
-                "duration_sum": {"$sum": {"$dateDiff": {"startDate": "$first_seen", "endDate": "$last_seen", "unit": "second"}}},
+                # Cap duration per-session at 30 min: heartbeats from tabs left open
+                # were inflating avg_duration to absurd values (hours)
+                "duration_sum": {"$sum": {"$min": [
+                    {"$dateDiff": {"startDate": "$first_seen", "endDate": "$last_seen", "unit": "second"}},
+                    1800,
+                ]}},
             }},
         ]
         try:
@@ -1064,4 +1092,125 @@ async def get_traffic_snapshot(db) -> Dict[str, Any]:
         "leads_from_traffic_24h": leads_24h,
         "top_countries_7d": [{"country": c["_id"], "sessions": c["sessions"]} for c in top_countries],
         "top_pages_7d": [{"path": p["_id"], "views": p["views"]} for p in top_pages],
+    }
+
+# ── Dashboard combinado (1 request en vez de 11) + caché en memoria ─────────
+
+_DASH_CACHE: Dict[str, Any] = {}
+DASH_CACHE_TTL = 45  # segundos
+
+
+@router.get("/admin/analytics/dashboard")
+async def admin_dashboard(request: Request, range: str = "7d",
+                          granularity: str = "day", compare: int = 1,
+                          country: Optional[str] = None, device: Optional[str] = None,
+                          has_lead: Optional[bool] = None, limit: int = 25):
+    """Todos los datos del dashboard en UNA sola llamada (ejecutadas en paralelo
+    en el servidor) + caché de 45s. Reduce 11 round-trips del navegador a 1."""
+    await auth_admin(request)
+    db = get_db()
+    await _ensure_once(db)
+
+    cache_key = f"{range}|{granularity}|{compare}|{country}|{device}|{has_lead}|{limit}"
+    cached = _DASH_CACHE.get(cache_key)
+    if cached and (_now() - cached["at"]).total_seconds() < DASH_CACHE_TTL:
+        # live siempre fresco (es barato); el resto desde caché
+        fresh_live = await admin_live(request)
+        return {**cached["payload"], "live": fresh_live, "cached": True}
+
+    async def _safe(coro):
+        try:
+            return await coro
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[dashboard] sub-query failed: {e}")
+            return None
+
+    (live, overview, timeline, top_pages, sources, geo,
+     devices, funnel, heatmap, sessions, goals, quality) = await asyncio.gather(
+        _safe(admin_live(request)),
+        _safe(admin_overview(request, range=range, country=country, device=device)),
+        _safe(admin_timeline(request, range=range, granularity=granularity,
+                             country=country, device=device, compare=compare)),
+        _safe(admin_top_pages(request, range=range, limit=10, country=country, device=device)),
+        _safe(admin_sources(request, range=range, limit=10)),
+        _safe(admin_geo(request, range=range)),
+        _safe(admin_devices(request, range=range)),
+        _safe(admin_funnel(request, range=range, country=country, device=device)),
+        _safe(admin_heatmap(request, range=range, country=country, device=device)),
+        _safe(admin_sessions_list(request, range=range, limit=limit,
+                                  country=country, device=device, has_lead=has_lead)),
+        _safe(admin_goals(request, range=range, country=country, device=device)),
+        _safe(_data_quality(db, range)),
+    )
+    payload = {
+        "live": live, "overview": overview, "timeline": timeline,
+        "top_pages": top_pages, "sources": sources, "geo": geo,
+        "devices": devices, "funnel": funnel, "heatmap": heatmap,
+        "sessions": sessions, "goals": goals, "data_quality": quality,
+        "generated_at": _iso(_now()), "cached": False,
+    }
+    _DASH_CACHE[cache_key] = {"at": _now(), "payload": payload}
+    # Evitar crecimiento sin límite
+    if len(_DASH_CACHE) > 50:
+        oldest = min(_DASH_CACHE, key=lambda k: _DASH_CACHE[k]["at"])
+        _DASH_CACHE.pop(oldest, None)
+    return payload
+
+
+async def _data_quality(db, range_str: str) -> Dict[str, Any]:
+    """Transparencia: cuántas sesiones bot fueron excluidas del dashboard."""
+    since = _range_to_dt(range_str)
+    real = await db.visitor_sessions.count_documents(
+        {"first_seen": {"$gte": since}, "is_bot": {"$ne": True}})
+    bots = await db.visitor_sessions.count_documents(
+        {"first_seen": {"$gte": since}, "is_bot": True})
+    spam = await db.visitor_sessions.count_documents(
+        {"first_seen": {"$gte": since}, "bot_reason": "spam_referrer"})
+    return {"real_sessions": real, "bot_sessions_excluded": bots,
+            "spam_referrer_sessions": spam}
+
+
+# ── Limpieza retroactiva de bots/spam ────────────────────────────────────────
+
+@router.post("/admin/analytics/cleanup-bots")
+async def cleanup_bots(request: Request, dry_run: int = 0):
+    """Marca retroactivamente como bot las sesiones históricas con referrer de spam
+    (polymeta, searchezee, simmani, etc.) o user-agent de bot, y elimina sus eventos
+    para que dejen de inflar las métricas. dry_run=1 solo reporta sin cambiar nada."""
+    await auth_admin(request)
+    db = get_db()
+
+    spam_q = {"referrer_host": {"$regex": SPAM_REF_RE.pattern, "$options": "i"},
+              "is_bot": {"$ne": True}}
+    ua_q = {"user_agent": {"$regex": BOT_RE.pattern, "$options": "i"},
+            "is_bot": {"$ne": True}}
+
+    spam_ids = await db.visitor_sessions.distinct("_id", spam_q)
+    ua_ids = await db.visitor_sessions.distinct("_id", ua_q)
+    all_ids = list(set(spam_ids) | set(ua_ids))
+
+    events_count = 0
+    if all_ids:
+        events_count = await db.visitor_events.count_documents({"session_id": {"$in": all_ids}})
+
+    if not dry_run and all_ids:
+        if spam_ids:
+            await db.visitor_sessions.update_many(
+                {"_id": {"$in": spam_ids}},
+                {"$set": {"is_bot": True, "bot_reason": "spam_referrer"}})
+        ua_only = list(set(ua_ids) - set(spam_ids))
+        if ua_only:
+            await db.visitor_sessions.update_many(
+                {"_id": {"$in": ua_only}},
+                {"$set": {"is_bot": True, "bot_reason": "bot_user_agent"}})
+        await db.visitor_events.delete_many({"session_id": {"$in": all_ids}})
+        _DASH_CACHE.clear()
+
+    return {
+        "success": True,
+        "dry_run": bool(dry_run),
+        "sessions_flagged_spam_referrer": len(spam_ids),
+        "sessions_flagged_bot_ua": len(set(ua_ids) - set(spam_ids)),
+        "events_deleted": events_count if not dry_run else 0,
+        "events_that_would_be_deleted": events_count if dry_run else None,
     }

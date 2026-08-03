@@ -141,16 +141,18 @@ async def analytics_ai_insights(request: Request, range: str = "7d", refresh: in
     await auth_admin(request)
     db = get_db()
 
-    ctx = await _collect_context(db, range)
-
-    # ── Cache lookup ─────────────────────────────────────────────────────
-    ctx_hash = hashlib.sha256(json.dumps(ctx, sort_keys=True, default=str).encode()).hexdigest()[:24]
-    cache_key = f"{range}_{ctx_hash}"
-
+    # ── Cache lookup FIRST (por rango, no por hash de contexto) ─────────────
+    # Antes la clave incluía un hash del contexto: cualquier pageview nuevo
+    # invalidaba el caché y forzaba una llamada al LLM (5-15s) al abrir la
+    # página. Ahora servimos el caché fresco por rango y solo regeneramos
+    # cuando expira el TTL o el admin pulsa "refresh".
+    cache_key = f"insights_{range}"
     if not refresh:
         cached = await db[CACHE_COLL].find_one({"_id": cache_key})
         if cached and (datetime.now(timezone.utc) - cached["created_at"].replace(tzinfo=timezone.utc)).total_seconds() < CACHE_TTL_SECONDS:
             return {**cached.get("payload", {}), "cached": True}
+
+    ctx = await _collect_context(db, range)
 
     api_key = os.environ.get("EMERGENT_LLM_KEY")
     if not api_key:

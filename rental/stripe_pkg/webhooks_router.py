@@ -151,6 +151,35 @@ async def stripe_connect_webhook(request: Request):
         metadata = event_data.get('metadata', {}) if isinstance(event_data, dict) else getattr(event_data, 'metadata', {}) or {}
         logging.info(f"💳 Payment succeeded: ${amount:.2f} (PI: {pi_id}) meta={dict(metadata) if metadata else {}}")
 
+        # ─── Evidencia 3D Secure (liability shift al banco emisor) ───
+        three_ds_evidence = None
+        try:
+            pi = stripe.PaymentIntent.retrieve(pi_id, expand=['latest_charge'])
+            charge = pi.latest_charge
+            card = (charge.payment_method_details.card
+                    if charge and charge.payment_method_details
+                    and charge.payment_method_details.type == 'card' else None)
+            tds = getattr(card, 'three_d_secure', None) if card else None
+            three_ds_evidence = {
+                "payment_intent_id": pi_id,
+                "charge_id": charge.id if charge else None,
+                "requested": True,
+                "authenticated": bool(tds and getattr(tds, 'succeeded', False)),
+                "result": getattr(tds, 'result', None) if tds else "not_supported_by_card",
+                "result_reason": getattr(tds, 'result_reason', None) if tds else None,
+                "version": getattr(tds, 'version', None) if tds else None,
+                "authentication_flow": getattr(tds, 'authentication_flow', None) if tds else None,
+                # Con request_three_d_secure="any": si la tarjeta no soporta 3DS,
+                # este registro es la prueba de que la verificación FUE solicitada.
+                "liability_shift": "issuer" if (tds and getattr(tds, 'succeeded', False)) else "requested_not_supported",
+                "amount": amount,
+                "recorded_at": datetime.utcnow(),
+            }
+            await get_db().three_ds_evidence.insert_one(dict(three_ds_evidence))
+            logging.info(f"🔐 3DS evidencia PI {pi_id}: result={three_ds_evidence['result']} shift={three_ds_evidence['liability_shift']}")
+        except Exception as tds_err:
+            logging.warning(f"3DS evidence capture failed for {pi_id}: {tds_err}")
+
         # ─── Link Stripe payment to auto-generated rental_payments doc ───
         try:
             contract_id = metadata.get('contract_id') if hasattr(metadata, 'get') else None
@@ -184,6 +213,7 @@ async def stripe_connect_webhook(request: Request):
                     "amount": rent_amount,
                     "late_fee": late_fee,
                     "stripe_payment_intent_id": pi_id,
+                    "three_ds": three_ds_evidence,
                     "receipt_number": receipt_number,
                     "updated_at": now,
                 }
