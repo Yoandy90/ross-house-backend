@@ -36,9 +36,9 @@ from sendgrid.helpers.mail import Mail
 # ─── CONFIG ───
 TRACKED_MESSAGE = {
     "to_email":   "joe3359@gmail.com",
-    "subject":    "Interest in Jasmine Apartments — a few questions (Ross House Rentals)",
-    "sent_at":    "2026-06-30T16:39:01Z",
-    "tracker_id": "jasmine_kuruvila_first_inquiry_2026_06_30",
+    "subject":    "Re: Interest in Jasmine Apartments — 3 quick questions",
+    "sent_at":    "2026-08-04T05:22:25Z",
+    "tracker_id": "jasmine_kuruvila_followup_2026_08_04",
 }
 NOTIFY_TO    = "yoandyross@gmail.com"
 COLL_NAME    = "email_trackers"
@@ -166,7 +166,9 @@ def main():
     # Fetch current state from SendGrid
     messages = fetch_events()
     msg = next(
-        (m for m in messages if m.get("to_email") == TRACKED_MESSAGE["to_email"]),
+        (m for m in messages
+         if m.get("to_email") == TRACKED_MESSAGE["to_email"]
+         and m.get("subject") == TRACKED_MESSAGE["subject"]),
         None,
     )
     if not msg:
