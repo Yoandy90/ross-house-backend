@@ -564,6 +564,46 @@ def generate_rental_contract_pdf(contract: dict, config: dict = None, tenant_pho
     ))
     elements.append(Spacer(1, 6))
 
+    # ─── 4.2 Recurring Payment Authorization (card/ACH on file) ─────
+    if pm_type in ('card', 'ach'):
+        vault_display = contract.get('vault_display', '')
+        method_en = "credit/debit card" if pm_type == 'card' else "bank account (ACH)"
+        method_es = "tarjeta de crédito/débito" if pm_type == 'card' else "cuenta bancaria (ACH)"
+        elements.append(Paragraph(
+            f"{section}.2 RECURRING PAYMENT AUTHORIZATION / AUTORIZACIÓN DE PAGOS RECURRENTES",
+            styles['SubSection']
+        ))
+        elements.append(Paragraph(
+            f"Tenant expressly AUTHORIZES Landlord to automatically charge the {method_en} on file "
+            f"{('(' + vault_display + ') ') if vault_display else ''}for the monthly rent of "
+            f"<b>{format_currency(rent)}</b> on day <b>{due_day}</b> of each month, plus any applicable "
+            "late fees or charges owed under this lease, for the entire lease term and any renewal, "
+            "without further action by Tenant (merchant-initiated transactions). Tenant's payment "
+            "credential was verified and securely stored by the payment processor (Stripe) at the time of "
+            "enrollment; card data is never stored by Landlord. This authorization remains in effect until "
+            "the lease terminates or Tenant revokes it in writing at least <b>15 days</b> before the next "
+            "charge date, in which case rent remains due by other accepted payment methods. Tenant agrees "
+            "to keep the payment method valid and funded; declined automatic charges do not excuse timely "
+            "payment of rent.",
+            styles['Body']
+        ))
+        elements.append(Paragraph(
+            f"El Arrendatario AUTORIZA expresamente al Arrendador a cobrar automáticamente la {method_es} "
+            f"registrada {('(' + vault_display + ') ') if vault_display else ''}por la renta mensual de "
+            f"<b>{format_currency(rent)}</b> el día <b>{due_day}</b> de cada mes, más cargos por mora u "
+            "otros cargos aplicables bajo este contrato, durante todo el plazo del contrato y cualquier "
+            "renovación, sin acción adicional del Arrendatario (transacciones iniciadas por el comercio). "
+            "La credencial de pago fue verificada y almacenada de forma segura por el procesador de pagos "
+            "(Stripe) al momento de registrarla; el Arrendador nunca almacena los datos de la tarjeta. Esta "
+            "autorización permanece vigente hasta que termine el contrato o el Arrendatario la revoque por "
+            "escrito con al menos <b>15 días</b> de anticipación a la siguiente fecha de cobro, en cuyo "
+            "caso la renta seguirá siendo exigible por los demás métodos de pago aceptados. El Arrendatario "
+            "se compromete a mantener el método de pago válido y con fondos; un cargo automático rechazado "
+            "no exime del pago puntual de la renta.",
+            styles['Body']
+        ))
+        elements.append(Spacer(1, 6))
+
     # ═══ SECTION 5: SECURITY DEPOSIT / DEPÓSITO ══════════════════════
     section += 1
     elements.append(Paragraph(
