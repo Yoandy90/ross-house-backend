@@ -680,6 +680,32 @@ def generate_rental_contract_pdf(contract: dict, config: dict = None, tenant_pho
         elements.append(Paragraph(f"  {i}. {ob}", styles['Body']))
     elements.append(Spacer(1, 6))
 
+    # ─── 7.1 Renters Insurance (mandatory) ──────────────────────────
+    elements.append(Paragraph(
+        f"{section}.1 RENTERS INSURANCE (MANDATORY) / SEGURO DE INQUILINO (OBLIGATORIO)",
+        styles['SubSection']
+    ))
+    elements.append(Paragraph(
+        "Tenant SHALL obtain and maintain, for the entire lease term, a renters insurance policy with "
+        "personal liability coverage of at least <b>$100,000 per occurrence</b>, naming Landlord "
+        "(Ross House Rentals LLC) as an <b>interested party / additional interest</b> for notification "
+        "purposes. Tenant shall provide proof of coverage before move-in and upon each renewal. "
+        "Landlord's insurance does NOT cover Tenant's personal property or Tenant's liability. "
+        "Failure to maintain this policy is a material breach of this lease.",
+        styles['Body']
+    ))
+    elements.append(Paragraph(
+        "El Arrendatario DEBERÁ obtener y mantener, durante todo el plazo del contrato, una póliza de "
+        "seguro de inquilino (renters insurance) con cobertura de responsabilidad civil de al menos "
+        "<b>$100,000 por ocurrencia</b>, designando al Arrendador (Ross House Rentals LLC) como "
+        "<b>parte interesada / interés adicional</b> para fines de notificación. El Arrendatario "
+        "entregará prueba de cobertura antes de la mudanza y en cada renovación. El seguro del "
+        "Arrendador NO cubre las pertenencias personales del Arrendatario ni su responsabilidad civil. "
+        "No mantener esta póliza constituye un incumplimiento material de este contrato.",
+        styles['Body']
+    ))
+    elements.append(Spacer(1, 6))
+
     # ═══ SECTION 8: UTILITIES / SERVICIOS ════════════════════════════
     section += 1
     elements.append(Paragraph(
