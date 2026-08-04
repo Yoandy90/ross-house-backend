@@ -321,7 +321,13 @@ async def stripe_connect_webhook(request: Request):
                 pay_detail = f"\nBanco: {(_b.bank_name or '').title()} ····{_b.last4} ({_b.account_type or 'checking'})\n{_risk}"
             elif pm_ref is not None and getattr(pm_ref, 'card', None):
                 _c = pm_ref.card
-                pay_detail = f"\nTarjeta: {(_c.brand or '').title()} ····{_c.last4}"
+                _funding_map = {"credit": "CRÉDITO", "debit": "DÉBITO", "prepaid": "PREPAGADA"}
+                _funding = _funding_map.get((_c.funding or '').lower(), _c.funding or 'desconocido')
+                _country = f" · emitida en {_c.country}" if getattr(_c, 'country', None) else ""
+                pay_detail = (f"\nTarjeta: {(_c.brand or '').title()} ····{_c.last4} "
+                              f"({_funding}{_country})")
+                if (_c.funding or '').lower() == 'prepaid':
+                    pay_detail += "\n⚠️ Tarjeta PREPAGADA — mayor riesgo de contracargo sin fondos recuperables"
 
             # Notify admin about the payment status
             if event_type == 'checkout.session.async_payment_succeeded':
