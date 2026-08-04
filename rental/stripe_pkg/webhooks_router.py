@@ -274,13 +274,21 @@ async def stripe_connect_webhook(request: Request):
             reference = (meta.get('reference', '') if hasattr(meta, 'get') else '') or 'sin referencia'
             cust_details_n = sess_get('customer_details', {}) or {}
             payer_email = cust_details_n.get('email', '') if isinstance(cust_details_n, dict) else ''
-            if plink_id:
+            session_id = sess_get('id', '')
+            if plink_id or session_id:
                 if payment_status == 'paid':
                     link_update = {"status": "paid", "paid_at": now}
                 else:
                     link_update = {"status": "processing"}
+                # Links clásicos (stripe_payment_link_id) y sesiones Checkout
+                # con 3DS obligatorio (stripe_checkout_session_id)
+                match_or = []
+                if plink_id:
+                    match_or.append({"stripe_payment_link_id": plink_id})
+                if session_id:
+                    match_or.append({"stripe_checkout_session_id": session_id})
                 await get_db().payment_links.update_one(
-                    {"stripe_payment_link_id": plink_id},
+                    {"$or": match_or},
                     {"$set": {**link_update,
                               "stripe_customer_id": customer_id,
                               "amount_paid": amount_total, "updated_at": now}},
