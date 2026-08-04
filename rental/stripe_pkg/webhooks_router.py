@@ -160,18 +160,22 @@ async def stripe_connect_webhook(request: Request):
                     if charge and charge.payment_method_details
                     and charge.payment_method_details.type == 'card' else None)
             tds = getattr(card, 'three_d_secure', None) if card else None
+            # Liability shift al banco emisor cuando el resultado es
+            # authenticated o attempt_acknowledged (Stripe docs)
+            tds_result = getattr(tds, 'result', None) if tds else None
+            tds_ok = tds_result in ('authenticated', 'attempt_acknowledged')
             three_ds_evidence = {
                 "payment_intent_id": pi_id,
                 "charge_id": charge.id if charge else None,
                 "requested": True,
-                "authenticated": bool(tds and getattr(tds, 'succeeded', False)),
-                "result": getattr(tds, 'result', None) if tds else "not_supported_by_card",
+                "authenticated": tds_ok,
+                "result": tds_result if tds else "not_supported_by_card",
                 "result_reason": getattr(tds, 'result_reason', None) if tds else None,
                 "version": getattr(tds, 'version', None) if tds else None,
                 "authentication_flow": getattr(tds, 'authentication_flow', None) if tds else None,
                 # Con request_three_d_secure="any": si la tarjeta no soporta 3DS,
                 # este registro es la prueba de que la verificación FUE solicitada.
-                "liability_shift": "issuer" if (tds and getattr(tds, 'succeeded', False)) else "requested_not_supported",
+                "liability_shift": "issuer" if tds_ok else "requested_not_supported",
                 "amount": amount,
                 "recorded_at": datetime.utcnow(),
             }
