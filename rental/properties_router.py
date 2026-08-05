@@ -1825,6 +1825,9 @@ async def create_property(request: Request, background_tasks: BackgroundTasks):
         "section8_last_inspection": data.get('section8_last_inspection'),  # ISO date or None
         "section8_next_inspection": data.get('section8_next_inspection'),  # ISO date or None
         "section8_notes": data.get('section8_notes', ''),
+        # ─── Property tax tracking (Moore County) ───
+        "tax_account_id": str(data.get('tax_account_id', '') or '').strip(),
+        "tax_annual_estimate": float(data.get('tax_annual_estimate') or 0),
         "created_at": now,
         "updated_at": now,
         "created_by": user.get('email', 'admin'),
@@ -1897,7 +1900,7 @@ async def get_property(property_id: str, request: Request):
 
 
 @router.put('/admin/properties/{property_id}')
-async def update_property(property_id: str, request: Request):
+async def update_property(property_id: str, request: Request, background_tasks: BackgroundTasks):
     """Update a property"""
     user = await auth_admin(request)
     data = await request.json()
@@ -1912,7 +1915,9 @@ async def update_property(property_id: str, request: Request):
                'square_feet', 'rent_amount', 'deposit_amount', 'features', 'status', 'notes', 'description',
                # Section 8 fields
                'section8_accepted', 'section8_pha', 'section8_pha_contact',
-               'section8_last_inspection', 'section8_next_inspection', 'section8_notes']
+               'section8_last_inspection', 'section8_next_inspection', 'section8_notes',
+               # Property tax tracking
+               'tax_account_id', 'tax_annual_estimate']
     # Also accept frontend field aliases
     alias_map = {'zip': 'zip_code', 'sqft': 'square_feet'}
     for alias, real in alias_map.items():
@@ -2167,5 +2172,7 @@ async def admin_section8_inspections(request: Request):
         "total": len(items),
         "needs_attention": counts["overdue"] + counts["urgent"] + counts["soon"] + counts["none"],
     }
+
+
 
 
