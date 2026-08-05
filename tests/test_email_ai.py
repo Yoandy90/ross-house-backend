@@ -66,6 +66,16 @@ def ctx(loop, monkeypatch_module=None):
     eir._send_via_sendgrid = fake_send
     eir._generate_ai_draft = fake_draft
 
+    # Estado conocido de config para los tests (BD compartida con prod)
+    async def _cfg_reset():
+        await db.app_settings.update_one(
+            {"_id": "email_ai"},
+            {"$set": {"auto_ack_enabled": True, "auto_draft_enabled": True,
+                      "auto_send_enabled": False}},
+            upsert=True)
+        await db.email_acks.delete_many({"email": {"$regex": "buzon-pytest"}})
+    loop.run_until_complete(_cfg_reset())
+
     yield {"app": app, "db": db, "token": token, "loop": loop, "sent": sent}
 
     async def _teardown():
