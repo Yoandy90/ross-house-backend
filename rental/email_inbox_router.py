@@ -11,22 +11,38 @@
 - POST /api/admin/inbox/cancel-scheduled/{batch_id} : cancela un envío programado.
 
 Colección: email_inbox
-{ folder: inbox|sent, from_email, from_name, to, subject, text, html,
-  read, in_reply_to, thread_key, scheduled_for, sendgrid_batch_id, created_at }
+{ folder: inbox|sent|spam, from_email, from_name, to, subject, text, html,
+  read, in_reply_to, thread_key, scheduled_for, sendgrid_batch_id,
+  ai_draft, ai_draft_at, ai_status(none|draft|sent_auto|approved), created_at }
+Config AI: colección app_settings doc {_id:'email_ai'}
+{ auto_ack_enabled, auto_draft_enabled, auto_send_enabled, ack_message }
 """
 import logging
 import os
-import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 from bson import ObjectId
 
 from .shared import get_db, auth_admin
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+
+# Remitentes automáticos: nunca responder ni generar borrador (evita loops)
+AUTOMATED_SENDERS = ("no-reply", "noreply", "mailer-daemon", "postmaster",
+                     "bounce", "notification", "donotreply", "do-not-reply")
+
+DEFAULT_AI_CONFIG = {
+    "auto_ack_enabled": True,      # confirmación automática de recibido
+    "auto_draft_enabled": True,    # AI genera borrador de respuesta
+    "auto_send_enabled": False,    # AI envía la respuesta SOLA (sin aprobar)
+    "ack_message": ("Hola,\n\nGracias por escribir a Ross House Rentals. Hemos recibido tu "
+                    "mensaje y te daremos respuesta lo antes posible (normalmente el mismo día).\n\n"
+                    "Si es una emergencia de mantenimiento, llámanos al (806) 934-2018.\n\n"
+                    "— Ross House Rentals\nDumas, TX · rosshouserentals.com"),
+}
 
 
 def _now():
@@ -46,16 +62,131 @@ def _from_email() -> str:
 
 def _doc_out(d: dict) -> dict:
     d["id"] = str(d.pop("_id"))
-    for k in ("created_at", "scheduled_for", "read_at"):
+    for k in ("created_at", "scheduled_for", "read_at", "ai_draft_at"):
         if d.get(k) and hasattr(d[k], "isoformat"):
             d[k] = d[k].isoformat()
     return d
 
 
+async def get_ai_config() -> dict:
+    doc = await get_db().app_settings.find_one({"_id": "email_ai"}) or {}
+    return {**DEFAULT_AI_CONFIG, **{k: v for k, v in doc.items() if k != "_id"}}
+
+
+def _is_automated_sender(email: str) -> bool:
+    local = (email or "").lower().split("@")[0]
+    return any(tag in local for tag in AUTOMATED_SENDERS)
+
+
+async def _send_via_sendgrid(to: str, subject: str, body_text: str,
+                             body_html: str = "") -> bool:
+    """Envío simple (usado por auto-ack y auto-send de AI)."""
+    try:
+        from sendgrid import SendGridAPIClient
+        from sendgrid.helpers.mail import Mail
+        if not body_html:
+            body_html = ("<div style='font-family:system-ui,sans-serif;white-space:pre-wrap;'>"
+                         + body_text.replace("<", "&lt;") + "</div>")
+        msg = Mail(from_email=(_from_email(), "Ross House Rentals"),
+                   to_emails=to, subject=subject, html_content=body_html)
+        resp = SendGridAPIClient(_sg_key()).send(msg)
+        return resp.status_code in (200, 201, 202)
+    except Exception as e:
+        logger.error(f"[buzon] envío falló a {to}: {e}")
+        return False
+
+
+async def _generate_ai_draft(email_doc: dict) -> Optional[str]:
+    """Genera un borrador de respuesta con el AI Brain (GPT-4o)."""
+    try:
+        from .ai_brain import RossHouseAIBrain
+        brain = RossHouseAIBrain(get_db())
+        await brain._ensure_key()
+        if not brain.is_available:
+            logger.warning("[buzon] AI no disponible (sin LLM key)")
+            return None
+        system = (
+            "Eres el asistente de email de Ross House Rentals, una empresa de casas de renta "
+            "en Dumas, Texas (dueño: Yoandy Ross, tel (806) 934-2018, web rosshouserentals.com). "
+            "Redacta una respuesta profesional, cálida y concisa al email recibido. "
+            "REGLAS: responde en el MISMO idioma del email recibido; no inventes precios, "
+            "disponibilidad ni fechas — si no tienes el dato, ofrece confirmarlo o agendar una "
+            "llamada; firma como 'Ross House Rentals'; devuelve SOLO el cuerpo del email, "
+            "sin asunto ni comentarios adicionales."
+        )
+        user = (f"Email recibido de: {email_doc.get('from_name') or email_doc.get('from_email')}\n"
+                f"Asunto: {email_doc.get('subject')}\n\n"
+                f"Mensaje:\n{(email_doc.get('text') or '')[:4000]}")
+        return await brain._call_openai(system, user)
+    except Exception as e:
+        logger.error(f"[buzon] error generando borrador AI: {e}")
+        return None
+
+
+async def _process_inbound_ai(email_id: str):
+    """Background: auto-ack + borrador AI (+ auto-envío si está activado)."""
+    db = get_db()
+    doc = await db.email_inbox.find_one({"_id": ObjectId(email_id)})
+    if not doc or doc.get("folder") != "inbox":
+        return
+    sender = doc.get("from_email", "")
+    if _is_automated_sender(sender):
+        return
+    cfg = await get_ai_config()
+
+    # 1) Confirmación automática de recibido (máx 1 por remitente cada 24h)
+    if cfg["auto_ack_enabled"]:
+        recent_ack = await db.email_acks.find_one({
+            "email": sender,
+            "last_ack_at": {"$gt": _now() - timedelta(hours=24)},
+        })
+        if not recent_ack:
+            subject = doc.get("subject") or "(sin asunto)"
+            ok = await _send_via_sendgrid(
+                sender, f"Re: {subject} — Recibimos tu mensaje ✅", cfg["ack_message"])
+            if ok:
+                await db.email_acks.update_one(
+                    {"email": sender}, {"$set": {"email": sender, "last_ack_at": _now()}},
+                    upsert=True)
+                await db.email_inbox.update_one(
+                    {"_id": doc["_id"]}, {"$set": {"ack_sent": True}})
+                logger.info(f"[buzon] auto-ack enviado a {sender}")
+
+    # 2) Borrador AI
+    if not cfg["auto_draft_enabled"]:
+        return
+    draft = await _generate_ai_draft(doc)
+    if not draft:
+        return
+    await db.email_inbox.update_one(
+        {"_id": doc["_id"]},
+        {"$set": {"ai_draft": draft, "ai_draft_at": _now(), "ai_status": "draft"}})
+    logger.info(f"[buzon] borrador AI listo para {sender}")
+
+    # 3) Auto-envío (si el admin activó el modo automático)
+    if cfg["auto_send_enabled"]:
+        subject = doc.get("subject") or "(sin asunto)"
+        reply_subject = subject if subject.lower().startswith("re:") else f"Re: {subject}"
+        ok = await _send_via_sendgrid(sender, reply_subject, draft)
+        if ok:
+            await db.email_inbox.update_one(
+                {"_id": doc["_id"]}, {"$set": {"ai_status": "sent_auto"}})
+            await db.email_inbox.insert_one({
+                "folder": "sent", "from_email": _from_email(),
+                "from_name": "Ross House Rentals (AI)", "to": sender,
+                "subject": reply_subject, "text": draft[:100000],
+                "html": "", "read": True, "ai_sent": True,
+                "in_reply_to": str(doc["_id"]),
+                "thread_key": subject.lower().replace("re:", "").replace("fwd:", "").strip()[:200],
+                "created_at": _now(),
+            })
+            logger.info(f"[buzon] respuesta AI AUTO-enviada a {sender}")
+
+
 # ────────────────────────── Webhook entrante (Inbound Parse) ──────────────────────────
 
 @router.post("/webhooks/email-inbound")
-async def email_inbound(request: Request):
+async def email_inbound(request: Request, background_tasks: BackgroundTasks):
     """SendGrid Inbound Parse envía multipart/form-data con el correo entrante."""
     form = await request.form()
     from_raw = str(form.get("from", ""))
@@ -65,9 +196,16 @@ async def email_inbound(request: Request):
         from_name = from_raw.split("<")[0].strip().strip('"')
         from_email = from_raw.split("<")[1].split(">")[0].strip()
 
+    # Filtro de spam (SendGrid incluye spam_score de SpamAssassin; >=5 = spam)
+    try:
+        spam_score = float(form.get("spam_score") or 0)
+    except (TypeError, ValueError):
+        spam_score = 0.0
+    is_spam = spam_score >= 5.0
+
     subject = str(form.get("subject", "(sin asunto)"))
     doc = {
-        "folder": "inbox",
+        "folder": "spam" if is_spam else "inbox",
         "from_email": from_email.lower(),
         "from_name": from_name,
         "to": str(form.get("to", "")),
@@ -75,19 +213,24 @@ async def email_inbound(request: Request):
         "text": str(form.get("text", ""))[:100000],
         "html": str(form.get("html", ""))[:300000],
         "read": False,
+        "spam_score": spam_score,
         "thread_key": subject.lower().replace("re:", "").replace("fwd:", "").strip()[:200],
         "attachments_count": int(form.get("attachments", 0) or 0),
         "created_at": _now(),
     }
-    await get_db().email_inbox.insert_one(doc)
-    logger.info(f"[buzon] entrante de {from_email}: {subject[:60]}")
+    res = await get_db().email_inbox.insert_one(doc)
+    logger.info(f"[buzon] entrante de {from_email}: {subject[:60]}"
+                + (" [SPAM]" if is_spam else ""))
 
-    # Notificar al admin que llegó correo nuevo
-    try:
-        from .notifications_helper import notify_admin  # si existe helper
-        await notify_admin(f"📬 Nuevo email de {from_name or from_email}: {subject[:80]}")
-    except Exception:
-        pass
+    if not is_spam:
+        # Auto-ack + borrador AI en background (no bloquea el webhook)
+        background_tasks.add_task(_process_inbound_ai, str(res.inserted_id))
+        # Notificar al admin que llegó correo nuevo
+        try:
+            from .notifications_helper import notify_admin  # si existe helper
+            await notify_admin(f"📬 Nuevo email de {from_name or from_email}: {subject[:80]}")
+        except Exception:
+            pass
     return {"ok": True}
 
 
@@ -110,13 +253,40 @@ async def list_inbox(request: Request, folder: str = "inbox", q: str = "",
         ]
     total = await db.email_inbox.count_documents(query)
     unread = await db.email_inbox.count_documents({"folder": "inbox", "read": False})
-    docs = await (db.email_inbox.find(query, {"html": 0})
+    docs = await (db.email_inbox.find(query, {"html": 0, "ai_draft": 0})
                   .sort([("created_at", -1)]).skip(skip).limit(min(limit, 100)).to_list(100))
     items = []
     for d in docs:
         d["preview"] = (d.pop("text", "") or "")[:140]
         items.append(_doc_out(d))
     return {"success": True, "total": total, "unread_count": unread, "emails": items}
+
+
+@router.get("/admin/inbox/ai-config")
+async def read_ai_config(request: Request):
+    await auth_admin(request)
+    return {"success": True, "config": await get_ai_config()}
+
+
+@router.put("/admin/inbox/ai-config")
+async def update_ai_config(request: Request):
+    """Body: {auto_ack_enabled?, auto_draft_enabled?, auto_send_enabled?, ack_message?}"""
+    await auth_admin(request)
+    data = await request.json()
+    sets = {}
+    for key in ("auto_ack_enabled", "auto_draft_enabled", "auto_send_enabled"):
+        if key in data:
+            sets[key] = bool(data[key])
+    if "ack_message" in data:
+        msg = str(data["ack_message"]).strip()
+        if not msg:
+            raise HTTPException(status_code=400, detail="ack_message no puede estar vacío")
+        sets["ack_message"] = msg[:2000]
+    if not sets:
+        raise HTTPException(status_code=400, detail="Sin cambios")
+    sets["updated_at"] = _now()
+    await get_db().app_settings.update_one({"_id": "email_ai"}, {"$set": sets}, upsert=True)
+    return {"success": True, "config": await get_ai_config()}
 
 
 @router.get("/admin/inbox/{email_id}")
@@ -261,3 +431,81 @@ async def cancel_scheduled(batch_id: str, request: Request):
         {"sendgrid_batch_id": batch_id},
         {"$set": {"cancelled": True, "subject_note": "CANCELADO"}})
     return {"success": True, "message": "Envío programado cancelado"}
+
+
+# ────────────────────────────── AI: config y borradores ──────────────────────────────
+
+@router.post("/admin/inbox/{email_id}/ai-draft")
+async def regenerate_ai_draft(email_id: str, request: Request):
+    """(Re)genera el borrador AI para un email recibido."""
+    await auth_admin(request)
+    db = get_db()
+    try:
+        oid = ObjectId(email_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="ID inválido")
+    doc = await db.email_inbox.find_one({"_id": oid})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Email no encontrado")
+    if doc.get("folder") == "sent":
+        raise HTTPException(status_code=400, detail="Solo aplica a correos recibidos")
+    draft = await _generate_ai_draft(doc)
+    if not draft:
+        raise HTTPException(status_code=502, detail="AI no disponible — revisa la LLM key en AI Brain")
+    await db.email_inbox.update_one(
+        {"_id": oid}, {"$set": {"ai_draft": draft, "ai_draft_at": _now(), "ai_status": "draft"}})
+    return {"success": True, "ai_draft": draft}
+
+
+@router.post("/admin/inbox/{email_id}/approve-draft")
+async def approve_ai_draft(email_id: str, request: Request):
+    """Aprueba y envía la respuesta AI. Body opcional: {body} (borrador editado)."""
+    admin = await auth_admin(request)
+    db = get_db()
+    try:
+        oid = ObjectId(email_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="ID inválido")
+    doc = await db.email_inbox.find_one({"_id": oid})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Email no encontrado")
+    data = await request.json() if (request.headers.get("content-length") or "0") != "0" else {}
+    body = str(data.get("body") or doc.get("ai_draft") or "").strip()
+    if not body:
+        raise HTTPException(status_code=400, detail="No hay borrador que enviar")
+
+    subject = doc.get("subject") or "(sin asunto)"
+    reply_subject = subject if subject.lower().startswith("re:") else f"Re: {subject}"
+    ok = await _send_via_sendgrid(doc["from_email"], reply_subject, body)
+    if not ok:
+        raise HTTPException(status_code=502, detail="SendGrid rechazó el envío")
+
+    await db.email_inbox.update_one(
+        {"_id": oid}, {"$set": {"ai_status": "approved", "ai_draft": body}})
+    await db.email_inbox.insert_one({
+        "folder": "sent", "from_email": _from_email(),
+        "from_name": "Ross House Rentals", "to": doc["from_email"],
+        "subject": reply_subject, "text": body[:100000], "html": "",
+        "read": True, "in_reply_to": str(oid), "ai_approved": True,
+        "thread_key": subject.lower().replace("re:", "").replace("fwd:", "").strip()[:200],
+        "sent_by": admin.get("email", ""), "created_at": _now(),
+    })
+    return {"success": True, "message": "Respuesta aprobada y enviada"}
+
+
+@router.post("/admin/inbox/{email_id}/move")
+async def move_email(email_id: str, request: Request):
+    """Mueve un email entre carpetas. Body: {folder: inbox|spam}"""
+    await auth_admin(request)
+    data = await request.json()
+    folder = str(data.get("folder", "")).strip()
+    if folder not in ("inbox", "spam"):
+        raise HTTPException(status_code=400, detail="folder debe ser inbox o spam")
+    try:
+        oid = ObjectId(email_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="ID inválido")
+    res = await get_db().email_inbox.update_one({"_id": oid}, {"$set": {"folder": folder}})
+    if res.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Email no encontrado")
+    return {"success": True}
