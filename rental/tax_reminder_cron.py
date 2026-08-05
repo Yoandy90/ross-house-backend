@@ -41,17 +41,27 @@ async def send_tax_reminder(db, final_call: bool = False) -> dict:
     if not props:
         return {"success": False, "error": "Sin propiedades"}
 
+    # Live synced amounts from the county portal (property_taxes_router)
+    statuses = {s.get('account_id'): s async for s in db.property_tax_status.find({})}
+
     rows = ""
     total_est = 0.0
     for p in props:
         acct = p.get('tax_account_id', '')
         est = float(p.get('tax_annual_estimate') or 0)
-        total_est += est
+        st = statuses.get(str(acct)) if acct else None
+        live_due = float(st.get('total_due') or 0) if st else 0.0
+        if live_due > 0:
+            total_est += live_due
+            amount_html = f"<span style='color:#b91c1c;font-weight:bold'>${live_due:,.2f} VENCIDO</span>"
+        else:
+            total_est += est
+            amount_html = f"${est:,.0f}" + (" <span style='color:#059669;font-size:11px'>(al día)</span>" if st else "")
         rows += f"""
         <tr>
           <td style="padding:8px;border:1px solid #e2e8f0;font-size:13px">{p.get('address','')}</td>
           <td style="padding:8px;border:1px solid #e2e8f0;font-size:13px;text-align:center"><b>{acct or '—'}</b></td>
-          <td style="padding:8px;border:1px solid #e2e8f0;font-size:13px;text-align:right">${est:,.0f}</td>
+          <td style="padding:8px;border:1px solid #e2e8f0;font-size:13px;text-align:right">{amount_html}</td>
         </tr>"""
 
     title = ("🚨 ÚLTIMA LLAMADA: impuestos de propiedad vencen el 31 de ENERO"
