@@ -97,14 +97,15 @@ async def _send_via_sendgrid(to: str, subject: str, body_text: str,
 
 
 async def _generate_ai_draft(email_doc: dict) -> Optional[str]:
-    """Genera un borrador de respuesta con el AI Brain (GPT-4o)."""
+    """Genera un borrador de respuesta con el AI Brain (emergentintegrations)."""
     try:
-        from .ai_brain import RossHouseAIBrain
-        brain = RossHouseAIBrain(get_db())
-        await brain._ensure_key()
-        if not brain.is_available:
-            logger.warning("[buzon] AI no disponible (sin LLM key)")
+        api_key = os.environ.get("EMERGENT_LLM_KEY")
+        if not api_key:
+            logger.warning("[buzon] EMERGENT_LLM_KEY no configurada")
             return None
+        from uuid import uuid4
+        from emergentintegrations.llm.chat import LlmChat, UserMessage
+        from .ai_brain_router import MODEL_PROVIDER, MODEL_NAME
         system = (
             "Eres el asistente de email de Ross House Rentals, una empresa de casas de renta "
             "en Dumas, Texas (dueño: Yoandy Ross, tel (806) 934-2018, web rosshouserentals.com). "
@@ -117,7 +118,11 @@ async def _generate_ai_draft(email_doc: dict) -> Optional[str]:
         user = (f"Email recibido de: {email_doc.get('from_name') or email_doc.get('from_email')}\n"
                 f"Asunto: {email_doc.get('subject')}\n\n"
                 f"Mensaje:\n{(email_doc.get('text') or '')[:4000]}")
-        return await brain._call_openai(system, user)
+        chat = LlmChat(api_key=api_key, session_id=f"email_draft_{uuid4()}",
+                       system_message=system).with_model(MODEL_PROVIDER, MODEL_NAME)
+        raw = await chat.send_message(UserMessage(text=user))
+        draft = str(raw or "").strip()
+        return draft or None
     except Exception as e:
         logger.error(f"[buzon] error generando borrador AI: {e}")
         return None
