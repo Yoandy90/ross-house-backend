@@ -587,7 +587,13 @@ def _serialize_application(a: dict) -> dict:
         "created_at": a.get("created_at", "").isoformat() if a.get("created_at") else "",
         "updated_at": a.get("updated_at", "").isoformat() if a.get("updated_at") else "",
         "reviewed_by": a.get("reviewed_by", ""),
+        "screening": _serialize_screening_ref(a.get("screening")),
     }
+
+
+def _serialize_screening_ref(s):
+    from rental.screening_router import serialize_screening
+    return serialize_screening(s)
 
 
 @router.get('/admin/rental-applications')

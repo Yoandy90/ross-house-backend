@@ -282,6 +282,7 @@ try:
     from rental.social_poster_router import router as social_poster_router
     from rental.payment_processors_router import router as payment_processors_router
     from rental.email_inbox_router import router as email_inbox_router
+    from rental.screening_router import router as screening_router
 
     app.include_router(auth_router, prefix="/api")
     app.include_router(properties_router, prefix="/api")
@@ -328,6 +329,7 @@ try:
     app.include_router(social_poster_router, prefix="/api")
     app.include_router(payment_processors_router, prefix="/api")
     app.include_router(email_inbox_router, prefix="/api")
+    app.include_router(screening_router, prefix="/api")
     # ensure_indexes() awaited inside lifespan startup.
 
     logger.info("  ✅ Credit Builder Router")
