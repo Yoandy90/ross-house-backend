@@ -48,6 +48,20 @@ DEFAULT_RESULTS = {
 def serialize_screening(s: dict | None) -> dict | None:
     if not s:
         return None
+    # Legacy/manual schema: screening waived by landlord decision
+    if s.get("type") == "waived" and "status" not in s:
+        return {
+            "status": "waived",
+            "provider": "",
+            "screening_link": "",
+            "requested_at": "",
+            "requested_by": "",
+            "completed_at": "",
+            "email_sent": False,
+            "reason": s.get("reason", ""),
+            "results": dict(DEFAULT_RESULTS),
+            "report": None,
+        }
     report = s.get("report") or None
     return {
         "status": s.get("status", "requested"),
@@ -182,7 +196,7 @@ async def update_screening(app_id: str, request: Request):
     await auth_admin(request)
     a = await _get_application(app_id)
     screening = a.get("screening")
-    if not screening:
+    if not screening or screening.get("type") == "waived":
         raise HTTPException(status_code=400, detail="Esta aplicación no tiene screening solicitado")
     data = await request.json()
 
@@ -249,7 +263,7 @@ async def upload_screening_report(app_id: str, request: Request):
     """Admin: attach the screening report PDF (base64) to an application."""
     user = await auth_admin(request)
     a = await _get_application(app_id)
-    if not a.get("screening"):
+    if not a.get("screening") or (a.get("screening") or {}).get("type") == "waived":
         raise HTTPException(status_code=400, detail="Esta aplicación no tiene screening solicitado")
     data = await request.json()
 

@@ -209,3 +209,35 @@ def test_10_unauthorized_without_token(ctx):
             return await c.post(f"/api/admin/rental-applications/{ctx['app_id']}/screening/request", json={})
     r = ctx["loop"].run_until_complete(_do())
     assert r.status_code == 401
+
+
+def test_11_legacy_waived_schema_serialized(ctx):
+    async def _mk():
+        res = await ctx["db"].rental_applications.insert_one({
+            "name": "Pytest Waived", "email": "w@example.com",
+            "property_interest": TEST_MARK, "status": "approved",
+            "screening": {"type": "waived", "reason": "Familiar directo del propietario"},
+            "created_at": datetime.utcnow(),
+        })
+        return str(res.inserted_id)
+    waived_id = ctx["loop"].run_until_complete(_mk())
+
+    r = _call(ctx, "GET", f"/api/admin/rental-applications/{waived_id}")
+    assert r.status_code == 200, r.text
+    s = r.json()["application"]["screening"]
+    assert s["status"] == "waived"
+    assert s["reason"] == "Familiar directo del propietario"
+
+    # PATCH / report upload must be rejected on waived screening
+    r = _call(ctx, "PATCH", f"/api/admin/rental-applications/{waived_id}/screening",
+              json={"status": "completed"})
+    assert r.status_code == 400
+    r = _call(ctx, "POST", f"/api/admin/rental-applications/{waived_id}/screening/report",
+              json={"filename": "x.pdf", "data_base64": base64.b64encode(b"x").decode()})
+    assert r.status_code == 400
+
+    # But re-requesting a real screening over a waived one is allowed
+    r = _call(ctx, "POST", f"/api/admin/rental-applications/{waived_id}/screening/request",
+              json={"provider": "boomscreen", "send_email": False})
+    assert r.status_code == 200, r.text
+    assert r.json()["screening"]["status"] == "requested"
