@@ -34,6 +34,12 @@ async def reconcile_property_statuses(db) -> dict:
             skipped_manual += 1
             continue
 
+        # Multi-unidad: el status se deriva de las unidades (units_router)
+        if prop.get("is_multi_unit"):
+            from rental.units_router import sync_property_from_units
+            await sync_property_from_units(pid)
+            continue
+
         active_contract = await db.rental_contracts.find_one({
             "property_id": pid,
             "status": "active",

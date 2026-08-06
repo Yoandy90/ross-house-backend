@@ -541,11 +541,24 @@ async def create_contract(request: Request):
     if not tenant:
         raise HTTPException(status_code=404, detail="Inquilino no encontrado")
 
+    # Unidad opcional (propiedades multi-unidad)
+    unit_id = data.get('unit_id') or None
+    unit = None
+    if unit_id:
+        if not ObjectId.is_valid(unit_id):
+            raise HTTPException(status_code=400, detail="unit_id inválido")
+        unit = await get_db().property_units.find_one({"_id": ObjectId(unit_id)})
+        if not unit or unit.get('property_id') != property_id:
+            raise HTTPException(status_code=404, detail="Unidad no encontrada en esta propiedad")
+        if unit.get('status') == 'rented' and unit.get('current_contract_id'):
+            raise HTTPException(status_code=400,
+                                detail=f"La unidad {unit.get('unit_name')} ya está rentada")
+
     count = await get_db().rental_contracts.count_documents({})
     contract_number = f"CONT-{now.year}-{str(count + 1).zfill(3)}"
 
-    rent_amount = float(data.get('rent_amount', prop.get('rent_amount', 0)))
-    deposit_amount = float(data.get('deposit_amount', prop.get('deposit_amount', 0)))
+    rent_amount = float(data.get('rent_amount', (unit or prop).get('rent_amount', 0)))
+    deposit_amount = float(data.get('deposit_amount', (unit or prop).get('deposit_amount', 0)))
 
     # Build addendums from request data or defaults from rental config
     addendums_data = data.get('addendums', {})
@@ -572,8 +585,10 @@ async def create_contract(request: Request):
     contract_doc = {
         "contract_number": contract_number,
         "property_id": property_id,
-        "property_address": prop.get('address', ''),
+        "property_address": prop.get('address', '') + (f" — {unit['unit_name']}" if unit else ''),
         "property_number": prop.get('property_number', ''),
+        "unit_id": unit_id,
+        "unit_name": unit.get('unit_name', '') if unit else '',
         "tenant_id": tenant_id,
         "tenant_name": tenant.get('name', ''),
         "tenant_phone": tenant.get('phone', ''),
@@ -603,15 +618,19 @@ async def create_contract(request: Request):
     result = await get_db().rental_contracts.insert_one(contract_doc)
     contract_id = str(result.inserted_id)
 
-    # If contract is active, update property and tenant
+    # If contract is active, update property/unit and tenant
     if contract_doc['status'] == 'active':
-        await get_db().properties.update_one(
-            {"_id": ObjectId(property_id)},
-            {"$set": {"status": "rented", "current_tenant_id": tenant_id, "current_contract_id": contract_id, "updated_at": now}}
-        )
+        if unit_id:
+            from rental.units_router import mark_unit_rented
+            await mark_unit_rented(unit_id, tenant_id, contract_id)
+        else:
+            await get_db().properties.update_one(
+                {"_id": ObjectId(property_id)},
+                {"$set": {"status": "rented", "current_tenant_id": tenant_id, "current_contract_id": contract_id, "updated_at": now}}
+            )
         await get_db().tenants.update_one(
             {"_id": ObjectId(tenant_id)},
-            {"$set": {"current_property_id": property_id, "updated_at": now}}
+            {"$set": {"current_property_id": property_id, "current_unit_id": unit_id, "updated_at": now}}
         )
 
     return {
@@ -665,26 +684,35 @@ async def update_contract_status(contract_id: str, request: Request):
                        f"Para forzar la activación envía force_activate=true."
             )
 
-        # Mark property as rented
-        await get_db().properties.update_one(
-            {"_id": ObjectId(contract['property_id'])},
-            {"$set": {"status": "rented", "current_tenant_id": contract['tenant_id'], "current_contract_id": contract_id, "updated_at": now}}
-        )
-        await get_db().tenants.update_one(
-            {"_id": ObjectId(contract['tenant_id'])},
-            {"$set": {"current_property_id": contract['property_id'], "updated_at": now}}
-        )
-    elif new_status in ('terminated', 'expired'):
-        # Free the property (only if not manually overridden)
-        prop = await get_db().properties.find_one({"_id": ObjectId(contract['property_id'])})
-        if prop and not prop.get('status_manually_set'):
+        # Mark property/unit as rented
+        if contract.get('unit_id'):
+            from rental.units_router import mark_unit_rented
+            await mark_unit_rented(contract['unit_id'], contract['tenant_id'], contract_id)
+        else:
             await get_db().properties.update_one(
                 {"_id": ObjectId(contract['property_id'])},
-                {"$set": {"status": "available", "current_tenant_id": None, "current_contract_id": None, "updated_at": now}}
+                {"$set": {"status": "rented", "current_tenant_id": contract['tenant_id'], "current_contract_id": contract_id, "updated_at": now}}
             )
         await get_db().tenants.update_one(
             {"_id": ObjectId(contract['tenant_id'])},
-            {"$set": {"current_property_id": None, "updated_at": now},
+            {"$set": {"current_property_id": contract['property_id'],
+                      "current_unit_id": contract.get('unit_id'), "updated_at": now}}
+        )
+    elif new_status in ('terminated', 'expired'):
+        # Free the property/unit (only if not manually overridden)
+        if contract.get('unit_id'):
+            from rental.units_router import free_unit
+            await free_unit(contract['unit_id'])
+        else:
+            prop = await get_db().properties.find_one({"_id": ObjectId(contract['property_id'])})
+            if prop and not prop.get('status_manually_set'):
+                await get_db().properties.update_one(
+                    {"_id": ObjectId(contract['property_id'])},
+                    {"$set": {"status": "available", "current_tenant_id": None, "current_contract_id": None, "updated_at": now}}
+                )
+        await get_db().tenants.update_one(
+            {"_id": ObjectId(contract['tenant_id'])},
+            {"$set": {"current_property_id": None, "current_unit_id": None, "updated_at": now},
              "$push": {"rental_history": {
                  "property_id": contract['property_id'],
                  "property_address": contract.get('property_address', ''),
@@ -694,22 +722,28 @@ async def update_contract_status(contract_id: str, request: Request):
              }}}
         )
     elif new_status in ('draft', 'pending_signature', 'pending'):
-        # Contract reverted to draft/pending — free the property if no other active contract uses it
-        prop_id = contract.get('property_id')
-        if prop_id:
-            prop = await get_db().properties.find_one({"_id": ObjectId(prop_id)})
-            if prop and not prop.get('status_manually_set'):
-                # Check if there's any OTHER active contract on this property
-                other_active = await get_db().rental_contracts.find_one({
-                    "property_id": prop_id,
-                    "status": "active",
-                    "_id": {"$ne": ObjectId(contract_id)},
-                })
-                if not other_active:
-                    await get_db().properties.update_one(
-                        {"_id": ObjectId(prop_id)},
-                        {"$set": {"status": "available", "current_tenant_id": None, "current_contract_id": None, "updated_at": now}}
-                    )
+        # Contract reverted to draft/pending — free the unit/property if no other active contract uses it
+        if contract.get('unit_id'):
+            from rental.units_router import free_unit
+            unit = await get_db().property_units.find_one({"_id": ObjectId(contract['unit_id'])})
+            if unit and unit.get('current_contract_id') == contract_id:
+                await free_unit(contract['unit_id'])
+        else:
+            prop_id = contract.get('property_id')
+            if prop_id:
+                prop = await get_db().properties.find_one({"_id": ObjectId(prop_id)})
+                if prop and not prop.get('status_manually_set'):
+                    # Check if there's any OTHER active contract on this property
+                    other_active = await get_db().rental_contracts.find_one({
+                        "property_id": prop_id,
+                        "status": "active",
+                        "_id": {"$ne": ObjectId(contract_id)},
+                    })
+                    if not other_active:
+                        await get_db().properties.update_one(
+                            {"_id": ObjectId(prop_id)},
+                            {"$set": {"status": "available", "current_tenant_id": None, "current_contract_id": None, "updated_at": now}}
+                        )
 
     await get_db().rental_contracts.update_one({"_id": ObjectId(contract_id)}, {"$set": update})
     return {"success": True, "message": f"Contrato actualizado a: {new_status}"}
@@ -734,6 +768,14 @@ async def sync_property_status(request: Request):
 
     async for prop in db.properties.find({}):
         pid = str(prop["_id"])
+
+        # Multi-unidad: el status se deriva de las unidades, no del contrato global
+        if prop.get('is_multi_unit'):
+            from rental.units_router import sync_property_from_units
+            await sync_property_from_units(pid)
+            unchanged.append({"id": pid, "address": prop.get('address', ''), "status": "multi-unit (derivado de unidades)"})
+            continue
+
         active_contract = await db.rental_contracts.find_one({"property_id": pid, "status": "active"})
 
         if prop.get('status_manually_set'):
