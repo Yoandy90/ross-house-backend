@@ -218,3 +218,60 @@ def test_07_large_unmatched_alert(ctx):
     # el big no se re-alerta en corridas posteriores
     bodies_after_first = [s["body"] for s in sent[1:]]
     assert all("WIRE DESCONOCIDO" not in b for b in bodies_after_first)
+
+
+def test_08_ai_suggestion_flow(ctx):
+    """AI sugiere match aproximado (mock) y accept lo confirma."""
+    db, loop = ctx["db"], ctx["loop"]
+
+    async def _seed():
+        await db.bank_transactions.insert_one({
+            "transaction_id": f"sug-{TEST_TAG}", "item_id": "x",
+            "name": f"CHECK 1042 {TEST_TAG}", "amount": 260.00,
+            "date": datetime.utcnow(), "match": {"status": "unmatched"}})
+        await db.provider_payments.insert_one({
+            "_id": f"pp2-{TEST_TAG}", "provider_id": "x",
+            "provider_name": f"Electricista {TEST_TAG}", "amount": 275.50,
+            "method": "check", "status": "paid", "paid_at": datetime.utcnow()})
+    loop.run_until_complete(_seed())
+
+    class FakeChat:
+        def __init__(self, *a, **k):
+            self.system = k.get("system_message", "")
+
+        def with_model(self, *a, **k):
+            return self
+
+        async def send_message(self, msg):
+            if "Schedule E" in self.system:
+                return f'[{{"id": "sug-{TEST_TAG}", "category": "repairs"}}]'
+            return (f'[{{"id": "sug-{TEST_TAG}", "ref": "provider_payments:pp2-{TEST_TAG}",'
+                    f'"confidence": 88, "reason": "Cheque 1042, difiere $15.50 por fee"}}]')
+
+    import emergentintegrations.llm.chat as ll
+    orig = ll.LlmChat
+    ll.LlmChat = FakeChat
+    try:
+        from rental.plaid_router import run_ai_analysis
+        r = loop.run_until_complete(run_ai_analysis())
+    finally:
+        ll.LlmChat = orig
+    assert r["suggested"] >= 1
+
+    async def _get():
+        return await db.bank_transactions.find_one({"transaction_id": f"sug-{TEST_TAG}"})
+    tx = loop.run_until_complete(_get())
+    assert tx["ai_category"] == "repairs"
+    assert tx["match_suggestion"]["confidence"] == 88
+
+    # aceptar la sugerencia → matched
+    resp = _req(ctx, "POST", f"/api/admin/plaid/transactions/sug-{TEST_TAG}/suggestion",
+                json={"action": "accept"})
+    assert resp.status_code == 200, resp.text
+    tx = loop.run_until_complete(_get())
+    assert tx["match"]["status"] == "matched"
+    assert tx["match"]["ai_suggested"] is True
+    assert "match_suggestion" not in tx
+    # accept de nuevo → 400 (ya no hay sugerencia)
+    assert _req(ctx, "POST", f"/api/admin/plaid/transactions/sug-{TEST_TAG}/suggestion",
+                json={"action": "accept"}).status_code == 400

@@ -72,11 +72,18 @@ async def plaid_sync_loop():
             elif await db.plaid_items.count_documents({}) == 0:
                 logger.info("[plaid-cron] sin cuentas vinculadas — omitido")
             else:
-                from rental.plaid_router import run_full_sync
+                from rental.plaid_router import run_full_sync, run_ai_analysis
                 result = await run_full_sync()
+                try:
+                    ai = await run_ai_analysis()
+                except Exception as e:
+                    ai = {}
+                    logger.warning(f"[plaid-cron] AI análisis omitido: {e}")
                 alerted = await check_large_unmatched(db)
                 logger.info(f"[plaid-cron] sync: {result.get('imported')} importadas, "
-                            f"{result.get('auto_matched')} conciliadas, {alerted} alertadas")
+                            f"{result.get('auto_matched')} conciliadas, "
+                            f"{ai.get('categorized', 0)} categorizadas AI, "
+                            f"{ai.get('suggested', 0)} sugerencias, {alerted} alertadas")
         except Exception as e:
             logger.error(f"[plaid-cron] error: {e}")
         await asyncio.sleep(interval)

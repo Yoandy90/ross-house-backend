@@ -298,3 +298,170 @@ async def reconcile(request: Request):
     await auth_admin(request)
     matched = await _auto_match()
     return {"success": True, "auto_matched": matched}
+
+
+# ── AI: categorización Schedule E + sugerencias de match ────────────────────
+SCHEDULE_E_CATEGORIES = {
+    "repairs": "Reparaciones", "utilities": "Utilities", "insurance": "Seguros",
+    "mortgage_interest": "Interés hipotecario", "supplies": "Suministros",
+    "taxes": "Impuestos", "management": "Administración",
+    "professional": "Legal/Profesional", "advertising": "Publicidad",
+    "auto_travel": "Auto/Viajes", "rent_income": "Ingreso renta",
+    "other_income": "Otro ingreso", "transfer": "Transferencia",
+    "personal": "Personal (no deducible)", "other": "Otro",
+}
+
+
+def _ai_chat(system: str):
+    import os
+    from uuid import uuid4
+    from emergentintegrations.llm.chat import LlmChat
+    from rental.ai_brain_router import MODEL_PROVIDER, MODEL_NAME
+    return LlmChat(api_key=os.environ["EMERGENT_LLM_KEY"],
+                   session_id=f"plaid_ai_{uuid4()}",
+                   system_message=system).with_model(MODEL_PROVIDER, MODEL_NAME)
+
+
+def _parse_json(raw: str):
+    import json as _json
+    raw = str(raw)
+    start = raw.index("["), raw.rindex("]") + 1
+    return _json.loads(raw[start[0]:start[1]])
+
+
+async def run_ai_analysis(limit: int = 30) -> dict:
+    """Categoriza (Schedule E) y sugiere matches aproximados para unmatched."""
+    import json as _json
+    from emergentintegrations.llm.chat import UserMessage
+    db = get_db()
+    txs = await (db.bank_transactions.find(
+        {"match.status": "unmatched",
+         "$or": [{"ai_category": {"$exists": False}},
+                 {"match_suggestion": {"$exists": False}}]})
+        .sort([("date", -1)]).limit(limit).to_list(limit))
+    if not txs:
+        return {"categorized": 0, "suggested": 0}
+
+    tx_brief = [{"id": t["transaction_id"], "name": t.get("name", ""),
+                 "amount": t.get("amount"), "plaid_category": t.get("category", ""),
+                 "date": t["date"].strftime("%Y-%m-%d") if isinstance(t.get("date"), datetime)
+                 else str(t.get("date"))[:10]} for t in txs]
+
+    # 1) Categorización Schedule E (batch, 1 llamada)
+    categorized = 0
+    try:
+        cats = ", ".join(SCHEDULE_E_CATEGORIES.keys())
+        chat = _ai_chat(
+            "Clasificas transacciones bancarias de un negocio de casas de renta en Texas "
+            f"para el Schedule E del IRS. Categorías válidas: {cats}. "
+            "amount>0 = salida de dinero, amount<0 = entrada. "
+            'Responde SOLO JSON: [{"id": "...", "category": "..."}]')
+        raw = await chat.send_message(UserMessage(
+            text=_json.dumps(tx_brief, ensure_ascii=False)))
+        for row in _parse_json(raw):
+            cat = row.get("category")
+            if cat in SCHEDULE_E_CATEGORIES:
+                await db.bank_transactions.update_one(
+                    {"transaction_id": row.get("id")},
+                    {"$set": {"ai_category": cat,
+                              "ai_category_label": SCHEDULE_E_CATEGORIES[cat]}})
+                categorized += 1
+    except Exception as e:
+        logger.error(f"[plaid-ai] categorización: {e}")
+
+    # 2) Sugerencias de match aproximado (monto ±10% o ±$50, fecha ±7d)
+    suggested = 0
+    try:
+        candidates = []
+        for coll, direction, label in MATCH_SOURCES:
+            async for doc in db[coll].find({}).sort([("_id", -1)]).limit(300):
+                amt, dt = _doc_amount(doc), _doc_date(doc)
+                if amt and dt and doc.get("status") not in ("cancelled", "void", "failed"):
+                    candidates.append({
+                        "ref": f"{coll}:{doc['_id']}", "dir": direction, "label": label,
+                        "amount": round(amt, 2), "date": dt.strftime("%Y-%m-%d"),
+                        "desc": str(doc.get("provider_name") or doc.get("tenant_name")
+                                    or doc.get("description") or "")[:50]})
+        pairs = []
+        for t in txs:
+            if t.get("match_suggestion"):
+                continue
+            t_amt = float(t.get("amount") or 0)
+            t_dir = "out" if t_amt > 0 else "in"
+            t_date = t.get("date") if isinstance(t.get("date"), datetime) else None
+            near = [c for c in candidates if c["dir"] == t_dir
+                    and abs(c["amount"] - abs(t_amt)) <= max(50, abs(t_amt) * 0.10)
+                    and (not t_date or abs((datetime.fromisoformat(c["date"]) - t_date).days) <= 7)]
+            if near:
+                pairs.append({"tx": {"id": t["transaction_id"], "name": t.get("name", ""),
+                                     "amount": t_amt,
+                                     "date": t_date.strftime("%Y-%m-%d") if t_date else ""},
+                              "candidatos": near[:6]})
+        if pairs:
+            chat = _ai_chat(
+                "Concilias transacciones bancarias con registros internos de un negocio de rentas. "
+                "Para cada transacción decide si algún candidato es el mismo movimiento "
+                "(diferencias pequeñas por fees/redondeo/fechas son normales). Sé conservador: "
+                "si no hay candidato claro, omite la transacción. Responde SOLO JSON: "
+                '[{"id": "tx id", "ref": "ref del candidato", "confidence": 0-100, '
+                '"reason": "explicación corta en español"}]')
+            raw = await chat.send_message(UserMessage(
+                text=_json.dumps(pairs, ensure_ascii=False)))
+            cand_by_ref = {c["ref"]: c for c in candidates}
+            for row in _parse_json(raw):
+                c = cand_by_ref.get(row.get("ref"))
+                if not c or int(row.get("confidence") or 0) < 60:
+                    continue
+                coll, ref_id = row["ref"].split(":", 1)
+                await db.bank_transactions.update_one(
+                    {"transaction_id": row.get("id"), "match.status": "unmatched"},
+                    {"$set": {"match_suggestion": {
+                        "collection": coll, "ref_id": ref_id, "type": c["label"],
+                        "ref_desc": c["desc"], "ref_amount": c["amount"],
+                        "confidence": int(row["confidence"]),
+                        "reason": str(row.get("reason", ""))[:200],
+                        "suggested_at": datetime.utcnow()}}})
+                suggested += 1
+    except Exception as e:
+        logger.error(f"[plaid-ai] sugerencias: {e}")
+
+    return {"categorized": categorized, "suggested": suggested}
+
+
+@router.post('/admin/plaid/ai-analyze')
+async def ai_analyze(request: Request):
+    await auth_admin(request)
+    result = await run_ai_analysis()
+    return {"success": True, **result}
+
+
+@router.post('/admin/plaid/transactions/{transaction_id}/suggestion')
+async def resolve_suggestion(transaction_id: str, request: Request):
+    """Body: {action: accept|reject} — resuelve la sugerencia de la IA."""
+    await auth_admin(request)
+    db = get_db()
+    data = await request.json()
+    action = data.get("action")
+    if action not in ("accept", "reject"):
+        raise HTTPException(status_code=400, detail="action debe ser accept o reject")
+    tx = await db.bank_transactions.find_one({"transaction_id": transaction_id})
+    if not tx:
+        raise HTTPException(status_code=404, detail="Transacción no encontrada")
+    sug = tx.get("match_suggestion")
+    if not sug:
+        raise HTTPException(status_code=400, detail="Esta transacción no tiene sugerencia")
+    if action == "accept":
+        await db.bank_transactions.update_one(
+            {"_id": tx["_id"]},
+            {"$set": {"match": {"status": "matched", "type": sug["type"],
+                                "collection": sug["collection"], "ref_id": sug["ref_id"],
+                                "ref_desc": sug["ref_desc"], "ai_suggested": True,
+                                "confidence": sug["confidence"],
+                                "matched_at": datetime.utcnow()}},
+             "$unset": {"match_suggestion": ""}})
+    else:
+        await db.bank_transactions.update_one(
+            {"_id": tx["_id"]},
+            {"$unset": {"match_suggestion": ""},
+             "$set": {"suggestion_rejected_at": datetime.utcnow()}})
+    return {"success": True, "action": action}
