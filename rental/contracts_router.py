@@ -1052,10 +1052,22 @@ async def office_sign_contract(contract_id: str, request: Request):
     if not contract:
         raise HTTPException(status_code=404, detail="Contrato no encontrado")
 
-    sig_type = data.get('type', 'canvas')  # 'canvas' or 'topaz'
+    sig_type = data.get('type', 'canvas')  # 'canvas' or 'topaz' or 'saved'
     signature_data = data.get('signature', '')  # base64 image
     signer_name = data.get('signer_name', '')
     signer_role = data.get('signer_role', 'tenant')  # 'tenant' or 'admin'
+    use_saved_admin = bool(data.get('use_saved_admin'))
+    auto_admin = bool(data.get('auto_admin'))  # al firmar el inquilino, aplicar también la firma guardada del admin
+
+    # Firma guardada del admin (configurada una sola vez en Configuración → Firma Admin)
+    if signer_role == 'admin' and use_saved_admin and not signature_data:
+        saved = await get_db().admin_signatures.find_one({"type": "landlord_default"})
+        if not saved or not saved.get('image_data'):
+            raise HTTPException(status_code=400, detail="No hay firma guardada — configúrala en Configuración → Firma Admin")
+        signature_data = saved['image_data']
+        sig_type = 'saved'
+        if not signer_name:
+            signer_name = user.get('name') or user.get('email', 'Administrador')
 
     if not signature_data:
         raise HTTPException(status_code=400, detail="No se recibió firma")
@@ -1080,59 +1092,85 @@ async def office_sign_contract(contract_id: str, request: Request):
         "method": "office",  # Indicates in-person signing
     }
 
-    # Determine which field to update based on signer role
+    # ── Aplicar firma según el rol ──
+    update = {"updated_at": now}
+    has_tenant_sig = bool(contract.get('tenant_signature'))
+    has_admin_sig = bool(contract.get('admin_signature') or contract.get('landlord_signature'))
+
     if signer_role == 'tenant':
-        update = {
-            "tenant_signature": signature_record,
-            "tenant_signed_at": now,
-            "updated_at": now,
-        }
-        # Check if admin also needs to sign or if contract is ready to activate
-        if contract.get('admin_signature'):
-            update['status'] = 'active'
-        else:
-            update['status'] = 'pending_signature'  # Waiting for admin
+        update['tenant_signature'] = signature_record
+        update['tenant_signed_at'] = now
+        update['tenant_signer_name'] = signer_name
+        has_tenant_sig = True
+
+        # Opcional: aplicar también la firma guardada del admin en el mismo paso
+        if auto_admin and not has_admin_sig:
+            saved = await get_db().admin_signatures.find_one({"type": "landlord_default"})
+            if saved and saved.get('image_data'):
+                admin_record = {
+                    "type": "saved",
+                    "image_data": saved['image_data'],
+                    "hash": hashlib.sha256(saved['image_data'].encode('utf-8')).hexdigest(),
+                    "signed_at": now,
+                    "signed_by_admin": user.get('email', 'admin'),
+                    "signer_name": user.get('name') or user.get('email', 'Administrador'),
+                    "signer_role": "admin",
+                    "client_ip": client_ip,
+                    "method": "office_saved",
+                }
+                update['admin_signature'] = admin_record
+                update['admin_signed_at'] = now
+                update['admin_signer_name'] = admin_record['signer_name']
+                has_admin_sig = True
     else:  # admin signature
-        update = {
-            "admin_signature": signature_record,
-            "admin_signed_at": now,
-            "updated_at": now,
-        }
-        # Check if tenant also signed
-        if contract.get('tenant_signature'):
-            update['status'] = 'active'
-        else:
-            update['status'] = 'pending_tenant'
+        update['admin_signature'] = signature_record
+        update['admin_signed_at'] = now
+        update['admin_signer_name'] = signer_name
+        has_admin_sig = True
 
-    # Also store in legacy signature field for backward compatibility
-    update['signature'] = signature_record
-    update['signature_status'] = 'signed'
-    update['signed_at'] = now
-
-    # Auto-activate if draft and both parties signed (or single signature mode)
-    current_status = contract.get('status', 'draft')
-    if current_status == 'draft':
+    # ── Estado: SOLO se activa cuando AMBAS partes firmaron ──
+    was_active = contract.get('status') == 'active'
+    if has_tenant_sig and has_admin_sig:
         update['status'] = 'active'
-        # Update property and tenant records
-        await get_db().properties.update_one(
-            {"_id": ObjectId(contract['property_id'])},
-            {"$set": {"status": "rented", "current_tenant_id": contract.get('tenant_id'), "current_contract_id": contract_id, "updated_at": now}}
-        )
+        update['signature_status'] = 'signed'
+        update['signed_at'] = now
+    elif has_tenant_sig:
+        update['status'] = 'pending_signature'   # falta el admin
+    else:
+        update['status'] = 'pending_tenant'      # falta el inquilino
+
+    # Al activarse: marcar propiedad rentada + inquilino vinculado + email del PDF firmado
+    if update.get('status') == 'active' and not was_active:
+        if contract.get('property_id'):
+            await get_db().properties.update_one(
+                {"_id": ObjectId(contract['property_id'])},
+                {"$set": {"status": "rented", "current_tenant_id": contract.get('tenant_id'), "current_contract_id": contract_id, "updated_at": now}}
+            )
         if contract.get('tenant_id'):
             await get_db().tenants.update_one(
                 {"_id": ObjectId(contract['tenant_id'])},
-                {"$set": {"current_property_id": contract['property_id'], "updated_at": now}}
+                {"$set": {"current_property_id": contract.get('property_id'), "updated_at": now}}
             )
 
     await get_db().rental_contracts.update_one({"_id": ObjectId(contract_id)}, {"$set": update})
-    
+
+    if update.get('status') == 'active' and not was_active:
+        try:
+            fresh = await get_db().rental_contracts.find_one({"_id": ObjectId(contract_id)})
+            if fresh:
+                await _email_signed_lease_pdf(fresh)
+        except Exception as e:
+            logging.warning(f"⚠️ Auto-email signed lease PDF failed: {e}")
+
     return {
-        "success": True, 
+        "success": True,
         "message": f"Firma de {signer_role} capturada exitosamente",
         "signer_name": signer_name,
         "signer_role": signer_role,
         "method": sig_type,
-        "hash": sig_hash
+        "hash": sig_hash,
+        "new_status": update.get('status'),
+        "fully_signed": bool(has_tenant_sig and has_admin_sig),
     }
 
 
