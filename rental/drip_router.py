@@ -359,6 +359,79 @@ async def send_next_now(request: Request):
     return {"success": True, "subject": tpl.get("subject_es"), **result}
 
 
+@router.post("/admin/drip/templates/{tpl_id}/preview")
+async def send_preview(request: Request, tpl_id: str):
+    """Envía ESTA plantilla solo al email indicado (vista previa, no marca como enviada)."""
+    await auth_admin(request)
+    data = await request.json()
+    to = (data.get("email") or "").strip().lower()
+    if not to or "@" not in to:
+        raise HTTPException(400, "Email inválido")
+    db = get_db()
+    tpl = await db.email_templates.find_one({"_id": ObjectId(tpl_id)})
+    if not tpl:
+        raise HTTPException(404, "Plantilla no encontrada")
+    from .newsletter_router import _sendgrid, _send_one, _campaign_html
+    sg_key, from_email = await _sendgrid()
+    if not sg_key:
+        raise HTTPException(500, "SendGrid no configurado")
+    subject = f"[VISTA PREVIA] {tpl.get('subject_es', '')}"
+    ok = await _send_one(sg_key, from_email, to, subject,
+                         _campaign_html(tpl.get("subject_es", ""), _bilingual_message(tpl), None, ""))
+    if not ok:
+        raise HTTPException(502, "SendGrid rechazó el envío")
+    return {"success": True, "sent_to": to, "subject": tpl.get("subject_es", "")}
+
+
+# ═══ Comentarios del blog ════════════════════════════════════
+
+@router.get("/public/blog/posts/{slug}/comments")
+async def blog_comments(slug: str):
+    db = get_db()
+    docs = await db.blog_comments.find(
+        {"slug": slug, "hidden": {"$ne": True}}).sort("created_at", -1).to_list(100)
+    return {"success": True, "comments": [{
+        "id": str(d["_id"]), "name": d.get("name", "Anónimo"),
+        "comment": d.get("comment", ""),
+        "created_at": d["created_at"].isoformat() if d.get("created_at") else "",
+    } for d in docs]}
+
+
+@router.post("/public/blog/posts/{slug}/comments")
+async def add_blog_comment(request: Request, slug: str):
+    db = get_db()
+    post = await db.email_templates.find_one({"slug": slug, "published_to_blog": True})
+    if not post:
+        raise HTTPException(404, "Post no encontrado")
+    data = await request.json()
+    name = (data.get("name") or "").strip()[:60]
+    comment = (data.get("comment") or "").strip()[:1000]
+    if not name or len(comment) < 3:
+        raise HTTPException(400, "Escribe tu nombre y un comentario")
+    ip = request.client.host if request.client else "unknown"
+    # anti-spam simple: máx 3 comentarios por IP por hora
+    from datetime import timedelta
+    recent = await db.blog_comments.count_documents(
+        {"ip": ip, "created_at": {"$gte": datetime.utcnow() - timedelta(hours=1)}})
+    if recent >= 3:
+        raise HTTPException(429, "Demasiados comentarios — intenta más tarde")
+    doc = {"slug": slug, "name": name, "comment": comment, "ip": ip,
+           "hidden": False, "created_at": datetime.utcnow()}
+    res = await db.blog_comments.insert_one(doc)
+    return {"success": True, "comment": {
+        "id": str(res.inserted_id), "name": name, "comment": comment,
+        "created_at": doc["created_at"].isoformat()}}
+
+
+@router.delete("/admin/blog/comments/{comment_id}")
+async def delete_blog_comment(request: Request, comment_id: str):
+    await auth_admin(request)
+    res = await get_db().blog_comments.delete_one({"_id": ObjectId(comment_id)})
+    if res.deleted_count == 0:
+        raise HTTPException(404, "Comentario no encontrado")
+    return {"success": True}
+
+
 # ═══ Blog público ════════════════════════════════════════════
 
 @router.get("/public/blog/posts")
