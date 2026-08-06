@@ -20,3 +20,4 @@ bcrypt==4.1.3
 python-dotenv
 emergentintegrations
 Pillow>=10.0.0
+plaid-python==37.1.0
