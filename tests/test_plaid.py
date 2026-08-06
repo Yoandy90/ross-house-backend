@@ -175,3 +175,46 @@ def test_05_manual_ignore(ctx):
 def test_06_unauthorized(ctx):
     assert _req(ctx, "GET", "/api/admin/plaid/accounts", auth=False).status_code == 401
     assert _req(ctx, "POST", "/api/admin/plaid/sync", auth=False).status_code == 401
+
+
+def test_07_large_unmatched_alert(ctx):
+    """El cron alerta movimientos >= $500 sin conciliar y los marca alerted."""
+    import rental.plaid_sync_cron as psc
+    db, loop = ctx["db"], ctx["loop"]
+    sent = []
+
+    async def fake_send(to, subject, body, body_html="", from_email=""):
+        sent.append({"to": to, "subject": subject, "body": body})
+        return True
+
+    import rental.email_inbox_router as eir
+    orig = eir._send_via_sendgrid
+    eir._send_via_sendgrid = fake_send
+
+    async def _run():
+        await db.bank_transactions.insert_many([
+            {"transaction_id": f"big-{TEST_TAG}", "item_id": "x",
+             "name": f"WIRE DESCONOCIDO {TEST_TAG}", "amount": 1200.0,
+             "date": datetime.utcnow(), "match": {"status": "unmatched"}},
+            {"transaction_id": f"small-{TEST_TAG}", "item_id": "x",
+             "name": f"CAFE {TEST_TAG}", "amount": 12.0,
+             "date": datetime.utcnow(), "match": {"status": "unmatched"}},
+        ])
+        n = await psc.check_large_unmatched(db)
+        big = await db.bank_transactions.find_one({"transaction_id": f"big-{TEST_TAG}"})
+        small = await db.bank_transactions.find_one({"transaction_id": f"small-{TEST_TAG}"})
+        # segunda corrida no re-alerta
+        n2 = await psc.check_large_unmatched(db)
+        return n, n2, big, small
+
+    try:
+        n, n2, big, small = loop.run_until_complete(_run())
+    finally:
+        eir._send_via_sendgrid = orig
+    assert n >= 1 and len(sent) >= 1
+    assert any("WIRE DESCONOCIDO" in s["body"] for s in sent)
+    assert big["alerted"] is True
+    assert small.get("alerted") is not True  # bajo el umbral
+    # el big no se re-alerta en corridas posteriores
+    bodies_after_first = [s["body"] for s in sent[1:]]
+    assert all("WIRE DESCONOCIDO" not in b for b in bodies_after_first)

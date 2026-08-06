@@ -36,9 +36,11 @@ async def nav_summary(request: Request):
         "count": len(delinquent),
         "total_due": round(sum(d.get("total_due", 0) for d in delinquent), 2),
     }
+    bank_unmatched = await db.bank_transactions.count_documents(
+        {"match.status": "unmatched"})
 
     total = (new_applications + open_maintenance + pending_signatures +
-             late_payments + delinquent_taxes["count"])
+             late_payments + delinquent_taxes["count"] + bank_unmatched)
     return {
         "success": True,
         "total": total,
@@ -47,6 +49,7 @@ async def nav_summary(request: Request):
         "pending_signatures": pending_signatures,
         "late_payments": late_payments,
         "delinquent_taxes": delinquent_taxes,
+        "bank_unmatched": bank_unmatched,
     }
 
 

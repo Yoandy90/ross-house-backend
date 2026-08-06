@@ -131,6 +131,15 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"   ⚠️ Weekly digest cron not started: {e}")
 
+    # Start Plaid bank sync cron (daily + alertas de movimientos grandes)
+    plaid_task = None
+    try:
+        from rental.plaid_sync_cron import plaid_sync_loop
+        plaid_task = asyncio.create_task(plaid_sync_loop())
+        logger.info("   ✅ Plaid bank sync cron scheduled")
+    except Exception as e:
+        logger.warning(f"   ⚠️ Plaid sync cron not started: {e}")
+
     # Start property tax reminder cron (Dec 1 & Jan 15, 9AM CT)
     tax_task = None
     try:

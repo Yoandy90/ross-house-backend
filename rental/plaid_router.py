@@ -195,10 +195,8 @@ async def unlink_item(item_id: str, request: Request):
     return {"success": True, "message": "Cuenta desvinculada"}
 
 
-@router.post('/admin/plaid/sync')
-async def sync_transactions(request: Request):
-    """Sincroniza transacciones de todas las cuentas vinculadas y auto-concilia."""
-    await auth_admin(request)
+async def run_full_sync() -> dict:
+    """Sincroniza todos los items y auto-concilia. Usado por el endpoint y el cron."""
     db = get_db()
     from plaid.model.transactions_sync_request import TransactionsSyncRequest
     client = _plaid()
@@ -248,6 +246,13 @@ async def sync_transactions(request: Request):
     matched = await _auto_match()
     return {"success": True, "imported": total_added, "removed": total_removed,
             "auto_matched": matched}
+
+
+@router.post('/admin/plaid/sync')
+async def sync_transactions(request: Request):
+    """Sincroniza transacciones de todas las cuentas vinculadas y auto-concilia."""
+    await auth_admin(request)
+    return await run_full_sync()
 
 
 @router.get('/admin/plaid/transactions')
