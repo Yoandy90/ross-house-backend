@@ -295,6 +295,7 @@ try:
     from rental.property_taxes_router import router as property_taxes_router
     from rental.admin_nav_router import router as admin_nav_router
     from rental.units_router import router as units_router
+    from rental.tax_1099_router import router as tax_1099_router
 
     app.include_router(auth_router, prefix="/api")
     app.include_router(properties_router, prefix="/api")
@@ -343,6 +344,7 @@ try:
     app.include_router(email_inbox_router, prefix="/api")
     app.include_router(screening_router, prefix="/api")
     app.include_router(units_router, prefix="/api")
+    app.include_router(tax_1099_router, prefix="/api")
     app.include_router(property_taxes_router, prefix="/api")
     app.include_router(admin_nav_router, prefix="/api")
     # ensure_indexes() awaited inside lifespan startup.
