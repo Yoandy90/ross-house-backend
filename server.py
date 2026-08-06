@@ -307,6 +307,7 @@ try:
     from rental.tax_1099_router import router as tax_1099_router
     from rental.listing_feed_router import router as listing_feed_router
     from rental.plaid_router import router as plaid_router
+    from rental.deal_finder_router import router as deal_finder_router
 
     app.include_router(auth_router, prefix="/api")
     app.include_router(properties_router, prefix="/api")
@@ -358,6 +359,7 @@ try:
     app.include_router(tax_1099_router, prefix="/api")
     app.include_router(listing_feed_router, prefix="/api")
     app.include_router(plaid_router, prefix="/api")
+    app.include_router(deal_finder_router, prefix="/api")
     app.include_router(property_taxes_router, prefix="/api")
     app.include_router(admin_nav_router, prefix="/api")
     # ensure_indexes() awaited inside lifespan startup.
