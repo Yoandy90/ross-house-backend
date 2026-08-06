@@ -37,6 +37,19 @@ AUTOMATED_SENDERS = ("no-reply", "noreply", "mailer-daemon", "postmaster",
 # Categorías de clasificación AI de correos entrantes
 EMAIL_CATEGORIES = ("lead", "tenant", "provider", "invoice", "other")
 
+# Remitentes disponibles para enviar (dominio autenticado en SendGrid)
+SENDER_ADDRESSES = {
+    "info@rosshouserentals.com": "General (info)",
+    "contact@rosshouserentals.com": "Contacto",
+    "yoandy@rosshouserentals.com": "Yoandy",
+    "yoandyross@rosshouserentals.com": "Yoandy Ross",
+    "payments@rosshouserentals.com": "Pagos",
+    "no-reply@rosshouserentals.com": "Notificaciones (no responder)",
+    "rentas@rosshouserentals.com": "Rentas / Interesados",
+    "mantenimiento@rosshouserentals.com": "Mantenimiento",
+    "soporte@rosshouserentals.com": "Soporte",
+}
+
 DEFAULT_AI_CONFIG = {
     "auto_ack_enabled": True,      # confirmación automática de recibido
     "auto_draft_enabled": True,    # AI genera borrador de respuesta
@@ -81,8 +94,17 @@ def _is_automated_sender(email: str) -> bool:
     return any(tag in local for tag in AUTOMATED_SENDERS)
 
 
+def _pick_sender(to_field: str) -> str:
+    """Responde desde el alias al que escribieron (si es uno permitido)."""
+    txt = (to_field or "").lower()
+    for addr in SENDER_ADDRESSES:
+        if addr in txt:
+            return addr
+    return _from_email()
+
+
 async def _send_via_sendgrid(to: str, subject: str, body_text: str,
-                             body_html: str = "") -> bool:
+                             body_html: str = "", from_email: str = "") -> bool:
     """Envío simple (usado por auto-ack y auto-send de AI)."""
     try:
         from sendgrid import SendGridAPIClient
@@ -90,7 +112,7 @@ async def _send_via_sendgrid(to: str, subject: str, body_text: str,
         if not body_html:
             body_html = ("<div style='font-family:system-ui,sans-serif;white-space:pre-wrap;'>"
                          + body_text.replace("<", "&lt;") + "</div>")
-        msg = Mail(from_email=(_from_email(), "Ross House Rentals"),
+        msg = Mail(from_email=(from_email or _from_email(), "Ross House Rentals"),
                    to_emails=to, subject=subject, html_content=body_html)
         resp = SendGridAPIClient(_sg_key()).send(msg)
         return resp.status_code in (200, 201, 202)
@@ -194,7 +216,8 @@ async def _process_inbound_ai(email_id: str):
         if not recent_ack:
             subject = doc.get("subject") or "(sin asunto)"
             ok = await _send_via_sendgrid(
-                sender, f"Re: {subject} — Recibimos tu mensaje ✅", cfg["ack_message"])
+                sender, f"Re: {subject} — Recibimos tu mensaje ✅", cfg["ack_message"],
+                from_email=_pick_sender(doc.get("to", "")))
             if ok:
                 await db.email_acks.update_one(
                     {"email": sender}, {"$set": {"email": sender, "last_ack_at": _now()}},
@@ -218,12 +241,13 @@ async def _process_inbound_ai(email_id: str):
     if cfg["auto_send_enabled"]:
         subject = doc.get("subject") or "(sin asunto)"
         reply_subject = subject if subject.lower().startswith("re:") else f"Re: {subject}"
-        ok = await _send_via_sendgrid(sender, reply_subject, draft)
+        reply_from = _pick_sender(doc.get("to", ""))
+        ok = await _send_via_sendgrid(sender, reply_subject, draft, from_email=reply_from)
         if ok:
             await db.email_inbox.update_one(
                 {"_id": doc["_id"]}, {"$set": {"ai_status": "sent_auto"}})
             await db.email_inbox.insert_one({
-                "folder": "sent", "from_email": _from_email(),
+                "folder": "sent", "from_email": reply_from,
                 "from_name": "Ross House Rentals (AI)", "to": sender,
                 "subject": reply_subject, "text": draft[:100000],
                 "html": "", "read": True, "ai_sent": True,
@@ -326,7 +350,8 @@ async def list_inbox(request: Request, folder: str = "inbox", q: str = "",
 @router.get("/admin/inbox/ai-config")
 async def read_ai_config(request: Request):
     await auth_admin(request)
-    return {"success": True, "config": await get_ai_config()}
+    return {"success": True, "config": await get_ai_config(),
+            "senders": SENDER_ADDRESSES, "default_sender": _from_email()}
 
 
 @router.put("/admin/inbox/ai-config")
@@ -401,7 +426,7 @@ async def delete_email(email_id: str, request: Request):
 
 @router.post("/admin/inbox/send")
 async def send_email(request: Request):
-    """Redactar o responder. Body: {to, subject, body_html?, body_text?,
+    """Redactar o responder. Body: {to, subject, body_html?, body_text?, from_email?,
     reply_to_id?, send_at? (ISO), cc?}. Programación via SendGrid send_at (máx 72h)."""
     admin = await auth_admin(request)
     data = await request.json()
@@ -411,6 +436,10 @@ async def send_email(request: Request):
     body_text = data.get("body_text") or ""
     if not to or not subject or not (body_html or body_text):
         raise HTTPException(status_code=400, detail="Faltan destinatario, asunto o cuerpo")
+    sender = str(data.get("from_email") or _from_email()).strip().lower()
+    if sender not in SENDER_ADDRESSES:
+        raise HTTPException(status_code=400,
+                            detail="Remitente no permitido — usa una dirección del dominio")
 
     from sendgrid import SendGridAPIClient
     from sendgrid.helpers.mail import Mail, Cc, BatchId, SendAt
@@ -420,7 +449,7 @@ async def send_email(request: Request):
                     + body_text.replace("<", "&lt;") + "</div>"
 
     msg = Mail(
-        from_email=(_from_email(), "Ross House Rentals"),
+        from_email=(sender, "Ross House Rentals"),
         to_emails=[e.strip() for e in to.split(",") if e.strip()],
         subject=subject,
         html_content=body_html,
@@ -456,7 +485,7 @@ async def send_email(request: Request):
 
     doc = {
         "folder": "sent",
-        "from_email": _from_email(),
+        "from_email": sender,
         "from_name": "Ross House Rentals",
         "to": to,
         "cc": cc or None,
@@ -537,14 +566,20 @@ async def approve_ai_draft(email_id: str, request: Request):
 
     subject = doc.get("subject") or "(sin asunto)"
     reply_subject = subject if subject.lower().startswith("re:") else f"Re: {subject}"
-    ok = await _send_via_sendgrid(doc["from_email"], reply_subject, body)
+    reply_from = str(data.get("from_email") or "").strip().lower()
+    if reply_from and reply_from not in SENDER_ADDRESSES:
+        raise HTTPException(status_code=400, detail="Remitente no permitido")
+    if not reply_from:
+        reply_from = _pick_sender(doc.get("to", ""))
+    ok = await _send_via_sendgrid(doc["from_email"], reply_subject, body,
+                                  from_email=reply_from)
     if not ok:
         raise HTTPException(status_code=502, detail="SendGrid rechazó el envío")
 
     await db.email_inbox.update_one(
         {"_id": oid}, {"$set": {"ai_status": "approved", "ai_draft": body}})
     await db.email_inbox.insert_one({
-        "folder": "sent", "from_email": _from_email(),
+        "folder": "sent", "from_email": reply_from,
         "from_name": "Ross House Rentals", "to": doc["from_email"],
         "subject": reply_subject, "text": body[:100000], "html": "",
         "read": True, "in_reply_to": str(oid), "ai_approved": True,

@@ -56,8 +56,9 @@ def ctx(loop, monkeypatch_module=None):
     # No enviar emails reales ni llamar al LLM en tests
     sent = []
 
-    async def fake_send(to, subject, body_text, body_html=""):
-        sent.append({"to": to, "subject": subject, "body": body_text})
+    async def fake_send(to, subject, body_text, body_html="", from_email=""):
+        sent.append({"to": to, "subject": subject, "body": body_text,
+                     "from": from_email})
         return True
 
     async def fake_draft(doc):
@@ -308,3 +309,25 @@ def test_13_classify_pending(ctx):
         return await ctx["db"].email_inbox.find_one({"_id": ObjectId(eid)})
     doc = ctx["loop"].run_until_complete(_check())
     assert doc.get("category") == "invoice"
+
+
+def test_14_send_rejects_invalid_sender(ctx):
+    r = _req(ctx, "POST", "/api/admin/inbox/send", json={
+        "to": "x@example.com", "subject": "t", "body_text": "b",
+        "from_email": "hacker@otrodominio.com"})
+    assert r.status_code == 400
+
+
+def test_15_ai_config_includes_senders(ctx):
+    r = _req(ctx, "GET", "/api/admin/inbox/ai-config")
+    assert r.status_code == 200
+    d = r.json()
+    assert "info@rosshouserentals.com" in d.get("senders", {})
+    assert d.get("default_sender")
+
+
+def test_16_reply_from_alias_derivation(ctx):
+    from rental.email_inbox_router import _pick_sender
+    assert _pick_sender("Contact <contact@rosshouserentals.com>") == "contact@rosshouserentals.com"
+    assert _pick_sender("admin@inbox.rosshouserentals.com") == "info@rosshouserentals.com"
+    assert _pick_sender("") == "info@rosshouserentals.com"
