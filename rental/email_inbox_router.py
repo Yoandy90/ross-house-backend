@@ -34,6 +34,9 @@ logger = logging.getLogger(__name__)
 AUTOMATED_SENDERS = ("no-reply", "noreply", "mailer-daemon", "postmaster",
                      "bounce", "notification", "donotreply", "do-not-reply")
 
+# Categorías de clasificación AI de correos entrantes
+EMAIL_CATEGORIES = ("lead", "tenant", "provider", "invoice", "other")
+
 DEFAULT_AI_CONFIG = {
     "auto_ack_enabled": True,      # confirmación automática de recibido
     "auto_draft_enabled": True,    # AI genera borrador de respuesta
@@ -128,13 +131,56 @@ async def _generate_ai_draft(email_doc: dict) -> Optional[str]:
         return None
 
 
+async def _classify_email(email_doc: dict) -> Optional[str]:
+    """Clasifica el correo entrante con AI en una de EMAIL_CATEGORIES."""
+    try:
+        api_key = os.environ.get("EMERGENT_LLM_KEY")
+        if not api_key:
+            return None
+        from uuid import uuid4
+        from emergentintegrations.llm.chat import LlmChat, UserMessage
+        from .ai_brain_router import MODEL_PROVIDER, MODEL_NAME
+        system = (
+            "Clasifica emails para Ross House Rentals (casas de renta en Dumas, TX). "
+            "Responde SOLO con UNA palabra de estas categorías:\n"
+            "lead = persona interesada en rentar/aplicar a una propiedad\n"
+            "tenant = inquilino actual (mantenimiento, renta, contrato, quejas)\n"
+            "invoice = factura, cobro, recibo, bill o estado de cuenta POR PAGAR "
+            "(aunque venga de un proveedor/utility, si es un cobro es invoice)\n"
+            "provider = proveedor/contratista/servicio escribiendo por algo que NO es un cobro "
+            "(plomero, seguro, banco, utility, gobierno)\n"
+            "other = cualquier otro caso (promociones, spam suave, personal)"
+        )
+        user = (f"De: {email_doc.get('from_name') or ''} <{email_doc.get('from_email')}>\n"
+                f"Asunto: {email_doc.get('subject')}\n\n"
+                f"{(email_doc.get('text') or '')[:1500]}")
+        chat = LlmChat(api_key=api_key, session_id=f"email_classify_{uuid4()}",
+                       system_message=system).with_model(MODEL_PROVIDER, MODEL_NAME)
+        raw = str(await chat.send_message(UserMessage(text=user)) or "").strip().lower()
+        for cat in EMAIL_CATEGORIES:
+            if cat in raw:
+                return cat
+        return "other"
+    except Exception as e:
+        logger.error(f"[buzon] error clasificando email: {e}")
+        return None
+
+
 async def _process_inbound_ai(email_id: str):
-    """Background: auto-ack + borrador AI (+ auto-envío si está activado)."""
+    """Background: clasificación + auto-ack + borrador AI (+ auto-envío si está activado)."""
     db = get_db()
     doc = await db.email_inbox.find_one({"_id": ObjectId(email_id)})
     if not doc or doc.get("folder") != "inbox":
         return
     sender = doc.get("from_email", "")
+
+    # 0) Clasificación AI por categoría (siempre, incluso para remitentes automáticos)
+    category = await _classify_email(doc)
+    if category:
+        await db.email_inbox.update_one(
+            {"_id": doc["_id"]}, {"$set": {"category": category}})
+        logger.info(f"[buzon] {sender} clasificado como '{category}'")
+
     if _is_automated_sender(sender):
         return
     cfg = await get_ai_config()
@@ -243,12 +289,15 @@ async def email_inbound(request: Request, background_tasks: BackgroundTasks):
 
 @router.get("/admin/inbox")
 async def list_inbox(request: Request, folder: str = "inbox", q: str = "",
-                     unread_only: int = 0, limit: int = 50, skip: int = 0):
+                     unread_only: int = 0, category: str = "",
+                     limit: int = 50, skip: int = 0):
     await auth_admin(request)
     db = get_db()
     query: dict = {"folder": folder}
     if unread_only:
         query["read"] = False
+    if category and category in EMAIL_CATEGORIES:
+        query["category"] = category
     if q:
         query["$or"] = [
             {"subject": {"$regex": q, "$options": "i"}},
@@ -258,13 +307,20 @@ async def list_inbox(request: Request, folder: str = "inbox", q: str = "",
         ]
     total = await db.email_inbox.count_documents(query)
     unread = await db.email_inbox.count_documents({"folder": "inbox", "read": False})
+    # Conteo por categoría (solo bandeja de entrada)
+    cat_counts: dict = {}
+    async for row in db.email_inbox.aggregate([
+            {"$match": {"folder": "inbox"}},
+            {"$group": {"_id": "$category", "n": {"$sum": 1}}}]):
+        cat_counts[row["_id"] or "unclassified"] = row["n"]
     docs = await (db.email_inbox.find(query, {"html": 0, "ai_draft": 0})
                   .sort([("created_at", -1)]).skip(skip).limit(min(limit, 100)).to_list(100))
     items = []
     for d in docs:
         d["preview"] = (d.pop("text", "") or "")[:140]
         items.append(_doc_out(d))
-    return {"success": True, "total": total, "unread_count": unread, "emails": items}
+    return {"success": True, "total": total, "unread_count": unread,
+            "category_counts": cat_counts, "emails": items}
 
 
 @router.get("/admin/inbox/ai-config")
@@ -496,6 +552,44 @@ async def approve_ai_draft(email_id: str, request: Request):
         "sent_by": admin.get("email", ""), "created_at": _now(),
     })
     return {"success": True, "message": "Respuesta aprobada y enviada"}
+
+
+@router.post("/admin/inbox/classify-pending")
+async def classify_pending(request: Request):
+    """Clasifica con AI los correos de la bandeja que aún no tienen categoría (máx 15)."""
+    await auth_admin(request)
+    db = get_db()
+    docs = await (db.email_inbox
+                  .find({"folder": "inbox", "category": {"$exists": False}}, {"html": 0})
+                  .sort([("created_at", -1)]).limit(15).to_list(15))
+    classified = 0
+    for doc in docs:
+        cat = await _classify_email(doc)
+        if cat:
+            await db.email_inbox.update_one(
+                {"_id": doc["_id"]}, {"$set": {"category": cat}})
+            classified += 1
+    return {"success": True, "classified": classified, "pending_found": len(docs)}
+
+
+@router.post("/admin/inbox/{email_id}/category")
+async def set_category(email_id: str, request: Request):
+    """Cambia la categoría manualmente. Body: {category: lead|tenant|provider|invoice|other}"""
+    await auth_admin(request)
+    data = await request.json()
+    category = str(data.get("category", "")).strip().lower()
+    if category not in EMAIL_CATEGORIES:
+        raise HTTPException(status_code=400,
+                            detail=f"category debe ser una de: {', '.join(EMAIL_CATEGORIES)}")
+    try:
+        oid = ObjectId(email_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="ID inválido")
+    res = await get_db().email_inbox.update_one(
+        {"_id": oid}, {"$set": {"category": category, "category_manual": True}})
+    if res.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Email no encontrado")
+    return {"success": True, "category": category}
 
 
 @router.post("/admin/inbox/{email_id}/move")

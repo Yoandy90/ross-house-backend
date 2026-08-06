@@ -63,8 +63,15 @@ def ctx(loop, monkeypatch_module=None):
     async def fake_draft(doc):
         return f"Borrador de prueba para {doc.get('from_email')}"
 
+    async def fake_classify(doc):
+        text = (doc.get("text") or "").lower()
+        if "factura" in text or "invoice" in text:
+            return "invoice"
+        return "lead"
+
     eir._send_via_sendgrid = fake_send
     eir._generate_ai_draft = fake_draft
+    eir._classify_email = fake_classify
 
     # Estado conocido de config para los tests (BD compartida con prod)
     async def _cfg_reset():
@@ -238,3 +245,66 @@ def test_08_move_between_folders(ctx):
 
 def test_09_unauthorized(ctx):
     assert _req(ctx, "GET", "/api/admin/inbox/ai-config", auth=False).status_code == 401
+
+
+def test_10_inbound_gets_ai_category(ctx):
+    async def _check():
+        return await ctx["db"].email_inbox.find_one(
+            {"from_email": "buzon-pytest-1@example.com"})
+    doc = ctx["loop"].run_until_complete(_check())
+    assert doc.get("category") == "lead"
+
+
+def test_11_list_filter_by_category_and_counts(ctx):
+    _req(ctx, "POST", "/api/webhooks/email-inbound", form={
+        "from": "Xcel Energy <billing-buzon-pytest@example.com>",
+        "to": "admin@inbox.rosshouserentals.com",
+        "subject": f"Su factura de agosto {TEST_TAG}",
+        "text": "Adjuntamos su factura del mes",
+        "spam_score": "0",
+    })
+    r = _req(ctx, "GET", "/api/admin/inbox?folder=inbox&category=invoice")
+    assert r.status_code == 200, r.text
+    d = r.json()
+    assert "category_counts" in d
+    assert d["category_counts"].get("invoice", 0) >= 1
+    assert all(e.get("category") == "invoice" for e in d["emails"])
+    assert any(e["from_email"] == "billing-buzon-pytest@example.com" for e in d["emails"])
+
+
+def test_12_set_category_manual(ctx):
+    async def _get_id():
+        d = await ctx["db"].email_inbox.find_one({"from_email": "buzon-pytest-1@example.com"})
+        return str(d["_id"])
+    eid = ctx["loop"].run_until_complete(_get_id())
+    r = _req(ctx, "POST", f"/api/admin/inbox/{eid}/category", json={"category": "tenant"})
+    assert r.status_code == 200, r.text
+    assert r.json()["category"] == "tenant"
+
+    async def _check():
+        return await ctx["db"].email_inbox.find_one({"_id": ObjectId(eid)})
+    doc = ctx["loop"].run_until_complete(_check())
+    assert doc["category"] == "tenant" and doc.get("category_manual") is True
+
+    r = _req(ctx, "POST", f"/api/admin/inbox/{eid}/category", json={"category": "banana"})
+    assert r.status_code == 400
+
+
+def test_13_classify_pending(ctx):
+    async def _insert():
+        res = await ctx["db"].email_inbox.insert_one({
+            "folder": "inbox", "from_email": "buzon-pytest-old@example.com",
+            "from_name": "Viejo", "to": "admin@inbox.rosshouserentals.com",
+            "subject": f"Correo sin clasificar {TEST_TAG}",
+            "text": "necesito una factura por favor", "read": True,
+        })
+        return str(res.inserted_id)
+    eid = ctx["loop"].run_until_complete(_insert())
+    r = _req(ctx, "POST", "/api/admin/inbox/classify-pending")
+    assert r.status_code == 200, r.text
+    assert r.json()["classified"] >= 1
+
+    async def _check():
+        return await ctx["db"].email_inbox.find_one({"_id": ObjectId(eid)})
+    doc = ctx["loop"].run_until_complete(_check())
+    assert doc.get("category") == "invoice"
