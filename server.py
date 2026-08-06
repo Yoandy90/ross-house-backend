@@ -167,6 +167,15 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"   ⚠️ Deal finder cron not started: {e}")
 
+    # Start drip email cron (bilingual template queue, N per week)
+    drip_task = None
+    try:
+        from rental.drip_cron import drip_loop
+        drip_task = asyncio.create_task(drip_loop())
+        logger.info("   ✅ Drip email cron scheduled")
+    except Exception as e:
+        logger.warning(f"   ⚠️ Drip cron not started: {e}")
+
     yield
 
     # Graceful shutdown of cron
@@ -202,6 +211,13 @@ async def lifespan(app: FastAPI):
         deal_finder_task.cancel()
         try:
             await deal_finder_task
+        except Exception:
+            pass
+
+    if drip_task and not drip_task.done():
+        drip_task.cancel()
+        try:
+            await drip_task
         except Exception:
             pass
 
@@ -324,6 +340,7 @@ try:
     from rental.listing_feed_router import router as listing_feed_router
     from rental.plaid_router import router as plaid_router
     from rental.deal_finder_router import router as deal_finder_router
+    from rental.drip_router import router as drip_router
 
     app.include_router(auth_router, prefix="/api")
     app.include_router(properties_router, prefix="/api")
@@ -376,6 +393,7 @@ try:
     app.include_router(listing_feed_router, prefix="/api")
     app.include_router(plaid_router, prefix="/api")
     app.include_router(deal_finder_router, prefix="/api")
+    app.include_router(drip_router, prefix="/api")
     app.include_router(property_taxes_router, prefix="/api")
     app.include_router(admin_nav_router, prefix="/api")
     # ensure_indexes() awaited inside lifespan startup.
