@@ -212,3 +212,60 @@ def test_08_leads_and_pipeline(ctx):
 def test_09_auth_required(ctx):
     r = _req(ctx, "GET", "/api/admin/deal-finder/leads", auth=False)
     assert r.status_code == 401
+
+
+# ─── Cron: radar automático ───────────────────────────────────
+
+def test_10_cron_config_endpoints(ctx):
+    r = _req(ctx, "GET", "/api/admin/deal-finder/cron-config")
+    assert r.status_code == 200, r.text
+    d = r.json()
+    assert "enabled" in d["config"] and "next_letter" in d["state"]
+
+    r = _req(ctx, "PATCH", "/api/admin/deal-finder/cron-config",
+             json={"enabled": False, "max_per_run": 5})  # 5 se clampa a 20
+    assert r.status_code == 200
+    r = _req(ctx, "GET", "/api/admin/deal-finder/cron-config")
+    assert r.json()["config"]["enabled"] is False
+    assert r.json()["config"]["max_per_run"] == 20
+
+    r = _req(ctx, "PATCH", "/api/admin/deal-finder/cron-config",
+             json={"enabled": True, "max_per_run": 200})
+    assert r.status_code == 200
+
+    r = _req(ctx, "PATCH", "/api/admin/deal-finder/cron-config", json={})
+    assert r.status_code == 400
+
+
+def test_11_cron_batch_live(ctx):
+    """Lote pequeño real del recorrido a-z (4 propiedades) con email mockeado."""
+    import rental.deal_finder_cron as dfc
+
+    async def _run():
+        db = ctx["db"]
+        # snapshot del estado para restaurar
+        prev_state = await db.app_settings.find_one({"_id": "deal_finder_cron_state"})
+
+        sent = {"called": False}
+        orig = dfc.send_alert_email
+
+        async def fake_send(db_, new_opps, became):
+            sent["called"] = True
+            return True
+        dfc.send_alert_email = fake_send
+        try:
+            res = await dfc.run_auto_scan_batch(db, max_props=4)
+        finally:
+            dfc.send_alert_email = orig
+            # restaurar estado previo (no interferir con el cron real)
+            if prev_state:
+                await db.app_settings.replace_one(
+                    {"_id": "deal_finder_cron_state"}, prev_state, upsert=True)
+        return res, sent
+
+    res, sent = ctx["loop"].run_until_complete(_run())
+    assert res["processed"] == 4, res
+    assert res["new"] + res["updated"] == 4
+    # el email solo se manda si hubo hallazgos fuertes — coherencia:
+    if res["strong_new"] or res["became_delinquent"]:
+        assert sent["called"]

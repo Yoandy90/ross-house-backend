@@ -167,6 +167,74 @@ def compute_signals(lead: dict) -> list[str]:
 
 
 # ═══════════════════════════════════════════════════════════════
+# Enrichment (shared by manual scans and the auto-scan cron)
+# ═══════════════════════════════════════════════════════════════
+
+async def enrich_and_upsert(db, client: httpx.AsyncClient, base: str, county: str,
+                            item: dict, only_delinquent: bool = False) -> tuple[str, dict, bool]:
+    """Enrich one search-result item (detail page + delinquent taxes), compute
+    signals and upsert into deal_finder_leads.
+    Returns (outcome 'new'|'updated'|'skipped', lead, became_delinquent)."""
+    prop_id = str(item.get("propertyId") or "").strip()
+    if not prop_id:
+        return "skipped", {}, False
+    year = item.get("year") or datetime.now().year
+    lead = {
+        "county": county,
+        "property_id": prop_id,
+        "year": year,
+        "geo_id": (item.get("geoId") or "").strip(),
+        "owner_name": (item.get("ownerName") or "").strip(),
+        "owner_id": str(item.get("ownerId") or ""),
+        "address": (item.get("address") or "").strip(),
+        "legal_description": (item.get("legalDescription") or "").strip(),
+        "property_type": (item.get("propertyTypeCode") or "").strip(),
+        "appraised_value": item.get("appraisedValue") or 0,
+        "portal_url": f"{base}/Property/View/{prop_id}",
+    }
+
+    # Enrich: detail page (mailing + values)
+    try:
+        rd = await client.get(f"{base}/Property/View/{prop_id}", params={"year": year})
+        if rd.status_code == 200:
+            lead.update(parse_property_detail(rd.text))
+    except Exception as e:
+        logger.warning(f"[deal_finder] detail failed {prop_id}: {e}")
+    await asyncio.sleep(0.5)
+
+    # Enrich: delinquent taxes
+    try:
+        tax = await fetch_account_tax_due(prop_id)
+        lead["tax_due_total"] = tax["total_due"]
+        lead["tax_years_due"] = [y["year"] for y in tax["years_due"]]
+    except Exception as e:
+        logger.warning(f"[deal_finder] tax due failed {prop_id}: {e}")
+        lead["tax_due_total"] = 0
+        lead["tax_years_due"] = []
+    await asyncio.sleep(0.5)
+
+    lead["signals"] = compute_signals(lead)
+    lead["last_synced_at"] = datetime.now(timezone.utc)
+
+    if only_delinquent and "tax_delinquent" not in lead["signals"]:
+        return "skipped", lead, False
+
+    prev = await db.deal_finder_leads.find_one(
+        {"county": county, "property_id": prop_id}, {"signals": 1})
+    became_delinquent = bool(prev) and "tax_delinquent" not in (prev.get("signals") or []) \
+        and "tax_delinquent" in lead["signals"]
+
+    res = await db.deal_finder_leads.update_one(
+        {"county": county, "property_id": prop_id},
+        {"$set": lead,
+         "$setOnInsert": {"status": "new", "notes": "",
+                          "created_at": datetime.now(timezone.utc)}},
+        upsert=True,
+    )
+    return ("new" if res.upserted_id else "updated"), lead, became_delinquent
+
+
+# ═══════════════════════════════════════════════════════════════
 # Scan engine (background task)
 # ═══════════════════════════════════════════════════════════════
 
@@ -204,62 +272,13 @@ async def _run_scan(scan_id: str, county: str, keywords: str,
 
             new_leads = updated = processed = 0
             for item in results:
-                prop_id = str(item.get("propertyId") or "").strip()
-                if not prop_id:
-                    continue
-                year = item.get("year") or datetime.now().year
-                lead = {
-                    "county": county,
-                    "property_id": prop_id,
-                    "year": year,
-                    "geo_id": (item.get("geoId") or "").strip(),
-                    "owner_name": (item.get("ownerName") or "").strip(),
-                    "owner_id": str(item.get("ownerId") or ""),
-                    "address": (item.get("address") or "").strip(),
-                    "legal_description": (item.get("legalDescription") or "").strip(),
-                    "property_type": (item.get("propertyTypeCode") or "").strip(),
-                    "appraised_value": item.get("appraisedValue") or 0,
-                    "portal_url": f"{base}/Property/View/{prop_id}",
-                }
-
-                # Enrich: detail page (mailing + values)
-                try:
-                    rd = await client.get(f"{base}/Property/View/{prop_id}", params={"year": year})
-                    if rd.status_code == 200:
-                        lead.update(parse_property_detail(rd.text))
-                except Exception as e:
-                    logger.warning(f"[deal_finder] detail failed {prop_id}: {e}")
-                await asyncio.sleep(0.5)
-
-                # Enrich: delinquent taxes
-                try:
-                    tax = await fetch_account_tax_due(prop_id)
-                    lead["tax_due_total"] = tax["total_due"]
-                    lead["tax_years_due"] = [y["year"] for y in tax["years_due"]]
-                except Exception as e:
-                    logger.warning(f"[deal_finder] tax due failed {prop_id}: {e}")
-                    lead["tax_due_total"] = 0
-                    lead["tax_years_due"] = []
-                await asyncio.sleep(0.5)
-
-                lead["signals"] = compute_signals(lead)
-                lead["last_synced_at"] = datetime.now(timezone.utc)
+                outcome, _lead, _became = await enrich_and_upsert(
+                    db, client, base, county, item, only_delinquent)
                 processed += 1
                 await _update(processed=processed)
-
-                if only_delinquent and "tax_delinquent" not in lead["signals"]:
-                    continue
-
-                res = await db.deal_finder_leads.update_one(
-                    {"county": county, "property_id": prop_id},
-                    {"$set": lead,
-                     "$setOnInsert": {"status": "new", "notes": "",
-                                      "created_at": datetime.now(timezone.utc)}},
-                    upsert=True,
-                )
-                if res.upserted_id:
+                if outcome == "new":
                     new_leads += 1
-                else:
+                elif outcome == "updated":
                     updated += 1
 
             await _update(status="done", new_leads=new_leads, updated=updated,
@@ -553,6 +572,80 @@ async def delete_lead(request: Request, lead_id: str):
     if res.deleted_count == 0:
         raise HTTPException(404, "Lead no encontrado")
     return {"success": True}
+
+
+@router.get("/admin/deal-finder/cron-config")
+async def get_cron_config(request: Request):
+    await auth_admin(request)
+    db = get_db()
+    cfg = await db.app_settings.find_one({"_id": "deal_finder_cron"}) or {}
+    state = await db.app_settings.find_one({"_id": "deal_finder_cron_state"}) or {}
+    from rental.deal_finder_cron import LETTERS, DEFAULT_MAX_PER_RUN, DEFAULT_ALERT_EMAIL
+    letter_idx = int(state.get("letter_idx") or 0) % len(LETTERS)
+    return {"success": True, "config": {
+        "enabled": cfg.get("enabled", True),
+        "max_per_run": int(cfg.get("max_per_run") or DEFAULT_MAX_PER_RUN),
+        "alert_email": cfg.get("alert_email") or DEFAULT_ALERT_EMAIL,
+    }, "state": {
+        "next_letter": LETTERS[letter_idx].upper(),
+        "coverage_pct": round(letter_idx / len(LETTERS) * 100),
+        "cycles": int(state.get("cycles") or 0),
+        "last_run": state["last_run"].isoformat() if state.get("last_run") else "",
+        "last_result": state.get("last_result") or {},
+        "running": bool(state.get("manual_running")),
+    }}
+
+
+class CronConfigUpdate(BaseModel):
+    enabled: Optional[bool] = None
+    max_per_run: Optional[int] = None
+    alert_email: Optional[str] = None
+
+
+@router.patch("/admin/deal-finder/cron-config")
+async def update_cron_config(request: Request, body: CronConfigUpdate):
+    await auth_admin(request)
+    db = get_db()
+    updates: dict = {}
+    if body.enabled is not None:
+        updates["enabled"] = body.enabled
+    if body.max_per_run is not None:
+        updates["max_per_run"] = max(20, min(body.max_per_run, 500))
+    if body.alert_email is not None:
+        updates["alert_email"] = body.alert_email.strip()
+    if not updates:
+        raise HTTPException(400, "Nada que actualizar")
+    await db.app_settings.update_one({"_id": "deal_finder_cron"}, {"$set": updates}, upsert=True)
+    return {"success": True, "updated": updates}
+
+
+@router.post("/admin/deal-finder/cron-run-now")
+async def run_cron_now(request: Request):
+    """Ejecuta un lote del recorrido automático ahora mismo (background)."""
+    await auth_admin(request)
+    db = get_db()
+    state = await db.app_settings.find_one({"_id": "deal_finder_cron_state"}) or {}
+    if state.get("manual_running"):
+        raise HTTPException(409, "El radar automático ya está corriendo — espera a que termine")
+    running_scan = await db.deal_finder_scans.find_one({"status": {"$in": ["searching", "enriching"]}})
+    if running_scan:
+        raise HTTPException(409, "Hay un escaneo manual en curso — espera a que termine")
+
+    await db.app_settings.update_one(
+        {"_id": "deal_finder_cron_state"}, {"$set": {"manual_running": True}}, upsert=True)
+
+    async def _run():
+        try:
+            from rental.deal_finder_cron import run_auto_scan_batch
+            await run_auto_scan_batch(db)
+        except Exception as e:
+            logger.error(f"[deal_finder] corrida manual del cron falló: {e}")
+        finally:
+            await db.app_settings.update_one(
+                {"_id": "deal_finder_cron_state"}, {"$set": {"manual_running": False}})
+
+    asyncio.create_task(_run())
+    return {"success": True, "message": "Lote del radar automático iniciado"}
 
 
 @router.post("/admin/deal-finder/leads/{lead_id}/analyze")

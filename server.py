@@ -158,6 +158,15 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"   ⚠️ Property tax sync cron not started: {e}")
 
+    # Start deal finder auto-scan cron (nightly county sweep + alerts)
+    deal_finder_task = None
+    try:
+        from rental.deal_finder_cron import deal_finder_scan_loop
+        deal_finder_task = asyncio.create_task(deal_finder_scan_loop())
+        logger.info("   ✅ Deal finder auto-scan cron scheduled (daily)")
+    except Exception as e:
+        logger.warning(f"   ⚠️ Deal finder cron not started: {e}")
+
     yield
 
     # Graceful shutdown of cron
@@ -186,6 +195,13 @@ async def lifespan(app: FastAPI):
         tax_task.cancel()
         try:
             await tax_task
+        except Exception:
+            pass
+
+    if deal_finder_task and not deal_finder_task.done():
+        deal_finder_task.cancel()
+        try:
+            await deal_finder_task
         except Exception:
             pass
 
