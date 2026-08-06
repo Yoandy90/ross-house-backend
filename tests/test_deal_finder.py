@@ -214,6 +214,44 @@ def test_09_auth_required(ctx):
     assert r.status_code == 401
 
 
+def test_12_letter_pdf_download(ctx):
+    """Genera carta AI y descarga el PDF (con remitente + destinatario)."""
+    r = _req(ctx, "GET", "/api/admin/deal-finder/leads?county=moore&limit=1")
+    lead = r.json()["leads"][0]
+    lid = lead["id"]
+
+    # sin carta → 400
+    r = _req(ctx, "GET", f"/api/admin/deal-finder/leads/{lid}/letter.pdf")
+    assert r.status_code in (200, 400)  # puede ya tener carta de otra corrida
+
+    if r.status_code == 400:
+        r = _req(ctx, "POST", f"/api/admin/deal-finder/leads/{lid}/letter")
+        assert r.status_code == 200, r.text
+        r = _req(ctx, "GET", f"/api/admin/deal-finder/leads/{lid}/letter.pdf")
+
+    assert r.status_code == 200, r.text
+    assert r.headers["content-type"] == "application/pdf"
+    assert r.content[:4] == b"%PDF"
+    assert len(r.content) > 1500
+
+
+def test_13_lob_status(ctx):
+    r = _req(ctx, "GET", "/api/admin/deal-finder/lob-status")
+    assert r.status_code == 200
+    assert "configured" in r.json()
+
+
+def test_14_mail_without_lob(ctx):
+    """Sin LOB_API_KEY el envío devuelve 400 (no rompe)."""
+    import os
+    if os.environ.get("LOB_API_KEY"):
+        return  # si está configurado, saltar
+    r = _req(ctx, "GET", "/api/admin/deal-finder/leads?county=moore&limit=1")
+    lid = r.json()["leads"][0]["id"]
+    r = _req(ctx, "POST", f"/api/admin/deal-finder/leads/{lid}/mail")
+    assert r.status_code == 400
+
+
 # ─── Cron: radar automático ───────────────────────────────────
 
 def test_10_cron_config_endpoints(ctx):

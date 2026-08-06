@@ -33,6 +33,7 @@ from typing import Optional
 import httpx
 from bson import ObjectId
 from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from rental.shared import get_db, auth_admin
@@ -387,6 +388,7 @@ def _lead_out(doc: dict) -> dict:
         "ai_score": doc.get("ai_score"),
         "ai_analysis": doc.get("ai_analysis"),
         "offer_letter": doc.get("offer_letter"),
+        "mail": doc.get("mail"),
         "portal_url": doc.get("portal_url", ""),
         "created_at": doc["created_at"].isoformat() if doc.get("created_at") else "",
         "last_synced_at": doc["last_synced_at"].isoformat() if doc.get("last_synced_at") else "",
@@ -684,3 +686,210 @@ async def generate_letter(request: Request, lead_id: str):
     }
     await db.deal_finder_leads.update_one({"_id": doc["_id"]}, {"$set": {"offer_letter": letter}})
     return {"success": True, "offer_letter": letter}
+
+
+# ═══════════════════════════════════════════════════════════════
+# Carta lista para imprimir (PDF) + envío físico vía Lob
+# ═══════════════════════════════════════════════════════════════
+
+async def _sender_info() -> dict:
+    """Remitente = payer del 1099 (Ross House Rentals LLC)."""
+    from rental.tax_1099_router import _get_payer
+    return await _get_payer()
+
+
+def _build_letter_pdf(lead: dict, sender: dict, lang: str) -> bytes:
+    """Genera una carta de negocios en PDF (US Letter) lista para imprimir y
+    doblar en un sobre #10 de ventana (la dirección del destinatario queda en la
+    zona de la ventana ~2\" desde arriba)."""
+    import io
+    from reportlab.lib.pagesizes import LETTER
+    from reportlab.lib.units import inch
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer, Frame,
+                                    PageTemplate, FrameBreak)
+    from reportlab.pdfgen import canvas as _canvas
+
+    body_text = (lead.get("offer_letter") or {}).get(
+        "letter_en" if lang == "en" else "letter_es", "")
+    body_text = body_text.replace("[TELÉFONO]", sender.get("phone", "")) \
+                         .replace("[PHONE]", sender.get("phone", "")) \
+                         .replace("[EMAIL]", sender.get("email", "yoandyross@gmail.com"))
+
+    styles = getSampleStyleSheet()
+    body_style = ParagraphStyle("body", parent=styles["Normal"],
+                                fontName="Helvetica", fontSize=11, leading=16)
+    small = ParagraphStyle("small", parent=styles["Normal"],
+                           fontName="Helvetica", fontSize=9, leading=12,
+                           textColor="#555555")
+
+    buf = io.BytesIO()
+
+    def _draw_static(c: _canvas.Canvas, doc):
+        c.saveState()
+        # Remitente arriba-izquierda (return address)
+        c.setFont("Helvetica-Bold", 10)
+        c.drawString(0.75 * inch, 10.35 * inch, sender.get("name", ""))
+        c.setFont("Helvetica", 9)
+        c.drawString(0.75 * inch, 10.20 * inch, sender.get("address", ""))
+        c.drawString(0.75 * inch, 10.05 * inch,
+                     f"{sender.get('city','')}, {sender.get('state','')} {sender.get('zip','')}")
+        if sender.get("phone"):
+            c.drawString(0.75 * inch, 9.90 * inch, sender["phone"])
+        # Ventana destinatario (~2\" desde arriba)
+        addr_top = 8.55 * inch
+        c.setFont("Helvetica", 11)
+        lines = [lead.get("owner_name", "").strip()]
+        lines += [ln for ln in (lead.get("mailing_lines") or []) if ln]
+        for i, ln in enumerate(lines[:5]):
+            c.drawString(0.9 * inch, addr_top - i * 0.18 * inch, ln)
+        c.restoreState()
+
+    doc = SimpleDocTemplate(buf, pagesize=LETTER,
+                            topMargin=3.4 * inch, bottomMargin=0.9 * inch,
+                            leftMargin=0.9 * inch, rightMargin=0.9 * inch)
+    story = [Paragraph(datetime.now().strftime("%B %d, %Y"), small), Spacer(1, 0.25 * inch)]
+    for para in [p for p in body_text.split("\n") if p.strip()]:
+        story.append(Paragraph(para.replace("&", "&amp;").replace("<", "&lt;"), body_style))
+        story.append(Spacer(1, 0.12 * inch))
+
+    doc.build(story, onFirstPage=_draw_static, onLaterPages=_draw_static)
+    return buf.getvalue()
+
+
+@router.get("/admin/deal-finder/leads/{lead_id}/letter.pdf")
+async def download_letter_pdf(request: Request, lead_id: str, lang: str = "en"):
+    await auth_admin(request)
+    db = get_db()
+    doc = await db.deal_finder_leads.find_one({"_id": ObjectId(lead_id)})
+    if not doc:
+        raise HTTPException(404, "Lead no encontrado")
+    if not (doc.get("offer_letter") or {}).get("letter_en"):
+        raise HTTPException(400, "Genera primero la carta de oferta con AI")
+    lang = "es" if lang == "es" else "en"
+    sender = await _sender_info()
+    pdf = _build_letter_pdf(doc, sender, lang)
+    fname = f"carta_{(doc.get('address') or doc['property_id']).split(',')[0].replace(' ', '_')}_{lang}.pdf"
+    return StreamingResponse(
+        iter([pdf]), media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'})
+
+
+# ─── Lob: envío físico (imprime, ensobra y despacha por USPS) ──
+
+def _lob_key() -> Optional[str]:
+    return os.environ.get("LOB_API_KEY")
+
+
+def _lob_addr(prefix: str, name: str, lines: list[str], city: str, state: str, zipc: str) -> dict:
+    out = {f"{prefix}[name]": (name or "Current Resident")[:40]}
+    line1 = lines[0] if lines else ""
+    line2 = lines[1] if len(lines) > 1 else ""
+    out[f"{prefix}[address_line1]"] = line1[:64]
+    if line2:
+        out[f"{prefix}[address_line2]"] = line2[:64]
+    out[f"{prefix}[address_city]"] = city
+    out[f"{prefix}[address_state]"] = state
+    out[f"{prefix}[address_zip]"] = zipc
+    out[f"{prefix}[address_country]"] = "US"
+    return out
+
+
+def _lead_mail_parts(lead: dict) -> tuple[list[str], str, str, str]:
+    """Devuelve (líneas de calle, city, state, zip) del destinatario."""
+    lines = [ln for ln in (lead.get("mailing_lines") or []) if ln]
+    city = lead.get("mailing_city", "")
+    state = lead.get("mailing_state", "")
+    zipc = lead.get("mailing_zip", "")
+    # quitar la última línea (city/state/zip) de las líneas de calle si aparece
+    street = [ln for ln in lines if not re.search(r",\s*[A-Z]{2}\s*[\d-]*$", ln)]
+    return street or lines, city, state, zipc
+
+
+@router.get("/admin/deal-finder/lob-status")
+async def lob_status(request: Request):
+    await auth_admin(request)
+    key = _lob_key()
+    return {"success": True, "configured": bool(key),
+            "mode": "live" if (key or "").startswith("live_") else "test" if key else None}
+
+
+@router.post("/admin/deal-finder/leads/{lead_id}/mail")
+async def mail_letter(request: Request, lead_id: str):
+    """Envía la carta físicamente vía Lob (verifica dirección, imprime, ensobra y despacha)."""
+    await auth_admin(request)
+    key = _lob_key()
+    if not key:
+        raise HTTPException(400, "Lob no está configurado — agrega LOB_API_KEY en el backend")
+    db = get_db()
+    doc = await db.deal_finder_leads.find_one({"_id": ObjectId(lead_id)})
+    if not doc:
+        raise HTTPException(404, "Lead no encontrado")
+    if not (doc.get("offer_letter") or {}).get("letter_en"):
+        raise HTTPException(400, "Genera primero la carta de oferta con AI")
+
+    street, city, state, zipc = _lead_mail_parts(doc)
+    if not (street and city and state and zipc):
+        raise HTTPException(422, "La dirección postal del dueño está incompleta — no se puede enviar")
+
+    sender = await _sender_info()
+
+    async with httpx.AsyncClient(timeout=40) as client:
+        # 1) Verificar dirección (CASS) — evita cartas devueltas
+        ver = await client.post("https://api.lob.com/v1/us_verifications",
+                                auth=(key, ""), data={
+                                    "primary_line": street[0],
+                                    "city": city, "state": state, "zip_code": zipc})
+        if ver.status_code == 200:
+            dpv = ver.json().get("deliverability", "")
+            if dpv not in ("deliverable", "deliverable_unnecessary_unit",
+                           "deliverable_incorrect_unit", "deliverable_missing_unit"):
+                raise HTTPException(422, f"USPS marca la dirección como no entregable ({dpv})")
+
+        # 2) HTML de la carta (US Letter, address_placement=top_first_page)
+        pdf = _build_letter_pdf(doc, sender, "en")
+        import base64
+        # Lob acepta HTML o un PDF; enviamos HTML embebiendo el texto para control total
+        body_text = (doc.get("offer_letter") or {}).get("letter_en", "") \
+            .replace("[TELÉFONO]", sender.get("phone", "")) \
+            .replace("[EMAIL]", sender.get("email", "yoandyross@gmail.com"))
+        body_html = "".join(
+            f"<p>{p.strip().replace('&','&amp;').replace('<','&lt;')}</p>"
+            for p in body_text.split("\n") if p.strip())
+        html = (f'<html><head><meta charset="utf-8"><style>'
+                f'@page{{size:letter;margin:0}}body{{width:8.5in;min-height:11in;margin:0;'
+                f'padding:3.4in .9in .9in;font-family:Helvetica,Arial,sans-serif;font-size:11pt;line-height:1.45}}'
+                f'</style></head><body>{body_html}</body></html>')
+
+        data = {
+            "description": f"Carta oferta — {doc.get('address', doc['property_id'])}",
+            "color": "false", "double_sided": "false",
+            "address_placement": "top_first_page",
+            "mail_type": "usps_first_class", "use_type": "marketing",
+            "file": html,
+        }
+        data.update(_lob_addr("to", doc.get("owner_name", ""), street, city, state, zipc))
+        data.update(_lob_addr("from", sender.get("name", ""),
+                              [sender.get("address", "")], sender.get("city", ""),
+                              sender.get("state", ""), sender.get("zip", "")))
+
+        idem = f"lead-{lead_id}-{int(datetime.now().timestamp())}"
+        r = await client.post("https://api.lob.com/v1/letters", auth=(key, ""),
+                              data=data, headers={"Idempotency-Key": idem})
+    if r.status_code not in (200, 201):
+        logger.error(f"[deal_finder] Lob falló {r.status_code}: {r.text[:300]}")
+        raise HTTPException(502, f"Lob rechazó el envío: {r.text[:200]}")
+
+    letter = r.json()
+    mail = {
+        "lob_id": letter.get("id"),
+        "status": "mailed" if (key.startswith("live_")) else "test",
+        "expected_delivery": letter.get("expected_delivery_date", ""),
+        "tracking_url": letter.get("url", ""),
+        "mode": "live" if key.startswith("live_") else "test",
+        "mailed_at": datetime.now(timezone.utc).isoformat(),
+    }
+    await db.deal_finder_leads.update_one(
+        {"_id": doc["_id"]},
+        {"$set": {"mail": mail, "status": "offer_sent"}})
+    return {"success": True, "mail": mail}
