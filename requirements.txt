@@ -21,3 +21,4 @@ python-dotenv
 emergentintegrations
 Pillow>=10.0.0
 plaid-python==37.1.0
+qrcode==8.2

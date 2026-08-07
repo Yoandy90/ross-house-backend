@@ -27,7 +27,7 @@ import logging
 import os
 import re
 import urllib.parse
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 import httpx
@@ -841,6 +841,184 @@ async def analyze_lead(request: Request, lead_id: str):
     return {"success": True, "ai_score": score, "ai_analysis": analysis}
 
 
+# ═══════════════════════════════════════════════════════════════
+# Oferta personalizada (PURL + QR): link único por lead donde el
+# dueño acepta la oferta, contraoferta o pide llamada — sin login.
+# ═══════════════════════════════════════════════════════════════
+
+SITE_BASE = "https://www.rosshouserentals.com"
+
+SUGGEST_PRICE_PROMPT = """Eres un analista de inversión inmobiliaria en el Panhandle de Texas.
+Recibirás datos de una propiedad (valores del CAD, impuestos atrasados, señales).
+Calcula una OFERTA DE COMPRA EN EFECTIVO agresiva pero realista para un inversionista:
+- Parte del valor de mercado/tasado; descuenta reparaciones estimadas por condición
+  (improvement bajo = más descuento), deuda fiscal (la absorbe el comprador) y margen
+  de inversión (objetivo: pagar 55-70% del valor de mercado).
+- Redondea a los $500 más cercanos. Mínimo $2,000.
+Responde SOLO JSON: {"suggested_price": <número>, "reasoning_es": "<2-3 frases en español
+explicando el cálculo>", "pct_of_value": <porcentaje del valor tasado>}"""
+
+
+def _offer_slug(owner_name: str) -> str:
+    import secrets as _sec
+    base = re.sub(r"[^a-z0-9]+", "-", (owner_name or "propietario").lower()).strip("-")
+    base = "-".join(base.split("-")[:2]) or "propietario"
+    code = "".join(_sec.choice("ABCDEFGHJKMNPQRSTUVWXYZ23456789") for _ in range(4))
+    return f"{base}-{code}"
+
+
+def _offer_qr_png(url: str) -> bytes:
+    import qrcode
+    from io import BytesIO
+    qr = qrcode.QRCode(box_size=8, border=2)
+    qr.add_data(url)
+    qr.make(fit=True)
+    img = qr.make_image(fill_color="black", back_color="white")
+    b = BytesIO()
+    img.save(b, format="PNG")
+    return b.getvalue()
+
+
+@router.post("/admin/deal-finder/leads/{lead_id}/suggest-price")
+async def suggest_price(request: Request, lead_id: str):
+    await auth_admin(request)
+    db = get_db()
+    doc = await db.deal_finder_leads.find_one({"_id": ObjectId(lead_id)})
+    if not doc:
+        raise HTTPException(404, "Lead no encontrado")
+    ai = await _ai_json(SUGGEST_PRICE_PROMPT, _lead_payload(doc))
+    return {"success": True,
+            "suggested_price": ai.get("suggested_price", 0),
+            "reasoning": ai.get("reasoning_es", ""),
+            "pct_of_value": ai.get("pct_of_value", 0)}
+
+
+class OfferBody(BaseModel):
+    mode: str = "amount"          # "amount" (con oferta) | "ask" (pedir su precio)
+    amount: float = 0
+
+
+@router.post("/admin/deal-finder/leads/{lead_id}/offer")
+async def create_offer(request: Request, lead_id: str, body: OfferBody):
+    """Crea (o regenera) el link único + QR de oferta para este lead."""
+    await auth_admin(request)
+    if body.mode not in ("amount", "ask"):
+        raise HTTPException(422, "mode debe ser amount o ask")
+    if body.mode == "amount" and body.amount <= 0:
+        raise HTTPException(422, "Indica el monto de la oferta")
+    db = get_db()
+    doc = await db.deal_finder_leads.find_one({"_id": ObjectId(lead_id)})
+    if not doc:
+        raise HTTPException(404, "Lead no encontrado")
+    existing = (doc.get("offer") or {})
+    slug = existing.get("slug")
+    if not slug:
+        for _ in range(5):
+            slug = _offer_slug(doc.get("owner_name", ""))
+            if not await db.deal_finder_leads.find_one({"offer.slug": slug}):
+                break
+    offer = {
+        "slug": slug,
+        "mode": body.mode,
+        "amount": round(body.amount, 2) if body.mode == "amount" else 0,
+        "created_at": existing.get("created_at") or datetime.now(timezone.utc).isoformat(),
+        "expires_at": (datetime.now(timezone.utc) + timedelta(days=30)).isoformat(),
+        "visits": existing.get("visits", 0),
+        "last_visit_at": existing.get("last_visit_at"),
+        "response": existing.get("response"),
+    }
+    await db.deal_finder_leads.update_one({"_id": doc["_id"]}, {"$set": {"offer": offer}})
+    return {"success": True, "offer": offer, "url": f"{SITE_BASE}/oferta/{slug}"}
+
+
+@router.get("/public/oferta/{slug}")
+async def public_offer(slug: str, request: Request):
+    """Página pública del dueño — registra la visita (¡sabemos que recibió la carta!)."""
+    db = get_db()
+    doc = await db.deal_finder_leads.find_one({"offer.slug": slug})
+    if not doc:
+        raise HTTPException(404, "Oferta no encontrada")
+    offer = doc.get("offer") or {}
+    await db.deal_finder_leads.update_one(
+        {"_id": doc["_id"]},
+        {"$inc": {"offer.visits": 1},
+         "$set": {"offer.last_visit_at": datetime.now(timezone.utc).isoformat()}})
+    expires = offer.get("expires_at", "")
+    expired = False
+    try:
+        expired = datetime.fromisoformat(expires) < datetime.now(timezone.utc)
+    except Exception:
+        pass
+    first_name = (doc.get("owner_name") or "").split()[0].title() if doc.get("owner_name") else ""
+    return {
+        "success": True,
+        "owner_first": first_name,
+        "owner_name": (doc.get("owner_name") or "").title(),
+        "address": doc.get("address", ""),
+        "county": COUNTIES.get(doc.get("county", ""), {}).get("name", ""),
+        "mode": offer.get("mode", "ask"),
+        "amount": offer.get("amount", 0),
+        "expires_at": expires,
+        "expired": expired,
+        "responded": bool(offer.get("response")),
+        "response_action": (offer.get("response") or {}).get("action", ""),
+    }
+
+
+class OfferResponseBody(BaseModel):
+    action: str                    # accept | counter | call | reject
+    price: float = 0
+    phone: str = ""
+    best_time: str = ""
+    message: str = ""
+
+
+@router.post("/public/oferta/{slug}/responder")
+async def public_offer_respond(slug: str, body: OfferResponseBody, request: Request):
+    if body.action not in ("accept", "counter", "call", "reject"):
+        raise HTTPException(422, "Acción inválida")
+    if body.action == "counter" and body.price <= 0:
+        raise HTTPException(422, "Indica tu precio")
+    db = get_db()
+    doc = await db.deal_finder_leads.find_one({"offer.slug": slug})
+    if not doc:
+        raise HTTPException(404, "Oferta no encontrada")
+    response = {
+        "action": body.action,
+        "price": round(body.price, 2) if body.price else 0,
+        "phone": body.phone.strip()[:25],
+        "best_time": body.best_time.strip()[:60],
+        "message": body.message.strip()[:500],
+        "at": datetime.now(timezone.utc).isoformat(),
+    }
+    new_status = {"accept": "negotiating", "counter": "interested",
+                  "call": "contacted", "reject": "discarded"}[body.action]
+    await db.deal_finder_leads.update_one(
+        {"_id": doc["_id"]},
+        {"$set": {"offer.response": response, "status": new_status}})
+
+    # Notificar al admin por email (best effort)
+    try:
+        from rental.newsletter_router import _sendgrid, _send_one
+        sg_key, from_email = await _sendgrid()
+        labels = {"accept": "✅ ACEPTÓ LA OFERTA", "counter": "💬 CONTRAOFERTA",
+                  "call": "📞 PIDE LLAMADA", "reject": "❌ No le interesa"}
+        offer = doc.get("offer") or {}
+        html = (f"<h2>{labels[body.action]}</h2>"
+                f"<p><b>Propiedad:</b> {doc.get('address','')}</p>"
+                f"<p><b>Dueño:</b> {doc.get('owner_name','')}</p>"
+                + (f"<p><b>Nuestra oferta:</b> ${offer.get('amount',0):,.0f}</p>" if offer.get('mode') == 'amount' else "")
+                + (f"<p><b>Su precio:</b> ${body.price:,.0f}</p>" if body.price else "")
+                + (f"<p><b>Teléfono:</b> {body.phone} · {body.best_time}</p>" if body.phone else "")
+                + (f"<p><b>Mensaje:</b> {body.message}</p>" if body.message else "")
+                + f"<p><a href='{SITE_BASE}/admin/oportunidades'>Ver en el panel →</a></p>")
+        await _send_one(sg_key, from_email, "yoandyross@gmail.com",
+                        f"{labels[body.action]} — {doc.get('address','')[:60]}", html)
+    except Exception as e:
+        logger.warning(f"[deal_finder] notificación de respuesta falló: {e}")
+    return {"success": True}
+
+
 @router.post("/admin/deal-finder/leads/{lead_id}/letter")
 async def generate_letter(request: Request, lead_id: str):
     await auth_admin(request)
@@ -922,6 +1100,45 @@ def _build_letter_pdf(lead: dict, sender: dict, lang: str) -> bytes:
     for para in [p for p in body_text.split("\n") if p.strip()]:
         story.append(Paragraph(para.replace("&", "&amp;").replace("<", "&lt;"), body_style))
         story.append(Spacer(1, 0.12 * inch))
+
+    # ── Bloque CTA con QR + link personalizado (si el lead tiene oferta) ──
+    offer = lead.get("offer") or {}
+    if offer.get("slug"):
+        from reportlab.platypus import Image as RLImage, Table, TableStyle
+        from reportlab.lib import colors as rl_colors
+        url = f"{SITE_BASE}/oferta/{offer['slug']}"
+        qr_buf = io.BytesIO(_offer_qr_png(url))
+        qr_img = RLImage(qr_buf, width=1.1 * inch, height=1.1 * inch)
+        if lang == "es":
+            cta_title = ("Nuestra oferta en efectivo: $%s" % f"{offer['amount']:,.0f}"
+                         if offer.get("mode") == "amount" and offer.get("amount")
+                         else "Díganos cuánto aceptaría por su propiedad")
+            cta_body = ("Responda en 1 minuto — escanee el código QR con la cámara de su "
+                        f"teléfono o visite:<br/><b>{url.replace('https://www.','')}</b><br/>"
+                        "Sin compromiso. Oferta válida por 30 días.")
+        else:
+            cta_title = ("Our cash offer: $%s" % f"{offer['amount']:,.0f}"
+                         if offer.get("mode") == "amount" and offer.get("amount")
+                         else "Tell us your price for the property")
+            cta_body = ("Respond in 1 minute — scan the QR code with your phone camera "
+                        f"or visit:<br/><b>{url.replace('https://www.','')}</b><br/>"
+                        "No obligation. Offer valid for 30 days.")
+        cta_style = ParagraphStyle("cta", parent=styles["Normal"], fontName="Helvetica",
+                                   fontSize=10, leading=14)
+        cta_bold = ParagraphStyle("ctab", parent=cta_style, fontName="Helvetica-Bold",
+                                  fontSize=12, leading=15, textColor="#C41428")
+        cell = [Paragraph(cta_title, cta_bold), Spacer(1, 4), Paragraph(cta_body, cta_style)]
+        tbl = Table([[qr_img, cell]], colWidths=[1.35 * inch, 5.0 * inch])
+        tbl.setStyle(TableStyle([
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("BOX", (0, 0), (-1, -1), 1.2, rl_colors.HexColor("#C41428")),
+            ("LEFTPADDING", (0, 0), (-1, -1), 10),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 10),
+            ("TOPPADDING", (0, 0), (-1, -1), 8),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+        ]))
+        story.append(Spacer(1, 0.2 * inch))
+        story.append(tbl)
 
     doc.build(story, onFirstPage=_draw_static, onLaterPages=_draw_static)
     return buf.getvalue()
@@ -1045,10 +1262,33 @@ async def mail_letter(request: Request, lead_id: str):
         body_html = "".join(
             f"<p>{p.strip().replace('&','&amp;').replace('<','&lt;')}</p>"
             for p in body_text.split("\n") if p.strip())
+
+        # Bloque CTA con QR + link personalizado (si el lead tiene oferta)
+        cta_html = ""
+        offer = doc.get("offer") or {}
+        if offer.get("slug"):
+            import base64 as _b64
+            url = f"{SITE_BASE}/oferta/{offer['slug']}"
+            qr_b64 = _b64.b64encode(_offer_qr_png(url)).decode()
+            title = (f"Our cash offer: ${offer['amount']:,.0f}"
+                     if offer.get("mode") == "amount" and offer.get("amount")
+                     else "Tell us your price for the property")
+            cta_html = (
+                f'<table style="margin-top:22pt;border:1.5pt solid #C41428;width:100%;'
+                f'border-collapse:collapse"><tr>'
+                f'<td style="width:95pt;padding:8pt;text-align:center">'
+                f'<img src="data:image/png;base64,{qr_b64}" style="width:80pt;height:80pt"/></td>'
+                f'<td style="padding:8pt 10pt;font-size:10pt;line-height:1.4">'
+                f'<div style="font-size:12pt;font-weight:bold;color:#C41428">{title}</div>'
+                f'Respond in 1 minute &mdash; scan the QR code with your phone camera or visit:<br/>'
+                f'<b>{url.replace("https://www.","")}</b><br/>'
+                f'No obligation. Offer valid for 30 days. / Responda en l&iacute;nea &mdash; sin compromiso.'
+                f'</td></tr></table>')
+
         html = (f'<html><head><meta charset="utf-8"><style>'
                 f'@page{{size:letter;margin:0}}body{{width:8.5in;min-height:11in;margin:0;'
                 f'padding:3.4in .9in .9in;font-family:Helvetica,Arial,sans-serif;font-size:11pt;line-height:1.45}}'
-                f'</style></head><body>{body_html}</body></html>')
+                f'</style></head><body>{body_html}{cta_html}</body></html>')
 
         data = {
             "description": f"Carta oferta — {doc.get('address', doc['property_id'])}",
