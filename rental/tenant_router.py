@@ -1991,6 +1991,9 @@ async def get_tenant_payment_config(request: Request):
         current_paid = existing is not None
 
     payment_methods = config.get("payment_methods", {})
+    if not isinstance(payment_methods, dict):
+        # Legacy configs stored a list like ["card", "cash"] — fall back to defaults
+        payment_methods = {}
 
     # Compute real amount due (rent + late fee from pending payment)
     rent_amount = 0.0
