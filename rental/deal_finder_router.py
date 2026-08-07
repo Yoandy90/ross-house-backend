@@ -1042,9 +1042,13 @@ async def generate_letter(request: Request, lead_id: str):
 # ═══════════════════════════════════════════════════════════════
 
 async def _sender_info() -> dict:
-    """Remitente = payer del 1099 (Ross House Rentals LLC)."""
+    """Remitente: Yoandy Ross (personal — mejor respuesta en direct mail);
+    la LLC va como segunda línea/firma."""
     from rental.tax_1099_router import _get_payer
-    return await _get_payer()
+    payer = await _get_payer()
+    payer["company"] = payer.get("name", "Ross House Rentals LLC")
+    payer["name"] = "Yoandy Ross"
+    return payer
 
 
 def _build_letter_pdf(lead: dict, sender: dict, lang: str) -> bytes:
@@ -1076,16 +1080,31 @@ def _build_letter_pdf(lead: dict, sender: dict, lang: str) -> bytes:
 
     def _draw_static(c: _canvas.Canvas, doc):
         c.saveState()
-        # Remitente arriba-izquierda (return address)
+        # Logo pequeño y discreto arriba-derecha (legitimidad sin parecer corporativo)
+        try:
+            _logo = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                 "assets", "logo.jpg")
+            c.drawImage(_logo, 7.05 * inch, 9.85 * inch, width=0.7 * inch, height=0.7 * inch,
+                        mask="auto")
+            c.setFont("Helvetica", 6.5)
+            c.setFillColorRGB(0.55, 0.55, 0.55)
+            c.drawCentredString(7.4 * inch, 9.72 * inch, "rosshouserentals.com")
+            c.setFillColorRGB(0, 0, 0)
+        except Exception:
+            pass
+        # Remitente arriba-izquierda (return address) — personal, con la LLC debajo
         c.setFont("Helvetica-Bold", 10)
         c.drawString(0.75 * inch, 10.35 * inch, sender.get("name", ""))
+        c.setFont("Helvetica", 8.5)
+        if sender.get("company"):
+            c.drawString(0.75 * inch, 10.21 * inch, sender["company"])
         c.setFont("Helvetica", 9)
-        c.drawString(0.75 * inch, 10.20 * inch, sender.get("address", ""))
-        c.drawString(0.75 * inch, 10.05 * inch,
+        c.drawString(0.75 * inch, 10.07 * inch, sender.get("address", ""))
+        c.drawString(0.75 * inch, 9.92 * inch,
                      f"{sender.get('city','')}, {sender.get('state','')} {sender.get('zip','')}")
         if sender.get("phone"):
-            c.drawString(0.75 * inch, 9.90 * inch, sender["phone"])
-        # Ventana destinatario (~2\" desde arriba)
+            c.drawString(0.75 * inch, 9.77 * inch, sender["phone"])
+        # Ventana destinatario (~2" desde arriba)
         addr_top = 8.55 * inch
         c.setFont("Helvetica", 11)
         lines = [lead.get("owner_name", "").strip()]
@@ -1286,10 +1305,20 @@ async def mail_letter(request: Request, lead_id: str):
                 f'No obligation. Offer valid for 30 days. / Responda en l&iacute;nea &mdash; sin compromiso.'
                 f'</td></tr></table>')
 
+        # Firma con logo pequeño (personal + LLC de respaldo)
+        sig_html = (
+            f'<table style="margin-top:18pt"><tr>'
+            f'<td style="padding-right:10pt"><img src="https://www.rosshouserentals.com/logo.jpg" '
+            f'style="width:42pt;height:42pt;border-radius:50%"/></td>'
+            f'<td style="font-size:10pt;line-height:1.35">'
+            f'<b>{sender.get("name","Yoandy Ross")}</b><br/>'
+            f'{sender.get("company","Ross House Rentals LLC")} &middot; Dumas, TX<br/>'
+            f'{sender.get("phone","")} &middot; rosshouserentals.com</td></tr></table>')
+
         html = (f'<html><head><meta charset="utf-8"><style>'
                 f'@page{{size:letter;margin:0}}body{{width:8.5in;min-height:11in;margin:0;'
                 f'padding:3.4in .9in .9in;font-family:Helvetica,Arial,sans-serif;font-size:11pt;line-height:1.45}}'
-                f'</style></head><body>{body_html}{cta_html}</body></html>')
+                f'</style></head><body>{body_html}{sig_html}{cta_html}</body></html>')
 
         data = {
             "description": f"Carta oferta — {doc.get('address', doc['property_id'])}",
