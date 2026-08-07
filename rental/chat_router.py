@@ -203,6 +203,25 @@ async def get_unread_count(request: Request):
 # ADMIN ENDPOINTS
 # ═══════════════════════════════════════════════════════════════════════════════
 
+@router.get("/ai/global-status")
+async def ai_global_status(request: Request):
+    """Admin: estado del auto-reply AI global del chat."""
+    await auth_admin(request)
+    cfg = await get_db().app_settings.find_one({"_id": "chat_ai"}) or {}
+    return {"success": True, "ai_enabled_global": bool(cfg.get("enabled", True))}
+
+
+@router.post("/ai/toggle-global")
+async def ai_toggle_global(request: Request):
+    """Admin: activar/desactivar el auto-reply AI global del chat."""
+    await auth_admin(request)
+    data = await request.json()
+    enabled = bool(data.get("enabled"))
+    await get_db().app_settings.update_one(
+        {"_id": "chat_ai"}, {"$set": {"enabled": enabled}}, upsert=True)
+    return {"success": True, "ai_enabled_global": enabled}
+
+
 @router.get("/admin/conversations")
 async def admin_get_conversations(request: Request, search: Optional[str] = None):
     """Admin: List all conversations, sorted by most recent."""
@@ -471,6 +490,11 @@ async def _ai_auto_reply(conversation_id: str, user_message: str, sender_name: s
     """Generate and send an AI auto-reply in the background."""
     try:
         if not _ai_brain:
+            return
+
+        # Respect the global AI toggle (admin app: Mensajes → switch AI)
+        cfg = await get_db().app_settings.find_one({"_id": "chat_ai"}) or {}
+        if not cfg.get("enabled", True):
             return
 
         # Small delay to feel more natural
