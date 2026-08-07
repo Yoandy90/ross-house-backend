@@ -58,9 +58,16 @@ COUNTIES = {
         "active": True,
         "situs_cities": ["DALHART", "TEXLINE", "KERRICK"],
     },
+    "potter": {
+        "name": "Potter-Randall (Amarillo)",
+        "base": "https://esearch.prad.org",
+        "active": True,
+        "platform": "trueprodigy",
+        "office": "PotterRandall",
+        "situs_cities": ["AMARILLO", "CANYON", "BUSHLAND"],
+    },
     # Estos condados usan una plataforma distinta (no BIS eSearch clásico) —
     # requieren scraper propio antes de activarlos:
-    "potter": {"name": "Potter-Randall (Amarillo)", "base": "https://esearch.prad.org", "active": False},
     "sherman": {"name": "Sherman County", "base": "", "active": False},
     "hartley": {"name": "Hartley County", "base": "https://esearch.hartleycad.org", "active": False},
 }
@@ -440,6 +447,135 @@ async def list_counties(request: Request):
     ]}
 
 
+# ═══════════════════════════════════════════════════════════════
+# Scraper TrueProdigy (Potter-Randall / Amarillo — esearch.prad.org)
+# La búsqueda pública usa prod-container.trueprodigyapi.com con token
+# de oficina (sin Bearer) y devuelve el registro completo (situs, dueño,
+# mailing y valores) — no requiere página de detalle. La deuda fiscal
+# no está disponible en el CAD (la lleva la oficina de impuestos).
+# ═══════════════════════════════════════════════════════════════
+
+TP_API = "https://prod-container.trueprodigyapi.com"
+
+
+async def _tp_token(client: httpx.AsyncClient, office: str) -> str:
+    r = await client.post(f"{TP_API}/trueprodigy/cadpublic/auth/token",
+                          json={"office": office})
+    r.raise_for_status()
+    return r.json()["user"]["token"]
+
+
+async def _tp_search(client: httpx.AsyncClient, token: str, query: str,
+                     year: int, page: int, page_size: int = 50) -> dict:
+    payload = {
+        "pYear": {"operator": "=", "value": str(year)},
+        "fullTextSearch": {"operator": "match", "value": query},
+    }
+    r = await client.post(
+        f"{TP_API}/public/property/searchfulltext?page={page}&pageSize={page_size}",
+        headers={"Authorization": token}, json=payload)
+    r.raise_for_status()
+    return r.json()
+
+
+def _tp_to_lead(county: str, rec: dict) -> dict:
+    # "904 S BONHAM ST, AMARILLO, TX, 79102" → "904 S BONHAM ST, AMARILLO TX 79102"
+    situs = re.sub(r",\s*TX,?\s*", " TX ", (rec.get("fullSitus") or "")).strip().rstrip(",")
+    m_line = (rec.get("addrDeliveryLine") or "").strip()
+    m_city = (rec.get("addrCity") or "").strip()
+    m_state = (rec.get("addrState") or "").strip().upper()
+    m_zip = (rec.get("addrZip") or "").strip()
+    lead = {
+        "county": county,
+        "property_id": str(rec.get("pid") or ""),
+        "year": int(rec.get("pYear") or datetime.now().year),
+        "geo_id": rec.get("geoID") or "",
+        "owner_name": (rec.get("displayName") or rec.get("name") or "").strip(),
+        "owner_id": str(rec.get("ownerID") or ""),
+        "address": situs,
+        "legal_description": rec.get("legalDescription") or "",
+        "property_type": (rec.get("propType") or "").strip().upper(),
+        "appraised_value": rec.get("appraisedValue") or 0,
+        "portal_url": f"https://esearch.prad.org/property-detail/{rec.get('pid')}/{rec.get('pYear')}",
+        "mailing_lines": [ln for ln in [m_line, f"{m_city}, {m_state} {m_zip}".strip(", ")] if ln],
+        "mailing_city": m_city.upper(),
+        "mailing_state": m_state,
+        "mailing_zip": m_zip,
+        "values": {
+            "Land Value": rec.get("landValue") or 0,
+            "Improvement Value": rec.get("improvementValue") or 0,
+            "Market Value": rec.get("marketValue") or 0,
+        },
+        "tax_due_total": 0,
+        "tax_years_due": [],
+        "latitude": rec.get("latitude") or "",
+        "longitude": rec.get("longitude") or "",
+    }
+    lead["signals"] = compute_signals(lead)
+    lead["last_synced_at"] = datetime.now(timezone.utc)
+    return lead
+
+
+async def _run_scan_trueprodigy(scan_id: str, county: str, query: str,
+                                max_results: int):
+    db = get_db()
+    office = COUNTIES[county]["office"]
+    oid = ObjectId(scan_id)
+    year = datetime.now().year
+
+    async def _update(**fields):
+        await db.deal_finder_scans.update_one({"_id": oid}, {"$set": fields})
+
+    try:
+        async with httpx.AsyncClient(timeout=40, headers=UA) as client:
+            token = await _tp_token(client, office)
+
+            results, page = [], 1
+            while len(results) < max_results:
+                data = await _tp_search(client, token, query, year, page)
+                items = data.get("results") or []
+                if not items:
+                    break
+                results.extend(items)
+                total = (data.get("totalProperty") or {}).get("propertyCount") or len(results)
+                await _update(total_found=total)
+                if len(items) < 50 or len(results) >= total:
+                    break
+                page += 1
+                await asyncio.sleep(0.6)
+
+            results = [r for r in results
+                       if (r.get("propType") or "").upper() not in SKIP_TYPES
+                       and (r.get("active") or "Yes") == "Yes"][:max_results]
+            await _update(total=len(results), status="enriching")
+
+            new_leads = updated = processed = 0
+            for rec in results:
+                lead = _tp_to_lead(county, rec)
+                if not lead["property_id"]:
+                    continue
+                res = await db.deal_finder_leads.update_one(
+                    {"county": county, "property_id": lead["property_id"]},
+                    {"$set": lead,
+                     "$setOnInsert": {"status": "new", "notes": "",
+                                      "created_at": datetime.now(timezone.utc)}},
+                    upsert=True,
+                )
+                processed += 1
+                await _update(processed=processed)
+                if res.upserted_id:
+                    new_leads += 1
+                else:
+                    updated += 1
+
+            await _update(status="done", new_leads=new_leads, updated=updated,
+                          finished_at=datetime.now(timezone.utc))
+            logger.info(f"[deal_finder] TP scan {scan_id} done: {new_leads} new, {updated} updated")
+    except Exception as e:
+        logger.error(f"[deal_finder] TP scan {scan_id} failed: {e}")
+        await _update(status="error", error=str(e), finished_at=datetime.now(timezone.utc))
+
+
 @router.post("/admin/deal-finder/scan")
 async def start_scan(request: Request, body: ScanRequest):
     await auth_admin(request)
@@ -458,6 +594,22 @@ async def start_scan(request: Request, body: ScanRequest):
     running = await db.deal_finder_scans.find_one({"status": {"$in": ["searching", "enriching"]}})
     if running:
         raise HTTPException(409, "Ya hay un escaneo en curso — espera a que termine")
+
+    platform = county.get("platform", "esearch")
+    if platform == "trueprodigy":
+        # búsqueda full-text (dirección, dueño o cuenta en un solo campo)
+        keywords = q
+        max_results = max(1, min(body.max_results, 200))
+        doc = {
+            "county": body.county, "keywords": keywords, "status": "searching",
+            "total_found": 0, "total": 0, "processed": 0, "new_leads": 0, "updated": 0,
+            "only_delinquent": False,
+            "started_at": datetime.now(timezone.utc), "finished_at": None, "error": "",
+        }
+        res = await db.deal_finder_scans.insert_one(doc)
+        scan_id = str(res.inserted_id)
+        asyncio.create_task(_run_scan_trueprodigy(scan_id, body.county, keywords, max_results))
+        return {"success": True, "scan_id": scan_id, "keywords": keywords}
 
     keywords = f'{field}:"{q}"' if " " in q else f"{field}:{q}"
     max_results = max(1, min(body.max_results, 100))
@@ -828,8 +980,27 @@ def _lead_mail_parts(lead: dict) -> tuple[list[str], str, str, str]:
 async def lob_status(request: Request):
     await auth_admin(request)
     key = _lob_key()
-    return {"success": True, "configured": bool(key),
-            "mode": "live" if (key or "").startswith("live_") else "test" if key else None}
+    out = {"success": True, "configured": bool(key),
+           "mode": "live" if (key or "").startswith("live_") else "test" if key else None,
+           "api_ok": False, "recent_letters": []}
+    if key:
+        try:
+            async with httpx.AsyncClient(timeout=20) as client:
+                r = await client.get("https://api.lob.com/v1/letters?limit=5", auth=(key, ""))
+                out["api_ok"] = r.status_code == 200
+                if r.status_code == 200:
+                    out["recent_letters"] = [{
+                        "id": l.get("id"),
+                        "to": (l.get("to") or {}).get("name", ""),
+                        "date_created": l.get("date_created", ""),
+                        "expected_delivery_date": l.get("expected_delivery_date", ""),
+                        "carrier": l.get("carrier", ""),
+                    } for l in (r.json().get("data") or [])]
+                else:
+                    out["api_error"] = r.json().get("error", {}).get("message", f"HTTP {r.status_code}")
+        except Exception as e:
+            out["api_error"] = str(e)[:150]
+    return out
 
 
 @router.post("/admin/deal-finder/leads/{lead_id}/mail")
