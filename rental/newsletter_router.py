@@ -72,7 +72,7 @@ def _campaign_html(subject: str, message: str, unsubscribe_url: str | None, extr
 async def _send_one(sg_key: str, from_email: str, to_email: str, subject: str, html: str) -> bool:
     def _send_sync() -> bool:
         import sendgrid
-        from sendgrid.helpers.mail import Mail, Email, To, Content
+        from sendgrid.helpers.mail import Mail, Email, To, Content, Category
         sg = sendgrid.SendGridAPIClient(api_key=sg_key)
         mail = Mail(
             from_email=Email(from_email, "Ross House Rentals"),
@@ -80,6 +80,7 @@ async def _send_one(sg_key: str, from_email: str, to_email: str, subject: str, h
             subject=subject,
             html_content=Content("text/html", html),
         )
+        mail.add_category(Category("rhr-newsletter"))
         resp = sg.client.mail.send.post(request_body=mail.get())
         return resp.status_code in (200, 201, 202)
 
@@ -228,6 +229,43 @@ async def _run_campaign(campaign_id: str, subject: str, message: str, audience: 
     logger.info(f"📣 Campaign {campaign_id}: sent={sent} failed={failed}")
 
 
+@router.post('/public/sendgrid/events')
+async def sendgrid_event_webhook(request: Request):
+    """SendGrid Event Webhook: guarda opens/clicks/bounces/etc. de emails del newsletter.
+    Filtra por categoría 'rhr-newsletter' para ignorar eventos de otros sistemas."""
+    try:
+        events = await request.json()
+    except Exception:
+        return {"success": True}
+    if not isinstance(events, list):
+        return {"success": True}
+    db = get_db()
+    docs = []
+    for ev in events[:500]:
+        if not isinstance(ev, dict):
+            continue
+        cats = ev.get('category') or []
+        if isinstance(cats, str):
+            cats = [cats]
+        if 'rhr-newsletter' not in cats:
+            continue  # evento de otro sistema (p.ej. Ross Tax)
+        etype = ev.get('event', '')
+        if etype not in ('open', 'click', 'delivered', 'bounce', 'dropped', 'spamreport', 'unsubscribe'):
+            continue
+        docs.append({
+            "email": (ev.get('email') or '').lower(),
+            "event": etype,
+            "timestamp": datetime.utcfromtimestamp(ev['timestamp']) if ev.get('timestamp') else datetime.utcnow(),
+            "sg_message_id": ev.get('sg_message_id', ''),
+            "url": ev.get('url', ''),
+            "useragent": ev.get('useragent', '')[:200],
+            "created_at": datetime.utcnow(),
+        })
+    if docs:
+        await db.email_events.insert_many(docs)
+    return {"success": True, "stored": len(docs)}
+
+
 @router.get('/admin/newsletter/health')
 async def admin_newsletter_health(request: Request):
     """Panel de salud de la lista: KPIs, historial de envíos y bajas recientes."""
@@ -264,6 +302,22 @@ async def admin_newsletter_health(request: Request):
     recent_unsubs = await db.newsletter_subscribers.find(
         {"unsubscribed": True}).sort("unsubscribed_at", -1).limit(20).to_list(20)
 
+    # ── Aperturas (SendGrid Event Webhook, hora Central Texas UTC-5/-6) ──
+    opens_total = await db.email_events.count_documents({"event": "open"})
+    unique_openers = len(await db.email_events.distinct("email", {"event": "open"}))
+    clicks_total = await db.email_events.count_documents({"event": "click"})
+    bounces_total = await db.email_events.count_documents({"event": {"$in": ["bounce", "dropped"]}})
+    opens_by_hour_raw = await db.email_events.aggregate([
+        {"$match": {"event": "open"}},
+        {"$project": {"hour_ct": {"$hour": {"date": "$timestamp", "timezone": "America/Chicago"}}}},
+        {"$group": {"_id": "$hour_ct", "n": {"$sum": 1}}},
+        {"$sort": {"_id": 1}},
+    ]).to_list(24)
+    opens_by_hour = [{"hour": d["_id"], "opens": d["n"]} for d in opens_by_hour_raw]
+    best_hour = max(opens_by_hour, key=lambda x: x["opens"])["hour"] if opens_by_hour else None
+    recent_opens = await db.email_events.find(
+        {"event": "open"}).sort("timestamp", -1).limit(20).to_list(20)
+
     return {
         "success": True,
         "kpis": {
@@ -271,7 +325,16 @@ async def admin_newsletter_health(request: Request):
             "unsub_rate": round(unsubscribed / total * 100, 1) if total else 0,
             "new_30d": new_30d, "unsub_30d": unsub_30d,
             "delivered_total": totals["sent"], "failed_total": totals["failed"],
+            "opens_total": opens_total, "unique_openers": unique_openers,
+            "clicks_total": clicks_total, "bounces_total": bounces_total,
+            "open_rate": round(unique_openers / active * 100, 1) if active else 0,
         },
+        "opens_by_hour": opens_by_hour,
+        "best_hour_ct": best_hour,
+        "recent_opens": [{
+            "email": o.get("email", ""),
+            "at": o["timestamp"].isoformat() if o.get("timestamp") else "",
+        } for o in recent_opens],
         "sends": sends,
         "recent_unsubscribes": [{
             "email": s.get("email", ""), "name": s.get("name", ""),
