@@ -44,26 +44,44 @@ async def _sendgrid():
 def _campaign_html(subject: str, message: str, unsubscribe_url: str | None, extra_html: str = '') -> str:
     body_html = message.replace('\n', '<br>')
     unsub = (
-        f'<p style="font-size:11px;color:#94a3b8;margin-top:24px">'
+        f'<p style="font-size:11px;color:#94a3b8;margin:16px 0 0;text-align:center">'
         f'¿No quieres recibir más noticias? '
         f'<a href="{unsubscribe_url}" style="color:#94a3b8">Cancelar suscripción</a></p>'
         if unsubscribe_url else ''
     )
     return f"""
-    <div style="font-family:Arial,Helvetica,sans-serif;max-width:600px;margin:0 auto;background:#ffffff">
-      <div style="background:linear-gradient(135deg,#0891b2,#0e7490);padding:24px;border-radius:12px 12px 0 0;text-align:center">
-        <h1 style="color:#fff;font-size:20px;margin:0">Ross House Rentals</h1>
-        <p style="color:#cffafe;font-size:12px;margin:4px 0 0">Dumas, Texas</p>
-      </div>
-      <div style="padding:28px;border:1px solid #e2e8f0;border-top:none;border-radius:0 0 12px 12px">
-        <h2 style="color:#0f172a;font-size:17px;margin:0 0 14px">{subject}</h2>
-        {extra_html}
-        <div style="color:#334155;font-size:14px;line-height:1.6">{body_html}</div>
-        <p style="margin-top:24px;font-size:12px;color:#64748b">
-          Ross House Rentals LLC · Dumas, TX · (806) 934-2018 ·
-          <a href="https://www.rosshouserentals.com" style="color:#0891b2">rosshouserentals.com</a>
-        </p>
-        {unsub}
+    <div style="background:#f6f7f9;padding:28px 12px;font-family:Arial,Helvetica,sans-serif">
+      <div style="max-width:600px;margin:0 auto">
+        <!-- Header con logo (branding del sitio) -->
+        <div style="background:#ffffff;border-radius:16px 16px 0 0;padding:26px 24px 18px;text-align:center;border:1px solid #e8eaed;border-bottom:none">
+          <img src="https://www.rosshouserentals.com/logo.jpg" alt="Ross House Rentals" width="76" height="76"
+               style="border-radius:50%;border:3px solid #ED1B33;display:inline-block" />
+          <h1 style="color:#231F20;font-size:21px;margin:12px 0 2px;letter-spacing:-0.3px">Ross House Rentals</h1>
+          <p style="color:#ED1B33;font-size:11px;font-weight:bold;letter-spacing:2.5px;margin:0;text-transform:uppercase">LLC · Dumas, Texas</p>
+        </div>
+        <!-- Barra de acento roja -->
+        <div style="height:5px;background:linear-gradient(90deg,#ED1B33,#C41428);font-size:0;line-height:0">&nbsp;</div>
+        <!-- Contenido -->
+        <div style="background:#ffffff;padding:30px 28px;border:1px solid #e8eaed;border-top:none;border-radius:0 0 16px 16px">
+          <h2 style="color:#231F20;font-size:18px;margin:0 0 16px;line-height:1.35">{subject}</h2>
+          {extra_html}
+          <div style="color:#3d3d3f;font-size:14px;line-height:1.65">{body_html}</div>
+          <!-- CTA -->
+          <div style="text-align:center;margin:28px 0 6px">
+            <a href="https://www.rosshouserentals.com"
+               style="display:inline-block;background:linear-gradient(135deg,#ED1B33,#C41428);color:#ffffff;font-size:14px;font-weight:bold;text-decoration:none;padding:12px 30px;border-radius:10px">
+              Visita rosshouserentals.com →</a>
+          </div>
+        </div>
+        <!-- Footer -->
+        <div style="text-align:center;padding:18px 10px 6px">
+          <p style="margin:0;font-size:12px;color:#64748b">
+            Ross House Rentals LLC · Dumas, TX ·
+            <a href="tel:+18069342018" style="color:#ED1B33;text-decoration:none;font-weight:bold">(806) 934-2018</a> ·
+            <a href="https://www.rosshouserentals.com" style="color:#ED1B33;text-decoration:none">rosshouserentals.com</a>
+          </p>
+          {unsub}
+        </div>
       </div>
     </div>
     """
