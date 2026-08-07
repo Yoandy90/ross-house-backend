@@ -63,10 +63,10 @@ def parse_tax_due_html(html: str) -> list[dict]:
     return years
 
 
-async def fetch_account_tax_due(account_id: str) -> dict:
-    """Fetch live delinquent-tax data for one Moore County account."""
+async def fetch_account_tax_due(account_id: str, base: str = "") -> dict:
+    """Fetch live delinquent-tax data for one county account (default: Moore)."""
     year = datetime.now().year
-    url = f"{ESEARCH}/Property/GetPropertyTaxDueModalResult?id={account_id}&year={year}"
+    url = f"{base or ESEARCH}/Property/GetPropertyTaxDueModalResult?id={account_id}&year={year}"
     async with httpx.AsyncClient(timeout=30, headers=UA, follow_redirects=True) as client:
         r = await client.get(url)
         r.raise_for_status()

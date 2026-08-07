@@ -181,7 +181,7 @@ async def public_unsubscribe(token: str = ''):
 # ════════════════════════════════ ADMIN ════════════════════════════════
 
 @router.get('/admin/newsletter/subscribers')
-async def admin_list_subscribers(request: Request, search: str = '', limit: int = 500):
+async def admin_list_subscribers(request: Request, search: str = '', limit: int = 50, skip: int = 0):
     await auth_admin(request)
     db = get_db()
     q: dict = {}
@@ -190,13 +190,16 @@ async def admin_list_subscribers(request: Request, search: str = '', limit: int 
             {"email": {"$regex": re.escape(search), "$options": "i"}},
             {"name": {"$regex": re.escape(search), "$options": "i"}},
         ]}
-    subs = await db.newsletter_subscribers.find(q).sort("created_at", -1).limit(limit).to_list(limit)
+    limit = min(limit, 200)
+    subs = await db.newsletter_subscribers.find(q).sort("created_at", -1).skip(max(skip, 0)).limit(limit).to_list(limit)
+    filtered = await db.newsletter_subscribers.count_documents(q)
     total = await db.newsletter_subscribers.count_documents({})
     active = await db.newsletter_subscribers.count_documents({"unsubscribed": {"$ne": True}})
     leads_count = await db.tenant_leads.count_documents({})
     return {
         "success": True,
         "subscribers": [serialize(s) for s in subs],
+        "filtered_total": filtered,
         "stats": {"total": total, "active": active, "unsubscribed": total - active, "leads": leads_count},
     }
 

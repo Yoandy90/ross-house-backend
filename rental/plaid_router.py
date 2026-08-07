@@ -256,23 +256,24 @@ async def sync_transactions(request: Request):
 
 
 @router.get('/admin/plaid/transactions')
-async def list_transactions(request: Request, status: str = "", limit: int = 100):
+async def list_transactions(request: Request, status: str = "", limit: int = 50, skip: int = 0):
     await auth_admin(request)
     db = get_db()
     q = {}
     if status in ("matched", "unmatched", "ignored"):
         q["match.status"] = status
     txs = []
-    async for t in db.bank_transactions.find(q).sort([("date", -1)]).limit(min(limit, 300)):
+    async for t in db.bank_transactions.find(q).sort([("date", -1)]).skip(max(skip, 0)).limit(min(limit, 300)):
         t["_id"] = str(t["_id"])
         if isinstance(t.get("date"), datetime):
             t["date"] = t["date"].strftime("%Y-%m-%d")
         txs.append(t)
+    total = await db.bank_transactions.count_documents(q)
     counts = {}
     async for row in db.bank_transactions.aggregate([
             {"$group": {"_id": "$match.status", "n": {"$sum": 1}}}]):
         counts[row["_id"] or "unmatched"] = row["n"]
-    return {"success": True, "transactions": txs, "counts": counts}
+    return {"success": True, "transactions": txs, "counts": counts, "total": total}
 
 
 @router.post('/admin/plaid/transactions/{transaction_id}/status')

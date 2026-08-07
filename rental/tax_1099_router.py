@@ -12,6 +12,7 @@
   de exportación tiene todos los campos para eso.
 """
 import io
+import os
 import logging
 from datetime import datetime
 
@@ -145,88 +146,53 @@ async def save_w9(provider_id: str, request: Request):
     return {"success": True}
 
 
+IRS_1099NEC_TEMPLATE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                    "assets", "f1099nec.pdf")
+
+
 def _build_1099_pdf(payer: dict, provider: dict, w9: dict, amount: float, year: int) -> bytes:
-    """Formulario sustituto 1099-NEC Copy B (para el proveedor)."""
-    from reportlab.lib.pagesizes import LETTER
-    from reportlab.lib.units import inch
-    from reportlab.pdfgen import canvas as rl_canvas
+    """Rellena el formulario OFICIAL del IRS (f1099nec.pdf) — Copy B + instrucciones
+    para el destinatario. Página 3 = Copy B, página 4 = Instructions for Recipient."""
+    from pypdf import PdfReader, PdfWriter
+
+    reader = PdfReader(IRS_1099NEC_TEMPLATE)
+    writer = PdfWriter()
+    writer.append(reader, pages=[3, 4])  # Copy B + instrucciones
+
+    P = "topmostSubform[0].CopyB[0]."
+    L, R = P + "LeftCol[0].", P + "RightCol[0]."
+    rec_name = w9.get("legal_name") or provider.get("name", "")
+    if w9.get("business_name"):
+        rec_name = f"{rec_name} / {w9['business_name']}"
+    fields = {
+        P + "PgHeader[0].CalendarYear[0].f2_1[0]": str(year)[-2:],
+        # PAYER (izquierda)
+        L + "f2_2[0]": payer.get("name", ""),
+        L + "f2_3[0]": payer.get("address", ""),
+        L + "f2_5[0]": payer.get("city", ""),
+        L + "f2_6[0]": payer.get("phone", ""),
+        L + "f2_7[0]": payer.get("state", ""),
+        L + "f2_9[0]": payer.get("zip", ""),
+        L + "f2_10[0]": payer.get("ein", ""),
+        # RECIPIENT
+        L + "f2_11[0]": w9.get("tin", ""),
+        L + "f2_12[0]": rec_name,
+        L + "f2_13[0]": w9.get("address", ""),
+        L + "f2_15[0]": w9.get("city", ""),
+        L + "f2_16[0]": w9.get("state", ""),
+        L + "f2_18[0]": w9.get("zip", ""),
+        L + "f2_19[0]": str(provider.get("_id", ""))[:20],  # account number
+        # Box 1a — Nonemployee compensation
+        R + "f2_20[0]": f"{amount:,.2f}",
+    }
+    writer.update_page_form_field_values(writer.pages[0], fields, auto_regenerate=False)
+    try:
+        writer.set_need_appearances_writer(True)
+    except Exception:
+        pass
 
     buf = io.BytesIO()
-    c = rl_canvas.Canvas(buf, pagesize=LETTER)
-    W, H = LETTER
-    m = 0.6 * inch
-    top = H - m
-
-    def box(x, y, w, h, label="", value="", vsize=10, bold=True):
-        c.setLineWidth(0.8)
-        c.rect(x, y - h, w, h)
-        if label:
-            c.setFont("Helvetica", 6.5)
-            c.drawString(x + 4, y - 10, label)
-        if value:
-            c.setFont("Helvetica-Bold" if bold else "Helvetica", vsize)
-            c.drawString(x + 4, y - h + 6, str(value))
-
-    # Encabezado
-    c.setFont("Helvetica-Bold", 16)
-    c.drawString(m, top, f"Form 1099-NEC")
-    c.setFont("Helvetica", 9)
-    c.drawString(m + 130, top + 2, f"Nonemployee Compensation — {year}")
-    c.setFont("Helvetica-Bold", 10)
-    c.drawRightString(W - m, top, "Copy B — For Recipient")
-    c.setFont("Helvetica", 7)
-    c.drawRightString(W - m, top - 11, "(Substitute statement — IRS Pub. 1179)")
-    y = top - 30
-
-    colw = (W - 2 * m) / 2
-    # Payer
-    payer_txt = (f"{payer.get('name','')}\n{payer.get('address','')}\n"
-                 f"{payer.get('city','')}, {payer.get('state','')} {payer.get('zip','')}\n"
-                 f"{payer.get('phone','')}")
-    box(m, y, colw, 78, "PAYER'S name, street address, city, state, ZIP, phone")
-    c.setFont("Helvetica", 9)
-    ty = y - 24
-    for line in payer_txt.split("\n"):
-        c.drawString(m + 4, ty, line)
-        ty -= 12
-    # Box 1 (importe)
-    box(m + colw, y, colw / 2, 39, "1. Nonemployee compensation", f"$ {amount:,.2f}", 12)
-    box(m + colw + colw / 2, y, colw / 2, 39, "4. Federal income tax withheld", "$ 0.00")
-    box(m + colw, y - 39, colw, 39, "Tax year", str(year))
-    y -= 88
-
-    box(m, y, colw / 2, 34, "PAYER'S TIN (EIN)", payer.get("ein", ""))
-    box(m + colw / 2, y, colw / 2, 34, "RECIPIENT'S TIN",
-        _mask_tin(w9.get("tin", "")) or "(pendiente W-9)")
-    box(m + colw, y, colw, 34, "Account number", provider.get("_id", "")[:18])
-    y -= 44
-
-    rec_name = w9.get("legal_name") or provider.get("name", "")
-    rec_biz = w9.get("business_name", "")
-    rec_addr = w9.get("address", "") or ""
-    rec_csz = f"{w9.get('city','')}, {w9.get('state','')} {w9.get('zip','')}".strip(", ")
-    box(m, y, W - 2 * m, 68, "RECIPIENT'S name, business name, street address, city, state, ZIP")
-    c.setFont("Helvetica-Bold", 10)
-    c.drawString(m + 4, y - 24, rec_name)
-    c.setFont("Helvetica", 9)
-    ty = y - 37
-    for line in [rec_biz, rec_addr, rec_csz]:
-        if line:
-            c.drawString(m + 4, ty, line)
-            ty -= 12
-    y -= 90
-
-    c.setFont("Helvetica", 7.5)
-    for i, line in enumerate([
-        "This is important tax information and is being furnished to the IRS. If you are required to file a return,",
-        "a negligence penalty or other sanction may be imposed on you if this income is taxable and the IRS",
-        "determines that it has not been reported. / Esta es información fiscal importante que se envía al IRS.",
-        f"Generado por Ross House Rentals — {datetime.utcnow().strftime('%Y-%m-%d')}",
-    ]):
-        c.drawString(m, y - i * 10, line)
-
-    c.showPage()
-    c.save()
+    writer.write(buf)
     return buf.getvalue()
 
 

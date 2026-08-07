@@ -52,9 +52,17 @@ COUNTIES = {
         "active": True,
         "situs_cities": ["DUMAS", "SUNRAY", "CACTUS", "MASTERSON"],
     },
-    "potter": {"name": "Potter County (Amarillo)", "base": "", "active": False},
+    "dallam": {
+        "name": "Dallam County (Dalhart)",
+        "base": "https://esearch.dallamcad.org",
+        "active": True,
+        "situs_cities": ["DALHART", "TEXLINE", "KERRICK"],
+    },
+    # Estos condados usan una plataforma distinta (no BIS eSearch clásico) —
+    # requieren scraper propio antes de activarlos:
+    "potter": {"name": "Potter-Randall (Amarillo)", "base": "https://esearch.prad.org", "active": False},
     "sherman": {"name": "Sherman County", "base": "", "active": False},
-    "hartley": {"name": "Hartley County", "base": "", "active": False},
+    "hartley": {"name": "Hartley County", "base": "https://esearch.hartleycad.org", "active": False},
 }
 
 SEARCH_FIELDS = {
@@ -205,7 +213,7 @@ async def enrich_and_upsert(db, client: httpx.AsyncClient, base: str, county: st
 
     # Enrich: delinquent taxes
     try:
-        tax = await fetch_account_tax_due(prop_id)
+        tax = await fetch_account_tax_due(prop_id, base)
         lead["tax_due_total"] = tax["total_due"]
         lead["tax_years_due"] = [y["year"] for y in tax["years_due"]]
     except Exception as e:
@@ -507,6 +515,8 @@ async def get_stats(request: Request):
 async def list_leads(request: Request, status: Optional[str] = None,
                      signal: Optional[str] = None, county: Optional[str] = None,
                      q: Optional[str] = None, sort: str = "score",
+                     city: Optional[str] = None, min_tax: float = 0,
+                     min_score: float = 0, min_value: float = 0,
                      limit: int = 100, skip: int = 0):
     await auth_admin(request)
     db = get_db()
@@ -517,6 +527,14 @@ async def list_leads(request: Request, status: Optional[str] = None,
         filt["signals"] = signal
     if county:
         filt["county"] = county
+    if city:
+        filt["address"] = {"$regex": re.escape(city.strip()), "$options": "i"}
+    if min_tax > 0:
+        filt["tax_due_total"] = {"$gte": min_tax}
+    if min_score > 0:
+        filt["ai_score"] = {"$gte": min_score}
+    if min_value > 0:
+        filt["appraised_value"] = {"$gte": min_value}
     if q:
         rx = {"$regex": re.escape(q.strip()), "$options": "i"}
         filt["$or"] = [{"address": rx}, {"owner_name": rx}, {"legal_description": rx}]
