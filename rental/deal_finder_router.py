@@ -403,6 +403,7 @@ def _lead_out(doc: dict) -> dict:
         "ai_score": doc.get("ai_score"),
         "ai_analysis": doc.get("ai_analysis"),
         "offer_letter": doc.get("offer_letter"),
+        "offer": doc.get("offer"),
         "mail": doc.get("mail"),
         "portal_url": doc.get("portal_url", ""),
         "created_at": doc["created_at"].isoformat() if doc.get("created_at") else "",
