@@ -16,7 +16,7 @@ import uuid
 import asyncio
 import secrets
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Request, HTTPException, BackgroundTasks
 from fastapi.responses import HTMLResponse
@@ -226,6 +226,59 @@ async def _run_campaign(campaign_id: str, subject: str, message: str, audience: 
         {"$set": {"status": "sent", "sent": sent, "failed": failed,
                   "total_recipients": len(recipients), "completed_at": datetime.utcnow()}})
     logger.info(f"📣 Campaign {campaign_id}: sent={sent} failed={failed}")
+
+
+@router.get('/admin/newsletter/health')
+async def admin_newsletter_health(request: Request):
+    """Panel de salud de la lista: KPIs, historial de envíos y bajas recientes."""
+    await auth_admin(request)
+    db = get_db()
+    now = datetime.utcnow()
+    d30 = now - timedelta(days=30)
+
+    total = await db.newsletter_subscribers.count_documents({})
+    unsubscribed = await db.newsletter_subscribers.count_documents({"unsubscribed": True})
+    active = total - unsubscribed
+    new_30d = await db.newsletter_subscribers.count_documents({"created_at": {"$gte": d30}})
+    unsub_30d = await db.newsletter_subscribers.count_documents({"unsubscribed_at": {"$gte": d30}})
+
+    # Historial de envíos (drip + campañas manuales)
+    camps = await db.newsletter_campaigns.find().sort("created_at", -1).limit(25).to_list(25)
+    sends = [{
+        "id": str(c["_id"]),
+        "subject": c.get("subject", ""),
+        "type": "drip" if c.get("type") == "drip" else "manual",
+        "status": c.get("status", ""),
+        "total_recipients": c.get("total_recipients", 0),
+        "sent": c.get("sent", 0),
+        "failed": c.get("failed", 0),
+        "created_at": c["created_at"].isoformat() if c.get("created_at") else "",
+    } for c in camps]
+
+    # Totales acumulados de todos los envíos
+    agg = await db.newsletter_campaigns.aggregate([
+        {"$group": {"_id": None, "sent": {"$sum": "$sent"}, "failed": {"$sum": "$failed"}}}
+    ]).to_list(1)
+    totals = {"sent": (agg[0]["sent"] if agg else 0), "failed": (agg[0]["failed"] if agg else 0)}
+
+    recent_unsubs = await db.newsletter_subscribers.find(
+        {"unsubscribed": True}).sort("unsubscribed_at", -1).limit(20).to_list(20)
+
+    return {
+        "success": True,
+        "kpis": {
+            "total": total, "active": active, "unsubscribed": unsubscribed,
+            "unsub_rate": round(unsubscribed / total * 100, 1) if total else 0,
+            "new_30d": new_30d, "unsub_30d": unsub_30d,
+            "delivered_total": totals["sent"], "failed_total": totals["failed"],
+        },
+        "sends": sends,
+        "recent_unsubscribes": [{
+            "email": s.get("email", ""), "name": s.get("name", ""),
+            "source": s.get("source", ""),
+            "unsubscribed_at": s["unsubscribed_at"].isoformat() if s.get("unsubscribed_at") else "",
+        } for s in recent_unsubs],
+    }
 
 
 @router.post('/admin/newsletter/campaigns')
