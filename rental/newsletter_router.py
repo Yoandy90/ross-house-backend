@@ -13,6 +13,7 @@ Admin:
 import os
 import re
 import uuid
+import asyncio
 import secrets
 import logging
 from datetime import datetime
@@ -69,7 +70,7 @@ def _campaign_html(subject: str, message: str, unsubscribe_url: str | None, extr
 
 
 async def _send_one(sg_key: str, from_email: str, to_email: str, subject: str, html: str) -> bool:
-    try:
+    def _send_sync() -> bool:
         import sendgrid
         from sendgrid.helpers.mail import Mail, Email, To, Content
         sg = sendgrid.SendGridAPIClient(api_key=sg_key)
@@ -81,6 +82,11 @@ async def _send_one(sg_key: str, from_email: str, to_email: str, subject: str, h
         )
         resp = sg.client.mail.send.post(request_body=mail.get())
         return resp.status_code in (200, 201, 202)
+
+    try:
+        # SendGrid SDK es síncrono — correr en thread para no bloquear el event loop
+        # durante campañas grandes (700+ destinatarios).
+        return await asyncio.to_thread(_send_sync)
     except Exception as e:
         logger.warning(f"[newsletter] send to {to_email} failed: {e}")
         return False
