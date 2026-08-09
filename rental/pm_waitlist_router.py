@@ -239,8 +239,59 @@ async def admin_pm_waitlist_stats(request: Request):
     db = get_db()
     total = await db.pm_service_waitlist.count_documents({})
     new_count = await db.pm_service_waitlist.count_documents({"status": "new"})
-    pipeline = [{"$group": {"_id": None, "total_props": {"$sum": "$property_count"}}}]
+    contacted = await db.pm_service_waitlist.count_documents({"status": "contacted"})
+    converted = await db.pm_service_waitlist.count_documents({"status": "converted"})
+    pipeline = [
+        {"$match": {"status": {"$ne": "discarded"}}},
+        {"$group": {"_id": None, "total_props": {"$sum": "$property_count"}}},
+    ]
     agg_cur = db.pm_service_waitlist.aggregate(pipeline)
     agg = await agg_cur.to_list(1)
     total_props = agg[0]['total_props'] if agg else 0
-    return {"total": total, "new": new_count, "total_properties_interested": total_props}
+    return {
+        "total": total,
+        "new": new_count,
+        "contacted": contacted,
+        "converted": converted,
+        "total_properties_interested": total_props,
+    }
+
+
+VALID_STATUSES = {'new', 'contacted', 'converted', 'discarded'}
+
+
+class PmLeadUpdate(BaseModel):
+    status: Optional[str] = None
+    admin_notes: Optional[str] = Field(default=None, max_length=2000)
+
+
+@router.patch('/admin/pm-service-waitlist/{lead_id}')
+async def admin_update_pm_lead(request: Request, lead_id: str, payload: PmLeadUpdate):
+    """Update status or admin notes for a PM waitlist lead."""
+    await auth_admin(request)
+    db = get_db()
+    updates = {"updated_at": datetime.utcnow()}
+    if payload.status is not None:
+        if payload.status not in VALID_STATUSES:
+            from fastapi import HTTPException
+            raise HTTPException(status_code=400, detail=f"Invalid status. Valid: {sorted(VALID_STATUSES)}")
+        updates['status'] = payload.status
+    if payload.admin_notes is not None:
+        updates['admin_notes'] = payload.admin_notes
+    result = await db.pm_service_waitlist.update_one({"_id": lead_id}, {"$set": updates})
+    if result.matched_count == 0:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="Lead not found")
+    return {"success": True, "id": lead_id, **{k: v for k, v in updates.items() if k != 'updated_at'}}
+
+
+@router.delete('/admin/pm-service-waitlist/{lead_id}')
+async def admin_delete_pm_lead(request: Request, lead_id: str):
+    """Permanently delete a PM waitlist lead (spam cleanup)."""
+    await auth_admin(request)
+    db = get_db()
+    result = await db.pm_service_waitlist.delete_one({"_id": lead_id})
+    if result.deleted_count == 0:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="Lead not found")
+    return {"success": True, "deleted": lead_id}

@@ -405,6 +405,7 @@ def _lead_out(doc: dict) -> dict:
         "offer_letter": doc.get("offer_letter"),
         "offer": doc.get("offer"),
         "mail": doc.get("mail"),
+        "contract": doc.get("contract"),
         "portal_url": doc.get("portal_url", ""),
         "created_at": doc["created_at"].isoformat() if doc.get("created_at") else "",
         "last_synced_at": doc["last_synced_at"].isoformat() if doc.get("last_synced_at") else "",
@@ -645,6 +646,65 @@ async def list_scans(request: Request):
     return {"success": True, "scans": [_scan_out(d) for d in docs]}
 
 
+@router.get("/admin/deal-finder/campaign-stats")
+async def campaign_stats(request: Request):
+    """Embudo de la campaña de cartas: enviadas → entregadas (est.) → QR
+    escaneados → respuestas, desglosado por condado y por tipo de señal."""
+    await auth_admin(request)
+    db = get_db()
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    funnel = {"sent": 0, "delivered": 0, "scanned": 0, "responded": 0}
+    by_county: dict = {}
+    by_signal: dict = {}
+    by_action: dict = {}
+
+    async for doc in db.deal_finder_leads.find(
+            {"mail.mailed_at": {"$exists": True}},
+            {"county": 1, "signals": 1, "mail": 1, "offer": 1}):
+        mail = doc.get("mail") or {}
+        offer = doc.get("offer") or {}
+        delivered = bool(mail.get("expected_delivery") and
+                         mail["expected_delivery"] <= today)
+        scanned = (offer.get("visits") or 0) > 0
+        responded = bool(offer.get("response"))
+        county = doc.get("county") or "otro"
+        signals = doc.get("signals") or ["otro"]
+
+        def bump(d, key):
+            row = d.setdefault(key, {"sent": 0, "delivered": 0, "scanned": 0, "responded": 0})
+            row["sent"] += 1
+            row["delivered"] += 1 if delivered else 0
+            row["scanned"] += 1 if scanned else 0
+            row["responded"] += 1 if responded else 0
+
+        funnel["sent"] += 1
+        funnel["delivered"] += 1 if delivered else 0
+        funnel["scanned"] += 1 if scanned else 0
+        funnel["responded"] += 1 if responded else 0
+        bump(by_county, county)
+        for s in signals:
+            bump(by_signal, s)
+        if responded:
+            action = (offer["response"] or {}).get("action", "otro")
+            by_action[action] = by_action.get(action, 0) + 1
+
+    def rates(row):
+        s = row["sent"] or 1
+        return {**row,
+                "scan_rate": round(row["scanned"] * 100 / s, 1),
+                "response_rate": round(row["responded"] * 100 / s, 1)}
+
+    return {"success": True,
+            "funnel": rates(funnel),
+            "by_county": {k: rates(v) for k, v in
+                          sorted(by_county.items(), key=lambda kv: -kv[1]["sent"])},
+            "by_signal": {k: rates(v) for k, v in
+                          sorted(by_signal.items(), key=lambda kv: -kv[1]["sent"])},
+            "by_action": by_action,
+            "note": "Entregadas = estimado por fecha de entrega esperada de Lob/USPS"}
+
+
 @router.get("/admin/deal-finder/stats")
 async def get_stats(request: Request):
     await auth_admin(request)
@@ -658,9 +718,28 @@ async def get_stats(request: Request):
     async for row in db.deal_finder_leads.aggregate([
             {"$group": {"_id": "$status", "n": {"$sum": 1}}}]):
         by_status[row["_id"] or "new"] = row["n"]
+
+    # ── Direct mail este mes (presupuesto Lob) ──
+    month_start = datetime.now(timezone.utc).replace(
+        day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
+    letter_cost = float(os.environ.get("LOB_LETTER_COST", "0.99"))
+    mail_month = {"live": 0, "test": 0}
+    async for row in db.deal_finder_leads.aggregate([
+            {"$match": {"mail.mailed_at": {"$gte": month_start}}},
+            {"$group": {"_id": "$mail.mode", "n": {"$sum": 1}}}]):
+        mail_month[row["_id"] or "test"] = row["n"]
+    mail_total = await db.deal_finder_leads.count_documents(
+        {"mail.mode": "live"})
     return {"success": True, "stats": {
         "total": total, "tax_delinquent": delinquent, "absentee_owner": absentee,
         "vacant_land": vacant, "high_score": high_score, "by_status": by_status,
+        "mail": {
+            "month_live": mail_month["live"],
+            "month_test": mail_month["test"],
+            "month_cost": round(mail_month["live"] * letter_cost, 2),
+            "letter_cost": letter_cost,
+            "all_time_live": mail_total,
+        },
     }}
 
 
@@ -940,10 +1019,11 @@ async def public_offer(slug: str, request: Request):
     if not doc:
         raise HTTPException(404, "Oferta no encontrada")
     offer = doc.get("offer") or {}
-    await db.deal_finder_leads.update_one(
-        {"_id": doc["_id"]},
-        {"$inc": {"offer.visits": 1},
-         "$set": {"offer.last_visit_at": datetime.now(timezone.utc).isoformat()}})
+    upd = {"$inc": {"offer.visits": 1},
+           "$set": {"offer.last_visit_at": datetime.now(timezone.utc).isoformat()}}
+    if not offer.get("first_visit_at"):
+        upd["$set"]["offer.first_visit_at"] = datetime.now(timezone.utc).isoformat()
+    await db.deal_finder_leads.update_one({"_id": doc["_id"]}, upd)
     expires = offer.get("expires_at", "")
     expired = False
     try:
@@ -998,26 +1078,370 @@ async def public_offer_respond(slug: str, body: OfferResponseBody, request: Requ
         {"_id": doc["_id"]},
         {"$set": {"offer.response": response, "status": new_status}})
 
-    # Notificar al admin por email (best effort)
-    try:
-        from rental.newsletter_router import _sendgrid, _send_one
-        sg_key, from_email = await _sendgrid()
-        labels = {"accept": "✅ ACEPTÓ LA OFERTA", "counter": "💬 CONTRAOFERTA",
-                  "call": "📞 PIDE LLAMADA", "reject": "❌ No le interesa"}
+    # ✅ ACEPTÓ: generar contrato automáticamente (queda guardado en el lead)
+    auto_contract_pdf = None
+    contract_price = 0.0
+    if body.action == "accept":
         offer = doc.get("offer") or {}
-        html = (f"<h2>{labels[body.action]}</h2>"
-                f"<p><b>Propiedad:</b> {doc.get('address','')}</p>"
-                f"<p><b>Dueño:</b> {doc.get('owner_name','')}</p>"
-                + (f"<p><b>Nuestra oferta:</b> ${offer.get('amount',0):,.0f}</p>" if offer.get('mode') == 'amount' else "")
-                + (f"<p><b>Su precio:</b> ${body.price:,.0f}</p>" if body.price else "")
-                + (f"<p><b>Teléfono:</b> {body.phone} · {body.best_time}</p>" if body.phone else "")
-                + (f"<p><b>Mensaje:</b> {body.message}</p>" if body.message else "")
-                + f"<p><a href='{SITE_BASE}/admin/oportunidades'>Ver en el panel →</a></p>")
-        await _send_one(sg_key, from_email, "yoandyross@gmail.com",
-                        f"{labels[body.action]} — {doc.get('address','')[:60]}", html)
-    except Exception as e:
-        logger.warning(f"[deal_finder] notificación de respuesta falló: {e}")
+        contract_price = float(offer.get("amount") or 0) or float(body.price or 0)
+        if contract_price > 0:
+            try:
+                auto_contract_pdf, _ = await _generate_contract_for_lead(
+                    db, doc, price=contract_price)
+                logger.info(f"[deal_finder] contrato auto-generado para {doc.get('address','')} (${contract_price:,.0f})")
+            except Exception as e:
+                logger.warning(f"[deal_finder] auto-contrato falló: {e}")
+
+    # Notificar al admin por email en segundo plano (incluye análisis IA si es contraoferta)
+    async def _notify_admin():
+        try:
+            from rental.newsletter_router import _sendgrid, _send_one
+            sg_key, from_email = await _sendgrid()
+            labels = {"accept": "✅ ACEPTÓ LA OFERTA", "counter": "💬 CONTRAOFERTA",
+                      "call": "📞 PIDE LLAMADA", "reject": "❌ No le interesa"}
+            offer = doc.get("offer") or {}
+            contract_note = ""
+            if auto_contract_pdf:
+                contract_note = ("<p style='background:#ecfdf5;border-left:4px solid #10b981;"
+                                 "padding:10px 14px;border-radius:6px;color:#065f46;'>"
+                                 f"📄 <b>Contrato de compra generado automáticamente</b> por "
+                                 f"${contract_price:,.0f} — va adjunto y quedó guardado en el lead. "
+                                 f"Puedes descargarlo o enviárselo al vendedor desde el panel.</p>")
+            # 🤖 Contraoferta → análisis de negociación con Claude
+            analysis_html = ""
+            if body.action == "counter" and (body.price or 0) > 0:
+                analysis = await _analyze_counteroffer(doc, float(body.price))
+                if analysis:
+                    await db.deal_finder_leads.update_one(
+                        {"_id": doc["_id"]}, {"$set": {"offer.response.ai_analysis": analysis}})
+                    analysis_html = _analysis_email_html(analysis)
+            html = (f"<h2>{labels[body.action]} — {doc.get('address','')}</h2>"
+                    f"<p><b>Propiedad:</b> {doc.get('address','')}</p>"
+                    f"<p><b>Dueño:</b> {doc.get('owner_name','')}</p>"
+                    + (f"<p><b>Nuestra oferta:</b> ${offer.get('amount',0):,.0f}</p>" if offer.get('mode') == 'amount' else "")
+                    + (f"<p><b>Su precio:</b> ${body.price:,.0f}</p>" if body.price else "")
+                    + (f"<p><b>Teléfono:</b> {body.phone} · {body.best_time}</p>" if body.phone else "")
+                    + (f"<p><b>Mensaje:</b> {body.message}</p>" if body.message else "")
+                    + analysis_html
+                    + contract_note
+                    + f"<p><a href='{SITE_BASE}/admin/oportunidades'>Ver en el panel →</a></p>")
+            subject = f"{labels[body.action]} — {doc.get('address','')[:60]}"
+            if auto_contract_pdf:
+                ok = await _email_with_pdf("yoandyross@gmail.com", subject, html,
+                                           auto_contract_pdf, _contract_filename(doc))
+                if not ok:
+                    await _send_one(sg_key, from_email, "yoandyross@gmail.com", subject, html)
+            else:
+                await _send_one(sg_key, from_email, "yoandyross@gmail.com", subject, html)
+        except Exception as e:
+            logger.warning(f"[deal_finder] notificación de respuesta falló: {e}")
+
+    asyncio.create_task(_notify_admin())
     return {"success": True}
+
+
+# ═══════════════════════════════════════════════════════════════
+# Contrato de compraventa (cash) — PDF pre-llenado
+# ═══════════════════════════════════════════════════════════════
+
+class ContractBody(BaseModel):
+    price: float
+    seller_name: str = ""
+    earnest_money: float = 500
+    closing_days: int = 30
+    title_company_id: str = ""
+    title_policy_paid_by: str = "Buyer"   # Buyer | Seller
+    special_terms: str = ""
+
+
+async def _generate_contract_for_lead(db, doc: dict, *, price: float,
+                                      seller_name: str = "", earnest_money: float = 500,
+                                      closing_days: int = 30, title_company_id: str = "",
+                                      title_policy_paid_by: str = "Buyer",
+                                      special_terms: str = "") -> tuple[bytes, dict]:
+    """Genera el contrato PDF, lo guarda en el lead (meta + PDF base64) y lo devuelve."""
+    import base64
+    from rental.title_companies_router import _ensure_seed
+    await _ensure_seed(db)
+    title_co = None
+    if title_company_id:
+        title_co = await db.title_companies.find_one({"_id": title_company_id})
+    if not title_co:
+        title_co = (await db.title_companies.find_one({"is_default": True})
+                    or await db.title_companies.find_one({}))
+    if not title_co:
+        raise HTTPException(400, "Agrega al menos una casa de título primero")
+
+    buyer = await _sender_info()
+    seller = (seller_name or doc.get("owner_name") or "").title()
+    mailing = [ln for ln in (doc.get("mailing_lines") or []) if ln]
+
+    from rental.purchase_contract import build_contract_pdf
+    pdf = build_contract_pdf(
+        buyer=buyer,
+        seller_name=seller,
+        seller_address=", ".join(mailing[:2]),
+        property_address=doc.get("address", ""),
+        legal_description=doc.get("legal_description", ""),
+        county_name=COUNTIES.get(doc.get("county", ""), {}).get("name", "Moore County"),
+        price=price,
+        earnest_money=earnest_money,
+        closing_days=closing_days,
+        title_co=title_co,
+        title_policy_paid_by=title_policy_paid_by if title_policy_paid_by in ("Buyer", "Seller") else "Buyer",
+        special_terms=special_terms[:2000],
+    )
+
+    meta = {
+        "price": round(price, 2),
+        "seller_name": seller,
+        "earnest_money": round(earnest_money, 2),
+        "closing_days": closing_days,
+        "title_company_id": title_co["_id"],
+        "title_company_name": title_co.get("name", ""),
+        "title_policy_paid_by": title_policy_paid_by,
+        "special_terms": special_terms[:2000],
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    await db.deal_finder_leads.update_one({"_id": doc["_id"]}, {"$set": {
+        "contract": meta,
+        "contract_pdf_b64": base64.b64encode(pdf).decode(),
+    }})
+    return pdf, meta
+
+
+def _contract_filename(doc: dict) -> str:
+    return f"contrato_{(doc.get('address') or str(doc.get('property_id', ''))).split(',')[0].replace(' ', '_')}.pdf"
+
+
+async def _email_with_pdf(to_email: str, subject: str, html: str,
+                          pdf: bytes, filename: str) -> bool:
+    """Envía un email con el contrato PDF adjunto vía SendGrid."""
+    from rental.newsletter_router import _sendgrid
+    sg_key, from_email = await _sendgrid()
+    if not sg_key:
+        return False
+
+    def _sync() -> bool:
+        import base64 as b64
+        import sendgrid
+        from sendgrid.helpers.mail import (Mail, Email, To, Content, Attachment,
+                                           FileContent, FileName, FileType, Disposition)
+        sg = sendgrid.SendGridAPIClient(api_key=sg_key)
+        mail = Mail(from_email=Email(from_email, "Ross House Rentals"),
+                    to_emails=To(to_email), subject=subject,
+                    html_content=Content("text/html", html))
+        att = Attachment(FileContent(b64.b64encode(pdf).decode()),
+                         FileName(filename), FileType("application/pdf"),
+                         Disposition("attachment"))
+        mail.add_attachment(att)
+        resp = sg.client.mail.send.post(request_body=mail.get())
+        return resp.status_code in (200, 201, 202)
+
+    try:
+        return await asyncio.to_thread(_sync)
+    except Exception as e:
+        logger.warning(f"[deal_finder] email con contrato a {to_email} falló: {e}")
+        return False
+
+
+async def _analyze_counteroffer(doc: dict, counter_price: float) -> dict | None:
+    """Analiza una contraoferta con Claude y devuelve recomendación de negociación."""
+    api_key = os.environ.get("EMERGENT_LLM_KEY")
+    if not api_key:
+        return None
+    offer = doc.get("offer") or {}
+    facts = {
+        "direccion": doc.get("address", ""),
+        "condado": COUNTIES.get(doc.get("county", ""), {}).get("name", doc.get("county", "")),
+        "valor_tasado_condado": doc.get("appraised_value", 0),
+        "desglose_valores": doc.get("values", {}),
+        "impuestos_atrasados": doc.get("tax_due_total", 0),
+        "anios_impuestos_deuda": doc.get("tax_years_due", []),
+        "seniales_distress": doc.get("signals", []),
+        "nuestra_oferta": offer.get("amount", 0),
+        "contraoferta_del_dueno": counter_price,
+        "notas_lead": (doc.get("notes") or "")[:500],
+    }
+    try:
+        from uuid import uuid4
+        from emergentintegrations.llm.chat import LlmChat, UserMessage
+        system_prompt = (
+            "Eres el asesor de adquisiciones de Ross House Rentals LLC, un inversionista que compra "
+            "casas en efectivo (AS-IS) en el Texas Panhandle (Dumas/Moore County) para rentarlas. "
+            "Estrategia: comprar con descuento fuerte (ideal ≤60-70% del valor tasado del condado, "
+            "que suele estar por DEBAJO del valor de mercado), asumiendo reparaciones desconocidas. "
+            "Los impuestos atrasados se pagan del dinero del VENDEDOR al cierre (no suben nuestro costo, "
+            "pero reducen lo que el dueño recibe neto — úsalo como palanca de negociación). "
+            "Analiza la contraoferta del dueño y responde SOLO JSON válido:\n"
+            "{\n"
+            '  "recommendation": "accept"|"counter"|"reject",\n'
+            '  "suggested_counter": número o null (si recommendation=counter, el precio que debemos ofrecer),\n'
+            '  "max_price": número (precio máximo walk-away para que el deal siga siendo bueno),\n'
+            '  "deal_score": 1-10 (qué tan bueno es el deal AL PRECIO DE LA CONTRAOFERTA),\n'
+            '  "reasoning": "3-4 frases en español explicando el análisis con números",\n'
+            '  "leverage_points": ["palanca de negociación 1", …2-3 en español],\n'
+            '  "email_script": "borrador corto y cordial EN INGLÉS (3-4 frases) para responder al dueño con la estrategia recomendada"\n'
+            "}"
+        )
+        user_prompt = ("Analiza esta contraoferta y devuelve el JSON:\n```json\n"
+                       + json.dumps(facts, ensure_ascii=False, default=str, indent=2) + "\n```")
+        chat = LlmChat(api_key=api_key,
+                       session_id=f"counter_analysis_{uuid4()}",
+                       system_message=system_prompt).with_model("anthropic", "claude-sonnet-4-5-20250929")
+        raw = await chat.send_message(UserMessage(text=user_prompt))
+        text = str(raw or "").strip()
+        if text.startswith("```"):
+            parts = text.split("```", 2)
+            text = parts[1] if len(parts) > 1 else parts[0]
+            if text.startswith("json"):
+                text = text[4:]
+            text = text.strip("` \n")
+        try:
+            parsed = json.loads(text)
+        except Exception:
+            first, last = text.find("{"), text.rfind("}")
+            parsed = json.loads(text[first:last + 1]) if first >= 0 and last > first else None
+        if not isinstance(parsed, dict) or "recommendation" not in parsed:
+            return None
+        parsed["generated_at"] = datetime.now(timezone.utc).isoformat()
+        parsed["analyzed_counter_price"] = counter_price
+        return parsed
+    except Exception as e:
+        logger.warning(f"[deal_finder] análisis de contraoferta falló: {e}")
+        return None
+
+
+def _analysis_email_html(analysis: dict) -> str:
+    """Bloque HTML del análisis de Claude para el email de notificación."""
+    rec_map = {"accept": ("✅ ACEPTAR", "#10b981"), "counter": ("🔁 CONTRAOFERTAR", "#f59e0b"),
+               "reject": ("❌ RECHAZAR / PASAR", "#ef4444")}
+    label, color = rec_map.get(analysis.get("recommendation", ""), ("🤖 ANÁLISIS", "#6366f1"))
+    sc = analysis.get("suggested_counter")
+    rows = ""
+    if sc:
+        rows += f"<p style='margin:4px 0'><b>Contraoferta sugerida:</b> ${sc:,.0f}</p>"
+    if analysis.get("max_price"):
+        rows += f"<p style='margin:4px 0'><b>Precio máximo (walk-away):</b> ${analysis['max_price']:,.0f}</p>"
+    if analysis.get("deal_score") is not None:
+        rows += f"<p style='margin:4px 0'><b>Score del deal a su precio:</b> {analysis['deal_score']}/10</p>"
+    points = "".join(f"<li>{p}</li>" for p in (analysis.get("leverage_points") or [])[:4])
+    script = analysis.get("email_script") or ""
+    return (f"<div style='border:2px solid {color};border-radius:10px;padding:14px 16px;margin:14px 0;background:#fafafa'>"
+            f"<p style='margin:0 0 6px;font-size:16px;font-weight:bold;color:{color}'>🤖 Recomendación IA: {label}</p>"
+            f"{rows}"
+            f"<p style='margin:8px 0;color:#334155'>{analysis.get('reasoning', '')}</p>"
+            + (f"<p style='margin:8px 0 2px'><b>Palancas de negociación:</b></p><ul style='margin:2px 0 8px;color:#334155'>{points}</ul>" if points else "")
+            + (f"<p style='margin:8px 0 2px'><b>Borrador para responder (inglés):</b></p>"
+               f"<p style='margin:2px 0;padding:8px 10px;background:#eef2ff;border-radius:6px;color:#1e293b;font-style:italic'>{script}</p>" if script else "")
+            + "</div>")
+
+
+@router.post("/admin/deal-finder/leads/{lead_id}/analyze-counter")
+async def analyze_counter_endpoint(request: Request, lead_id: str):
+    """Analiza (o re-analiza) la contraoferta de un lead bajo demanda."""
+    await auth_admin(request)
+    db = get_db()
+    doc = await db.deal_finder_leads.find_one({"_id": ObjectId(lead_id)})
+    if not doc:
+        raise HTTPException(404, "Lead no encontrado")
+    response = (doc.get("offer") or {}).get("response") or {}
+    counter_price = float(response.get("price") or 0)
+    if counter_price <= 0:
+        raise HTTPException(422, "Este lead no tiene una contraoferta con precio")
+    analysis = await _analyze_counteroffer(doc, counter_price)
+    if not analysis:
+        raise HTTPException(502, "El análisis IA no está disponible ahora — intenta de nuevo")
+    await db.deal_finder_leads.update_one(
+        {"_id": doc["_id"]}, {"$set": {"offer.response.ai_analysis": analysis}})
+    return {"success": True, "analysis": analysis}
+
+
+@router.post("/admin/deal-finder/leads/{lead_id}/contract.pdf")
+async def generate_contract_pdf(request: Request, lead_id: str, body: ContractBody):
+    """Genera el contrato de compra cash pre-llenado (PDF) y lo guarda en el lead."""
+    await auth_admin(request)
+    if body.price <= 0:
+        raise HTTPException(422, "Indica el precio de compra")
+    db = get_db()
+    doc = await db.deal_finder_leads.find_one({"_id": ObjectId(lead_id)})
+    if not doc:
+        raise HTTPException(404, "Lead no encontrado")
+    pdf, _ = await _generate_contract_for_lead(
+        db, doc, price=body.price, seller_name=body.seller_name,
+        earnest_money=body.earnest_money, closing_days=body.closing_days,
+        title_company_id=body.title_company_id,
+        title_policy_paid_by=body.title_policy_paid_by,
+        special_terms=body.special_terms)
+    return StreamingResponse(
+        iter([pdf]), media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{_contract_filename(doc)}"'})
+
+
+@router.get("/admin/deal-finder/leads/{lead_id}/contract-download.pdf")
+async def download_stored_contract(request: Request, lead_id: str):
+    """Descarga el último contrato guardado en la base de datos."""
+    import base64
+    await auth_admin(request)
+    db = get_db()
+    doc = await db.deal_finder_leads.find_one({"_id": ObjectId(lead_id)})
+    if not doc:
+        raise HTTPException(404, "Lead no encontrado")
+    b64 = doc.get("contract_pdf_b64")
+    if not b64:
+        raise HTTPException(404, "Este lead no tiene contrato guardado — genera uno primero")
+    pdf = base64.b64decode(b64)
+    return StreamingResponse(
+        iter([pdf]), media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{_contract_filename(doc)}"'})
+
+
+class ContractEmailBody(BaseModel):
+    to_email: str
+    message: str = ""
+
+
+@router.post("/admin/deal-finder/leads/{lead_id}/contract-email")
+async def email_contract_to_seller(request: Request, lead_id: str, body: ContractEmailBody):
+    """Envía el contrato guardado por email al vendedor (u otra dirección)."""
+    import base64
+    await auth_admin(request)
+    if not re.match(r"[^@]+@[^@]+\.[^@]+", body.to_email or ""):
+        raise HTTPException(422, "Email inválido")
+    db = get_db()
+    doc = await db.deal_finder_leads.find_one({"_id": ObjectId(lead_id)})
+    if not doc:
+        raise HTTPException(404, "Lead no encontrado")
+    b64 = doc.get("contract_pdf_b64")
+    if not b64:
+        raise HTTPException(404, "Este lead no tiene contrato guardado — genera uno primero")
+    contract = doc.get("contract") or {}
+    seller = contract.get("seller_name") or (doc.get("owner_name") or "").title()
+    extra = f"<p style='color:#475569;font-size:14px;line-height:1.6'>{body.message.strip()[:1000]}</p>" if body.message.strip() else ""
+    html = f"""
+    <div style="font-family:-apple-system,Segoe UI,Roboto,sans-serif;max-width:600px;margin:auto;">
+      <h2 style="color:#0f172a;">Purchase Agreement — {doc.get('address', '')}</h2>
+      <p style="color:#475569;font-size:14px;line-height:1.6;">
+        Dear {seller},<br/><br/>
+        Please find attached the cash purchase agreement for the property at
+        <b>{doc.get('address', '')}</b> in the amount of <b>${contract.get('price', 0):,.2f}</b>.
+        Closing will be handled by <b>{contract.get('title_company_name', '')}</b>.
+      </p>
+      {extra}
+      <p style="color:#475569;font-size:14px;line-height:1.6;">
+        If you have any questions, call us at (806) 934-2018 or reply to this email.<br/><br/>
+        — Yoandy Ross · Ross House Rentals LLC
+      </p>
+    </div>"""
+    ok = await _email_with_pdf(body.to_email.strip(), f"Purchase Agreement — {doc.get('address', '')}",
+                               html, base64.b64decode(b64), _contract_filename(doc))
+    if not ok:
+        raise HTTPException(502, "No se pudo enviar el email (revisa SendGrid)")
+    await db.deal_finder_leads.update_one({"_id": doc["_id"]}, {"$set": {
+        "contract.emailed_to": body.to_email.strip(),
+        "contract.emailed_at": datetime.now(timezone.utc).isoformat(),
+    }})
+    return {"success": True, "sent_to": body.to_email.strip()}
 
 
 @router.post("/admin/deal-finder/leads/{lead_id}/letter")
@@ -1041,6 +1465,97 @@ async def generate_letter(request: Request, lead_id: str):
 # Carta lista para imprimir (PDF) + envío físico vía Lob
 # ═══════════════════════════════════════════════════════════════
 
+# ─── Foto aérea de la propiedad (Census geocoder + Esri World Imagery, gratis) ──
+
+async def _geocode_address(address: str) -> Optional[tuple]:
+    """Geocodifica una dirección con el US Census Geocoder (gratuito)."""
+    if not address:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=25) as client:
+            r = await client.get(
+                "https://geocoding.geo.census.gov/geocoder/locations/onelineaddress",
+                params={"address": address, "benchmark": "Public_AR_Current",
+                        "format": "json"})
+            matches = ((r.json().get("result") or {}).get("addressMatches") or [])
+            if matches:
+                c = matches[0]["coordinates"]
+                return float(c["y"]), float(c["x"])
+    except Exception as e:
+        logger.warning(f"[deal_finder] geocode falló '{address}': {e}")
+    return None
+
+
+async def _aerial_photo(lat: float, lon: float, out_w: int = 540, out_h: int = 330,
+                        zoom: int = 19) -> Optional[bytes]:
+    """Foto aérea centrada en la propiedad (mosaico de tiles Esri World Imagery)
+    con un marcador rojo en el punto exacto. Devuelve JPEG o None."""
+    import math
+    from io import BytesIO
+    from PIL import Image, ImageDraw
+    try:
+        n = 2 ** zoom
+        px = (lon + 180) / 360 * n * 256
+        py = (1 - math.log(math.tan(math.radians(lat)) +
+                           1 / math.cos(math.radians(lat))) / math.pi) / 2 * n * 256
+        x0, y0 = int(px - out_w / 2), int(py - out_h / 2)
+        tx0, ty0 = x0 // 256, y0 // 256
+        tx1, ty1 = (x0 + out_w) // 256, (y0 + out_h) // 256
+        tiles = [(tx, ty) for ty in range(ty0, ty1 + 1) for tx in range(tx0, tx1 + 1)]
+        async with httpx.AsyncClient(timeout=20) as client:
+            results = await asyncio.gather(*[
+                client.get("https://server.arcgisonline.com/ArcGIS/rest/services/"
+                           f"World_Imagery/MapServer/tile/{zoom}/{ty}/{tx}")
+                for tx, ty in tiles], return_exceptions=True)
+        mosaic = Image.new("RGB", ((tx1 - tx0 + 1) * 256, (ty1 - ty0 + 1) * 256))
+        for (tx, ty), r in zip(tiles, results):
+            if isinstance(r, Exception) or r.status_code != 200:
+                return None
+            mosaic.paste(Image.open(BytesIO(r.content)), ((tx - tx0) * 256, (ty - ty0) * 256))
+        crop = mosaic.crop((x0 - tx0 * 256, y0 - ty0 * 256,
+                            x0 - tx0 * 256 + out_w, y0 - ty0 * 256 + out_h))
+        # Marcador: anillo + punto rojo en el centro
+        d = ImageDraw.Draw(crop)
+        cx, cy = out_w // 2, out_h // 2
+        d.ellipse([cx - 26, cy - 26, cx + 26, cy + 26], outline="#C41428", width=5)
+        d.ellipse([cx - 6, cy - 6, cx + 6, cy + 6], fill="#C41428")
+        buf = BytesIO()
+        crop.save(buf, "JPEG", quality=82)
+        return buf.getvalue()
+    except Exception as e:
+        logger.warning(f"[deal_finder] foto aérea falló ({lat},{lon}): {e}")
+        return None
+
+
+async def _lead_photo(db, doc: dict) -> Optional[bytes]:
+    """Foto aérea del lead (cacheada en el documento). None si no es posible."""
+    import base64
+    cached = doc.get("photo") or {}
+    if cached.get("b64"):
+        return base64.b64decode(cached["b64"])
+    lat = lon = None
+    try:
+        if doc.get("latitude") and doc.get("longitude"):
+            lat, lon = float(doc["latitude"]), float(doc["longitude"])
+    except (TypeError, ValueError):
+        pass
+    if lat is None:
+        coords = await _geocode_address(doc.get("address", ""))
+        if not coords:
+            return None
+        lat, lon = coords
+        await db.deal_finder_leads.update_one(
+            {"_id": doc["_id"]}, {"$set": {"latitude": str(lat), "longitude": str(lon)}})
+    img = await _aerial_photo(lat, lon)
+    if img:
+        await db.deal_finder_leads.update_one(
+            {"_id": doc["_id"]},
+            {"$set": {"photo": {"b64": base64.b64encode(img).decode(),
+                                "source": "aerial",
+                                "at": datetime.now(timezone.utc).isoformat()}}})
+    return img
+
+
 async def _sender_info() -> dict:
     """Remitente: Yoandy Ross (personal — mejor respuesta en direct mail);
     la LLC va como segunda línea/firma."""
@@ -1051,116 +1566,252 @@ async def _sender_info() -> dict:
     return payer
 
 
-def _build_letter_pdf(lead: dict, sender: dict, lang: str) -> bytes:
-    """Genera una carta de negocios en PDF (US Letter) lista para imprimir y
-    doblar en un sobre #10 de ventana (la dirección del destinatario queda en la
-    zona de la ventana ~2\" desde arriba)."""
+def _letter_date(lang: str) -> str:
+    now = datetime.now()
+    if lang == "es":
+        meses = ["enero", "febrero", "marzo", "abril", "mayo", "junio", "julio",
+                 "agosto", "septiembre", "octubre", "noviembre", "diciembre"]
+        return f"{now.day} de {meses[now.month - 1]} de {now.year}"
+    return now.strftime("%B %d, %Y")
+
+
+def _build_letter_pdf(lead: dict, sender: dict, lang: str,
+                      photo: Optional[bytes] = None) -> bytes:
+    """Carta premium en PDF (US Letter) lista para imprimir y doblar en sobre #10
+    de ventana (destinatario en la zona de la ventana ~2\" desde arriba).
+    Diseño: membrete con acento de marca, tipografía serif, caja CTA con QR,
+    tarjeta de firma y pie de página elegante."""
     import io
     from reportlab.lib.pagesizes import LETTER
     from reportlab.lib.units import inch
+    from reportlab.lib import colors as rl_colors
+    from reportlab.lib.enums import TA_JUSTIFY
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-    from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer, Frame,
-                                    PageTemplate, FrameBreak)
+    from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer,
+                                    Table, TableStyle, Image as RLImage)
     from reportlab.pdfgen import canvas as _canvas
 
-    body_text = (lead.get("offer_letter") or {}).get(
-        "letter_en" if lang == "en" else "letter_es", "")
-    body_text = body_text.replace("[TELÉFONO]", sender.get("phone", "")) \
-                         .replace("[PHONE]", sender.get("phone", "")) \
-                         .replace("[EMAIL]", sender.get("email", "yoandyross@gmail.com"))
+    RED = rl_colors.HexColor("#C41428")
+    DARK = rl_colors.HexColor("#20242E")
+    GRAY = rl_colors.HexColor("#6B7280")
+    LIGHT = rl_colors.HexColor("#D9DCE1")
+    TINT = rl_colors.HexColor("#FCF5F5")
+    W, H = LETTER
 
     styles = getSampleStyleSheet()
     body_style = ParagraphStyle("body", parent=styles["Normal"],
-                                fontName="Helvetica", fontSize=11, leading=16)
-    small = ParagraphStyle("small", parent=styles["Normal"],
-                           fontName="Helvetica", fontSize=9, leading=12,
-                           textColor="#555555")
+                                fontName="Times-Roman", fontSize=11, leading=16,
+                                alignment=TA_JUSTIFY, textColor=DARK)
+    date_style = ParagraphStyle("date", parent=styles["Normal"],
+                                fontName="Times-Italic", fontSize=10.5, leading=13,
+                                textColor=GRAY)
+
+    logo_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                             "assets", "logo.jpg")
+    csz = f"{sender.get('city','')}, {sender.get('state','')} {sender.get('zip','')}"
 
     buf = io.BytesIO()
 
-    def _draw_static(c: _canvas.Canvas, doc):
+    def _draw_static(c: _canvas.Canvas, doc, first: bool = True):
         c.saveState()
-        # Logo pequeño y discreto arriba-derecha (legitimidad sin parecer corporativo)
+        # ── Membrete ────────────────────────────────────────────
+        # Remitente arriba-izquierda (return address visible en la ventana del sobre)
+        c.setFillColor(DARK)
+        c.setFont("Helvetica-Bold", 12.5)
+        c.drawString(0.8 * inch, 10.52 * inch, (sender.get("name", "") or "").upper(),
+                     charSpace=1.1)
+        c.setFont("Helvetica", 7.8)
+        c.setFillColor(RED)
+        if sender.get("company"):
+            c.drawString(0.8 * inch, 10.36 * inch, sender["company"].upper(), charSpace=0.8)
+        c.setFillColor(GRAY)
+        c.setFont("Helvetica", 8.8)
+        c.drawString(0.8 * inch, 10.20 * inch, sender.get("address", ""))
+        c.drawString(0.8 * inch, 10.06 * inch, csz)
+        if sender.get("phone"):
+            c.drawString(0.8 * inch, 9.92 * inch, sender["phone"])
+        # Logo arriba-derecha con web debajo
         try:
-            _logo = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                                 "assets", "logo.jpg")
-            c.drawImage(_logo, 7.05 * inch, 9.85 * inch, width=0.7 * inch, height=0.7 * inch,
-                        mask="auto")
-            c.setFont("Helvetica", 6.5)
-            c.setFillColorRGB(0.55, 0.55, 0.55)
-            c.drawCentredString(7.4 * inch, 9.72 * inch, "rosshouserentals.com")
-            c.setFillColorRGB(0, 0, 0)
+            c.drawImage(logo_path, W - 0.8 * inch - 0.72 * inch, 10.06 * inch,
+                        width=0.72 * inch, height=0.72 * inch, mask="auto")
+            c.setFont("Helvetica", 7)
+            c.drawRightString(W - 0.8 * inch, 9.92 * inch, "rosshouserentals.com")
         except Exception:
             pass
-        # Remitente arriba-izquierda (return address) — personal, con la LLC debajo
-        c.setFont("Helvetica-Bold", 10)
-        c.drawString(0.75 * inch, 10.35 * inch, sender.get("name", ""))
-        c.setFont("Helvetica", 8.5)
-        if sender.get("company"):
-            c.drawString(0.75 * inch, 10.21 * inch, sender["company"])
-        c.setFont("Helvetica", 9)
-        c.drawString(0.75 * inch, 10.07 * inch, sender.get("address", ""))
-        c.drawString(0.75 * inch, 9.92 * inch,
-                     f"{sender.get('city','')}, {sender.get('state','')} {sender.get('zip','')}")
-        if sender.get("phone"):
-            c.drawString(0.75 * inch, 9.77 * inch, sender["phone"])
-        # Ventana destinatario (~2" desde arriba)
-        addr_top = 8.55 * inch
-        c.setFont("Helvetica", 11)
-        lines = [lead.get("owner_name", "").strip()]
-        lines += [ln for ln in (lead.get("mailing_lines") or []) if ln]
-        for i, ln in enumerate(lines[:5]):
-            c.drawString(0.9 * inch, addr_top - i * 0.18 * inch, ln)
+        # Divisor de marca: trazo rojo grueso + línea fina
+        c.setStrokeColor(RED)
+        c.setLineWidth(2.6)
+        c.line(0.8 * inch, 9.72 * inch, 2.15 * inch, 9.72 * inch)
+        c.setStrokeColor(LIGHT)
+        c.setLineWidth(0.7)
+        c.line(2.15 * inch, 9.72 * inch, W - 0.8 * inch, 9.72 * inch)
+        # ── Destinatario (zona de ventana ~2" desde arriba) ─────
+        if first:
+            c.setFillColor(DARK)
+            c.setFont("Helvetica", 10.5)
+            addr_top = 8.55 * inch
+            lines = [lead.get("owner_name", "").strip().title() or lead.get("owner_name", "").strip()]
+            lines += [ln for ln in (lead.get("mailing_lines") or []) if ln]
+            for i, ln in enumerate(lines[:5]):
+                c.drawString(0.9 * inch, addr_top - i * 0.18 * inch, ln)
+            # ── Foto aérea de la propiedad (derecha, zona libre) ──
+            if photo:
+                try:
+                    from reportlab.lib.utils import ImageReader
+                    pw, ph = 2.55 * inch, 1.55 * inch
+                    px_ = W - 0.9 * inch - pw
+                    py_ = 8.06 * inch
+                    c.drawImage(ImageReader(io.BytesIO(photo)), px_, py_,
+                                width=pw, height=ph)
+                    c.setStrokeColor(LIGHT)
+                    c.setLineWidth(1)
+                    c.rect(px_, py_, pw, ph)
+                    c.setFont("Helvetica-Oblique", 7.3)
+                    c.setFillColor(GRAY)
+                    caption = ("Vista aérea de su propiedad" if lang == "es"
+                               else "Aerial view of your property")
+                    c.drawRightString(px_ + pw, py_ - 0.13 * inch, caption)
+                except Exception:
+                    pass
+        # ── Pie de página ────────────────────────────────────────
+        c.setStrokeColor(RED)
+        c.setLineWidth(1.4)
+        c.line(0.8 * inch, 0.85 * inch, W - 0.8 * inch, 0.85 * inch)
+        c.setFont("Helvetica", 7.4)
+        c.setFillColor(GRAY)
+        footer = " · ".join(filter(None, [
+            sender.get("name", ""), sender.get("company", ""),
+            f"{sender.get('address','')}, {csz}", sender.get("phone", ""),
+            "rosshouserentals.com"]))
+        c.drawCentredString(W / 2, 0.64 * inch, footer)
         c.restoreState()
 
-    doc = SimpleDocTemplate(buf, pagesize=LETTER,
-                            topMargin=3.4 * inch, bottomMargin=0.9 * inch,
-                            leftMargin=0.9 * inch, rightMargin=0.9 * inch)
-    story = [Paragraph(datetime.now().strftime("%B %d, %Y"), small), Spacer(1, 0.25 * inch)]
-    for para in [p for p in body_text.split("\n") if p.strip()]:
-        story.append(Paragraph(para.replace("&", "&amp;").replace("<", "&lt;"), body_style))
-        story.append(Spacer(1, 0.12 * inch))
+    # ── Tarjeta de firma (logo + contacto, con barra de acento) ──
+    sig_name = ParagraphStyle("sn", parent=styles["Normal"], fontName="Helvetica-Bold",
+                              fontSize=11, leading=14, textColor=DARK)
+    sig_meta = ParagraphStyle("sm", parent=styles["Normal"], fontName="Helvetica",
+                              fontSize=8.8, leading=12.5, textColor=GRAY)
+    flip_style = ParagraphStyle("flip", parent=styles["Normal"], fontName="Helvetica-Bold",
+                                fontSize=8.5, leading=11, textColor=RED, alignment=2)
 
-    # ── Bloque CTA con QR + link personalizado (si el lead tiene oferta) ──
-    offer = lead.get("offer") or {}
-    if offer.get("slug"):
-        from reportlab.platypus import Image as RLImage, Table, TableStyle
-        from reportlab.lib import colors as rl_colors
+    def _sig_wrap():
+        sig_cell = [Paragraph(sender.get("name", "Yoandy Ross"), sig_name),
+                    Paragraph(f"{sender.get('company','Ross House Rentals LLC')} — Dumas, TX", sig_meta),
+                    Paragraph(f"{sender.get('phone','')} · {sender.get('email','yoandyross@gmail.com')}", sig_meta)]
+        try:
+            sig_logo = RLImage(logo_path, width=0.52 * inch, height=0.52 * inch)
+        except Exception:
+            sig_logo = ""
+        sig_tbl = Table([["", sig_logo, sig_cell]],
+                        colWidths=[0.055 * inch, 0.75 * inch, 4.6 * inch])
+        sig_tbl.setStyle(TableStyle([
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("BACKGROUND", (0, 0), (0, -1), RED),
+            ("LEFTPADDING", (1, 0), (1, -1), 10),
+            ("LEFTPADDING", (2, 0), (2, -1), 4),
+            ("TOPPADDING", (0, 0), (-1, -1), 4),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ]))
+        wrap = Table([[sig_tbl]], colWidths=[5.5 * inch])
+        wrap.setStyle(TableStyle([("LEFTPADDING", (0, 0), (-1, -1), 0),
+                                  ("TOPPADDING", (0, 0), (-1, -1), 0),
+                                  ("BOTTOMPADDING", (0, 0), (-1, -1), 0)]))
+        wrap.hAlign = "LEFT"
+        return wrap
+
+    def _cta_tbl(lg: str):
+        offer = lead.get("offer") or {}
+        if not offer.get("slug"):
+            return None
         url = f"{SITE_BASE}/oferta/{offer['slug']}"
         qr_buf = io.BytesIO(_offer_qr_png(url))
-        qr_img = RLImage(qr_buf, width=1.1 * inch, height=1.1 * inch)
-        if lang == "es":
-            cta_title = ("Nuestra oferta en efectivo: $%s" % f"{offer['amount']:,.0f}"
+        qr_img = RLImage(qr_buf, width=1.12 * inch, height=1.12 * inch)
+        if lg == "es":
+            kicker = "RESPONDA EN LÍNEA — 1 MINUTO"
+            cta_title = (f"Nuestra oferta en efectivo: <font color='#C41428'>${offer['amount']:,.0f}</font>"
                          if offer.get("mode") == "amount" and offer.get("amount")
                          else "Díganos cuánto aceptaría por su propiedad")
-            cta_body = ("Responda en 1 minuto — escanee el código QR con la cámara de su "
-                        f"teléfono o visite:<br/><b>{url.replace('https://www.','')}</b><br/>"
-                        "Sin compromiso. Oferta válida por 30 días.")
+            cta_body = ("Escanee el código QR con la cámara de su teléfono o visite "
+                        f"<b>{url.replace('https://www.','')}</b> para ver su oferta "
+                        "personalizada y responder al instante.<br/>"
+                        "<i>Sin compromiso · Compramos AS-IS · Oferta válida por 30 días</i>")
         else:
-            cta_title = ("Our cash offer: $%s" % f"{offer['amount']:,.0f}"
+            kicker = "RESPOND ONLINE — TAKES 1 MINUTE"
+            cta_title = (f"Our cash offer: <font color='#C41428'>${offer['amount']:,.0f}</font>"
                          if offer.get("mode") == "amount" and offer.get("amount")
                          else "Tell us your price for the property")
-            cta_body = ("Respond in 1 minute — scan the QR code with your phone camera "
-                        f"or visit:<br/><b>{url.replace('https://www.','')}</b><br/>"
-                        "No obligation. Offer valid for 30 days.")
+            cta_body = ("Scan the QR code with your phone camera or visit "
+                        f"<b>{url.replace('https://www.','')}</b> to view your "
+                        "personalized offer and respond instantly.<br/>"
+                        "<i>No obligation · We buy AS-IS · Offer valid for 30 days</i>")
+        kicker_style = ParagraphStyle("kick", parent=styles["Normal"], fontName="Helvetica-Bold",
+                                      fontSize=7.6, leading=10, textColor=RED)
+        cta_bold = ParagraphStyle("ctab", parent=styles["Normal"], fontName="Helvetica-Bold",
+                                  fontSize=13, leading=16, textColor=DARK)
         cta_style = ParagraphStyle("cta", parent=styles["Normal"], fontName="Helvetica",
-                                   fontSize=10, leading=14)
-        cta_bold = ParagraphStyle("ctab", parent=cta_style, fontName="Helvetica-Bold",
-                                  fontSize=12, leading=15, textColor="#C41428")
-        cell = [Paragraph(cta_title, cta_bold), Spacer(1, 4), Paragraph(cta_body, cta_style)]
-        tbl = Table([[qr_img, cell]], colWidths=[1.35 * inch, 5.0 * inch])
-        tbl.setStyle(TableStyle([
+                                   fontSize=9.4, leading=13.5, textColor=DARK)
+        cell = [Paragraph(kicker, kicker_style), Spacer(1, 3),
+                Paragraph(cta_title, cta_bold), Spacer(1, 5), Paragraph(cta_body, cta_style)]
+        tbl = Table([[qr_img, cell]], colWidths=[1.45 * inch, 5.05 * inch])
+        style_cmds = [
             ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-            ("BOX", (0, 0), (-1, -1), 1.2, rl_colors.HexColor("#C41428")),
-            ("LEFTPADDING", (0, 0), (-1, -1), 10),
-            ("RIGHTPADDING", (0, 0), (-1, -1), 10),
-            ("TOPPADDING", (0, 0), (-1, -1), 8),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
-        ]))
-        story.append(Spacer(1, 0.2 * inch))
-        story.append(tbl)
+            ("BACKGROUND", (0, 0), (-1, -1), TINT),
+            ("BOX", (0, 0), (-1, -1), 1.3, RED),
+            ("LEFTPADDING", (0, 0), (-1, -1), 12),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 12),
+            ("TOPPADDING", (0, 0), (-1, -1), 10),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 10),
+        ]
+        try:
+            tbl.setStyle(TableStyle(style_cmds + [("ROUNDEDCORNERS", [8, 8, 8, 8])]))
+        except Exception:
+            tbl.setStyle(TableStyle(style_cmds))
+        return tbl
 
-    doc.build(story, onFirstPage=_draw_static, onLaterPages=_draw_static)
+    def _lang_story(lg: str, flip_note: str):
+        txt = (lead.get("offer_letter") or {}).get(
+            "letter_en" if lg == "en" else "letter_es", "") \
+            .replace("[TELÉFONO]", sender.get("phone", "")) \
+            .replace("[PHONE]", sender.get("phone", "")) \
+            .replace("[EMAIL]", sender.get("email", "yoandyross@gmail.com"))
+        s = [Paragraph(flip_note, flip_style), Spacer(1, 0.06 * inch),
+             Paragraph(_letter_date(lg), date_style), Spacer(1, 0.14 * inch)]
+        for para in [p for p in txt.split("\n") if p.strip()]:
+            s.append(Paragraph(para.replace("&", "&amp;").replace("<", "&lt;"), body_style))
+            s.append(Spacer(1, 0.09 * inch))
+        s.append(Spacer(1, 0.1 * inch))
+        s.append(_sig_wrap())
+        cta = _cta_tbl(lg)
+        if cta is not None:
+            s.append(Spacer(1, 0.22 * inch))
+            s.append(cta)
+        return s
+
+    # ── Documento bilingüe: página 1 = idioma primario (con destinatario y
+    #    foto), página 2 = el otro idioma (para imprimir por ambos lados) ──
+    from reportlab.platypus import (BaseDocTemplate, PageTemplate, Frame,
+                                    NextPageTemplate, PageBreak)
+    primary = "es" if lang == "es" else "en"
+    secondary = "en" if primary == "es" else "es"
+    note_front = ("English version on the other side →" if primary == "es"
+                  else "¿Prefiere español? → Vea el reverso")
+    note_back = ("¿Prefiere español? → Vea el frente" if primary == "es"
+                 else "English version on the front side →")
+
+    frame_first = Frame(0.9 * inch, 1.0 * inch, W - 1.8 * inch,
+                        H - 3.15 * inch - 1.0 * inch, id="f1")
+    frame_later = Frame(0.9 * inch, 1.0 * inch, W - 1.8 * inch,
+                        H - 1.55 * inch - 1.0 * inch, id="f2")
+    doc = BaseDocTemplate(buf, pagesize=LETTER)
+    doc.addPageTemplates([
+        PageTemplate(id="first", frames=[frame_first],
+                     onPage=lambda c, d: _draw_static(c, d, True)),
+        PageTemplate(id="later", frames=[frame_later],
+                     onPage=lambda c, d: _draw_static(c, d, False)),
+    ])
+    story = ([NextPageTemplate("later")] + _lang_story(primary, note_front)
+             + [PageBreak()] + _lang_story(secondary, note_back))
+    doc.build(story)
     return buf.getvalue()
 
 
@@ -1175,7 +1826,8 @@ async def download_letter_pdf(request: Request, lead_id: str, lang: str = "en"):
         raise HTTPException(400, "Genera primero la carta de oferta con AI")
     lang = "es" if lang == "es" else "en"
     sender = await _sender_info()
-    pdf = _build_letter_pdf(doc, sender, lang)
+    photo = await _lead_photo(db, doc)
+    pdf = _build_letter_pdf(doc, sender, lang, photo)
     fname = f"carta_{(doc.get('address') or doc['property_id']).split(',')[0].replace(' ', '_')}_{lang}.pdf"
     return StreamingResponse(
         iter([pdf]), media_type="application/pdf",
@@ -1272,57 +1924,107 @@ async def mail_letter(request: Request, lead_id: str):
                            "deliverable_incorrect_unit", "deliverable_missing_unit"):
                 raise HTTPException(422, f"USPS marca la dirección como no entregable ({dpv})")
 
-        # 2) HTML de la carta (US Letter, address_placement=top_first_page)
-        pdf = _build_letter_pdf(doc, sender, "en")
-        import base64
-        # Lob acepta HTML o un PDF; enviamos HTML embebiendo el texto para control total
-        body_text = (doc.get("offer_letter") or {}).get("letter_en", "") \
-            .replace("[TELÉFONO]", sender.get("phone", "")) \
-            .replace("[EMAIL]", sender.get("email", "yoandyross@gmail.com"))
-        body_html = "".join(
-            f"<p>{p.strip().replace('&','&amp;').replace('<','&lt;')}</p>"
-            for p in body_text.split("\n") if p.strip())
+        # 2) HTML premium BILINGÜE (doble cara: inglés al frente, español al reverso)
+        photo_b64 = ""
+        photo = await _lead_photo(db, doc)
+        if photo:
+            import base64 as _pb64
+            photo_b64 = _pb64.b64encode(photo).decode()
 
-        # Bloque CTA con QR + link personalizado (si el lead tiene oferta)
-        cta_html = ""
         offer = doc.get("offer") or {}
+        qr_b64, purl = "", ""
         if offer.get("slug"):
             import base64 as _b64
-            url = f"{SITE_BASE}/oferta/{offer['slug']}"
-            qr_b64 = _b64.b64encode(_offer_qr_png(url)).decode()
-            title = (f"Our cash offer: ${offer['amount']:,.0f}"
-                     if offer.get("mode") == "amount" and offer.get("amount")
-                     else "Tell us your price for the property")
-            cta_html = (
-                f'<table style="margin-top:22pt;border:1.5pt solid #C41428;width:100%;'
-                f'border-collapse:collapse"><tr>'
-                f'<td style="width:95pt;padding:8pt;text-align:center">'
-                f'<img src="data:image/png;base64,{qr_b64}" style="width:80pt;height:80pt"/></td>'
-                f'<td style="padding:8pt 10pt;font-size:10pt;line-height:1.4">'
-                f'<div style="font-size:12pt;font-weight:bold;color:#C41428">{title}</div>'
-                f'Respond in 1 minute &mdash; scan the QR code with your phone camera or visit:<br/>'
-                f'<b>{url.replace("https://www.","")}</b><br/>'
-                f'No obligation. Offer valid for 30 days. / Responda en l&iacute;nea &mdash; sin compromiso.'
-                f'</td></tr></table>')
+            purl = f"{SITE_BASE}/oferta/{offer['slug']}"
+            qr_b64 = _b64.b64encode(_offer_qr_png(purl)).decode()
 
-        # Firma con logo pequeño (personal + LLC de respaldo)
+        csz = f"{sender.get('city','')}, {sender.get('state','')} {sender.get('zip','')}"
+        footer_html = (
+            f'<div style="position:absolute;bottom:.55in;left:.9in;right:.9in;'
+            f'border-top:1.5pt solid #C41428;padding-top:6pt;text-align:center;'
+            f'font-family:Helvetica,Arial,sans-serif;font-size:7.5pt;color:#6B7280">'
+            f'{sender.get("name","")} &middot; {sender.get("company","")} &middot; '
+            f'{sender.get("address","")}, {csz} &middot; {sender.get("phone","")} &middot; '
+            f'rosshouserentals.com</div>')
         sig_html = (
-            f'<table style="margin-top:18pt"><tr>'
-            f'<td style="padding-right:10pt"><img src="https://www.rosshouserentals.com/logo.jpg" '
-            f'style="width:42pt;height:42pt;border-radius:50%"/></td>'
-            f'<td style="font-size:10pt;line-height:1.35">'
-            f'<b>{sender.get("name","Yoandy Ross")}</b><br/>'
-            f'{sender.get("company","Ross House Rentals LLC")} &middot; Dumas, TX<br/>'
+            f'<table style="margin-top:16pt;border-collapse:collapse"><tr>'
+            f'<td style="width:4pt;background:#C41428"></td>'
+            f'<td style="padding:4pt 10pt"><img src="https://www.rosshouserentals.com/logo.jpg" '
+            f'style="width:40pt;height:40pt;border-radius:50%"/></td>'
+            f'<td style="font-size:9.5pt;line-height:1.4;color:#6B7280">'
+            f'<span style="font-size:11pt;font-weight:bold;color:#20242E">{sender.get("name","Yoandy Ross")}</span><br/>'
+            f'{sender.get("company","Ross House Rentals LLC")} &mdash; Dumas, TX<br/>'
             f'{sender.get("phone","")} &middot; rosshouserentals.com</td></tr></table>')
 
+        def _page_html(lg: str) -> str:
+            body_text = (doc.get("offer_letter") or {}).get(
+                "letter_en" if lg == "en" else "letter_es", "") \
+                .replace("[TELÉFONO]", sender.get("phone", "")) \
+                .replace("[PHONE]", sender.get("phone", "")) \
+                .replace("[EMAIL]", sender.get("email", "yoandyross@gmail.com"))
+            body_html = "".join(
+                f'<p style="margin:0 0 11pt;text-align:justify">'
+                f"{p.strip().replace('&','&amp;').replace('<','&lt;')}</p>"
+                for p in body_text.split("\n") if p.strip())
+            flip = ('&iquest;Prefiere espa&ntilde;ol? &rarr; Vea el reverso' if lg == "en"
+                    else 'English version on the other side &rarr;')
+            flip_html = (f'<div style="text-align:right;font-family:Helvetica,Arial,sans-serif;'
+                         f'font-size:8.5pt;font-weight:bold;color:#C41428;margin-bottom:6pt">{flip}</div>')
+            date_html = (f'<div style="font-style:italic;color:#6B7280;font-size:10pt;'
+                         f'margin-bottom:14pt">{_letter_date(lg)}</div>')
+            ph = ""
+            if photo_b64:
+                cap = ("Aerial view of your property" if lg == "en"
+                       else "Vista a&eacute;rea de su propiedad")
+                ph = (f'<div style="float:right;width:190pt;margin:0 0 8pt 14pt;text-align:right">'
+                      f'<img src="data:image/jpeg;base64,{photo_b64}" '
+                      f'style="width:190pt;height:116pt;border:1pt solid #D9DCE1;border-radius:6pt"/>'
+                      f'<div style="font-size:7.3pt;color:#6B7280;font-style:italic;'
+                      f'font-family:Helvetica,Arial,sans-serif;margin-top:2pt">{cap}</div></div>')
+            cta = ""
+            if qr_b64:
+                if lg == "en":
+                    kicker = "RESPOND ONLINE &mdash; TAKES 1 MINUTE"
+                    title = (f'Our cash offer: <span style="color:#C41428">${offer["amount"]:,.0f}</span>'
+                             if offer.get("mode") == "amount" and offer.get("amount")
+                             else "Tell us your price for the property")
+                    body_cta = (f'Scan the QR code with your phone camera or visit '
+                                f'<b>{purl.replace("https://www.","")}</b> to view your personalized '
+                                f'offer and respond instantly.<br/>'
+                                f'<i>No obligation &middot; We buy AS-IS &middot; Offer valid for 30 days</i>')
+                else:
+                    kicker = "RESPONDA EN L&Iacute;NEA &mdash; TOMA 1 MINUTO"
+                    title = (f'Nuestra oferta en efectivo: <span style="color:#C41428">${offer["amount"]:,.0f}</span>'
+                             if offer.get("mode") == "amount" and offer.get("amount")
+                             else "D&iacute;ganos cu&aacute;nto aceptar&iacute;a por su propiedad")
+                    body_cta = (f'Escanee el c&oacute;digo QR con la c&aacute;mara de su tel&eacute;fono o visite '
+                                f'<b>{purl.replace("https://www.","")}</b> para ver su oferta '
+                                f'personalizada y responder al instante.<br/>'
+                                f'<i>Sin compromiso &middot; Compramos AS-IS &middot; Oferta v&aacute;lida por 30 d&iacute;as</i>')
+                cta = (f'<table style="margin-top:20pt;border:1.5pt solid #C41428;width:100%;'
+                       f'border-collapse:separate;border-radius:8pt;background:#FCF5F5"><tr>'
+                       f'<td style="width:100pt;padding:10pt;text-align:center">'
+                       f'<img src="data:image/png;base64,{qr_b64}" style="width:84pt;height:84pt"/></td>'
+                       f'<td style="padding:10pt 12pt 10pt 2pt;font-size:9.5pt;line-height:1.45;color:#20242E">'
+                       f'<div style="font-size:7.5pt;font-weight:bold;letter-spacing:1pt;color:#C41428">{kicker}</div>'
+                       f'<div style="font-size:13pt;font-weight:bold;margin:3pt 0 5pt">{title}</div>'
+                       f'{body_cta}</td></tr></table>')
+            return f'{flip_html}{date_html}{ph}{body_html}{sig_html}{cta}{footer_html}'
+
         html = (f'<html><head><meta charset="utf-8"><style>'
-                f'@page{{size:letter;margin:0}}body{{width:8.5in;min-height:11in;margin:0;'
-                f'padding:3.4in .9in .9in;font-family:Helvetica,Arial,sans-serif;font-size:11pt;line-height:1.45}}'
-                f'</style></head><body>{body_html}{sig_html}{cta_html}</body></html>')
+                f'@page{{size:letter;margin:0}}body{{margin:0}}'
+                f'.pg{{position:relative;width:8.5in;height:11in;box-sizing:border-box;'
+                f'font-family:Georgia,\'Times New Roman\',serif;font-size:11.5pt;'
+                f'line-height:1.5;color:#20242E;page-break-after:always}}'
+                f'.p1{{padding:3.4in .9in 1.1in}}.p2{{padding:1.1in .9in 1.1in}}'
+                f'</style></head><body>'
+                f'<div class="pg p1">{_page_html("en")}</div>'
+                f'<div class="pg p2">{_page_html("es")}</div>'
+                f'</body></html>')
 
         data = {
             "description": f"Carta oferta — {doc.get('address', doc['property_id'])}",
-            "color": "false", "double_sided": "false",
+            "color": "true", "double_sided": "true",
             "address_placement": "top_first_page",
             "mail_type": "usps_first_class", "use_type": "marketing",
             "file": html,

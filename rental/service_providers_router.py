@@ -20,6 +20,7 @@ import logging
 import os
 import re
 import uuid
+import asyncio
 from datetime import datetime
 from typing import Optional, List, Dict, Any
 from bson import ObjectId
@@ -1006,6 +1007,12 @@ async def admin_create_payment(request: Request, provider_id: str, payload: Paym
             {"$inc": {"total_paid": payload.amount, "total_payments": 1},
              "$set": {"last_paid_at": paid_at, "updated_at": datetime.utcnow()}}
         )
+        # Alerta 1099-NEC si cruza $600 reportables en el año (best-effort)
+        try:
+            from rental.tax_1099_router import check_1099_threshold
+            asyncio.create_task(check_1099_threshold(provider_id))
+        except Exception:
+            pass
 
     # Notify provider
     if payload.notify_provider:
@@ -1143,6 +1150,12 @@ async def admin_update_payment(request: Request, payment_id: str, payload: Payme
                 {"_id": existing['provider_id']},
                 {"$inc": {"total_paid": amt}, "$set": {"last_paid_at": datetime.utcnow()}}
             )
+            # Alerta 1099-NEC si cruza $600 reportables en el año (best-effort)
+            try:
+                from rental.tax_1099_router import check_1099_threshold
+                asyncio.create_task(check_1099_threshold(existing['provider_id']))
+            except Exception:
+                pass
         elif old_status == 'paid' and payload.status != 'paid':
             await db.service_providers.update_one(
                 {"_id": existing['provider_id']},

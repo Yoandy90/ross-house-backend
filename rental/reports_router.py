@@ -779,3 +779,253 @@ async def admin_reports_summary(request: Request):
             "period_end": t12["period_end"],
         },
     }
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# REPORTE FISCAL ANUAL CONSOLIDADO (para el contador)
+# Ingresos de renta + gastos por propiedad + resumen 1099-NEC
+# ═══════════════════════════════════════════════════════════════════════
+
+async def _build_annual_tax(db, year: int) -> Dict[str, Any]:
+    # ── Ingresos de renta por propiedad ──
+    income: Dict[str, Dict[str, float]] = defaultdict(
+        lambda: {"rent": 0.0, "late_fees": 0.0, "payments": 0})
+    for coll in ("rental_payments", "rental_payments_archive"):
+        async for pmt in db[coll].find({"period": {"$regex": f"^{year}-"}}):
+            if pmt.get("status") not in PAID_STATUSES:
+                continue
+            prop = (pmt.get("property_address") or "Sin propiedad").strip()
+            paid = float(pmt.get("total_paid") or 0) or \
+                (float(pmt.get("amount") or 0) + float(pmt.get("late_fee") or 0))
+            income[prop]["rent"] += float(pmt.get("amount") or paid)
+            income[prop]["late_fees"] += float(pmt.get("late_fee") or 0)
+            income[prop]["payments"] += 1
+    total_income = sum(v["rent"] + v["late_fees"] for v in income.values())
+
+    # ── Gastos por propiedad y categoría (property_expenses) ──
+    expenses: Dict[str, Dict[str, float]] = defaultdict(lambda: defaultdict(float))
+    async for exp in db.property_expenses.find(
+            {"expense_date": {"$regex": f"^{year}-"}}):
+        if exp.get("status") in ("cancelled", "void"):
+            continue
+        prop = (exp.get("property_address") or "General").strip()
+        cat = (exp.get("category") or "otros").strip().lower()
+        expenses[prop][cat] += float(exp.get("amount") or 0)
+    prop_expense_total = sum(sum(cats.values()) for cats in expenses.values())
+
+    # ── Mano de obra de contratistas (provider_payments) + resumen 1099 ──
+    from rental.tax_1099_router import _provider_totals
+    totals_1099 = await _provider_totals(year)
+    contractors = []
+    contractor_total = 0.0
+    for pid, t in sorted(totals_1099.items(), key=lambda kv: -(kv[1]["reportable"] + kv[1]["excluded"])):
+        p = await db.service_providers.find_one({"_id": pid}) or {}
+        w9 = p.get("w9") or {}
+        w9_ok = bool(w9.get("legal_name") and w9.get("tin") and w9.get("address"))
+        paid = t["reportable"] + t["excluded"]
+        contractor_total += paid
+        contractors.append({
+            "name": p.get("name", "(eliminado)"),
+            "company": p.get("company_name", ""),
+            "paid": round(paid, 2),
+            "reportable": round(t["reportable"], 2),
+            "excluded": round(t["excluded"], 2),
+            "needs_1099": t["reportable"] >= 600,
+            "w9_complete": w9_ok,
+            "form_sent": bool((p.get("form_1099_sent") or {}).get(str(year))),
+        })
+
+    total_expenses = prop_expense_total + contractor_total
+    return {
+        "year": year,
+        "generated_at": datetime.utcnow().isoformat(),
+        "income_by_property": {k: {kk: round(vv, 2) for kk, vv in v.items()}
+                               for k, v in income.items()},
+        "expenses_by_property": {k: {kk: round(vv, 2) for kk, vv in cats.items()}
+                                 for k, cats in expenses.items()},
+        "contractors": contractors,
+        "totals": {
+            "income": round(total_income, 2),
+            "property_expenses": round(prop_expense_total, 2),
+            "contract_labor": round(contractor_total, 2),
+            "expenses": round(total_expenses, 2),
+            "net": round(total_income - total_expenses, 2),
+        },
+    }
+
+
+CAT_LABELS = {
+    "maintenance": "Mantenimiento y reparaciones", "repairs": "Reparaciones",
+    "utilities": "Servicios (utilities)", "insurance": "Seguro",
+    "taxes": "Impuestos de propiedad", "supplies": "Materiales",
+    "cleaning": "Limpieza", "management": "Administración",
+    "legal": "Legal y profesional", "advertising": "Publicidad",
+    "mortgage": "Interés hipotecario", "hoa": "HOA", "otros": "Otros",
+}
+
+
+def _annual_tax_pdf(data: Dict[str, Any], payer: Dict[str, Any]) -> bytes:
+    import os as _os
+    from reportlab.lib.pagesizes import LETTER
+    from reportlab.lib.units import inch
+    from reportlab.lib import colors as rl
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer, Table,
+                                    TableStyle, Image as RLImage)
+
+    RED = rl.HexColor("#C41428")
+    DARK = rl.HexColor("#20242E")
+    GRAY = rl.HexColor("#6B7280")
+    LIGHT = rl.HexColor("#E5E7EB")
+    TINT = rl.HexColor("#F8FafC")
+    year = data["year"]
+
+    styles = getSampleStyleSheet()
+    h1 = ParagraphStyle("h1", parent=styles["Normal"], fontName="Helvetica-Bold",
+                        fontSize=17, leading=21, textColor=DARK)
+    sub = ParagraphStyle("sub", parent=styles["Normal"], fontName="Helvetica",
+                         fontSize=9, leading=12, textColor=GRAY)
+    h2 = ParagraphStyle("h2", parent=styles["Normal"], fontName="Helvetica-Bold",
+                        fontSize=12, leading=15, textColor=RED, spaceBefore=14)
+    cell = ParagraphStyle("cell", parent=styles["Normal"], fontName="Helvetica",
+                          fontSize=8.6, leading=11.5, textColor=DARK)
+    cellg = ParagraphStyle("cellg", parent=cell, textColor=GRAY)
+
+    def money(v):
+        return f"${float(v or 0):,.2f}"
+
+    def tbl(rows, widths, header=True, align_right_from=1):
+        t = Table(rows, colWidths=widths, repeatRows=1 if header else 0)
+        cmds = [
+            ("FONTNAME", (0, 0), (-1, -1), "Helvetica"),
+            ("FONTSIZE", (0, 0), (-1, -1), 8.6),
+            ("TEXTCOLOR", (0, 0), (-1, -1), DARK),
+            ("ALIGN", (align_right_from, 0), (-1, -1), "RIGHT"),
+            ("TOPPADDING", (0, 0), (-1, -1), 5),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+            ("LINEBELOW", (0, 0), (-1, -2), 0.5, LIGHT),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [rl.white, TINT]),
+        ]
+        if header:
+            cmds += [("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                     ("TEXTCOLOR", (0, 0), (-1, 0), rl.white),
+                     ("BACKGROUND", (0, 0), (-1, 0), DARK)]
+        t.setStyle(TableStyle(cmds))
+        return t
+
+    logo = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))),
+                         "assets", "logo.jpg")
+
+    def _decorate(c, doc_):
+        c.saveState()
+        W, H = LETTER
+        c.setStrokeColor(RED)
+        c.setLineWidth(3)
+        c.line(0.75 * inch, H - 0.6 * inch, W - 0.75 * inch, H - 0.6 * inch)
+        c.setFont("Helvetica", 7.5)
+        c.setFillColor(GRAY)
+        c.drawString(0.75 * inch, 0.5 * inch,
+                     f"Reporte Fiscal {year} — {payer.get('name', 'Ross House Rentals LLC')} · Confidencial")
+        c.drawRightString(W - 0.75 * inch, 0.5 * inch, f"Página {doc_.page}")
+        c.restoreState()
+
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=LETTER, topMargin=0.9 * inch,
+                            bottomMargin=0.85 * inch, leftMargin=0.75 * inch,
+                            rightMargin=0.75 * inch)
+    story = []
+
+    # ── Encabezado ──
+    head_cells = [[
+        Paragraph(f"Reporte Fiscal Anual {year}", h1),
+        "",
+    ]]
+    try:
+        head_cells[0][1] = RLImage(logo, width=0.65 * inch, height=0.65 * inch)
+    except Exception:
+        pass
+    ht = Table(head_cells, colWidths=[5.8 * inch, 1.2 * inch])
+    ht.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                            ("ALIGN", (1, 0), (1, 0), "RIGHT"),
+                            ("LEFTPADDING", (0, 0), (-1, -1), 0),
+                            ("RIGHTPADDING", (0, 0), (-1, -1), 0)]))
+    story.append(ht)
+    csz = f"{payer.get('city','')}, {payer.get('state','')} {payer.get('zip','')}"
+    story.append(Paragraph(
+        f"{payer.get('name','Ross House Rentals LLC')} · EIN {payer.get('ein','—')} · "
+        f"{payer.get('address','')}, {csz}<br/>Preparado para el contador · "
+        f"Generado el {datetime.utcnow().strftime('%m/%d/%Y')} · Cifras en USD", sub))
+
+    T = data["totals"]
+    # ── Resumen ejecutivo ──
+    story.append(Paragraph("Resumen del año", h2))
+    story.append(tbl(
+        [["Concepto", "Monto"],
+         ["Ingresos de renta (cobrado)", money(T["income"])],
+         ["Gastos de propiedades", f"({money(T['property_expenses'])})"],
+         ["Mano de obra de contratistas", f"({money(T['contract_labor'])})"],
+         ["Total gastos", f"({money(T['expenses'])})"],
+         ["Resultado neto", money(T["net"])]],
+        [4.6 * inch, 2.4 * inch]))
+
+    # ── Ingresos por propiedad ──
+    story.append(Paragraph("1 · Ingresos de renta por propiedad", h2))
+    rows = [["Propiedad", "Pagos", "Renta", "Cargos por atraso", "Total"]]
+    for prop, v in sorted(data["income_by_property"].items()):
+        rows.append([Paragraph(prop, cell), str(int(v["payments"])), money(v["rent"]),
+                     money(v["late_fees"]), money(v["rent"] + v["late_fees"])])
+    if len(rows) == 1:
+        rows.append([Paragraph("Sin ingresos registrados", cellg), "—", "—", "—", "—"])
+    story.append(tbl(rows, [2.6 * inch, 0.7 * inch, 1.3 * inch, 1.3 * inch, 1.1 * inch]))
+
+    # ── Gastos por propiedad y categoría ──
+    story.append(Paragraph("2 · Gastos por propiedad (Schedule E)", h2))
+    rows = [["Propiedad", "Categoría", "Monto"]]
+    for prop, cats in sorted(data["expenses_by_property"].items()):
+        for cat, amt in sorted(cats.items(), key=lambda kv: -kv[1]):
+            rows.append([Paragraph(prop, cell),
+                         Paragraph(CAT_LABELS.get(cat, cat.title()), cell), money(amt)])
+    if len(rows) == 1:
+        rows.append([Paragraph("Sin gastos registrados", cellg), "—", "—"])
+    rows.append([Paragraph("<b>Total gastos de propiedades</b>", cell), "",
+                 money(T["property_expenses"])])
+    story.append(tbl(rows, [2.8 * inch, 2.8 * inch, 1.4 * inch]))
+
+    # ── Contratistas / 1099-NEC ──
+    story.append(Paragraph("3 · Contratistas y 1099-NEC", h2))
+    rows = [["Contratista", "Pagado", "Reportable", "1099-K*", "¿1099?", "W-9", "Enviado"]]
+    for c_ in data["contractors"]:
+        nm = c_["name"] + (f"<br/><font color='#6B7280' size='7'>{c_['company']}</font>"
+                           if c_["company"] else "")
+        rows.append([Paragraph(nm, cell), money(c_["paid"]), money(c_["reportable"]),
+                     money(c_["excluded"]),
+                     "Sí" if c_["needs_1099"] else "No",
+                     "OK" if c_["w9_complete"] else "FALTA",
+                     "Sí" if c_["form_sent"] else "—"])
+    if len(rows) == 1:
+        rows.append([Paragraph("Sin pagos a contratistas", cellg)] + ["—"] * 6)
+    story.append(tbl(rows, [2.2 * inch, 0.95 * inch, 0.95 * inch, 0.85 * inch,
+                            0.6 * inch, 0.7 * inch, 0.75 * inch]))
+    story.append(Spacer(1, 6))
+    story.append(Paragraph(
+        "* 1099-K: pagos vía Venmo/PayPal/tarjeta — los reporta el procesador; siguen siendo "
+        "gasto deducible. «Reportable» = base del Box 1a del 1099-NEC (cash/check/Zelle/ACH).", sub))
+
+    doc.build(story, onFirstPage=_decorate, onLaterPages=_decorate)
+    return buf.getvalue()
+
+
+@router.get("/admin/reports/annual-tax")
+async def admin_annual_tax(request: Request, year: int = 0, format: str = "pdf"):
+    """Reporte fiscal anual consolidado para el contador (?format=json|pdf)."""
+    await auth_admin(request)
+    db = get_db()
+    year = year or datetime.utcnow().year
+    data = await _build_annual_tax(db, year)
+    if format == "json":
+        return {"success": True, **data}
+    from rental.tax_1099_router import _get_payer
+    payer = await _get_payer()
+    pdf = _annual_tax_pdf(data, payer)
+    return StreamingResponse(io.BytesIO(pdf), media_type="application/pdf", headers={
+        "Content-Disposition": f'attachment; filename="Reporte-Fiscal-{year}.pdf"'})

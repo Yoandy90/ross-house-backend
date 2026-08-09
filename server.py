@@ -149,6 +149,24 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"   ⚠️ Tax reminder cron not started: {e}")
 
+    # Start 1099-NEC deadline reminder cron (Jan 10 & Jan 28, 9AM CT)
+    tax_1099_task = None
+    try:
+        from rental.tax_1099_router import tax_1099_deadline_loop
+        tax_1099_task = asyncio.create_task(tax_1099_deadline_loop())
+        logger.info("   ✅ 1099-NEC deadline cron scheduled")
+    except Exception as e:
+        logger.warning(f"   ⚠️ 1099-NEC deadline cron not started: {e}")
+
+    # Start City of Dumas utilities cron (daily 8AM CT)
+    city_utils_task = None
+    try:
+        from rental.city_utilities_router import city_utilities_loop
+        city_utils_task = asyncio.create_task(city_utilities_loop())
+        logger.info("   ✅ City utilities cron scheduled")
+    except Exception as e:
+        logger.warning(f"   ⚠️ City utilities cron not started: {e}")
+
     # Start daily county tax-due sync (Moore County eSearch)
     tax_sync_task = None
     try:
@@ -320,6 +338,7 @@ try:
     from rental.tenant_leads_router import router as tenant_leads_router
     from rental.newsletter_router import router as newsletter_router
     from rental.tax_reminder_cron import router as tax_reminder_router
+    from rental.city_utilities_router import router as city_utilities_router
     from rental.service_providers_router import router as service_providers_router
     from rental.ai_brain_router import router as ai_brain_router
     from rental.chatbot_router import router as chatbot_router
@@ -328,8 +347,10 @@ try:
     from rental.analytics_ai_router import router as analytics_ai_router, ensure_indexes as analytics_ai_indexes
     from rental.lease_renewals_router import router as lease_renewals_router, ensure_indexes as lease_renewals_indexes
     from rental.pm_waitlist_router import router as pm_waitlist_router
+    from rental.title_companies_router import router as title_companies_router
     from rental.app_adoption_router import router as app_adoption_router
     from rental.social_poster_router import router as social_poster_router
+    from rental.tiktok_router import router as tiktok_router
     from rental.payment_processors_router import router as payment_processors_router
     from rental.email_inbox_router import router as email_inbox_router
     from rental.screening_router import router as screening_router
@@ -375,6 +396,7 @@ try:
     app.include_router(tenant_leads_router, prefix="/api")
     app.include_router(newsletter_router, prefix="/api")
     app.include_router(tax_reminder_router, prefix="/api")
+    app.include_router(city_utilities_router, prefix="/api")
     app.include_router(service_providers_router, prefix="/api")
     app.include_router(ai_brain_router, prefix="/api")
     app.include_router(chatbot_router, prefix="/api")
@@ -383,8 +405,10 @@ try:
     app.include_router(analytics_ai_router, prefix="/api")
     app.include_router(lease_renewals_router, prefix="/api")
     app.include_router(pm_waitlist_router, prefix="/api")
+    app.include_router(title_companies_router, prefix="/api")
     app.include_router(app_adoption_router, prefix="/api")
     app.include_router(social_poster_router, prefix="/api")
+    app.include_router(tiktok_router, prefix="/api")
     app.include_router(payment_processors_router, prefix="/api")
     app.include_router(email_inbox_router, prefix="/api")
     app.include_router(screening_router, prefix="/api")
