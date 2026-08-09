@@ -261,31 +261,64 @@ async def tiktok_publish(payload: PublishPayload, request: Request):
     if payload.mode == "direct" and not payload.title.strip():
         raise HTTPException(status_code=422, detail="El título es requerido para publicación directa")
     token = await _fresh_access_token()
+    video_url = payload.video_url.strip()
 
-    if payload.mode == "draft":
-        # video.upload — send to creator's TikTok inbox as a draft
-        body = {"source_info": {"source": "PULL_FROM_URL", "video_url": payload.video_url.strip()}}
-        url = INBOX_VIDEO_INIT_URL
-    else:
-        body = {
-            "post_info": {
-                "title": payload.title.strip(),
-                "privacy_level": payload.privacy_level,
-                "disable_comment": payload.disable_comment,
-                "disable_duet": payload.disable_duet,
-                "disable_stitch": payload.disable_stitch,
-                "video_cover_timestamp_ms": payload.video_cover_timestamp_ms,
-            },
-            "source_info": {"source": "PULL_FROM_URL", "video_url": payload.video_url.strip()},
-        }
-        url = VIDEO_INIT_URL
+    post_info = {
+        "title": payload.title.strip(),
+        "privacy_level": payload.privacy_level,
+        "disable_comment": payload.disable_comment,
+        "disable_duet": payload.disable_duet,
+        "disable_stitch": payload.disable_stitch,
+        "video_cover_timestamp_ms": payload.video_cover_timestamp_ms,
+    }
+    init_url = INBOX_VIDEO_INIT_URL if payload.mode == "draft" else VIDEO_INIT_URL
+    used_source = "PULL_FROM_URL"
 
-    async with httpx.AsyncClient(timeout=60) as client:
-        r = await client.post(url, json=body, headers={
+    async with httpx.AsyncClient(timeout=120) as client:
+        body = {"source_info": {"source": "PULL_FROM_URL", "video_url": video_url}}
+        if payload.mode == "direct":
+            body["post_info"] = post_info
+        r = await client.post(init_url, json=body, headers={
             "Authorization": f"Bearer {token}", "Content-Type": "application/json"})
-    data = r.json()
-    err = data.get("error", {})
-    if r.status_code != 200 or (err.get("code") not in (None, "ok")):
+        data = r.json()
+        err = data.get("error", {})
+
+        # Fallback: if domain is not verified for pull_by_url, download the
+        # video server-side and push it via FILE_UPLOAD (no verification needed).
+        if err.get("code") == "url_ownership_unverified":
+            logger.info("TikTok pull_by_url rejected (domain unverified) — falling back to FILE_UPLOAD")
+            vid = await client.get(video_url, follow_redirects=True)
+            if vid.status_code != 200 or not vid.content:
+                raise HTTPException(status_code=400, detail="No se pudo descargar el video para subirlo a TikTok")
+            content = vid.content
+            size = len(content)
+            if size > 64 * 1024 * 1024:
+                raise HTTPException(status_code=400, detail="Video >64MB: usa un dominio verificado (pull_by_url)")
+            body = {"source_info": {
+                "source": "FILE_UPLOAD",
+                "video_size": size,
+                "chunk_size": size,
+                "total_chunk_count": 1,
+            }}
+            if payload.mode == "direct":
+                body["post_info"] = post_info
+            r = await client.post(init_url, json=body, headers={
+                "Authorization": f"Bearer {token}", "Content-Type": "application/json"})
+            data = r.json()
+            err = data.get("error", {})
+            if r.status_code == 200 and err.get("code") in (None, "ok"):
+                upload_url = (data.get("data") or {}).get("upload_url")
+                up = await client.put(upload_url, content=content, headers={
+                    "Content-Type": "video/mp4",
+                    "Content-Length": str(size),
+                    "Content-Range": f"bytes 0-{size-1}/{size}",
+                })
+                if up.status_code not in (200, 201, 206):
+                    logger.error(f"TikTok chunk upload failed: {up.status_code} {up.text[:300]}")
+                    raise HTTPException(status_code=400, detail="Error subiendo el archivo de video a TikTok")
+                used_source = "FILE_UPLOAD"
+
+    if err.get("code") not in (None, "ok"):
         logger.error(f"TikTok publish failed: {data}")
         raise HTTPException(status_code=400, detail=err.get("message") or err.get("code") or "Error publicando en TikTok")
 
@@ -293,15 +326,16 @@ async def tiktok_publish(payload: PublishPayload, request: Request):
     await get_db().tiktok_posts.insert_one({
         "publish_id": publish_id,
         "title": payload.title.strip(),
-        "video_url": payload.video_url.strip(),
+        "video_url": video_url,
         "privacy_level": payload.privacy_level if payload.mode == "direct" else None,
         "mode": payload.mode,
-        "status": "PROCESSING_DOWNLOAD",
+        "source": used_source,
+        "status": "PROCESSING_DOWNLOAD" if used_source == "PULL_FROM_URL" else "PROCESSING_UPLOAD",
         "created_by": user.get("email", "admin"),
         "created_at": _now(),
         "updated_at": _now(),
     })
-    return {"success": True, "publish_id": publish_id, "mode": payload.mode}
+    return {"success": True, "publish_id": publish_id, "mode": payload.mode, "source": used_source}
 
 
 @router.get("/admin/marketing/tiktok/posts")
