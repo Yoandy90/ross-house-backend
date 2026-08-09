@@ -320,7 +320,8 @@ async def tiktok_publish(payload: PublishPayload, request: Request):
 
     if err.get("code") not in (None, "ok"):
         logger.error(f"TikTok publish failed: {data}")
-        raise HTTPException(status_code=400, detail=err.get("message") or err.get("code") or "Error publicando en TikTok")
+        detail = f"[{err.get('code')}] {err.get('message') or 'Error publicando en TikTok'}"
+        raise HTTPException(status_code=400, detail=detail)
 
     publish_id = (data.get("data") or {}).get("publish_id")
     await get_db().tiktok_posts.insert_one({
