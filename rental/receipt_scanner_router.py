@@ -185,6 +185,149 @@ Reglas:
     }
 
 
+@router.get('/admin/property-expenses/tax-report')
+async def tax_report_pdf(request: Request, year: int = 0):
+    """PDF fiscal anual: gastos agrupados por línea IRS Schedule E por propiedad."""
+    await auth_admin(request)
+    if not year:
+        year = datetime.utcnow().year
+
+    # Fallback: mapear categoría interna → línea IRS si el gasto no fue clasificado
+    cat_to_irs = {
+        'maintenance': 'cleaning_maintenance', 'cleaning': 'cleaning_maintenance',
+        'landscaping': 'cleaning_maintenance', 'repair': 'repairs', 'appliance': 'repairs',
+        'insurance': 'insurance', 'taxes': 'taxes', 'utilities': 'utilities',
+        'legal': 'legal_professional', 'advertising': 'advertising',
+        'management': 'management_fees', 'other': 'other',
+    }
+
+    expenses = []
+    async for e in get_db().property_expenses.find({"expense_date": {"$gte": f"{year}-01-01", "$lte": f"{year}-12-31"}}).sort("expense_date", 1):
+        irs = e.get("irs_category") or cat_to_irs.get(e.get("category", "other"), "other")
+        expenses.append({
+            "property_id": e.get("property_id") or "",
+            "irs": irs if irs in IRS_SCHEDULE_E else "other",
+            "date": e.get("expense_date", ""),
+            "vendor": e.get("vendor", ""),
+            "description": e.get("description", ""),
+            "amount": float(e.get("amount", 0)),
+            "auto": not bool(e.get("irs_category")),
+        })
+
+    prop_names = {}
+    async for p in get_db().properties.find({}, {"name": 1, "address": 1}):
+        prop_names[str(p["_id"])] = p.get("name") or p.get("address") or "Propiedad"
+
+    # ── Construir PDF ──
+    from reportlab.lib.pagesizes import letter
+    from reportlab.lib.units import inch
+    from reportlab.lib import colors
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
+
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=letter, topMargin=0.6 * inch, bottomMargin=0.6 * inch,
+                            leftMargin=0.6 * inch, rightMargin=0.6 * inch)
+    ss = getSampleStyleSheet()
+    h1 = ParagraphStyle('h1', parent=ss['Title'], fontSize=17, spaceAfter=2)
+    sub = ParagraphStyle('sub', parent=ss['Normal'], fontSize=9, textColor=colors.HexColor('#666666'), spaceAfter=10)
+    h2 = ParagraphStyle('h2', parent=ss['Heading2'], fontSize=12, textColor=colors.HexColor('#C8102E'), spaceBefore=12, spaceAfter=4)
+    small = ParagraphStyle('small', parent=ss['Normal'], fontSize=7.5, textColor=colors.HexColor('#888888'))
+    cell = ParagraphStyle('cell', parent=ss['Normal'], fontSize=8)
+
+    fm = lambda v: f"${v:,.2f}"
+    story = [
+        Paragraph(f"Reporte Fiscal {year} — Gastos de Propiedades", h1),
+        Paragraph(f"Ross House Rentals · IRS Schedule E (Form 1040) · Generado {datetime.utcnow().strftime('%m/%d/%Y')}", sub),
+    ]
+
+    grand_by_irs, grand_total = {}, 0.0
+
+    # Secciones por propiedad
+    by_prop = {}
+    for e in expenses:
+        by_prop.setdefault(e["property_id"], []).append(e)
+
+    for pid in sorted(by_prop.keys(), key=lambda x: prop_names.get(x, 'zz General')):
+        pexp = by_prop[pid]
+        pname = prop_names.get(pid, "General (sin propiedad)")
+        ptotal = sum(e["amount"] for e in pexp)
+        story.append(Paragraph(f"{pname} — Total: {fm(ptotal)}", h2))
+
+        by_irs = {}
+        for e in pexp:
+            by_irs.setdefault(e["irs"], []).append(e)
+
+        rows = [["Línea IRS", "Fecha", "Proveedor", "Descripción", "Monto"]]
+        row_styles = []
+        r = 1
+        for irs_key in IRS_SCHEDULE_E:
+            if irs_key not in by_irs:
+                continue
+            items = by_irs[irs_key]
+            subtotal = sum(e["amount"] for e in items)
+            for i, e in enumerate(items):
+                label = IRS_SCHEDULE_E[irs_key] if i == 0 else ""
+                mark = " *" if e["auto"] else ""
+                rows.append([Paragraph(f"<b>{label}</b>", cell) if label else "",
+                             e["date"], Paragraph((e["vendor"] or "—")[:40], cell),
+                             Paragraph((e["description"] or "")[:60] + mark, cell), fm(e["amount"])])
+                r += 1
+            rows.append(["", "", "", Paragraph(f"<b>Subtotal {IRS_SCHEDULE_E[irs_key]}</b>", cell), Paragraph(f"<b>{fm(subtotal)}</b>", cell)])
+            row_styles.append(('BACKGROUND', (0, r), (-1, r), colors.HexColor('#FDECEC')))
+            r += 1
+            grand_by_irs[irs_key] = grand_by_irs.get(irs_key, 0) + subtotal
+            grand_total += subtotal
+
+        t = Table(rows, colWidths=[1.75 * inch, 0.75 * inch, 1.35 * inch, 2.4 * inch, 0.85 * inch], repeatRows=1)
+        t.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#C8102E')),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+            ('FONTSIZE', (0, 0), (-1, -1), 8),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('ALIGN', (-1, 0), (-1, -1), 'RIGHT'),
+            ('GRID', (0, 0), (-1, -1), 0.4, colors.HexColor('#DDDDDD')),
+            ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+            ('TOPPADDING', (0, 0), (-1, -1), 3),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 3),
+        ] + row_styles))
+        story.append(t)
+
+    # Resumen global Schedule E
+    story.append(PageBreak())
+    story.append(Paragraph(f"Resumen Schedule E {year} — Todas las Propiedades", h2))
+    srows = [["Línea IRS Schedule E", "Total"]]
+    for irs_key, total in grand_by_irs.items():
+        srows.append([IRS_SCHEDULE_E[irs_key], fm(total)])
+    srows.append([Paragraph("<b>TOTAL GASTOS DEDUCIBLES</b>", cell), Paragraph(f"<b>{fm(grand_total)}</b>", cell)])
+    st = Table(srows, colWidths=[4.5 * inch, 1.5 * inch])
+    st.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#1a1a2e')),
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+        ('FONTSIZE', (0, 0), (-1, -1), 9),
+        ('ALIGN', (-1, 0), (-1, -1), 'RIGHT'),
+        ('GRID', (0, 0), (-1, -1), 0.4, colors.HexColor('#DDDDDD')),
+        ('BACKGROUND', (0, len(srows) - 1), (-1, len(srows) - 1), colors.HexColor('#FDECEC')),
+        ('TOPPADDING', (0, 0), (-1, -1), 5),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 5),
+    ]))
+    story.append(st)
+    story.append(Spacer(1, 14))
+    story.append(Paragraph("* Clasificación IRS asignada automáticamente según la categoría del gasto (no revisada manualmente). "
+                           "Este reporte es un resumen informativo para tu contador; no constituye asesoría fiscal.", small))
+
+    if not expenses:
+        story = [Paragraph(f"Reporte Fiscal {year}", h1), Paragraph(f"No hay gastos registrados en {year}.", sub)]
+
+    doc.build(story)
+    return Response(
+        content=buf.getvalue(),
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="Reporte_Fiscal_{year}_ScheduleE.pdf"'},
+    )
+
+
 @router.get('/admin/property-expenses/receipt/{receipt_id}')
 async def get_receipt_image(receipt_id: str, request: Request):
     """Devuelve la imagen del recibo adjunto a un gasto."""
