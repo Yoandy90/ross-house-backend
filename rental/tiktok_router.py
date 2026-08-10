@@ -21,7 +21,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 import httpx
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request, UploadFile, File, Form
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
 
@@ -253,6 +253,100 @@ class PublishPayload(BaseModel):
     mode: str = "direct"  # direct = video.publish | draft = video.upload (inbox)
 
 
+async def _push_file_to_tiktok(client: httpx.AsyncClient, token: str, content: bytes,
+                               post_info: Optional[dict], init_url: str,
+                               mime: str = "video/mp4") -> dict:
+    """Init a FILE_UPLOAD publish and PUT the video bytes (chunked per TikTok spec)."""
+    size = len(content)
+    MB = 1024 * 1024
+    if size <= 64 * MB:
+        chunk_size, count = size, 1
+    else:
+        chunk_size = 50 * MB
+        count = size // chunk_size  # last chunk absorbs the remainder (≤128MB)
+    body = {"source_info": {
+        "source": "FILE_UPLOAD",
+        "video_size": size,
+        "chunk_size": chunk_size,
+        "total_chunk_count": count,
+    }}
+    if post_info is not None:
+        body["post_info"] = post_info
+    r = await client.post(init_url, json=body, headers={
+        "Authorization": f"Bearer {token}", "Content-Type": "application/json"})
+    data = r.json()
+    err = data.get("error", {})
+    if r.status_code != 200 or err.get("code") not in (None, "ok"):
+        logger.error(f"TikTok FILE_UPLOAD init failed: {data}")
+        raise HTTPException(status_code=400, detail=f"[{err.get('code')}] {err.get('message') or 'Error iniciando subida'}")
+    upload_url = (data.get("data") or {}).get("upload_url")
+    # Sequential chunk PUTs
+    for i in range(count):
+        start = i * chunk_size
+        end = size - 1 if i == count - 1 else (start + chunk_size - 1)
+        chunk = content[start:end + 1]
+        up = await client.put(upload_url, content=chunk, headers={
+            "Content-Type": mime,
+            "Content-Length": str(len(chunk)),
+            "Content-Range": f"bytes {start}-{end}/{size}",
+        })
+        if up.status_code not in (200, 201, 206):
+            logger.error(f"TikTok chunk {i+1}/{count} failed: {up.status_code} {up.text[:300]}")
+            raise HTTPException(status_code=400, detail="Error subiendo el archivo de video a TikTok")
+    return data
+
+
+@router.post("/admin/marketing/tiktok/publish-file")
+async def tiktok_publish_file(
+    request: Request,
+    file: UploadFile = File(...),
+    title: str = Form(""),
+    privacy_level: str = Form("SELF_ONLY"),
+    disable_comment: bool = Form(False),
+    disable_duet: bool = Form(False),
+    disable_stitch: bool = Form(False),
+    mode: str = Form("direct"),
+):
+    """Publish a video uploaded directly from the admin's phone/PC."""
+    user = await auth_admin(request)
+    if mode == "direct" and not title.strip():
+        raise HTTPException(status_code=422, detail="El título es requerido para publicación directa")
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=422, detail="Archivo vacío")
+    if len(content) > 287 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Video demasiado grande (máx ~280MB)")
+    token = await _fresh_access_token()
+    post_info = None
+    if mode == "direct":
+        post_info = {
+            "title": title.strip(),
+            "privacy_level": privacy_level,
+            "disable_comment": disable_comment,
+            "disable_duet": disable_duet,
+            "disable_stitch": disable_stitch,
+            "video_cover_timestamp_ms": 0,
+        }
+    init_url = INBOX_VIDEO_INIT_URL if mode == "draft" else VIDEO_INIT_URL
+    mime = file.content_type if (file.content_type or "").startswith("video/") else "video/mp4"
+    async with httpx.AsyncClient(timeout=300) as client:
+        data = await _push_file_to_tiktok(client, token, content, post_info, init_url, mime)
+    publish_id = (data.get("data") or {}).get("publish_id")
+    await get_db().tiktok_posts.insert_one({
+        "publish_id": publish_id,
+        "title": title.strip(),
+        "video_url": f"(archivo subido: {file.filename})",
+        "privacy_level": privacy_level if mode == "direct" else None,
+        "mode": mode,
+        "source": "FILE_UPLOAD",
+        "status": "PROCESSING_UPLOAD",
+        "created_by": user.get("email", "admin"),
+        "created_at": _now(),
+        "updated_at": _now(),
+    })
+    return {"success": True, "publish_id": publish_id, "mode": mode, "source": "FILE_UPLOAD"}
+
+
 @router.post("/admin/marketing/tiktok/publish")
 async def tiktok_publish(payload: PublishPayload, request: Request):
     user = await auth_admin(request)
@@ -290,33 +384,11 @@ async def tiktok_publish(payload: PublishPayload, request: Request):
             vid = await client.get(video_url, follow_redirects=True)
             if vid.status_code != 200 or not vid.content:
                 raise HTTPException(status_code=400, detail="No se pudo descargar el video para subirlo a TikTok")
-            content = vid.content
-            size = len(content)
-            if size > 64 * 1024 * 1024:
-                raise HTTPException(status_code=400, detail="Video >64MB: usa un dominio verificado (pull_by_url)")
-            body = {"source_info": {
-                "source": "FILE_UPLOAD",
-                "video_size": size,
-                "chunk_size": size,
-                "total_chunk_count": 1,
-            }}
-            if payload.mode == "direct":
-                body["post_info"] = post_info
-            r = await client.post(init_url, json=body, headers={
-                "Authorization": f"Bearer {token}", "Content-Type": "application/json"})
-            data = r.json()
+            data = await _push_file_to_tiktok(
+                client, token, vid.content,
+                post_info if payload.mode == "direct" else None, init_url)
             err = data.get("error", {})
-            if r.status_code == 200 and err.get("code") in (None, "ok"):
-                upload_url = (data.get("data") or {}).get("upload_url")
-                up = await client.put(upload_url, content=content, headers={
-                    "Content-Type": "video/mp4",
-                    "Content-Length": str(size),
-                    "Content-Range": f"bytes 0-{size-1}/{size}",
-                })
-                if up.status_code not in (200, 201, 206):
-                    logger.error(f"TikTok chunk upload failed: {up.status_code} {up.text[:300]}")
-                    raise HTTPException(status_code=400, detail="Error subiendo el archivo de video a TikTok")
-                used_source = "FILE_UPLOAD"
+            used_source = "FILE_UPLOAD"
 
     if err.get("code") not in (None, "ok"):
         logger.error(f"TikTok publish failed: {data}")
