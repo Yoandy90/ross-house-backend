@@ -1834,8 +1834,20 @@ def _build_letter_pdf(lead: dict, sender: dict, lang: str,
 
 
 @router.get("/admin/deal-finder/leads/{lead_id}/letter.pdf")
-async def download_letter_pdf(request: Request, lead_id: str, lang: str = "en"):
-    await auth_admin(request)
+async def download_letter_pdf(request: Request, lead_id: str, lang: str = "en",
+                              token: Optional[str] = None):
+    # Auth por header (web) o por query token (app móvil abre el PDF en el navegador)
+    if token and not request.headers.get("Authorization"):
+        import jwt as _jwt
+        from rental.shared import TENANT_JWT_SECRET
+        try:
+            payload = _jwt.decode(token, TENANT_JWT_SECRET, algorithms=["HS256"])
+            if not (payload.get("type") == "marketplace" and payload.get("role") == "admin"):
+                raise ValueError("no admin")
+        except Exception:
+            raise HTTPException(401, "No autorizado")
+    else:
+        await auth_admin(request)
     db = get_db()
     doc = await db.deal_finder_leads.find_one({"_id": ObjectId(lead_id)})
     if not doc:
