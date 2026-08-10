@@ -264,12 +264,19 @@ ALLOWED_ORIGINS = [
 
 # Add preview URLs for development/testing
 import os
-if os.environ.get("ENVIRONMENT") != "production":
-    ALLOWED_ORIGINS.append("*")  # Allow all in non-production
+_ENV = os.environ.get("ENVIRONMENT", "").lower()
+_IS_DEV = _ENV in ("development", "dev", "local")
+
+# Safe-by-default: only open CORS wide when ENVIRONMENT is EXPLICITLY a dev value.
+# In production the deployed web app calls the API same-origin (Vercel rewrites /api
+# server-side) and native apps send no Origin, so the strict allowlist is sufficient.
+# The regex keeps the Emergent Expo web preview working without opening "*".
+_PREVIEW_REGEX = r"^https://([a-z0-9-]+\.)?(preview\.emergentagent\.com|emergent\.host)$"
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS if os.environ.get("ENVIRONMENT") == "production" else ["*"],
+    allow_origins=["*"] if _IS_DEV else ALLOWED_ORIGINS,
+    allow_origin_regex=None if _IS_DEV else _PREVIEW_REGEX,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -478,21 +485,16 @@ async def upload_image(
         raise HTTPException(status_code=401, detail="Authorization header required")
     import jwt as _jwt
     _token = authorization.split(" ", 1)[1].strip()
-    _secrets = [
-        os.environ.get("TENANT_JWT_SECRET"),
-        os.environ.get("JWT_SECRET_KEY"),
-        os.environ.get("JWT_SECRET"),
-    ]
+    # Only accept the strong secret used by real auth tokens (TENANT_JWT_SECRET).
+    # The old JWT_SECRET_KEY had a guessable default and must NOT be trusted here.
+    _sec = os.environ.get("TENANT_JWT_SECRET")
     _valid = False
-    for _sec in _secrets:
-        if not _sec:
-            continue
+    if _sec:
         try:
             _jwt.decode(_token, _sec, algorithms=["HS256"])
             _valid = True
-            break
         except Exception:
-            continue
+            _valid = False
     if not _valid:
         raise HTTPException(status_code=401, detail="Token inválido")
 

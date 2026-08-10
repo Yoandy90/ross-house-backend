@@ -60,6 +60,19 @@ def verify_password(password: str, hashed: str) -> bool:
         return False
 
 
+# ─── Login security constants ──────────────────────────────────
+# Generic message for ALL login failures (prevents user enumeration).
+GENERIC_LOGIN_ERROR = "Credenciales inválidas"
+# Dummy hash used to run bcrypt even when the user/hash is missing (constant-time,
+# prevents timing-based user enumeration).
+_DUMMY_HASH = hash_password("__timing_constant_dummy_password__")
+MAX_LOGIN_FAILURES = 5
+LOCK_MINUTES = 15
+MAX_PASSWORD_LEN = 256  # bcrypt truncates >72 bytes; reject absurd inputs
+# Password-reset code security
+RESET_MAX_ATTEMPTS = 5
+
+
 def normalize_rental_phone(phone: str, country_code: str = '+1') -> str:
     digits = ''.join(filter(str.isdigit, phone))
     if len(digits) == 10:
@@ -241,59 +254,63 @@ async def marketplace_register(request: Request):
 
 @router.post('/public/marketplace-login')
 async def marketplace_login(request: Request):
-    """Login for marketplace users (all roles).
-    Supports: email+password (primary) or email+phone (legacy fallback).
+    """Login for marketplace users (all roles). Email + password ONLY.
+
+    Security: no phone/last-4 fallback (that was a password bypass). Generic
+    error for all failures (no user enumeration), constant-time bcrypt check,
+    and account lockout after repeated failures.
     """
-    # Rate limiting
+    # Rate limiting (per IP/process — defense in depth alongside DB lockout)
     client_ip = request.client.host if request.client else "unknown"
     check_rate_limit(client_ip, "login")
-    
+
     body = await request.json()
     email = body.get("email", "").strip().lower()
     password = body.get("password", "").strip()
-    phone = body.get("phone", "").strip().replace("-", "").replace(" ", "").replace("(", "").replace(")", "")
 
-    if not email:
-        raise HTTPException(status_code=400, detail="Email es requerido")
-    if not password and not phone:
-        raise HTTPException(status_code=400, detail="Contraseña o teléfono es requerido")
+    # Never reveal which field was wrong.
+    if not email or not password or len(password) > MAX_PASSWORD_LEN:
+        raise HTTPException(status_code=401, detail=GENERIC_LOGIN_ERROR)
 
-    # Find user
+    now = datetime.utcnow()
+
+    # Locate the account (app_users primary, tenants legacy) WITHOUT leaking existence.
     user = await get_db().app_users.find_one({"email": {"$regex": f"^{re.escape(email)}$", "$options": "i"}})
+    collection = "app_users"
     if not user:
-        # Fallback: check tenants collection
         tenant = await get_db().tenants.find_one({"email": {"$regex": f"^{re.escape(email)}$", "$options": "i"}})
-        if not tenant:
-            raise HTTPException(status_code=401, detail="Credenciales inválidas")
-        user_id = str(tenant["_id"])
-        role = "tenant"
-        token = create_tenant_token(user_id, email, tenant.get("tenant_number", ""))
-        return {
-            "success": True, "token": token,
-            "user": {"id": user_id, "name": tenant.get("name", ""), "email": email,
-                     "role": role, "tenant_number": tenant.get("tenant_number", "")},
-        }
+        if tenant:
+            user, collection = tenant, "tenants"
 
-    # Method 1: Password authentication (primary)
-    if password and user.get("password_hash"):
-        if not verify_password(password, user["password_hash"]):
-            raise HTTPException(status_code=401, detail="Contraseña incorrecta")
-    # Method 2: Phone fallback (for users without password)
-    elif phone:
-        stored_phone = user.get("phone", "").replace("-", "").replace(" ", "").replace("(", "").replace(")", "")
-        if phone != stored_phone and phone != stored_phone[-4:]:
-            raise HTTPException(status_code=401, detail="Credenciales inválidas")
-    # Method 3: Password provided but user has no hash — try phone match
-    elif password and not user.get("password_hash"):
-        clean_pw = password.replace("-", "").replace(" ", "").replace("(", "").replace(")", "")
-        stored_phone = user.get("phone", "").replace("-", "").replace(" ", "").replace("(", "").replace(")", "")
-        if clean_pw != stored_phone and clean_pw != stored_phone[-4:]:
-            raise HTTPException(status_code=401, detail="Credenciales inválidas. Usa 'Olvidé mi contraseña' para establecer una.")
-    else:
-        raise HTTPException(status_code=401, detail="Credenciales inválidas")
+    locked = bool(user and user.get("locked_until") and user["locked_until"] > now)
+    stored_hash = user.get("password_hash") if user else None
+    # Always run bcrypt (even for missing user/hash) to keep timing constant.
+    password_ok = False if locked else verify_password(password, stored_hash or _DUMMY_HASH)
+
+    if (not user) or locked or (not stored_hash) or (not password_ok):
+        # Count the failure for a real, unlocked account and lock it if over the threshold.
+        if user and not locked and stored_hash:
+            coll = get_db()[collection]
+            await coll.update_one(
+                {"_id": user["_id"], "failed_login_attempts": {"$lt": MAX_LOGIN_FAILURES}},
+                {"$inc": {"failed_login_attempts": 1}},
+            )
+            latest = await coll.find_one({"_id": user["_id"]})
+            if latest and latest.get("failed_login_attempts", 0) >= MAX_LOGIN_FAILURES:
+                await coll.update_one(
+                    {"_id": user["_id"]},
+                    {"$set": {"locked_until": now + timedelta(minutes=LOCK_MINUTES)}},
+                )
+        raise HTTPException(status_code=401, detail=GENERIC_LOGIN_ERROR)
+
+    # Success — clear failure state.
+    await get_db()[collection].update_one(
+        {"_id": user["_id"]},
+        {"$set": {"failed_login_attempts": 0, "locked_until": None}},
+    )
 
     user_id = str(user["_id"])
-    role = user.get("role", "tenant")
+    role = "tenant" if collection == "tenants" else user.get("role", "tenant")
     token = create_marketplace_token(user_id, email, role)
 
     return {
@@ -302,36 +319,12 @@ async def marketplace_login(request: Request):
         "user": {
             "id": user_id,
             "name": user.get("name", ""),
-            "email": user.get("email", ""),
+            "email": user.get("email", email),
             "role": role,
             "tenant_number": user.get("tenant_number", ""),
-            "has_password": bool(user.get("password_hash")),
-        }
+            "has_password": True,
+        },
     }
-
-    # Fallback: check tenants collection (backward compat)
-    tenant = await get_db().tenants.find_one({"email": {"$regex": f"^{re.escape(email)}$", "$options": "i"}})
-    if tenant:
-        stored_phone = tenant.get("phone", "").replace("-", "").replace(" ", "").replace("(", "").replace(")", "")
-        if phone != stored_phone and phone != stored_phone[-4:]:
-            raise HTTPException(status_code=401, detail="Credenciales inválidas")
-
-        tenant_id = str(tenant["_id"])
-        token = create_marketplace_token(tenant_id, email, "tenant")
-
-        return {
-            "success": True,
-            "token": token,
-            "user": {
-                "id": tenant_id,
-                "name": tenant.get("name", ""),
-                "email": tenant.get("email", ""),
-                "role": "tenant",
-                "tenant_number": tenant.get("tenant_number", ""),
-            }
-        }
-
-    raise HTTPException(status_code=401, detail="Credenciales inválidas")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -406,11 +399,18 @@ async def reset_password(request: Request):
     if len(new_password) < 6:
         raise HTTPException(status_code=400, detail="La contraseña debe tener al menos 6 caracteres")
 
-    reset = await get_db().password_resets.find_one({"email": email, "code": code, "used": False})
-    if not reset:
+    # Atomically reserve one verification attempt (cross-instance safe) — blocks
+    # brute-forcing the 6-digit code. find_one_and_update returns None once the
+    # attempt cap is hit or the code expired.
+    reset = await get_db().password_resets.find_one_and_update(
+        {"email": email, "used": False,
+         "expires_at": {"$gt": datetime.utcnow()},
+         "attempts": {"$lt": RESET_MAX_ATTEMPTS}},
+        {"$inc": {"attempts": 1}},
+        return_document=True,
+    )
+    if not reset or reset.get("code") != code:
         raise HTTPException(status_code=400, detail="Código inválido o expirado")
-    if reset.get("expires_at") and reset["expires_at"] < datetime.utcnow():
-        raise HTTPException(status_code=400, detail="El código ha expirado")
 
     await get_db().password_resets.update_one({"_id": reset["_id"]}, {"$set": {"used": True}})
 
