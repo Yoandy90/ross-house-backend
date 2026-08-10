@@ -331,6 +331,8 @@ investor (Ross House Rentals LLC, Dumas TX) offering to buy a property directly 
 Rules: friendly, no pressure, mention we buy AS-IS, cash, we pay closing costs, quick close.
 NEVER mention delinquent taxes, financial distress or anything that could embarrass the owner.
 Include placeholders [TELÉFONO] and [EMAIL] for contact info.
+CRITICAL LENGTH LIMIT: each letter MUST be at most 150 words (4-5 short paragraphs) so it fits
+on a single printed page together with the signature and QR call-to-action box.
 
 Respond ONLY with valid JSON:
 {
@@ -1768,27 +1770,31 @@ def _build_letter_pdf(lead: dict, sender: dict, lang: str,
             tbl.setStyle(TableStyle(style_cmds))
         return tbl
 
-    def _lang_story(lg: str, flip_note: str):
+    def _lang_story(lg: str, flip_note: str, fs: float = 11, ld: float = 16,
+                    gap: float = 0.09):
+        b_style = ParagraphStyle(f"body{fs}", parent=body_style,
+                                 fontSize=fs, leading=ld)
         txt = (lead.get("offer_letter") or {}).get(
             "letter_en" if lg == "en" else "letter_es", "") \
             .replace("[TELÉFONO]", sender.get("phone", "")) \
             .replace("[PHONE]", sender.get("phone", "")) \
             .replace("[EMAIL]", sender.get("email", "yoandyross@gmail.com"))
         s = [Paragraph(flip_note, flip_style), Spacer(1, 0.06 * inch),
-             Paragraph(_letter_date(lg), date_style), Spacer(1, 0.14 * inch)]
+             Paragraph(_letter_date(lg), date_style), Spacer(1, 0.12 * inch)]
         for para in [p for p in txt.split("\n") if p.strip()]:
-            s.append(Paragraph(para.replace("&", "&amp;").replace("<", "&lt;"), body_style))
-            s.append(Spacer(1, 0.09 * inch))
-        s.append(Spacer(1, 0.1 * inch))
+            s.append(Paragraph(para.replace("&", "&amp;").replace("<", "&lt;"), b_style))
+            s.append(Spacer(1, gap * inch))
+        s.append(Spacer(1, 0.08 * inch))
         s.append(_sig_wrap())
         cta = _cta_tbl(lg)
         if cta is not None:
-            s.append(Spacer(1, 0.22 * inch))
+            s.append(Spacer(1, 0.16 * inch))
             s.append(cta)
         return s
 
     # ── Documento bilingüe: página 1 = idioma primario (con destinatario y
-    #    foto), página 2 = el otro idioma (para imprimir por ambos lados) ──
+    #    foto), página 2 = el otro idioma (para imprimir por ambos lados).
+    #    Auto-ajuste: reduce tipografía hasta que cada idioma quepa en UNA cara ──
     from reportlab.platypus import (BaseDocTemplate, PageTemplate, Frame,
                                     NextPageTemplate, PageBreak)
     primary = "es" if lang == "es" else "en"
@@ -1798,20 +1804,32 @@ def _build_letter_pdf(lead: dict, sender: dict, lang: str,
     note_back = ("¿Prefiere español? → Vea el frente" if primary == "es"
                  else "English version on the front side →")
 
-    frame_first = Frame(0.9 * inch, 1.0 * inch, W - 1.8 * inch,
-                        H - 3.15 * inch - 1.0 * inch, id="f1")
-    frame_later = Frame(0.9 * inch, 1.0 * inch, W - 1.8 * inch,
-                        H - 1.55 * inch - 1.0 * inch, id="f2")
-    doc = BaseDocTemplate(buf, pagesize=LETTER)
-    doc.addPageTemplates([
-        PageTemplate(id="first", frames=[frame_first],
-                     onPage=lambda c, d: _draw_static(c, d, True)),
-        PageTemplate(id="later", frames=[frame_later],
-                     onPage=lambda c, d: _draw_static(c, d, False)),
-    ])
-    story = ([NextPageTemplate("later")] + _lang_story(primary, note_front)
-             + [PageBreak()] + _lang_story(secondary, note_back))
-    doc.build(story)
+    def _make_doc(target_buf, fs, ld, gap):
+        frame_first = Frame(0.9 * inch, 1.0 * inch, W - 1.8 * inch,
+                            H - 3.15 * inch - 1.0 * inch, id="f1")
+        frame_later = Frame(0.9 * inch, 1.0 * inch, W - 1.8 * inch,
+                            H - 1.55 * inch - 1.0 * inch, id="f2")
+        d = BaseDocTemplate(target_buf, pagesize=LETTER)
+        d.addPageTemplates([
+            PageTemplate(id="first", frames=[frame_first],
+                         onPage=lambda c, dd: _draw_static(c, dd, True)),
+            PageTemplate(id="later", frames=[frame_later],
+                         onPage=lambda c, dd: _draw_static(c, dd, False)),
+        ])
+        story = ([NextPageTemplate("later")]
+                 + _lang_story(primary, note_front, fs, ld, gap)
+                 + [PageBreak()]
+                 + _lang_story(secondary, note_back, fs, ld, gap))
+        d.build(story)
+        return d.page
+
+    # Prueba niveles de compactación hasta lograr exactamente 2 páginas (1 hoja dúplex)
+    levels = [(11, 16, 0.09), (10.3, 14.5, 0.07), (9.6, 13.2, 0.055), (8.9, 12.2, 0.045)]
+    for fs, ld, gap in levels:
+        buf = io.BytesIO()
+        pages = _make_doc(buf, fs, ld, gap)
+        if pages <= 2:
+            break
     return buf.getvalue()
 
 
@@ -1962,8 +1980,20 @@ async def mail_letter(request: Request, lead_id: str):
                 .replace("[TELÉFONO]", sender.get("phone", "")) \
                 .replace("[PHONE]", sender.get("phone", "")) \
                 .replace("[EMAIL]", sender.get("email", "yoandyross@gmail.com"))
+            # Auto-ajuste: reduce tipografía según longitud para que cada idioma
+            # quepa en UNA cara (la p1 tiene menos espacio por la zona de dirección)
+            chars = len(body_text)
+            budget = 900 if lg == "en" else 1500
+            if chars <= budget:
+                fs, pmargin, ph_w, ph_h = "11.5pt", "11pt", 190, 116
+            elif chars <= budget + 350:
+                fs, pmargin, ph_w, ph_h = "10.4pt", "8pt", 168, 103
+            elif chars <= budget + 750:
+                fs, pmargin, ph_w, ph_h = "9.6pt", "6pt", 150, 92
+            else:
+                fs, pmargin, ph_w, ph_h = "8.9pt", "5pt", 136, 83
             body_html = "".join(
-                f'<p style="margin:0 0 11pt;text-align:justify">'
+                f'<p style="margin:0 0 {pmargin};text-align:justify">'
                 f"{p.strip().replace('&','&amp;').replace('<','&lt;')}</p>"
                 for p in body_text.split("\n") if p.strip())
             flip = ('&iquest;Prefiere espa&ntilde;ol? &rarr; Vea el reverso' if lg == "en"
@@ -1976,9 +2006,9 @@ async def mail_letter(request: Request, lead_id: str):
             if photo_b64:
                 cap = ("Aerial view of your property" if lg == "en"
                        else "Vista a&eacute;rea de su propiedad")
-                ph = (f'<div style="float:right;width:190pt;margin:0 0 8pt 14pt;text-align:right">'
+                ph = (f'<div style="float:right;width:{ph_w}pt;margin:0 0 8pt 14pt;text-align:right">'
                       f'<img src="data:image/jpeg;base64,{photo_b64}" '
-                      f'style="width:190pt;height:116pt;border:1pt solid #D9DCE1;border-radius:6pt"/>'
+                      f'style="width:{ph_w}pt;height:{ph_h}pt;border:1pt solid #D9DCE1;border-radius:6pt"/>'
                       f'<div style="font-size:7.3pt;color:#6B7280;font-style:italic;'
                       f'font-family:Helvetica,Arial,sans-serif;margin-top:2pt">{cap}</div></div>')
             cta = ""
@@ -2009,7 +2039,8 @@ async def mail_letter(request: Request, lead_id: str):
                        f'<div style="font-size:7.5pt;font-weight:bold;letter-spacing:1pt;color:#C41428">{kicker}</div>'
                        f'<div style="font-size:13pt;font-weight:bold;margin:3pt 0 5pt">{title}</div>'
                        f'{body_cta}</td></tr></table>')
-            return f'{flip_html}{date_html}{ph}{body_html}{sig_html}{cta}{footer_html}'
+            return (f'<div style="font-size:{fs}">'
+                    f'{flip_html}{date_html}{ph}{body_html}{sig_html}{cta}{footer_html}</div>')
 
         html = (f'<html><head><meta charset="utf-8"><style>'
                 f'@page{{size:letter;margin:0}}body{{margin:0}}'
