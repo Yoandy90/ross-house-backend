@@ -1952,6 +1952,64 @@ async def lob_status(request: Request):
     return out
 
 
+TRACK_LABELS = {
+    "Mailed": "📮 Despachada por USPS",
+    "In Transit": "🚚 En tránsito",
+    "In Local Area": "📍 En el área local del destinatario",
+    "Processed for Delivery": "📬 Procesada para entrega (llega hoy/mañana)",
+    "Re-Routed": "↩️ Re-enrutada por USPS",
+    "Returned to Sender": "⛔ Devuelta al remitente",
+}
+
+
+@router.get("/admin/deal-finder/leads/{lead_id}/mail-status")
+async def mail_tracking(request: Request, lead_id: str):
+    """Rastreo REAL de la carta física: consulta los tracking events de USPS vía Lob
+    y actualiza el estado en la base de datos."""
+    await auth_admin(request)
+    key = _lob_key()
+    if not key:
+        raise HTTPException(400, "Lob no está configurado")
+    db = get_db()
+    doc = await db.deal_finder_leads.find_one({"_id": ObjectId(lead_id)})
+    if not doc or not (doc.get("mail") or {}).get("lob_id"):
+        raise HTTPException(404, "Este lead no tiene carta enviada por Lob")
+    lob_id = doc["mail"]["lob_id"]
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.get(f"https://api.lob.com/v1/letters/{lob_id}", auth=(key, ""))
+    if r.status_code != 200:
+        raise HTTPException(400, "Carta no encontrada en Lob (¿se envió con otra API key test/live?)")
+    letter = r.json()
+    events = [{
+        "name": e.get("name"),
+        "label": TRACK_LABELS.get(e.get("name"), e.get("name")),
+        "time": e.get("time"),
+        "location": e.get("location"),
+    } for e in (letter.get("tracking_events") or [])]
+    last = events[-1]["name"] if events else None
+    friendly = ("delivered_soon" if last == "Processed for Delivery"
+                else "returned" if last == "Returned to Sender"
+                else "in_transit" if last in ("In Transit", "In Local Area", "Re-Routed", "Mailed")
+                else doc["mail"].get("status", "mailed"))
+    await db.deal_finder_leads.update_one({"_id": doc["_id"]}, {"$set": {
+        "mail.tracking_events": events,
+        "mail.tracking_status": friendly,
+        "mail.expected_delivery": letter.get("expected_delivery_date"),
+        "mail.send_date": letter.get("send_date"),
+        "mail.last_tracked_at": datetime.utcnow(),
+    }})
+    return {
+        "lob_id": lob_id,
+        "status": friendly,
+        "expected_delivery": letter.get("expected_delivery_date"),
+        "send_date": (letter.get("send_date") or "")[:10],
+        "carrier": "USPS First Class",
+        "events": events,
+        "note": ("USPS aún no reporta eventos — normal en las primeras 24-72h tras el envío"
+                 if not events else None),
+    }
+
+
 @router.post("/admin/deal-finder/leads/{lead_id}/mail")
 async def mail_letter(request: Request, lead_id: str):
     """Envía la carta físicamente vía Lob (verifica dirección, imprime, ensobra y despacha)."""
