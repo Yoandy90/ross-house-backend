@@ -34,7 +34,7 @@ from datetime import datetime, timezone
 import httpx
 from fastapi import APIRouter, HTTPException, Request
 
-from .shared import get_db, auth_admin
+from .shared import get_db, auth_admin, auth_tenant_flex
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -491,6 +491,218 @@ async def create_hosted_checkout(*, amount_cents: int, reference: str,
                         detail="El procesador activo es Stripe — usa el flujo Stripe existente")
 
 
+# ─────────────── PAGO DE RENTA MULTI-PROCESADOR (tenants) ───────────────
+
+def _receipt_prefix(processor: str) -> str:
+    return {"square": "SQR", "clover": "CLV", "stripe": "STR"}.get(processor, "PAY")
+
+
+async def _mark_checkout_completed(payment: dict) -> dict:
+    """Marca un rental_payment de checkout como completado y genera recibo."""
+    now = datetime.now(timezone.utc)
+    prefix = _receipt_prefix(payment.get("checkout_processor", ""))
+    receipt_number = f"{prefix}-{now.strftime('%Y%m%d')}-{str(payment.get('tenant_id', ''))[-4:]}"
+    await get_db().rental_payments.update_one(
+        {"_id": payment["_id"], "status": {"$ne": "completed"}},
+        {"$set": {
+            "status": "completed",
+            "receipt_number": receipt_number,
+            "payment_date": now.isoformat(),
+            "updated_at": now,
+        }})
+    logger.info("✅ Checkout %s completado: %s — $%s", payment.get("checkout_processor"),
+                receipt_number, payment.get("total_paid"))
+    return {"receipt_number": receipt_number}
+
+
+@router.post("/tenant/create-checkout-payment")
+async def tenant_create_checkout_payment(request: Request):
+    """Inquilino: inicia el pago de renta con el procesador ACTIVO.
+
+    - stripe → {"processor": "stripe"}: el cliente sigue el flujo Stripe existente.
+    - square/clover → crea Hosted Checkout y devuelve {"processor", "url", "payment_id"}.
+    """
+    tenant = await auth_tenant_flex(request)
+    data = await request.json()
+    hosted = bool(data.get("hosted"))  # web: checkout hospedado también para Stripe
+
+    name, _ = await get_active_processor()
+    if name == "stripe" and not hosted:
+        return {"success": True, "processor": "stripe"}
+
+    from bson import ObjectId  # noqa: F401 (parity with stripe flow)
+    contract = await get_db().rental_contracts.find_one({
+        "tenant_id": tenant["_id"], "status": "active"})
+    if not contract:
+        raise HTTPException(status_code=404, detail="No se encontró contrato activo")
+
+    now = datetime.utcnow()
+    current_month = now.strftime('%B').lower()
+    existing = await get_db().rental_payments.find_one({
+        "contract_id": str(contract["_id"]),
+        "period_month": {"$regex": f"^{current_month[:3]}", "$options": "i"},
+        "period_year": now.year,
+        "status": {"$in": ["completed", "paid", "pending_verification"]},
+    })
+    if existing:
+        raise HTTPException(status_code=400, detail="Ya existe un pago registrado para este mes")
+
+    # Monto SIEMPRE del contrato (server-side) — igual que el flujo Stripe
+    contract_rent = float(contract.get("rent_amount") or 0)
+    late_fee = float(data.get("late_fee") or 0)
+    amount = contract_rent if contract_rent > 0 else float(data.get("rent_amount") or data.get("amount") or 0)
+    total = amount + late_fee
+    if total <= 0:
+        raise HTTPException(status_code=400, detail="Monto inválido")
+
+    reference = f"Renta {current_month.title()} {now.year} - {tenant.get('name', '')}"
+    if name == "stripe":
+        # Stripe Checkout Session (hosted) — para pagos con tarjeta desde la web
+        company = await get_db().rental_config.find_one({"type": "company"}) or {}
+        sk = company.get("stripe_secret_key", "")
+        if not sk:
+            raise HTTPException(status_code=400, detail="Stripe no está configurado")
+        import stripe as stripe_lib
+        stripe_lib.api_key = sk
+        session = stripe_lib.checkout.Session.create(
+            mode="payment",
+            line_items=[{"price_data": {"currency": "usd",
+                                        "product_data": {"name": reference},
+                                        "unit_amount": int(round(total * 100))},
+                         "quantity": 1}],
+            customer_email=tenant.get("email") or None,
+            success_url="https://www.rosshouserentals.com/pago-exitoso",
+            cancel_url="https://www.rosshouserentals.com/tenant/dashboard",
+            metadata={"tenant_id": str(tenant["_id"]), "contract_id": str(contract["_id"])},
+        )
+        checkout = {"processor": "stripe", "url": session.url, "external_id": session.id, "order_id": ""}
+    else:
+        checkout = await create_hosted_checkout(
+            amount_cents=int(round(total * 100)),
+            reference=reference,
+            customer_email=tenant.get("email", ""),
+            redirect_url="https://www.rosshouserentals.com/pago-exitoso",
+        )
+
+    payment_doc = {
+        "contract_id": str(contract["_id"]),
+        "property_id": str(contract.get("property_id", "")),
+        "tenant_id": str(tenant["_id"]),
+        "tenant_name": tenant.get("name", ""),
+        "amount": amount,
+        "late_fee": late_fee,
+        "total_paid": total,
+        "payment_method": name,
+        "checkout_processor": name,
+        "checkout_external_id": checkout.get("external_id", ""),
+        "checkout_order_id": checkout.get("order_id", ""),
+        "reference_number": checkout.get("external_id", ""),
+        "period_month": current_month,
+        "period_year": now.year,
+        "status": "pending_checkout",
+        "submitted_by": f"tenant_{name}",
+        "submitted_at": now,
+        "created_at": now,
+        "updated_at": now,
+    }
+    r = await get_db().rental_payments.insert_one(payment_doc)
+
+    return {"success": True, "processor": name, "url": checkout.get("url", ""),
+            "payment_id": str(r.inserted_id), "amount": total}
+
+
+@router.get("/tenant/checkout-payment-status/{payment_id}")
+async def tenant_checkout_payment_status(payment_id: str, request: Request):
+    """Inquilino: consulta si el Hosted Checkout ya fue pagado (verifica con el procesador)."""
+    tenant = await auth_tenant_flex(request)
+    from bson import ObjectId
+    try:
+        payment = await get_db().rental_payments.find_one({"_id": ObjectId(payment_id)})
+    except Exception:
+        payment = None
+    if not payment or payment.get("tenant_id") != str(tenant["_id"]):
+        raise HTTPException(status_code=404, detail="Pago no encontrado")
+
+    if payment.get("status") == "completed":
+        return {"success": True, "completed": True,
+                "receipt_number": payment.get("receipt_number", ""),
+                "amount": payment.get("total_paid", 0)}
+
+    processor = payment.get("checkout_processor", "")
+    doc = await _get_doc()
+    cfg = _active_creds(doc["processors"].get(processor, {}))
+    env = doc["processors"].get(processor, {}).get("environment", "sandbox")
+    paid = False
+
+    try:
+        if processor == "stripe" and payment.get("checkout_external_id"):
+            company = await get_db().rental_config.find_one({"type": "company"}) or {}
+            sk = company.get("stripe_secret_key", "")
+            if sk:
+                import stripe as stripe_lib
+                stripe_lib.api_key = sk
+                session = stripe_lib.checkout.Session.retrieve(payment["checkout_external_id"])
+                paid = session.get("payment_status") == "paid"
+        elif processor == "square" and payment.get("checkout_order_id"):
+            base = SQUARE_BASE.get(env, SQUARE_BASE["sandbox"])
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                r = await client.get(f"{base}/orders/{payment['checkout_order_id']}",
+                                     headers={"Authorization": f"Bearer {cfg.get('access_token', '')}",
+                                              "Square-Version": SQUARE_VERSION})
+            if r.status_code < 400:
+                order = r.json().get("order", {})
+                tenders = order.get("tenders", [])
+                paid = order.get("state") == "COMPLETED" or any(
+                    t.get("card_details", {}).get("status") == "CAPTURED" or t.get("type")
+                    for t in tenders)
+        elif processor == "clover" and payment.get("checkout_external_id"):
+            base = CLOVER_BASE.get(env, CLOVER_BASE["sandbox"])
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                r = await client.get(
+                    f"{base}/invoicingcheckoutservice/v1/checkouts/{payment['checkout_external_id']}",
+                    headers={"Authorization": f"Bearer {cfg.get('private_key', '')}",
+                             "X-Clover-Merchant-Id": cfg.get("merchant_id", "")})
+            if r.status_code < 400:
+                status = (r.json().get("status") or "").upper()
+                paid = status in ("PAID", "COMPLETE", "COMPLETED", "APPROVED")
+    except Exception as e:
+        logger.warning("Checkout status check failed (%s): %s", processor, e)
+
+    # Respaldo: webhook ya registró el evento de pago
+    if not paid:
+        ext_ids = [v for v in (payment.get("checkout_order_id"), payment.get("checkout_external_id")) if v]
+        if ext_ids:
+            evt = await get_db().processor_webhook_events.find_one({
+                "processor": processor,
+                "$or": [{"matched_payment_id": str(payment["_id"])},
+                        {"payload_ids": {"$in": ext_ids}}]})
+            if evt:
+                paid = True
+
+    if paid:
+        info = await _mark_checkout_completed(payment)
+        return {"success": True, "completed": True,
+                "receipt_number": info["receipt_number"],
+                "amount": payment.get("total_paid", 0)}
+    return {"success": True, "completed": False}
+
+
+async def _try_complete_from_webhook(processor: str, candidate_ids: list, event_doc_id) -> None:
+    """Al recibir un webhook, intenta completar el rental_payment que coincida."""
+    ids = [i for i in candidate_ids if i]
+    if not ids:
+        return
+    payment = await get_db().rental_payments.find_one({
+        "checkout_processor": processor,
+        "status": "pending_checkout",
+        "$or": [{"checkout_order_id": {"$in": ids}}, {"checkout_external_id": {"$in": ids}}],
+    })
+    if payment:
+        await _mark_checkout_completed(payment)
+        await get_db().processor_webhook_events.update_one(
+            {"_id": event_doc_id}, {"$set": {"matched_payment_id": str(payment["_id"])}})
+
+
 # ────────────────────────────── WEBHOOKS ──────────────────────────────
 
 @router.post("/webhooks/square")
@@ -524,10 +736,21 @@ async def square_webhook(request: Request):
         "event_id": event_id,
         "type": event.get("type", ""),
         "payload": event,
+        "payload_ids": [v for v in [
+            (event.get("data", {}).get("object", {}).get("payment", {}) or {}).get("order_id"),
+            (event.get("data", {}).get("object", {}).get("payment", {}) or {}).get("id"),
+            event.get("data", {}).get("id"),
+        ] if v],
         "verified": bool(sig_key),
         "received_at": datetime.now(timezone.utc),
     })
     logger.info("Square webhook: %s", event.get("type", "?"))
+    # Completar pago de renta si el evento es de un pago exitoso
+    pay_obj = (event.get("data", {}).get("object", {}) or {}).get("payment", {}) or {}
+    if pay_obj.get("status") in ("COMPLETED", "APPROVED"):
+        inserted = await db.processor_webhook_events.find_one({"event_id": event_id})
+        await _try_complete_from_webhook("square", [pay_obj.get("order_id"), pay_obj.get("id")],
+                                         inserted["_id"] if inserted else None)
     return {"ok": True}
 
 
@@ -578,8 +801,16 @@ async def clover_webhook(request: Request):
         "event_id": event_id,
         "type": payload.get("status", "") or "event",
         "payload": payload,
+        "payload_ids": [v for v in [payload.get("checkoutSessionId"), payload.get("id"),
+                                    payload.get("paymentId")] if v],
         "verified": bool(secret),
         "received_at": datetime.now(timezone.utc),
     })
     logger.info("Clover webhook: %s", payload.get("status", "?"))
+    if (payload.get("status") or "").upper() in ("PAID", "APPROVED", "COMPLETE", "COMPLETED", "SUCCESS"):
+        inserted = await db.processor_webhook_events.find_one({"event_id": event_id})
+        await _try_complete_from_webhook(
+            "clover",
+            [payload.get("checkoutSessionId"), payload.get("id"), payload.get("paymentId")],
+            inserted["_id"] if inserted else None)
     return {"received": True}
