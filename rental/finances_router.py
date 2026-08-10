@@ -110,13 +110,12 @@ async def create_property_expense(request: Request):
     data = await request.json()
     now = datetime.utcnow()
 
-    property_id = data.get('property_id')
-    if not property_id:
-        raise HTTPException(status_code=400, detail="Se requiere property_id")
-
-    prop = await get_db().properties.find_one({"_id": ObjectId(property_id)})
-    if not prop:
-        raise HTTPException(status_code=404, detail="Propiedad no encontrada")
+    property_id = data.get('property_id') or ''
+    prop = None
+    if property_id:
+        prop = await get_db().properties.find_one({"_id": ObjectId(property_id)})
+        if not prop:
+            raise HTTPException(status_code=404, detail="Propiedad no encontrada")
 
     count = await get_db().property_expenses.count_documents({})
     expense_number = f"EXP-{now.year}-{str(count + 1).zfill(4)}"
@@ -124,14 +123,16 @@ async def create_property_expense(request: Request):
     expense_doc = {
         "expense_number": expense_number,
         "property_id": property_id,
-        "property_address": prop.get('address', ''),
-        "property_number": prop.get('property_number', ''),
+        "property_address": prop.get('address', '') if prop else '',
+        "property_number": prop.get('property_number', '') if prop else '',
         "category": data.get('category', 'other'),
+        "irs_category": data.get('irs_category', ''),
         "description": data.get('description', ''),
         "amount": float(data.get('amount', 0)),
         "vendor": data.get('vendor', ''),
         "expense_date": data.get('expense_date', now.strftime('%Y-%m-%d')),
         "receipt_number": data.get('receipt_number', ''),
+        "receipt_id": data.get('receipt_id', ''),
         "notes": data.get('notes', ''),
         "status": data.get('status', 'paid'),  # paid, pending, cancelled
         "created_at": now,
@@ -161,17 +162,22 @@ async def update_property_expense(expense_id: str, request: Request):
         raise HTTPException(status_code=404, detail="Gasto no encontrado")
 
     update_fields = {"updated_at": now}
-    for field in ['category', 'description', 'vendor', 'expense_date', 'receipt_number', 'notes', 'status']:
+    for field in ['category', 'irs_category', 'description', 'vendor', 'expense_date', 'receipt_number', 'receipt_id', 'notes', 'status']:
         if field in data:
             update_fields[field] = data[field]
     if 'amount' in data:
         update_fields['amount'] = float(data['amount'])
     if 'property_id' in data and data['property_id'] != expense.get('property_id'):
-        prop = await get_db().properties.find_one({"_id": ObjectId(data['property_id'])})
-        if prop:
-            update_fields['property_id'] = data['property_id']
-            update_fields['property_address'] = prop.get('address', '')
-            update_fields['property_number'] = prop.get('property_number', '')
+        if not data['property_id']:
+            update_fields['property_id'] = ''
+            update_fields['property_address'] = ''
+            update_fields['property_number'] = ''
+        else:
+            prop = await get_db().properties.find_one({"_id": ObjectId(data['property_id'])})
+            if prop:
+                update_fields['property_id'] = data['property_id']
+                update_fields['property_address'] = prop.get('address', '')
+                update_fields['property_number'] = prop.get('property_number', '')
 
     await get_db().property_expenses.update_one({"_id": ObjectId(expense_id)}, {"$set": update_fields})
     return {"success": True, "message": "Gasto actualizado exitosamente"}

@@ -310,6 +310,7 @@ try:
     from rental.tenant_router import router as tenant_router
     from rental.contracts_router import router as contracts_router
     from rental.finances_router import router as finances_router
+    from rental.receipt_scanner_router import router as receipt_scanner_router
     from rental.owner_router import router as owner_router
     from rental.stripe_router import router as stripe_router
     from rental.investments_router import router as investments_router
@@ -368,6 +369,7 @@ try:
     app.include_router(tenant_router, prefix="/api")
     app.include_router(contracts_router, prefix="/api")
     app.include_router(finances_router, prefix="/api")
+    app.include_router(receipt_scanner_router, prefix="/api")
     app.include_router(owner_router, prefix="/api")
     app.include_router(stripe_router, prefix="/api")
     app.include_router(investments_router, prefix="/api")
