@@ -29,7 +29,7 @@ import logging
 import os
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import httpx
 from fastapi import APIRouter, HTTPException, Request
@@ -182,6 +182,81 @@ async def list_processors(request: Request):
     await auth_admin(request)
     doc = await _get_doc()
     return {"success": True, **_masked_view(doc)}
+
+
+@router.get("/admin/payment-processors/fee-comparison")
+async def fee_comparison(request: Request):
+    """Compara comisiones estimadas de Stripe/Square/Clover con el volumen REAL de rentas (últimos 12 meses)."""
+    await auth_admin(request)
+
+    # Tarifas publicadas estándar para pagos online (card-not-present)
+    RATES = {
+        "stripe": {"label": "Stripe", "pct": 0.029, "fixed": 0.30, "rate_label": "2.9% + $0.30"},
+        "square": {"label": "Square", "pct": 0.029, "fixed": 0.30, "rate_label": "2.9% + $0.30"},
+        "clover": {"label": "Clover", "pct": 0.035, "fixed": 0.10, "rate_label": "3.5% + $0.10"},
+    }
+
+    now = datetime.now(timezone.utc)
+    start = (now - timedelta(days=365)).strftime('%Y-%m-%d')
+
+    monthly: dict = {}
+    tx_count = 0
+    volume = 0.0
+    async for p in get_db().rental_payments.find({"status": {"$in": ["completed", "paid"]}}):
+        amt = float(p.get("total_paid") or p.get("amount") or 0)
+        if amt <= 0:
+            continue
+        d = p.get("payment_date") or p.get("created_at")
+        if isinstance(d, datetime):
+            dstr = d.strftime('%Y-%m-%d')
+        else:
+            dstr = str(d or "")[:10]
+        if not dstr or dstr < start:
+            continue
+        month = dstr[:7]
+        m = monthly.setdefault(month, {"volume": 0.0, "count": 0})
+        m["volume"] += amt
+        m["count"] += 1
+        volume += amt
+        tx_count += 1
+
+    months_sorted = sorted(monthly.keys())
+    months_with_data = max(len(months_sorted), 1)
+    avg_ticket = volume / tx_count if tx_count else 0
+
+    active, _ = await get_active_processor()
+
+    comparison = []
+    for name, r in RATES.items():
+        fee_annual = volume * r["pct"] + tx_count * r["fixed"]
+        comparison.append({
+            "processor": name,
+            "label": r["label"],
+            "rate_label": r["rate_label"],
+            "fee_annual": round(fee_annual, 2),
+            "fee_monthly_avg": round(fee_annual / months_with_data, 2),
+            "effective_pct": round(fee_annual / volume * 100, 2) if volume else 0,
+            "is_active": name == active,
+        })
+    comparison.sort(key=lambda c: c["fee_annual"])
+    cheapest = comparison[0]["processor"] if comparison else None
+    active_fee = next((c["fee_annual"] for c in comparison if c["is_active"]), 0)
+    savings = round(active_fee - comparison[0]["fee_annual"], 2) if comparison else 0
+
+    return {
+        "success": True,
+        "volume_12m": round(volume, 2),
+        "tx_count_12m": tx_count,
+        "monthly_avg_volume": round(volume / months_with_data, 2),
+        "avg_ticket": round(avg_ticket, 2),
+        "months_with_data": len(months_sorted),
+        "monthly": [{"month": m, **{k: round(v, 2) if k == 'volume' else v for k, v in monthly[m].items()}} for m in months_sorted],
+        "active_processor": active,
+        "comparison": comparison,
+        "cheapest": cheapest,
+        "savings_annual_vs_active": savings,
+        "note": "Tarifas publicadas estándar para pagos online. Tus tarifas negociadas pueden variar.",
+    }
 
 
 @router.put("/admin/payment-processors/{name}")
