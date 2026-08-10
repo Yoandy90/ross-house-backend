@@ -1577,12 +1577,38 @@ def _letter_date(lang: str) -> str:
     return now.strftime("%B %d, %Y")
 
 
+def _register_embedded_fonts():
+    """Registra TTFs bajo los nombres estándar para que reportlab EMBEBA las
+    fuentes (Lob exige fuentes embebidas en los PDFs)."""
+    try:
+        from reportlab.pdfbase import pdfmetrics
+        from reportlab.pdfbase.ttfonts import TTFont
+        fdir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "assets", "fonts")
+        mapping = {
+            "Helvetica": "LiberationSans-Regular.ttf",
+            "Helvetica-Bold": "LiberationSans-Bold.ttf",
+            "Helvetica-Oblique": "LiberationSans-Italic.ttf",
+            "Times-Roman": "LiberationSerif-Regular.ttf",
+            "Times-Italic": "LiberationSerif-Italic.ttf",
+        }
+        for name, fn in mapping.items():
+            path = os.path.join(fdir, fn)
+            if os.path.exists(path):
+                pdfmetrics.registerFont(TTFont(name, path))
+    except Exception as e:
+        logger.warning(f"[deal_finder] no se pudieron embeber fuentes: {e}")
+
+
 def _build_letter_pdf(lead: dict, sender: dict, lang: str,
-                      photo: Optional[bytes] = None) -> bytes:
+                      photo: Optional[bytes] = None,
+                      for_lob: bool = False) -> bytes:
     """Carta premium en PDF (US Letter) lista para imprimir y doblar en sobre #10
     de ventana (destinatario en la zona de la ventana ~2\" desde arriba).
     Diseño: membrete con acento de marca, tipografía serif, caja CTA con QR,
-    tarjeta de firma y pie de página elegante."""
+    tarjeta de firma y pie de página elegante.
+    for_lob=True: deja limpia la zona superior-izquierda de la página 1 para que
+    Lob imprima ahí el remitente y destinatario (address_placement=top_first_page)."""
+    _register_embedded_fonts()
     import io
     from reportlab.lib.pagesizes import LETTER
     from reportlab.lib.units import inch
@@ -1616,23 +1642,25 @@ def _build_letter_pdf(lead: dict, sender: dict, lang: str,
 
     def _draw_static(c: _canvas.Canvas, doc, first: bool = True):
         c.saveState()
+        lob_first = for_lob and first
         # ── Membrete ────────────────────────────────────────────
-        # Remitente arriba-izquierda (return address visible en la ventana del sobre)
-        c.setFillColor(DARK)
-        c.setFont("Helvetica-Bold", 12.5)
-        c.drawString(0.8 * inch, 10.52 * inch, (sender.get("name", "") or "").upper(),
-                     charSpace=1.1)
-        c.setFont("Helvetica", 7.8)
-        c.setFillColor(RED)
-        if sender.get("company"):
-            c.drawString(0.8 * inch, 10.36 * inch, sender["company"].upper(), charSpace=0.8)
-        c.setFillColor(GRAY)
-        c.setFont("Helvetica", 8.8)
-        c.drawString(0.8 * inch, 10.20 * inch, sender.get("address", ""))
-        c.drawString(0.8 * inch, 10.06 * inch, csz)
-        if sender.get("phone"):
-            c.drawString(0.8 * inch, 9.92 * inch, sender["phone"])
-        # Logo arriba-derecha con web debajo
+        # Remitente arriba-izquierda (Lob imprime su propio bloque en pág. 1)
+        if not lob_first:
+            c.setFillColor(DARK)
+            c.setFont("Helvetica-Bold", 12.5)
+            c.drawString(0.8 * inch, 10.52 * inch, (sender.get("name", "") or "").upper(),
+                         charSpace=1.1)
+            c.setFont("Helvetica", 7.8)
+            c.setFillColor(RED)
+            if sender.get("company"):
+                c.drawString(0.8 * inch, 10.36 * inch, sender["company"].upper(), charSpace=0.8)
+            c.setFillColor(GRAY)
+            c.setFont("Helvetica", 8.8)
+            c.drawString(0.8 * inch, 10.20 * inch, sender.get("address", ""))
+            c.drawString(0.8 * inch, 10.06 * inch, csz)
+            if sender.get("phone"):
+                c.drawString(0.8 * inch, 9.92 * inch, sender["phone"])
+        # Logo arriba-derecha con web debajo (fuera de la zona de dirección de Lob)
         try:
             c.drawImage(logo_path, W - 0.8 * inch - 0.72 * inch, 10.06 * inch,
                         width=0.72 * inch, height=0.72 * inch, mask="auto")
@@ -1641,21 +1669,23 @@ def _build_letter_pdf(lead: dict, sender: dict, lang: str,
         except Exception:
             pass
         # Divisor de marca: trazo rojo grueso + línea fina
-        c.setStrokeColor(RED)
-        c.setLineWidth(2.6)
-        c.line(0.8 * inch, 9.72 * inch, 2.15 * inch, 9.72 * inch)
-        c.setStrokeColor(LIGHT)
-        c.setLineWidth(0.7)
-        c.line(2.15 * inch, 9.72 * inch, W - 0.8 * inch, 9.72 * inch)
+        if not lob_first:
+            c.setStrokeColor(RED)
+            c.setLineWidth(2.6)
+            c.line(0.8 * inch, 9.72 * inch, 2.15 * inch, 9.72 * inch)
+            c.setStrokeColor(LIGHT)
+            c.setLineWidth(0.7)
+            c.line(2.15 * inch, 9.72 * inch, W - 0.8 * inch, 9.72 * inch)
         # ── Destinatario (zona de ventana ~2" desde arriba) ─────
         if first:
-            c.setFillColor(DARK)
-            c.setFont("Helvetica", 10.5)
-            addr_top = 8.55 * inch
-            lines = [lead.get("owner_name", "").strip().title() or lead.get("owner_name", "").strip()]
-            lines += [ln for ln in (lead.get("mailing_lines") or []) if ln]
-            for i, ln in enumerate(lines[:5]):
-                c.drawString(0.9 * inch, addr_top - i * 0.18 * inch, ln)
+            if not for_lob:
+                c.setFillColor(DARK)
+                c.setFont("Helvetica", 10.5)
+                addr_top = 8.55 * inch
+                lines = [lead.get("owner_name", "").strip().title() or lead.get("owner_name", "").strip()]
+                lines += [ln for ln in (lead.get("mailing_lines") or []) if ln]
+                for i, ln in enumerate(lines[:5]):
+                    c.drawString(0.9 * inch, addr_top - i * 0.18 * inch, ln)
             # ── Foto aérea de la propiedad (derecha, zona libre) ──
             if photo:
                 try:
@@ -1954,123 +1984,17 @@ async def mail_letter(request: Request, lead_id: str):
                            "deliverable_incorrect_unit", "deliverable_missing_unit"):
                 raise HTTPException(422, f"USPS marca la dirección como no entregable ({dpv})")
 
-        # 2) HTML premium BILINGÜE (doble cara: inglés al frente, español al reverso)
-        photo_b64 = ""
+        # 2) PDF bilingüe (idéntico a la vista previa) — Lob imprime doble cara.
+        #    for_lob=True deja limpia la zona superior de la pág. 1 para que Lob
+        #    imprima ahí el bloque de remitente/destinatario.
         photo = await _lead_photo(db, doc)
-        if photo:
-            import base64 as _pb64
-            photo_b64 = _pb64.b64encode(photo).decode()
-
-        offer = doc.get("offer") or {}
-        qr_b64, purl = "", ""
-        if offer.get("slug"):
-            import base64 as _b64
-            purl = f"{SITE_BASE}/oferta/{offer['slug']}"
-            qr_b64 = _b64.b64encode(_offer_qr_png(purl)).decode()
-
-        csz = f"{sender.get('city','')}, {sender.get('state','')} {sender.get('zip','')}"
-        footer_html = (
-            f'<div style="position:absolute;bottom:.55in;left:.9in;right:.9in;'
-            f'border-top:1.5pt solid #C41428;padding-top:6pt;text-align:center;'
-            f'font-family:Helvetica,Arial,sans-serif;font-size:7.5pt;color:#6B7280">'
-            f'{sender.get("name","")} &middot; {sender.get("company","")} &middot; '
-            f'{sender.get("address","")}, {csz} &middot; {sender.get("phone","")} &middot; '
-            f'rosshouserentals.com</div>')
-        sig_html = (
-            f'<table style="margin-top:16pt;border-collapse:collapse"><tr>'
-            f'<td style="width:4pt;background:#C41428"></td>'
-            f'<td style="padding:4pt 10pt"><img src="https://www.rosshouserentals.com/logo.jpg" '
-            f'style="width:40pt;height:40pt;border-radius:50%"/></td>'
-            f'<td style="font-size:9.5pt;line-height:1.4;color:#6B7280">'
-            f'<span style="font-size:11pt;font-weight:bold;color:#20242E">{sender.get("name","Yoandy Ross")}</span><br/>'
-            f'{sender.get("company","Ross House Rentals LLC")} &mdash; Dumas, TX<br/>'
-            f'{sender.get("phone","")} &middot; rosshouserentals.com</td></tr></table>')
-
-        def _page_html(lg: str) -> str:
-            body_text = (doc.get("offer_letter") or {}).get(
-                "letter_en" if lg == "en" else "letter_es", "") \
-                .replace("[TELÉFONO]", sender.get("phone", "")) \
-                .replace("[PHONE]", sender.get("phone", "")) \
-                .replace("[EMAIL]", sender.get("email", "yoandyross@gmail.com"))
-            # Auto-ajuste: reduce tipografía según longitud para que cada idioma
-            # quepa en UNA cara (la p1 tiene menos espacio por la zona de dirección)
-            chars = len(body_text)
-            budget = 900 if lg == "en" else 1500
-            if chars <= budget:
-                fs, pmargin, ph_w, ph_h = "11.5pt", "11pt", 190, 116
-            elif chars <= budget + 350:
-                fs, pmargin, ph_w, ph_h = "10.4pt", "8pt", 168, 103
-            elif chars <= budget + 750:
-                fs, pmargin, ph_w, ph_h = "9.6pt", "6pt", 150, 92
-            else:
-                fs, pmargin, ph_w, ph_h = "8.9pt", "5pt", 136, 83
-            body_html = "".join(
-                f'<p style="margin:0 0 {pmargin};text-align:justify">'
-                f"{p.strip().replace('&','&amp;').replace('<','&lt;')}</p>"
-                for p in body_text.split("\n") if p.strip())
-            flip = ('&iquest;Prefiere espa&ntilde;ol? &rarr; Vea el reverso' if lg == "en"
-                    else 'English version on the other side &rarr;')
-            flip_html = (f'<div style="text-align:right;font-family:Helvetica,Arial,sans-serif;'
-                         f'font-size:8.5pt;font-weight:bold;color:#C41428;margin-bottom:6pt">{flip}</div>')
-            date_html = (f'<div style="font-style:italic;color:#6B7280;font-size:10pt;'
-                         f'margin-bottom:14pt">{_letter_date(lg)}</div>')
-            ph = ""
-            if photo_b64:
-                cap = ("Aerial view of your property" if lg == "en"
-                       else "Vista a&eacute;rea de su propiedad")
-                ph = (f'<div style="float:right;width:{ph_w}pt;margin:0 0 8pt 14pt;text-align:right">'
-                      f'<img src="data:image/jpeg;base64,{photo_b64}" '
-                      f'style="width:{ph_w}pt;height:{ph_h}pt;border:1pt solid #D9DCE1;border-radius:6pt"/>'
-                      f'<div style="font-size:7.3pt;color:#6B7280;font-style:italic;'
-                      f'font-family:Helvetica,Arial,sans-serif;margin-top:2pt">{cap}</div></div>')
-            cta = ""
-            if qr_b64:
-                if lg == "en":
-                    kicker = "RESPOND ONLINE &mdash; TAKES 1 MINUTE"
-                    title = (f'Our cash offer: <span style="color:#C41428">${offer["amount"]:,.0f}</span>'
-                             if offer.get("mode") == "amount" and offer.get("amount")
-                             else "Tell us your price for the property")
-                    body_cta = (f'Scan the QR code with your phone camera or visit '
-                                f'<b>{purl.replace("https://www.","")}</b> to view your personalized '
-                                f'offer and respond instantly.<br/>'
-                                f'<i>No obligation &middot; We buy AS-IS &middot; Offer valid for 30 days</i>')
-                else:
-                    kicker = "RESPONDA EN L&Iacute;NEA &mdash; TOMA 1 MINUTO"
-                    title = (f'Nuestra oferta en efectivo: <span style="color:#C41428">${offer["amount"]:,.0f}</span>'
-                             if offer.get("mode") == "amount" and offer.get("amount")
-                             else "D&iacute;ganos cu&aacute;nto aceptar&iacute;a por su propiedad")
-                    body_cta = (f'Escanee el c&oacute;digo QR con la c&aacute;mara de su tel&eacute;fono o visite '
-                                f'<b>{purl.replace("https://www.","")}</b> para ver su oferta '
-                                f'personalizada y responder al instante.<br/>'
-                                f'<i>Sin compromiso &middot; Compramos AS-IS &middot; Oferta v&aacute;lida por 30 d&iacute;as</i>')
-                cta = (f'<table style="margin-top:20pt;border:1.5pt solid #C41428;width:100%;'
-                       f'border-collapse:separate;border-radius:8pt;background:#FCF5F5"><tr>'
-                       f'<td style="width:100pt;padding:10pt;text-align:center">'
-                       f'<img src="data:image/png;base64,{qr_b64}" style="width:84pt;height:84pt"/></td>'
-                       f'<td style="padding:10pt 12pt 10pt 2pt;font-size:9.5pt;line-height:1.45;color:#20242E">'
-                       f'<div style="font-size:7.5pt;font-weight:bold;letter-spacing:1pt;color:#C41428">{kicker}</div>'
-                       f'<div style="font-size:13pt;font-weight:bold;margin:3pt 0 5pt">{title}</div>'
-                       f'{body_cta}</td></tr></table>')
-            return (f'<div style="font-size:{fs}">'
-                    f'{flip_html}{date_html}{ph}{body_html}{sig_html}{cta}{footer_html}</div>')
-
-        html = (f'<html><head><meta charset="utf-8"><style>'
-                f'@page{{size:letter;margin:0}}body{{margin:0}}'
-                f'.pg{{position:relative;width:8.5in;height:11in;box-sizing:border-box;'
-                f'font-family:Georgia,\'Times New Roman\',serif;font-size:11.5pt;'
-                f'line-height:1.5;color:#20242E;page-break-after:always}}'
-                f'.p1{{padding:3.4in .9in 1.1in}}.p2{{padding:1.1in .9in 1.1in}}'
-                f'</style></head><body>'
-                f'<div class="pg p1">{_page_html("en")}</div>'
-                f'<div class="pg p2">{_page_html("es")}</div>'
-                f'</body></html>')
+        pdf_bytes = _build_letter_pdf(doc, sender, "en", photo=photo, for_lob=True)
 
         data = {
             "description": f"Carta oferta — {doc.get('address', doc['property_id'])}",
             "color": "true", "double_sided": "true",
             "address_placement": "top_first_page",
             "mail_type": "usps_first_class", "use_type": "marketing",
-            "file": html,
         }
         data.update(_lob_addr("to", doc.get("owner_name", ""), street, city, state, zipc))
         data.update(_lob_addr("from", sender.get("name", ""),
@@ -2079,7 +2003,9 @@ async def mail_letter(request: Request, lead_id: str):
 
         idem = f"lead-{lead_id}-{int(datetime.now().timestamp())}"
         r = await client.post("https://api.lob.com/v1/letters", auth=(key, ""),
-                              data=data, headers={"Idempotency-Key": idem})
+                              data=data,
+                              files={"file": ("carta.pdf", pdf_bytes, "application/pdf")},
+                              headers={"Idempotency-Key": idem})
     if r.status_code not in (200, 201):
         logger.error(f"[deal_finder] Lob falló {r.status_code}: {r.text[:300]}")
         raise HTTPException(502, f"Lob rechazó el envío: {r.text[:200]}")
