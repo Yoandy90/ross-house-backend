@@ -222,6 +222,41 @@ async def ai_toggle_global(request: Request):
     return {"success": True, "ai_enabled_global": enabled}
 
 
+@router.get("/ai/status/{conversation_id}")
+async def ai_status_conversation(conversation_id: str, request: Request):
+    """Admin: estado del auto-reply AI para UNA conversación.
+    Si la conversación no tiene override, hereda el estado global."""
+    await auth_admin(request)
+    db = get_db()
+    try:
+        conv = await db.chat_conversations.find_one({"_id": ObjectId(conversation_id)})
+    except Exception:
+        conv = None
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversación no encontrada")
+    cfg = await db.app_settings.find_one({"_id": "chat_ai"}) or {}
+    global_enabled = bool(cfg.get("enabled", True))
+    per_conv = conv.get("ai_enabled")
+    return {
+        "success": True,
+        "ai_enabled": global_enabled if per_conv is None else bool(per_conv),
+        "ai_enabled_global": global_enabled,
+    }
+
+
+@router.post("/ai/toggle/{conversation_id}")
+async def ai_toggle_conversation(conversation_id: str, request: Request):
+    """Admin: activar/desactivar el auto-reply AI SOLO para esta conversación."""
+    await auth_admin(request)
+    data = await request.json()
+    enabled = bool(data.get("enabled"))
+    res = await get_db().chat_conversations.update_one(
+        {"_id": ObjectId(conversation_id)}, {"$set": {"ai_enabled": enabled}})
+    if res.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Conversación no encontrada")
+    return {"success": True, "ai_enabled": enabled}
+
+
 @router.get("/admin/conversations")
 async def admin_get_conversations(request: Request, search: Optional[str] = None):
     """Admin: List all conversations, sorted by most recent."""
@@ -267,6 +302,30 @@ async def admin_get_messages(request: Request, conversation_id: str, limit: int 
     )
 
     return {"success": True, "messages": [serialize(m) for m in messages]}
+
+
+@router.get("/conversations/{conversation_id}/messages")
+async def get_conversation_messages(conversation_id: str, request: Request, limit: int = 50, before: Optional[str] = None):
+    """Alias usado por la app móvil admin — mismo comportamiento que
+    /chat/admin/messages/{id} (lista cronológica + marca como leído)."""
+    return await admin_get_messages(request, conversation_id, limit, before)
+
+
+@router.post("/conversations/{conversation_id}/read")
+async def mark_conversation_read(conversation_id: str, request: Request):
+    """Admin: marcar todos los mensajes del inquilino como leídos."""
+    db = get_db()
+    await auth_admin(request)
+    await db.chat_messages.update_many(
+        {"conversation_id": conversation_id, "sender_type": "tenant", "read": False},
+        {"$set": {"read": True}}
+    )
+    try:
+        await db.chat_conversations.update_one(
+            {"_id": ObjectId(conversation_id)}, {"$set": {"unread_admin": 0}})
+    except Exception:
+        pass
+    return {"success": True}
 
 
 @router.post("/admin/send")
@@ -496,6 +555,14 @@ async def _ai_auto_reply(conversation_id: str, user_message: str, sender_name: s
         cfg = await get_db().app_settings.find_one({"_id": "chat_ai"}) or {}
         if not cfg.get("enabled", True):
             return
+
+        # Respect the per-conversation AI toggle (admin chat header switch)
+        try:
+            conv_doc = await get_db().chat_conversations.find_one({"_id": ObjectId(conversation_id)})
+            if conv_doc and conv_doc.get("ai_enabled") is False:
+                return
+        except Exception:
+            pass
 
         # Small delay to feel more natural
         await asyncio.sleep(2)

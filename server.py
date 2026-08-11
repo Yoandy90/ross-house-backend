@@ -38,6 +38,15 @@ logger = logging.getLogger(__name__)
 client = AsyncIOMotorClient(MONGO_URL)
 db = client[DB_NAME]
 
+# ─── Load API keys stored in DB into os.environ (BEFORE routers import) ───
+# Allows rotating 3rd-party keys (SendGrid, Twilio, Lob, Plaid, etc.) from
+# the Admin Panel without rebuilding or redeploying.
+try:
+    from rental.api_keys_router import load_db_keys_into_env
+    load_db_keys_into_env(MONGO_URL, DB_NAME)
+except Exception as e:
+    logger.warning(f"⚠️ DB API keys not loaded (using .env only): {e}")
+
 
 # ─── Lifespan ─────────────────────────────────────────────────
 @asynccontextmanager
@@ -112,6 +121,14 @@ async def lifespan(app: FastAPI):
         logger.info("   ✅ Autopay cron scheduled")
     except Exception as e:
         logger.warning(f"   ⚠️ Autopay cron not started: {e}")
+
+    # Start newsletter scheduler — sends scheduled/recurring campaigns
+    try:
+        from rental.newsletter_pro_router import newsletter_scheduler_loop
+        asyncio.create_task(newsletter_scheduler_loop())
+        logger.info("   ✅ Newsletter scheduler started")
+    except Exception as e:
+        logger.warning(f"   ⚠️ Newsletter scheduler not started: {e}")
 
     # Start app-adoption re-engagement email cron (weekly)
     reengage_task = None
@@ -370,6 +387,8 @@ try:
     from rental.plaid_router import router as plaid_router
     from rental.deal_finder_router import router as deal_finder_router
     from rental.drip_router import router as drip_router
+    from rental.api_keys_router import router as api_keys_router
+    from rental.newsletter_pro_router import router as newsletter_pro_router
 
     app.include_router(auth_router, prefix="/api")
     app.include_router(properties_router, prefix="/api")
@@ -427,6 +446,8 @@ try:
     app.include_router(plaid_router, prefix="/api")
     app.include_router(deal_finder_router, prefix="/api")
     app.include_router(drip_router, prefix="/api")
+    app.include_router(api_keys_router, prefix="/api")
+    app.include_router(newsletter_pro_router, prefix="/api")
     app.include_router(property_taxes_router, prefix="/api")
     app.include_router(admin_nav_router, prefix="/api")
     # ensure_indexes() awaited inside lifespan startup.

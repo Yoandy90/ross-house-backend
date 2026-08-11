@@ -64,17 +64,29 @@ class ACHAuthorizationRequest(BaseModel):
 # ═══════════════════════════════════════════════════════════════════
 async def get_current_user(request: Request):
     """Extract user from JWT token"""
-    from rental.shared import verify_jwt_token
-    
+    import jwt
+    from rental.shared import TENANT_JWT_SECRET
+
     auth_header = request.headers.get("Authorization", "")
     if not auth_header.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Token requerido")
-    
+
     token = auth_header.replace("Bearer ", "")
-    payload = verify_jwt_token(token)
-    if not payload:
+    try:
+        payload = jwt.decode(token, TENANT_JWT_SECRET, algorithms=["HS256"])
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token expirado")
+    except Exception:
         raise HTTPException(status_code=401, detail="Token inválido")
-    
+
+    # Normalize user_id field — different tokens use different keys
+    if "user_id" not in payload:
+        payload["user_id"] = (
+            payload.get("sub")
+            or payload.get("tenant_id")
+            or payload.get("id")
+        )
+
     return payload
 
 

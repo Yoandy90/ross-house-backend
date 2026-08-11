@@ -262,6 +262,7 @@ async def sendgrid_event_webhook(request: Request):
         return {"success": True}
     db = get_db()
     docs = []
+    recipient_updates = []
     for ev in events[:500]:
         if not isinstance(ev, dict):
             continue
@@ -273,17 +274,42 @@ async def sendgrid_event_webhook(request: Request):
         etype = ev.get('event', '')
         if etype not in ('open', 'click', 'delivered', 'bounce', 'dropped', 'spamreport', 'unsubscribe'):
             continue
+        ev_time = datetime.utcfromtimestamp(ev['timestamp']) if ev.get('timestamp') else datetime.utcnow()
         docs.append({
             "email": (ev.get('email') or '').lower(),
             "event": etype,
-            "timestamp": datetime.utcfromtimestamp(ev['timestamp']) if ev.get('timestamp') else datetime.utcnow(),
+            "timestamp": ev_time,
             "sg_message_id": ev.get('sg_message_id', ''),
+            "campaign_id": ev.get('campaign_id', ''),
             "url": ev.get('url', ''),
             "useragent": ev.get('useragent', '')[:200],
             "created_at": datetime.utcnow(),
         })
+        # Tracking por destinatario (custom_args: campaign_id) — Newsletter Pro
+        cid = ev.get('campaign_id')
+        if cid:
+            email = (ev.get('email') or '').lower()
+            if etype == 'delivered':
+                upd = {"$set": {"delivered": True}, "$min": {"delivered_at": ev_time}}
+            elif etype == 'open':
+                upd = {"$set": {"opened": True, "last_open_at": ev_time},
+                       "$min": {"first_open_at": ev_time}, "$inc": {"opens": 1}}
+            elif etype == 'click':
+                upd = {"$set": {"clicked": True}, "$min": {"clicked_at": ev_time}}
+            elif etype in ('bounce', 'dropped'):
+                upd = {"$set": {"bounced": True, "bounce_reason": (ev.get('reason') or '')[:200]}}
+            else:
+                upd = None
+            if upd:
+                recipient_updates.append((cid, email, upd))
     if docs:
         await db.email_events.insert_many(docs)
+    for cid, email, upd in recipient_updates:
+        try:
+            await db.newsletter_recipients.update_one(
+                {"campaign_id": cid, "email": email}, upd)
+        except Exception:
+            pass
     return {"success": True, "stored": len(docs)}
 
 

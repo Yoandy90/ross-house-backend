@@ -205,7 +205,9 @@ async def admin_login_step1(request: Request):
         raise HTTPException(status_code=400, detail="Email y contraseña son requeridos")
 
     # CAPTCHA gate (cheap bot filter before we touch DB / bcrypt).
-    await verify_turnstile_token(captcha_token, request)
+    # optional=True: la app móvil no puede renderizar el widget de Turnstile.
+    # La protección contra fuerza bruta la da el lockout de cuenta (abajo).
+    await verify_turnstile_token(captcha_token, request, optional=True)
 
     db = get_db()
     user = await db.app_users.find_one({"email": {"$regex": f"^{re.escape(email)}$", "$options": "i"}})
@@ -213,9 +215,30 @@ async def admin_login_step1(request: Request):
         # Generic message to avoid user enumeration.
         raise HTTPException(status_code=401, detail="Credenciales inválidas")
 
+    # ── Account lockout (same policy as marketplace-login: 5 fails → 15 min) ──
+    now_dt = datetime.utcnow()
+    if user.get("locked_until") and user["locked_until"] > now_dt:
+        raise HTTPException(status_code=401, detail="Credenciales inválidas")
+
     pwd_hash = user.get("password_hash") or ""
     if not pwd_hash or not _verify_password(password, pwd_hash):
+        await db.app_users.update_one(
+            {"_id": user["_id"], "failed_login_attempts": {"$lt": 5}},
+            {"$inc": {"failed_login_attempts": 1}},
+        )
+        latest = await db.app_users.find_one({"_id": user["_id"]})
+        if latest and latest.get("failed_login_attempts", 0) >= 5:
+            await db.app_users.update_one(
+                {"_id": user["_id"]},
+                {"$set": {"locked_until": now_dt + timedelta(minutes=15)}},
+            )
         raise HTTPException(status_code=401, detail="Credenciales inválidas")
+
+    # Password OK — clear failure state.
+    await db.app_users.update_one(
+        {"_id": user["_id"]},
+        {"$set": {"failed_login_attempts": 0, "locked_until": None}},
+    )
 
     user_id = str(user["_id"])
     settings = await _get_settings_for(user_id)

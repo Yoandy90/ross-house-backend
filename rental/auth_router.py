@@ -311,6 +311,12 @@ async def marketplace_login(request: Request):
 
     user_id = str(user["_id"])
     role = "tenant" if collection == "tenants" else user.get("role", "tenant")
+
+    # ── SECURITY: admin accounts MUST use the 2FA flow (/admin/auth/login-step1/2).
+    # Issuing an admin token here would bypass the OTP entirely.
+    if role == "admin":
+        raise HTTPException(status_code=403, detail="admin_2fa_required")
+
     token = create_marketplace_token(user_id, email, role)
 
     return {
