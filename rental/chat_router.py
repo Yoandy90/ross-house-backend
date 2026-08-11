@@ -178,6 +178,7 @@ async def send_message(request: Request, body: SendMessageBody):
                 "last_message": preview,
                 "last_message_at": datetime.now(timezone.utc),
                 "tenant_name": user_name,
+                "hidden_admin": False,  # reaparece si estaba oculta
             },
             "$inc": {"unread_admin": 1},
         }
@@ -277,7 +278,7 @@ async def admin_get_conversations(request: Request, search: Optional[str] = None
     db = get_db()
     await auth_admin(request)
 
-    query = {}
+    query = {"hidden_admin": {"$ne": True}}
     if search:
         query["$or"] = [
             {"tenant_name": {"$regex": search, "$options": "i"}},
@@ -287,6 +288,32 @@ async def admin_get_conversations(request: Request, search: Optional[str] = None
     convs = await db.chat_conversations.find(query).sort("last_message_at", -1).to_list(100)
 
     return {"success": True, "conversations": [serialize(c) for c in convs]}
+
+
+@router.delete("/admin/conversations/{conversation_id}")
+async def admin_delete_conversation(conversation_id: str, request: Request, delete_for_both: bool = False):
+    """Admin: eliminar una conversación.
+    - delete_for_both=true  → borra conversación + mensajes para TODOS.
+    - delete_for_both=false → solo la oculta de la lista del admin (el cliente la conserva)."""
+    db = get_db()
+    await auth_admin(request)
+    try:
+        oid = ObjectId(conversation_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="ID inválido")
+
+    conv = await db.chat_conversations.find_one({"_id": oid})
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversación no encontrada")
+
+    if delete_for_both:
+        await db.chat_messages.delete_many({"conversation_id": conversation_id})
+        await db.chat_conversations.delete_one({"_id": oid})
+        return {"success": True, "message": "Conversación eliminada para ambos"}
+
+    await db.chat_conversations.update_one(
+        {"_id": oid}, {"$set": {"hidden_admin": True, "unread_admin": 0}})
+    return {"success": True, "message": "Conversación ocultada de tu lista"}
 
 
 @router.get("/admin/messages/{conversation_id}")
