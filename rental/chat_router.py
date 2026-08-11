@@ -33,16 +33,26 @@ def set_ai_brain(brain):
 # ── Pydantic Models ──
 
 class SendMessageBody(BaseModel):
-    content: str
+    content: str = ""
+    message: Optional[str] = None   # alias tolerante para builds antiguos
+    text: Optional[str] = None      # alias tolerante
     message_type: str = "text"  # text | image | file
     file_name: Optional[str] = None
+
+    def resolved_content(self) -> str:
+        return (self.content or self.message or self.text or "").strip()
 
 
 class AdminSendMessageBody(BaseModel):
     conversation_id: str
-    content: str
+    content: str = ""
+    message: Optional[str] = None   # alias tolerante para builds antiguos
+    text: Optional[str] = None      # alias tolerante
     message_type: str = "text"
     file_name: Optional[str] = None
+
+    def resolved_content(self) -> str:
+        return (self.content or self.message or self.text or "").strip()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -121,6 +131,10 @@ async def send_message(request: Request, body: SendMessageBody):
     user_id = user["_id"]
     user_name = user.get("name", user.get("email", "Inquilino"))
 
+    content = body.resolved_content()
+    if not content and body.message_type == "text":
+        raise HTTPException(status_code=400, detail="El mensaje no puede estar vacío")
+
     # Get or create conversation
     conv = await db.chat_conversations.find_one({"tenant_id": user_id})
     if not conv:
@@ -147,7 +161,7 @@ async def send_message(request: Request, body: SendMessageBody):
         "sender_id": user_id,
         "sender_name": user_name,
         "message_type": body.message_type,
-        "content": body.content,
+        "content": content,
         "file_name": body.file_name,
         "read": False,
         "created_at": datetime.now(timezone.utc),
@@ -156,7 +170,7 @@ async def send_message(request: Request, body: SendMessageBody):
     msg["_id"] = result.inserted_id
 
     # Update conversation
-    preview = body.content[:80] if body.message_type == "text" else f"📎 {body.file_name or 'Archivo'}"
+    preview = content[:80] if body.message_type == "text" else f"📎 {body.file_name or 'Archivo'}"
     await db.chat_conversations.update_one(
         {"_id": conv["_id"]},
         {
@@ -181,7 +195,7 @@ async def send_message(request: Request, body: SendMessageBody):
 
     # 🧠 AI Brain Auto-Reply (runs in background)
     if _ai_brain and body.message_type == "text":
-        asyncio.create_task(_ai_auto_reply(conv_id, body.content, user_name))
+        asyncio.create_task(_ai_auto_reply(conv_id, content, user_name))
 
     return {"success": True, "message": serialize(msg)}
 
@@ -335,6 +349,10 @@ async def admin_send_message(request: Request, body: AdminSendMessageBody):
     admin = await auth_admin(request)
     admin_name = admin.get("name", admin.get("email", "Ross House Admin"))
 
+    content = body.resolved_content()
+    if not content and body.message_type == "text":
+        raise HTTPException(status_code=400, detail="El mensaje no puede estar vacío")
+
     conv = await db.chat_conversations.find_one({"_id": ObjectId(body.conversation_id)})
     if not conv:
         raise HTTPException(status_code=404, detail="Conversación no encontrada")
@@ -347,7 +365,7 @@ async def admin_send_message(request: Request, body: AdminSendMessageBody):
         "sender_id": str(admin["_id"]),
         "sender_name": admin_name,
         "message_type": body.message_type,
-        "content": body.content,
+        "content": content,
         "file_name": body.file_name,
         "read": False,
         "created_at": datetime.now(timezone.utc),
@@ -355,7 +373,7 @@ async def admin_send_message(request: Request, body: AdminSendMessageBody):
     result = await db.chat_messages.insert_one(msg)
     msg["_id"] = result.inserted_id
 
-    preview = body.content[:80] if body.message_type == "text" else f"📎 {body.file_name or 'Archivo'}"
+    preview = content[:80] if body.message_type == "text" else f"📎 {body.file_name or 'Archivo'}"
     await db.chat_conversations.update_one(
         {"_id": conv["_id"]},
         {
