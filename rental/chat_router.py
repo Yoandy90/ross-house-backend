@@ -273,12 +273,17 @@ async def ai_toggle_conversation(conversation_id: str, request: Request):
 
 
 @router.get("/admin/conversations")
-async def admin_get_conversations(request: Request, search: Optional[str] = None):
-    """Admin: List all conversations, sorted by most recent."""
+async def admin_get_conversations(request: Request, search: Optional[str] = None, source: Optional[str] = None):
+    """Admin: List all conversations, sorted by most recent.
+    source: 'web' (chat web Rossy) | 'app' (app móvil) | 'all'/None (todas)."""
     db = get_db()
     await auth_admin(request)
 
     query = {"hidden_admin": {"$ne": True}}
+    if source == "web":
+        query["source"] = "web"
+    elif source == "app":
+        query["source"] = {"$ne": "web"}
     if search:
         query["$or"] = [
             {"tenant_name": {"$regex": search, "$options": "i"}},
@@ -411,6 +416,23 @@ async def admin_send_message(request: Request, body: AdminSendMessageBody):
             "$inc": {"unread_tenant": 1},
         }
     )
+
+    # Bridge: si la conversación viene del chat web (Rossy), reflejar la
+    # respuesta del admin en la sesión del widget para que el visitante la vea.
+    if conv.get("chatbot_session_id") and body.message_type == "text":
+        try:
+            await db.public_chatbot_sessions.update_one(
+                {"_id": conv["chatbot_session_id"]},
+                {"$push": {"messages": {
+                    "role": "assistant",
+                    "content": content,
+                    "from_admin": True,
+                    "admin_name": admin_name,
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                }}, "$set": {"updated_at": datetime.now(timezone.utc).isoformat()}},
+            )
+        except Exception as e:
+            logger.warning(f"Bridge admin->webchat failed: {e}")
 
     # Push notification to tenant
     tenant_id = conv.get("tenant_id", "")

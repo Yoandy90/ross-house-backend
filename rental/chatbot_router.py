@@ -32,7 +32,7 @@ from fastapi import APIRouter, Request, HTTPException, Depends
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from .shared import get_db, auth_admin
+from .shared import get_db, auth_admin, send_rental_push_to_admins
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -162,6 +162,107 @@ async def _get_or_create_session(db, session_id: Optional[str], ip: str, ua: str
 CAPTURE_RE = re.compile(r"<CAPTURE_LEAD>\s*(\{.*?\})\s*</CAPTURE_LEAD>", re.DOTALL)
 
 
+# ── Bridge: espejo del chat web (Rossy) en chat_conversations ────────────────
+# Hace visible cada conversación del widget público en el sistema de mensajes
+# del admin (app móvil "Mensajes → Web" y panel /admin/chat) + push al admin.
+
+async def _bridge_conversation(db, session: Dict[str, Any]) -> Dict[str, Any]:
+    """Get/create the chat_conversations doc linked to a public chatbot session."""
+    sid = session["_id"]
+    contact = session.get("captured_contact") or {}
+    conv = await db.chat_conversations.find_one({"chatbot_session_id": sid})
+    if conv:
+        # Refresca identidad si el lead fue capturado después de crearla
+        updates = {}
+        if contact.get("name") and conv.get("tenant_name") != contact["name"]:
+            updates["tenant_name"] = contact["name"]
+        if contact.get("email") and conv.get("tenant_email") != contact.get("email"):
+            updates["tenant_email"] = contact["email"]
+        if contact.get("phone") and conv.get("tenant_phone") != contact.get("phone"):
+            updates["tenant_phone"] = contact["phone"]
+        if updates:
+            await db.chat_conversations.update_one({"_id": conv["_id"]}, {"$set": updates})
+            conv.update(updates)
+        return conv
+    now = datetime.now(timezone.utc)
+    conv = {
+        "tenant_id": f"webchat_{sid[:16]}",
+        "tenant_name": contact.get("name") or f"Visitante Web #{sid[:6]}",
+        "tenant_email": contact.get("email", ""),
+        "tenant_phone": contact.get("phone", ""),
+        "is_guest": True,
+        "source": "web",
+        "chatbot_session_id": sid,
+        "last_message": "",
+        "last_message_at": now,
+        "unread_tenant": 0,
+        "unread_admin": 0,
+        "created_at": now,
+    }
+    result = await db.chat_conversations.insert_one(conv)
+    conv["_id"] = result.inserted_id
+    return conv
+
+
+async def _bridge_user_message(db, session: Dict[str, Any], content: str):
+    """Mirror a web visitor message into the admin chat system + push admins."""
+    try:
+        conv = await _bridge_conversation(db, session)
+        conv_id = str(conv["_id"])
+        await db.chat_messages.insert_one({
+            "conversation_id": conv_id,
+            "sender_type": "tenant",
+            "sender_id": conv.get("tenant_id", ""),
+            "sender_name": conv.get("tenant_name", "Visitante Web"),
+            "message_type": "text",
+            "content": content,
+            "read": False,
+            "created_at": datetime.now(timezone.utc),
+        })
+        await db.chat_conversations.update_one(
+            {"_id": conv["_id"]},
+            {"$set": {
+                "last_message": content[:80],
+                "last_message_at": datetime.now(timezone.utc),
+                "hidden_admin": False,  # reaparece si estaba oculta
+            }, "$inc": {"unread_admin": 1}},
+        )
+        try:
+            await send_rental_push_to_admins(
+                title=f"💬 {conv.get('tenant_name', 'Visitante')} (chat web)",
+                body=content[:80],
+                data={"type": "chat_message", "conversation_id": conv_id},
+            )
+        except Exception as e:
+            logger.warning(f"[chatbot bridge] push to admins failed: {e}")
+    except Exception:
+        logger.exception("[chatbot bridge] user message mirror failed")
+
+
+async def _bridge_ai_reply(db, session: Dict[str, Any], content: str):
+    """Mirror the AI (Rossy) reply into the admin chat system (no unread inc)."""
+    if not content:
+        return
+    try:
+        conv = await _bridge_conversation(db, session)
+        await db.chat_messages.insert_one({
+            "conversation_id": str(conv["_id"]),
+            "sender_type": "ai",
+            "sender_id": "rossy_ai",
+            "sender_name": "Rossy (IA)",
+            "message_type": "text",
+            "content": content,
+            "read": True,
+            "created_at": datetime.now(timezone.utc),
+        })
+        await db.chat_conversations.update_one(
+            {"_id": conv["_id"]},
+            {"$set": {"last_message": f"🤖 {content[:76]}", "last_message_at": datetime.now(timezone.utc)}},
+        )
+    except Exception:
+        logger.exception("[chatbot bridge] AI reply mirror failed")
+
+
 async def _maybe_capture_lead(db, session: Dict[str, Any], full_text: str, request_ip: str, ua: str) -> Optional[str]:
     """If the AI emitted a <CAPTURE_LEAD> block, parse it, create/update the
     tenant lead, link it to the session, and return the new text with the block stripped."""
@@ -278,6 +379,9 @@ async def chatbot_chat(body: ChatMsg, request: Request):
          "$set": {"updated_at": now_iso, "lang": lang}},
     )
 
+    # Bridge: reflejar el mensaje del visitante en el chat del admin + push
+    await _bridge_user_message(db, session, body.message)
+
     # Re-fetch trimmed history
     session = await db[COLL].find_one({"_id": sid})
     history = (session.get("messages") or [])[-MAX_HISTORY:]
@@ -347,6 +451,8 @@ async def chatbot_chat(body: ChatMsg, request: Request):
         sess_after = await db[COLL].find_one({"_id": sid})
         if sess_after and sess_after.get("lead_id"):
             yield f"data: {json.dumps({'type': 'lead_captured', 'lead_id': sess_after['lead_id']})}\n\n"
+        # Bridge: reflejar la respuesta de la IA en el chat del admin
+        await _bridge_ai_reply(db, sess_after or session, cleaned)
         yield f"data: {json.dumps({'type': 'done'})}\n\n"
 
     return StreamingResponse(
