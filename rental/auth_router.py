@@ -750,6 +750,7 @@ async def get_marketplace_profile(request: Request):
             "email": user.get("email", ""),
             "phone": user.get("phone", ""),
             "role": user.get("role", "tenant"),
+            "profile_photo_url": user.get("profile_photo_url", ""),
             "company_name": user.get("company_name", ""),
             "created_at": str(user.get("created_at", "")),
         }
