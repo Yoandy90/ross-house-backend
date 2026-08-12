@@ -48,6 +48,10 @@ KEY_REGISTRY = [
     # TikTok
     {"key": "TIKTOK_CLIENT_KEY", "label": "Client Key", "category": "TikTok (Marketing)", "secret": False, "placeholder": "sbawxxxxxxxx"},
     {"key": "TIKTOK_CLIENT_SECRET", "label": "Client Secret", "category": "TikTok (Marketing)", "secret": True, "placeholder": "xxxxxxxx"},
+    # Facebook / Meta
+    {"key": "META_APP_ID", "label": "App ID", "category": "Facebook (Meta)", "secret": False, "placeholder": "27927083xxxxxxx"},
+    {"key": "META_APP_SECRET", "label": "App Secret", "category": "Facebook (Meta)", "secret": True, "placeholder": "xxxxxxxx"},
+    {"key": "META_CONFIG_ID", "label": "Configuration ID (Login for Business)", "category": "Facebook (Meta)", "secret": False, "placeholder": "15754333xxxxxxx"},
     # OpenAI
     {"key": "OPENAI_API_KEY", "label": "OpenAI API Key", "category": "OpenAI (IA)", "secret": True, "placeholder": "sk-xxxxxxxx..."},
     # Emergent LLM

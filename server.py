@@ -376,6 +376,7 @@ try:
     from rental.app_adoption_router import router as app_adoption_router
     from rental.social_poster_router import router as social_poster_router
     from rental.tiktok_router import router as tiktok_router
+    from rental.facebook_router import router as facebook_router
     from rental.payment_processors_router import router as payment_processors_router
     from rental.email_inbox_router import router as email_inbox_router
     from rental.screening_router import router as screening_router
@@ -437,6 +438,7 @@ try:
     app.include_router(app_adoption_router, prefix="/api")
     app.include_router(social_poster_router, prefix="/api")
     app.include_router(tiktok_router, prefix="/api")
+    app.include_router(facebook_router, prefix="/api")
     app.include_router(payment_processors_router, prefix="/api")
     app.include_router(email_inbox_router, prefix="/api")
     app.include_router(screening_router, prefix="/api")
@@ -460,10 +462,12 @@ try:
     from rental.ai_brain import RossHouseAIBrain
     from rental.ai_brain_router import router as ai_brain_router, set_ai_brain as set_router_brain
     from rental.chat_router import set_ai_brain as set_chat_ai_brain
+    from rental.facebook_router import set_ai_brain as set_fb_ai_brain
 
     ai_brain = RossHouseAIBrain(db)
     set_router_brain(ai_brain)
     set_chat_ai_brain(ai_brain)
+    set_fb_ai_brain(ai_brain)
     app.include_router(ai_brain_router, prefix="/api")
     logger.info("🧠 AI Brain initialized and connected to chat")
 
