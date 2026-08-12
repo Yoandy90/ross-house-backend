@@ -310,12 +310,14 @@ async def health_check():
     except Exception:
         db_status = "disconnected"
 
+    from rental.api_keys_router import get_last_load_stats
     return {
         "status": "ok",
         "service": "Ross House Rentals API",
         "version": "1.0.0",
         "database": db_status,
         "database_name": DB_NAME,
+        "db_keys": get_last_load_stats(),
         "timestamp": datetime.utcnow().isoformat(),
     }
 

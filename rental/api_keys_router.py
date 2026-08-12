@@ -76,12 +76,14 @@ _ORIGINAL_ENV = {k["key"]: os.environ.get(k["key"]) for k in KEY_REGISTRY}
 def load_db_keys_into_env(mongo_url: str, db_name: str) -> int:
     """Read encrypted keys from admin_config and inject into os.environ.
     Returns the number of keys loaded. Safe to call multiple times."""
+    global _LOAD_STATS
     from pymongo import MongoClient
     from cryptography.fernet import Fernet
 
     raw_key = os.environ.get("VAULT_ENCRYPTION_KEY")
     if not raw_key:
         logger.warning("VAULT_ENCRYPTION_KEY missing — DB API keys not loaded")
+        _LOAD_STATS = {"vault_key_present": False, "loaded": 0, "failed_decrypt": 0}
         return 0
 
     cipher = Fernet(raw_key.encode())
@@ -89,6 +91,7 @@ def load_db_keys_into_env(mongo_url: str, db_name: str) -> int:
     try:
         doc = client[db_name].admin_config.find_one({"type": CONFIG_TYPE}) or {}
         loaded = 0
+        failed = 0
         for key_name, enc_value in (doc.get("keys") or {}).items():
             if key_name not in _REGISTRY_MAP or not enc_value:
                 continue
@@ -96,15 +99,24 @@ def load_db_keys_into_env(mongo_url: str, db_name: str) -> int:
                 value = cipher.decrypt(enc_value.encode()).decode()
             except Exception:
                 logger.warning(f"API key {key_name}: decryption failed — skipped")
+                failed += 1
                 continue
             if value:
                 os.environ[key_name] = value
                 loaded += 1
         if loaded:
             logger.info(f"🔑 {loaded} API key(s) loaded from DB into environment")
+        _LOAD_STATS = {"vault_key_present": True, "loaded": loaded, "failed_decrypt": failed}
         return loaded
     finally:
         client.close()
+
+
+_LOAD_STATS = {"vault_key_present": None, "loaded": 0, "failed_decrypt": 0}
+
+
+def get_last_load_stats() -> dict:
+    return dict(_LOAD_STATS)
 
 
 # ════════════════════════════════════════════════════════════════════════════
