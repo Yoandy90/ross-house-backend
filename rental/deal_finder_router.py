@@ -383,6 +383,7 @@ def _lead_payload(lead: dict) -> dict:
 def _lead_out(doc: dict) -> dict:
     return {
         "id": str(doc["_id"]),
+        "favorite": bool(doc.get("favorite", False)),
         "county": doc.get("county", ""),
         "county_name": COUNTIES.get(doc.get("county", ""), {}).get("name", doc.get("county", "")),
         "property_id": doc.get("property_id", ""),
@@ -751,10 +752,12 @@ async def list_leads(request: Request, status: Optional[str] = None,
                      q: Optional[str] = None, sort: str = "score",
                      city: Optional[str] = None, min_tax: float = 0,
                      min_score: float = 0, min_value: float = 0,
-                     limit: int = 100, skip: int = 0):
+                     limit: int = 100, skip: int = 0, favorite: int = 0):
     await auth_admin(request)
     db = get_db()
     filt: dict = {}
+    if favorite:
+        filt["favorite"] = True
     if status:
         filt["status"] = status
     if signal:
@@ -795,6 +798,7 @@ async def get_lead(request: Request, lead_id: str):
 class LeadUpdate(BaseModel):
     status: Optional[str] = None
     notes: Optional[str] = None
+    favorite: Optional[bool] = None
 
 
 @router.patch("/admin/deal-finder/leads/{lead_id}")
@@ -808,6 +812,8 @@ async def update_lead(request: Request, lead_id: str, body: LeadUpdate):
         updates["status"] = body.status
     if body.notes is not None:
         updates["notes"] = body.notes
+    if body.favorite is not None:
+        updates["favorite"] = body.favorite
     if not updates:
         raise HTTPException(400, "Nada que actualizar")
     updates["updated_at"] = datetime.now(timezone.utc)
