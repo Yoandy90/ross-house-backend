@@ -246,22 +246,42 @@ class PublishPayload(BaseModel):
     media_base64: Optional[str] = None   # foto o video en base64
     media_type: Optional[str] = None     # "photo" | "video"
     media_url: Optional[str] = None      # alternativa: URL pública
+    scheduled_at: Optional[str] = None   # ISO datetime → programar publicación
+
+
+def _schedule_params(scheduled_at: Optional[str]) -> dict:
+    """FB scheduling: published=false + scheduled_publish_time (10 min–75 días)."""
+    if not scheduled_at:
+        return {"published": "true"}
+    try:
+        dt = datetime.fromisoformat(scheduled_at.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Fecha de programación inválida")
+    delta = (dt - _now()).total_seconds()
+    if delta < 600:
+        raise HTTPException(status_code=400, detail="Programa al menos 10 minutos en el futuro")
+    if delta > 75 * 86400:
+        raise HTTPException(status_code=400, detail="Máximo 75 días en el futuro")
+    return {"published": "false", "scheduled_publish_time": str(int(dt.timestamp()))}
 
 
 @router.post("/admin/marketing/facebook/publish")
 async def fb_publish(payload: PublishPayload, request: Request):
     await auth_admin(request)
     page_id, token = await _page_token()
+    sched = _schedule_params(payload.scheduled_at)
 
     if payload.media_type == "photo":
         if payload.media_base64:
             raw = base64.b64decode(payload.media_base64.split(",")[-1])
             result = await _graph("POST", f"/{page_id}/photos", token,
-                                  data={"caption": payload.message, "published": "true"},
+                                  data={"caption": payload.message, **sched},
                                   files={"source": ("photo.jpg", raw, "image/jpeg")}, timeout=120)
         elif payload.media_url:
             result = await _graph("POST", f"/{page_id}/photos", token,
-                                  data={"url": payload.media_url, "caption": payload.message})
+                                  data={"url": payload.media_url, "caption": payload.message, **sched})
         else:
             raise HTTPException(status_code=400, detail="Falta la foto")
     elif payload.media_type == "video":
@@ -270,11 +290,11 @@ async def fb_publish(payload: PublishPayload, request: Request):
             if len(raw) > 90 * 1024 * 1024:
                 raise HTTPException(status_code=400, detail="Video demasiado grande (máx 90MB)")
             result = await _graph("POST", f"/{page_id}/videos", token,
-                                  data={"description": payload.message},
+                                  data={"description": payload.message, **sched},
                                   files={"source": ("video.mp4", raw, "video/mp4")}, timeout=300)
         elif payload.media_url:
             result = await _graph("POST", f"/{page_id}/videos", token,
-                                  data={"file_url": payload.media_url, "description": payload.message},
+                                  data={"file_url": payload.media_url, "description": payload.message, **sched},
                                   timeout=120)
         else:
             raise HTTPException(status_code=400, detail="Falta el video")
@@ -282,13 +302,15 @@ async def fb_publish(payload: PublishPayload, request: Request):
         if not payload.message.strip():
             raise HTTPException(status_code=400, detail="Escribe el mensaje del post")
         result = await _graph("POST", f"/{page_id}/feed", token,
-                              data={"message": payload.message, "published": "true"})
+                              data={"message": payload.message, **sched})
 
     await get_db().fb_posts_log.insert_one({
         "page_id": page_id, "message": payload.message[:200],
-        "media_type": payload.media_type, "meta_result": result, "created_at": _now(),
+        "media_type": payload.media_type, "scheduled_at": payload.scheduled_at,
+        "meta_result": result, "created_at": _now(),
     })
-    return {"success": True, "result": result, "message": "¡Publicado en Facebook! 🎉"}
+    return {"success": True, "result": result,
+            "message": "Publicación programada 🗓️" if payload.scheduled_at else "¡Publicado en Facebook! 🎉"}
 
 
 @router.get("/admin/marketing/facebook/posts")
@@ -464,6 +486,199 @@ async def fb_save_settings(payload: SettingsPayload, request: Request):
     await get_db().admin_config.update_one(
         {"type": "facebook_settings"}, {"$set": updates}, upsert=True)
     return {"success": True, "settings": await _get_settings()}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# AI COMPOSER: temas, posts bilingües, imágenes (Gemini Nano Banana)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _parse_llm_json(raw: str):
+    """Parse JSON from an LLM reply (strips code fences / prose)."""
+    if not raw:
+        return None
+    txt = raw.strip()
+    if "```" in txt:
+        parts = txt.split("```")
+        for p in parts:
+            p = p.strip()
+            if p.startswith("json"):
+                p = p[4:].strip()
+            if p.startswith("[") or p.startswith("{"):
+                txt = p
+                break
+    start = min([i for i in [txt.find("["), txt.find("{")] if i >= 0] or [0])
+    txt = txt[start:]
+    try:
+        return json.loads(txt)
+    except Exception:
+        return None
+
+
+async def _llm_json(system: str, prompt: str):
+    api_key = os.environ.get("EMERGENT_LLM_KEY")
+    if not api_key:
+        return None
+    try:
+        from emergentintegrations.llm.chat import LlmChat, UserMessage
+        chat = LlmChat(api_key=api_key, session_id=f"fbc-{secrets.token_hex(6)}",
+                       system_message=system).with_model("anthropic", "claude-sonnet-4-5-20250929")
+        result = await chat.send_message(UserMessage(text=prompt))
+        return _parse_llm_json(result if isinstance(result, str) else str(result))
+    except Exception as e:
+        logger.error(f"FB composer LLM error: {e}")
+        return None
+
+
+COMPOSER_CONTEXT = """Contexto del negocio: Ross House Rentals LLC — renta y venta de casas en
+Dumas, Texas y alrededores (Moore County / Texas Panhandle). Audiencia: familias trabajadoras,
+comunidad hispana y anglo. Teléfono (806) 934-2018 · www.rosshouserentals.com"""
+
+
+class TopicsPayload(BaseModel):
+    strategy: str = ""
+
+
+@router.post("/admin/marketing/facebook/ai-topics")
+async def fb_ai_topics(payload: TopicsPayload, request: Request):
+    await auth_admin(request)
+    system = f"""Eres estratega de contenido para redes sociales de una empresa de bienes raíces.
+{COMPOSER_CONTEXT}
+Responde SOLO con JSON válido, sin texto extra."""
+    prompt = f"""Genera 8 ideas de publicaciones para la página de Facebook.
+{f'Enfoque solicitado: {payload.strategy}' if payload.strategy.strip() else 'Mezcla: destacar propiedades, tips para inquilinos, mercado local de Dumas TX, comunidad/temporada, testimonios, detrás de cámaras.'}
+Formato JSON EXACTO:
+[{{"emoji":"🏠","title":"título corto del tema","angle":"1 frase de por qué funciona","image_idea":"descripción en inglés de la imagen ideal para este post"}}]"""
+    topics = await _llm_json(system, prompt)
+    if not isinstance(topics, list) or not topics:
+        raise HTTPException(status_code=503, detail="La IA no pudo generar temas, intenta de nuevo")
+    return {"success": True, "topics": topics[:8]}
+
+
+class ComposePayload(BaseModel):
+    topic: str = ""
+    property_id: Optional[str] = None
+    extra: str = ""
+
+
+@router.post("/admin/marketing/facebook/ai-compose")
+async def fb_ai_compose(payload: ComposePayload, request: Request):
+    await auth_admin(request)
+    prop_block = ""
+    if payload.property_id:
+        from bson import ObjectId
+        db = get_db()
+        try:
+            prop = await db.properties.find_one({"_id": ObjectId(payload.property_id)})
+        except Exception:
+            prop = await db.properties.find_one({"_id": payload.property_id})
+        if prop:
+            rent = prop.get("rent_amount") or prop.get("monthly_rent") or prop.get("rent")
+            prop_block = f"""
+PROPIEDAD REAL a destacar (usa estos datos, NO inventes otros):
+- Dirección: {prop.get('address', '')}, {prop.get('city', 'Dumas')}, TX
+- Recámaras: {prop.get('bedrooms', '?')} · Baños: {prop.get('bathrooms', '?')}
+- Renta: {f'${rent}/mes' if rent else 'consultar precio por teléfono'}
+- Descripción: {str(prop.get('description', ''))[:300]}
+- Características: {', '.join([str(f) for f in (prop.get('features') or [])][:8])}"""
+    system = f"""Eres copywriter de redes sociales para bienes raíces.
+{COMPOSER_CONTEXT}
+Responde SOLO con JSON válido, sin texto extra."""
+    prompt = f"""Escribe 3 variaciones distintas de un post de Facebook.
+Tema: {payload.topic or 'promocionar los servicios de renta de casas'}
+{prop_block}
+{f'Instrucciones extra: {payload.extra}' if payload.extra.strip() else ''}
+REGLAS:
+- BILINGÜE: primero la versión en ESPAÑOL, línea divisoria, luego la versión en INGLÉS en el mismo post.
+- Tono cálido y profesional, 2-4 emojis por idioma, llamada a la acción con el teléfono y la web.
+- NO inventes precios ni datos que no estén arriba.
+- 4-6 hashtags relevantes al final (mezcla ES/EN, ej: #DumasTX #CasasEnRenta #HomesForRent).
+Formato JSON EXACTO:
+[{{"style":"nombre corto del estilo (ej: Directo, Storytelling, Urgencia)","text":"post completo bilingüe con hashtags incluidos","image_prompt":"detailed English prompt to generate the perfect photo for this post (no text/words in image)"}}]"""
+    variations = await _llm_json(system, prompt)
+    if not isinstance(variations, list) or not variations:
+        raise HTTPException(status_code=503, detail="La IA no pudo generar el post, intenta de nuevo")
+    return {"success": True, "variations": variations[:3]}
+
+
+class AIImagePayload(BaseModel):
+    prompt: str
+
+
+@router.post("/admin/marketing/facebook/ai-image")
+async def fb_ai_image(payload: AIImagePayload, request: Request):
+    await auth_admin(request)
+    if not payload.prompt.strip():
+        raise HTTPException(status_code=400, detail="Escribe el prompt de la imagen")
+    api_key = os.environ.get("EMERGENT_LLM_KEY")
+    if not api_key:
+        raise HTTPException(status_code=503, detail="EMERGENT_LLM_KEY no configurada")
+    try:
+        from emergentintegrations.llm.chat import LlmChat, UserMessage
+        chat = LlmChat(api_key=api_key, session_id=f"fbimg-{secrets.token_hex(6)}",
+                       system_message="You are a professional real estate social media image generator.")
+        chat.with_model("gemini", "gemini-3.1-flash-image-preview").with_params(modalities=["image", "text"])
+        msg = UserMessage(text=(
+            f"{payload.prompt}. Photorealistic, warm natural lighting, high quality, "
+            "social-media ready, 4:3 composition. Do NOT include any text, words or logos in the image."))
+        _text, images = await chat.send_message_multimodal_response(msg)
+        if not images:
+            raise HTTPException(status_code=503, detail="La IA no devolvió imagen, intenta de nuevo")
+        img = images[0]
+        mime = img.get("mime_type", "image/png")
+        return {"success": True, "image_base64": f"data:{mime};base64,{img['data']}"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"FB ai-image error: {e}")
+        raise HTTPException(status_code=503, detail="Error generando la imagen, intenta de nuevo")
+
+
+@router.get("/admin/marketing/facebook/composer-properties")
+async def fb_composer_properties(request: Request):
+    """Propiedades del inventario con sus fotos (para el composer)."""
+    await auth_admin(request)
+    db = get_db()
+    site = "https://www.rosshouserentals.com"
+    out = []
+    async for prop in db.properties.find({}).limit(50):
+        pid = str(prop["_id"])
+        photos = await db.property_photos.find(
+            {"property_id": pid, "is_deleted": {"$ne": True}}
+        ).sort("uploaded_at", -1).to_list(10)
+        urls = []
+        for p in photos:
+            sp = (p.get("storage_path") or "")
+            if sp.startswith("ross-rentals/"):
+                sp = sp[len("ross-rentals/"):]
+            if sp:
+                urls.append(f"{site}/api/public/property-file/{sp}")
+        rent = prop.get("rent_amount") or prop.get("monthly_rent") or prop.get("rent")
+        out.append({
+            "id": pid,
+            "label": prop.get("name") or prop.get("address") or pid,
+            "address": prop.get("address", ""),
+            "bedrooms": prop.get("bedrooms"),
+            "bathrooms": prop.get("bathrooms"),
+            "rent": rent,
+            "photos": urls,
+        })
+    return {"success": True, "properties": out}
+
+
+@router.get("/admin/marketing/facebook/scheduled")
+async def fb_scheduled_posts(request: Request):
+    await auth_admin(request)
+    page_id, token = await _page_token()
+    data = await _graph("GET", f"/{page_id}/scheduled_posts", token, params={
+        "fields": "id,message,scheduled_publish_time,full_picture", "limit": 25,
+    })
+    posts = [{
+        "id": p["id"],
+        "message": p.get("message", ""),
+        "scheduled_publish_time": p.get("scheduled_publish_time"),
+        "picture": p.get("full_picture"),
+    } for p in data.get("data", [])]
+    return {"success": True, "scheduled": posts}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
