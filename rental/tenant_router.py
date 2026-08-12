@@ -1346,11 +1346,22 @@ async def upload_profile_photo(request: Request):
         clean = storage_path.replace(f"{APP_NAME}/", "") if storage_path.startswith(f"{APP_NAME}/") else storage_path
         photo_url = f"{base_url}/api/public/property-file/{clean}"
 
-        # Update app_users record
-        await get_db().app_users.update_one(
-            {"_id": user.get("_id")},
+        # Update app_users record (auth_marketplace serializes _id to str → convert back)
+        from bson import ObjectId as _OID
+        try:
+            uid = _OID(user["_id"]) if not isinstance(user["_id"], _OID) else user["_id"]
+        except Exception:
+            uid = user["_id"]
+        upd = await get_db().app_users.update_one(
+            {"_id": uid},
             {"$set": {"profile_photo_url": photo_url, "updated_at": datetime.utcnow()}}
         )
+        if upd.matched_count == 0:
+            # Fallback: match by email (legacy users with string _id)
+            await get_db().app_users.update_one(
+                {"email": user_email},
+                {"$set": {"profile_photo_url": photo_url, "updated_at": datetime.utcnow()}}
+            )
 
         # Also update tenant record if linked
         if tenant:
