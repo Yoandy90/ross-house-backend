@@ -292,6 +292,43 @@ async def admin_get_conversations(request: Request, search: Optional[str] = None
 
     convs = await db.chat_conversations.find(query).sort("last_message_at", -1).to_list(100)
 
+    # Enriquecer con la foto de perfil del inquilino/usuario (app_users y tenants)
+    oids, emails = [], []
+    for c in convs:
+        tid = str(c.get("tenant_id") or "")
+        if len(tid) == 24:
+            try:
+                oids.append(ObjectId(tid))
+            except Exception:
+                pass
+        em = (c.get("tenant_email") or "").lower()
+        if em:
+            emails.append(em)
+    photo_map: dict = {}
+    if oids or emails:
+        or_q = []
+        if oids:
+            or_q.append({"_id": {"$in": oids}})
+        if emails:
+            or_q.append({"email": {"$in": emails}})
+        async for u in db.app_users.find({"$or": or_q}, {"profile_photo_url": 1, "email": 1}):
+            p = u.get("profile_photo_url") or ""
+            if p:
+                photo_map[str(u["_id"])] = p
+                if u.get("email"):
+                    photo_map[u["email"].lower()] = p
+        if emails:
+            async for t in db.tenants.find({"email": {"$in": emails}}, {"profile_photo_url": 1, "photo_url": 1, "email": 1}):
+                p = t.get("profile_photo_url") or t.get("photo_url") or ""
+                if p and t.get("email") and t["email"].lower() not in photo_map:
+                    photo_map[t["email"].lower()] = p
+    for c in convs:
+        c["tenant_photo_url"] = (
+            photo_map.get(str(c.get("tenant_id") or ""))
+            or photo_map.get((c.get("tenant_email") or "").lower())
+            or ""
+        )
+
     return {"success": True, "conversations": [serialize(c) for c in convs]}
 
 
