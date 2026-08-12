@@ -752,12 +752,14 @@ async def list_leads(request: Request, status: Optional[str] = None,
                      q: Optional[str] = None, sort: str = "score",
                      city: Optional[str] = None, min_tax: float = 0,
                      min_score: float = 0, min_value: float = 0,
-                     limit: int = 100, skip: int = 0, favorite: int = 0):
+                     limit: int = 100, skip: int = 0, favorite: int = 0, mailed: int = 0):
     await auth_admin(request)
     db = get_db()
     filt: dict = {}
     if favorite:
         filt["favorite"] = True
+    if mailed:
+        filt["mail.lob_id"] = {"$exists": True, "$nin": [None, ""]}
     if status:
         filt["status"] = status
     if signal:
@@ -776,13 +778,89 @@ async def list_leads(request: Request, status: Optional[str] = None,
         rx = {"$regex": re.escape(q.strip()), "$options": "i"}
         filt["$or"] = [{"address": rx}, {"owner_name": rx}, {"legal_description": rx}]
 
-    sort_spec = [("ai_score", -1), ("tax_due_total", -1)] if sort == "score" else \
+    sort_spec = [("mail.mailed_at", -1)] if mailed else \
+                [("ai_score", -1), ("tax_due_total", -1)] if sort == "score" else \
                 [("tax_due_total", -1)] if sort == "tax_due" else \
                 [("appraised_value", -1)] if sort == "value" else \
                 [("last_synced_at", -1)]
     docs = await db.deal_finder_leads.find(filt).sort(sort_spec).skip(skip).to_list(min(limit, 200))
     total = await db.deal_finder_leads.count_documents(filt)
     return {"success": True, "leads": [_lead_out(d) for d in docs], "total": total}
+
+
+class RadarAIPayload(BaseModel):
+    question: str
+
+
+RADAR_AI_SYSTEM = """Eres el AI Brain de Ross House Rentals LLC, especializado en inversión
+inmobiliaria (Dumas, TX / Moore County). Analizas el pipeline del Radar de Oportunidades
+(propiedades con impuestos atrasados y otras señales de venta motivada).
+
+Tu trabajo:
+- Recomendar las MEJORES oportunidades y explicar por qué (impuestos vencidos vs valor, equity,
+  señales, historial de cartas enviadas).
+- Predecir probabilidad de éxito (alta/media/baja + %) de cada recomendación y qué ofertar.
+- Sugerir acciones concretas: a quién enviar carta hoy, a quién dar seguimiento, qué marcar en la
+  lista de deseos.
+- Responde en ESPAÑOL, conciso y accionable, con montos en USD. Usa listas. No inventes datos que
+  no estén en el contexto."""
+
+
+@router.post("/admin/deal-finder/ai-assistant")
+async def deal_finder_ai_assistant(request: Request, body: RadarAIPayload):
+    """AI Brain del Radar: analiza el pipeline y responde preguntas / predice / recomienda."""
+    await auth_admin(request)
+    if not body.question.strip():
+        raise HTTPException(400, "Escribe tu pregunta")
+    db = get_db()
+    docs = await db.deal_finder_leads.find({}).sort(
+        [("ai_score", -1), ("tax_due_total", -1)]).limit(45).to_list(45)
+
+    lines = []
+    for d in docs:
+        mail = d.get("mail") or {}
+        parts = [
+            f"[{str(d['_id'])[-6:]}] {d.get('address', '?')}",
+            f"score:{round(d.get('ai_score') or 0)}",
+            f"status:{d.get('status', 'new')}",
+            f"tax_due:${round(d.get('tax_due_total') or 0):,}",
+            f"valor:${round(d.get('appraised_value') or 0):,}",
+            f"dueño:{d.get('owner_name', '?')}",
+        ]
+        if d.get("years_delinquent"):
+            parts.append(f"años_morosos:{d['years_delinquent']}")
+        if d.get("favorite"):
+            parts.append("⭐deseos")
+        if mail.get("lob_id"):
+            parts.append(f"carta_enviada:{(mail.get('mailed_at') or '')[:10]} entrega_est:{mail.get('expected_delivery', '?')} modo:{mail.get('mode', '?')}")
+        if (d.get("offer_letter") or {}).get("letter_en"):
+            parts.append("carta_generada")
+        lines.append(" | ".join(parts))
+
+    mailed_count = sum(1 for d in docs if (d.get("mail") or {}).get("lob_id"))
+    context = (f"PIPELINE ACTUAL ({len(docs)} leads, {mailed_count} con carta enviada):\n"
+               + "\n".join(lines))
+
+    api_key = os.environ.get("EMERGENT_LLM_KEY")
+    if not api_key:
+        raise HTTPException(503, "IA no configurada")
+    try:
+        from emergentintegrations.llm.chat import LlmChat, UserMessage
+        import secrets as _secrets
+        chat = LlmChat(api_key=api_key, session_id=f"radar-{_secrets.token_hex(6)}",
+                       system_message=RADAR_AI_SYSTEM).with_model("anthropic", "claude-sonnet-4-5-20250929")
+        answer = await chat.send_message(UserMessage(text=f"{context}\n\nPREGUNTA DEL ADMIN: {body.question}"))
+        answer = answer if isinstance(answer, str) else str(answer)
+    except Exception as e:
+        logger.error(f"[deal_finder] AI assistant error: {e}")
+        raise HTTPException(503, "La IA no está disponible, intenta de nuevo")
+
+    await db.ai_brain_logs.insert_one({
+        "action_type": "deal_finder_assistant",
+        "details": {"question": body.question[:200], "answer_preview": answer[:200]},
+        "created_at": datetime.now(timezone.utc),
+    })
+    return {"success": True, "answer": answer}
 
 
 @router.get("/admin/deal-finder/leads/{lead_id}")
