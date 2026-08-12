@@ -56,6 +56,22 @@ async def _public_context(db) -> Dict[str, Any]:
     ctx: Dict[str, Any] = {"company": "Ross House Rentals LLC", "city": "Dumas, TX 79029",
                             "phone": "(806) 934-2018", "email": "info@rosshouserentals.com"}
     try:
+        cfg = await db.rental_config.find_one({"type": "company"}) or {}
+        ctx["company"] = cfg.get("name") or ctx["company"]
+        ctx["address"] = cfg.get("address") or "305 Bruce Ave, Dumas, TX 79029"
+        ctx["phone"] = cfg.get("phone") or ctx["phone"]
+        ctx["email"] = cfg.get("email") or ctx["email"]
+        ctx["website"] = cfg.get("website") or "www.rosshouserentals.com"
+        if cfg.get("business_hours"):
+            ctx["business_hours"] = cfg["business_hours"]
+        if cfg.get("description"):
+            ctx["about"] = cfg["description"]
+        socials = {k: cfg[k] for k in ("facebook_url", "instagram_url", "tiktok_url") if cfg.get(k)}
+        if socials:
+            ctx["social_media"] = socials
+    except Exception:
+        pass
+    try:
         props = await db.properties.find({"status": {"$in": ["active", "available", "vacant"]}}).to_list(50)
         ctx["available_properties"] = [
             {

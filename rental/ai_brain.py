@@ -29,11 +29,8 @@ ROSS_HOUSE_SYSTEM_PROMPT = """Eres el Asistente Virtual Oficial de Ross House Re
 
 🏠 SOBRE ROSS HOUSE RENTALS LLC:
 - Empresa dedicada a la administración de propiedades residenciales, alquiler, y venta de bienes raíces
-- Ubicada en Amarillo, Texas, USA
 - Propietario: Yoandy Ross
-- Sitio web: rosshouserentals.com
-- Contacto: info@rosshouserentals.com | (806) 591-4974
-- Horario de atención: Lunes a Viernes 9AM - 6PM, Sábados 10AM - 2PM (CST)
+- IMPORTANTE: Los datos oficiales de contacto (dirección, teléfono, email, sitio web, horario) vienen en el CONTEXTO más abajo bajo "🏢 DATOS OFICIALES DE LA EMPRESA". Usa SIEMPRE esos datos actualizados al responder preguntas de contacto/ubicación/horario.
 
 🎯 TU ROL:
 1. Atender consultas de inquilinos sobre sus propiedades, pagos de renta, mantenimiento y contratos
@@ -506,6 +503,22 @@ Genera una respuesta profesional a este email."""
         """
         context_parts = []
 
+        # 🏢 Datos oficiales de la empresa (fuente única: rental_config)
+        try:
+            cfg = await self.db.rental_config.find_one({"type": "company"}) or {}
+            context_parts.append("🏢 DATOS OFICIALES DE LA EMPRESA:")
+            context_parts.append(f"Nombre: {cfg.get('name') or 'Ross House Rentals LLC'}")
+            context_parts.append(f"Dirección: {cfg.get('address') or '305 Bruce Ave, Dumas, TX 79029'}")
+            context_parts.append(f"Teléfono: {cfg.get('phone') or '(806) 934-2018'}")
+            context_parts.append(f"Email: {cfg.get('email') or 'info@rosshouserentals.com'}")
+            context_parts.append(f"Sitio web: {cfg.get('website') or 'www.rosshouserentals.com'}")
+            if cfg.get('business_hours'):
+                context_parts.append(f"Horario de atención: {cfg['business_hours']}")
+            if cfg.get('description'):
+                context_parts.append(f"Sobre la empresa: {cfg['description']}")
+        except Exception:
+            pass
+
         try:
             from bson import ObjectId
             import re as _re
@@ -517,7 +530,7 @@ Genera una respuesta profesional a este email."""
             except Exception:
                 conv = None
             if not conv:
-                return ""
+                return "\n".join(context_parts)
 
             display_name = conv.get('tenant_name', sender_name)
             context_parts.append(f"📌 CONVERSACIÓN CON: {display_name}")

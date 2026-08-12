@@ -2852,6 +2852,8 @@ async def update_rental_config(request: Request):
 
     allowed_fields = [
         'name', 'address', 'phone', 'email', 'website', 'state', 'county',
+        'legal_name', 'ein', 'business_hours', 'description',
+        'facebook_url', 'instagram_url', 'tiktok_url', 'internal_notes',
         'late_fee_default', 'grace_days_default',
         'lease_clauses', 'pet_defaults', 'notices',
         'stripe_secret_key', 'stripe_publishable_key', 'stripe_enabled',
@@ -2875,6 +2877,30 @@ async def update_rental_config(request: Request):
     )
 
     return {"success": True, "message": "Configuración de renta actualizada exitosamente"}
+
+
+# Campos del perfil de empresa visibles públicamente (web, app, chatbot).
+# ein, internal_notes, legal_name y config sensible NUNCA se exponen aquí.
+COMPANY_PUBLIC_DEFAULTS = {
+    "name": "Ross House Rentals LLC",
+    "address": "305 Bruce Ave, Dumas, TX 79029",
+    "phone": "(806) 934-2018",
+    "email": "info@rosshouserentals.com",
+    "website": "www.rosshouserentals.com",
+    "business_hours": "",
+    "description": "",
+    "facebook_url": "",
+    "instagram_url": "",
+    "tiktok_url": "",
+}
+
+
+@router.get('/public/company-profile')
+async def get_public_company_profile():
+    """Perfil público de la empresa — fuente única de verdad para web, app y AI."""
+    cfg = await get_db().rental_config.find_one({"type": "company"}) or {}
+    company = {k: (cfg.get(k) or v) for k, v in COMPANY_PUBLIC_DEFAULTS.items()}
+    return {"success": True, "company": company}
 
 
 # ─── Admin Signature (Reusable landlord signature) ─────────────────────────
