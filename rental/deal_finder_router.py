@@ -143,6 +143,22 @@ def parse_property_detail(raw_html: str) -> dict:
     for label, val in re.findall(r"<th>([^<]{2,60}?):</th>\s*<td class=\"table-number\">\s*\$?([\d,.\-]+)", h):
         out["values"][label.strip()] = _parse_money(val)
 
+    # Exemptions (e.g. "HS" homestead → owner-occupied residential)
+    m = re.search(r"Exemptions:</th>\s*<td[^>]*>(.*?)</td>", h, re.I)
+    if m:
+        out["exemptions"] = re.sub(r"<[^>]+>", "", m.group(1)).strip()
+
+    # Neighborhood (e.g. "(CODAPT1) Apartment in Dumas" → multifamily hint)
+    m = re.search(r"Neighborhood:</th>\s*<td[^>]*>(.*?)</td>", h, re.I)
+    if m:
+        nb = re.sub(r"<[^>]+>", "", m.group(1)).strip()
+        nm = re.match(r"\(([A-Z0-9]+)\)\s*(.*)", nb)
+        if nm:
+            out["neighborhood_code"] = nm.group(1)
+            out["neighborhood_name"] = nm.group(2).strip()
+        elif nb:
+            out["neighborhood_name"] = nb
+
     return out
 
 
@@ -180,6 +196,60 @@ def compute_signals(lead: dict) -> list[str]:
         if 0 < market < 60000:
             signals.append("low_value")
     return signals
+
+
+# ═══════════════════════════════════════════════════════════════
+# Clasificación de propiedades (comercial / residencial / etc.)
+# ═══════════════════════════════════════════════════════════════
+
+ENTITY_OWNER_RX = re.compile(
+    r"\b(LLC|L\.L\.C|INC|CORP(ORATION)?|LTD|COMPANY|CO\.|PARTNERS(HIP)?|"
+    r"PROPERTIES|PROPERTY|INVESTMENTS?|ENTERPRISES?|HOLDINGS?|VENTURES?|GROUP|"
+    r"CHURCH|IGLESIA|MINISTRIES|ASSEMBLY|CITY OF|COUNTY OF|ISD|SCHOOL|TRUST|TRUSTEE|"
+    r"BANK|CREDIT UNION|ASSN|ASSOCIATION|FOUNDATION)\b", re.I)
+
+MULTIFAM_RX = re.compile(
+    r"\b(APT|APARTMENT|APARTMENTS|DUPLEX|TRIPLEX|FOURPLEX|4[- ]?PLEX|MULTI[- ]?FAMILY)\b", re.I)
+
+
+def classify_property(lead: dict) -> list[str]:
+    """Clasifica una oportunidad en una o más clases:
+    comercial | residencial | multifamiliar | terreno | agricola
+    (combinables: p.ej. terreno vacío de una LLC = terreno + comercial)."""
+    classes: set = set()
+    ptype = (lead.get("property_type") or "").upper()
+    values = lead.get("values") or {}
+    improvement = sum(v for k, v in values.items() if "improvement" in k.lower())
+    land = sum(v for k, v in values.items() if "land" in k.lower())
+    ag = (values.get("Ag Use Value") or 0) + (values.get("Agricultural Market Valuation") or 0)
+    owner = (lead.get("owner_name") or "").upper()
+    legal = (lead.get("legal_description") or "").upper()
+    nbhd = f"{lead.get('neighborhood_code') or ''} {lead.get('neighborhood_name') or ''}".upper()
+    exemptions = (lead.get("exemptions") or "").upper()
+    homestead = bool(re.search(r"\bHS\b|HOMESTEAD", exemptions))
+
+    if ptype == "P":
+        # Propiedad personal de negocio (equipos/inventario) → actividad comercial
+        classes.add("comercial")
+    if ag > 0:
+        classes.add("agricola")
+    if ptype != "P" and land > 0 and improvement <= 0 and ag <= 0:
+        classes.add("terreno")
+    if MULTIFAM_RX.search(nbhd) or MULTIFAM_RX.search(legal):
+        classes.add("multifamiliar")
+    if homestead:
+        # Residencia principal del dueño → definitivamente NO comercial
+        classes.add("residencial")
+        classes.discard("comercial")
+    elif ptype != "P" and ENTITY_OWNER_RX.search(owner):
+        classes.add("comercial")
+    if ptype in ("R", "MH") and improvement > 0 and not classes.intersection(
+            {"multifamiliar", "terreno", "agricola", "comercial"}):
+        classes.add("residencial")
+    if not classes:
+        classes.add("residencial")
+    return sorted(classes)
+
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -230,6 +300,7 @@ async def enrich_and_upsert(db, client: httpx.AsyncClient, base: str, county: st
     await asyncio.sleep(0.5)
 
     lead["signals"] = compute_signals(lead)
+    lead["property_classes"] = classify_property(lead)
     lead["last_synced_at"] = datetime.now(timezone.utc)
 
     if only_delinquent and "tax_delinquent" not in lead["signals"]:
@@ -364,6 +435,7 @@ def _lead_payload(lead: dict) -> dict:
         "direccion": lead.get("address"),
         "dueno": lead.get("owner_name"),
         "tipo": lead.get("property_type"),
+        "clases": lead.get("property_classes"),
         "descripcion_legal": lead.get("legal_description"),
         "valor_tasado": lead.get("appraised_value"),
         "valores": lead.get("values"),
@@ -392,6 +464,10 @@ def _lead_out(doc: dict) -> dict:
         "address": doc.get("address", ""),
         "legal_description": doc.get("legal_description", ""),
         "property_type": doc.get("property_type", ""),
+        "property_classes": doc.get("property_classes", []),
+        "exemptions": doc.get("exemptions", ""),
+        "neighborhood_code": doc.get("neighborhood_code", ""),
+        "neighborhood_name": doc.get("neighborhood_name", ""),
         "appraised_value": doc.get("appraised_value", 0),
         "values": doc.get("values", {}),
         "mailing_lines": doc.get("mailing_lines", []),
@@ -517,6 +593,7 @@ def _tp_to_lead(county: str, rec: dict) -> dict:
         "longitude": rec.get("longitude") or "",
     }
     lead["signals"] = compute_signals(lead)
+    lead["property_classes"] = classify_property(lead)
     lead["last_synced_at"] = datetime.now(timezone.utc)
     return lead
 
@@ -722,6 +799,12 @@ async def get_stats(request: Request):
             {"$group": {"_id": "$status", "n": {"$sum": 1}}}]):
         by_status[row["_id"] or "new"] = row["n"]
 
+    by_class = {}
+    async for row in db.deal_finder_leads.aggregate([
+            {"$unwind": "$property_classes"},
+            {"$group": {"_id": "$property_classes", "n": {"$sum": 1}}}]):
+        by_class[row["_id"]] = row["n"]
+
     # ── Direct mail este mes (presupuesto Lob) ──
     month_start = datetime.now(timezone.utc).replace(
         day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
@@ -736,6 +819,7 @@ async def get_stats(request: Request):
     return {"success": True, "stats": {
         "total": total, "tax_delinquent": delinquent, "absentee_owner": absentee,
         "vacant_land": vacant, "high_score": high_score, "by_status": by_status,
+        "by_class": by_class,
         "mail": {
             "month_live": mail_month["live"],
             "month_test": mail_month["test"],
@@ -752,10 +836,15 @@ async def list_leads(request: Request, status: Optional[str] = None,
                      q: Optional[str] = None, sort: str = "score",
                      city: Optional[str] = None, min_tax: float = 0,
                      min_score: float = 0, min_value: float = 0,
+                     classes: Optional[str] = None,
                      limit: int = 100, skip: int = 0, favorite: int = 0, mailed: int = 0):
     await auth_admin(request)
     db = get_db()
     filt: dict = {}
+    if classes:
+        cls = [c.strip() for c in classes.split(",") if c.strip()]
+        if cls:
+            filt["property_classes"] = {"$all": cls}
     if favorite:
         filt["favorite"] = True
     if mailed:
