@@ -2853,7 +2853,7 @@ async def update_rental_config(request: Request):
     allowed_fields = [
         'name', 'address', 'phone', 'email', 'website', 'state', 'county',
         'legal_name', 'ein', 'business_hours', 'description',
-        'facebook_url', 'instagram_url', 'tiktok_url', 'internal_notes',
+        'facebook_url', 'instagram_url', 'tiktok_url', 'internal_notes', 'dnc_pin',
         'late_fee_default', 'grace_days_default',
         'lease_clauses', 'pet_defaults', 'notices',
         'stripe_secret_key', 'stripe_publishable_key', 'stripe_enabled',

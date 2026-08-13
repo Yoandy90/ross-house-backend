@@ -1282,6 +1282,12 @@ async def skip_trace_lead(request: Request, lead_id: str):
 class OfferSendBody(BaseModel):
     channel: str          # "email" | "sms"
     to: str
+    pin: str = ""         # PIN para desbloquear envío a números DNC
+
+
+async def _get_dnc_pin(db) -> str:
+    cfg = await db.rental_config.find_one({"type": "company"}) or {}
+    return str(cfg.get("dnc_pin") or "2018")
 
 
 @router.post("/admin/deal-finder/leads/{lead_id}/offer/send")
@@ -1299,6 +1305,19 @@ async def send_offer_link(request: Request, lead_id: str, body: OfferSendBody):
     offer = doc.get("offer") or {}
     if not offer.get("slug"):
         raise HTTPException(400, "Primero genera el link de la oferta")
+
+    # 🛡️ Bloqueo automático DNC (TCPA): SMS a números en No-Llamar requiere PIN
+    if body.channel == "sms":
+        to_digits = re.sub(r"\D", "", to)[-10:]
+        for ph in ((doc.get("contact") or {}).get("phones") or []):
+            if re.sub(r"\D", "", ph.get("number", ""))[-10:] == to_digits and (ph.get("dnc") or ph.get("tcpa")):
+                pin_ok = body.pin and body.pin == await _get_dnc_pin(db)
+                if not pin_ok:
+                    raise HTTPException(423,
+                        "DNC_PIN_REQUIRED: Este número está en la lista No Llamar (DNC). "
+                        "Enviar SMS puede generar multas TCPA de $500-$1,500. "
+                        "Ingresa tu PIN para desbloquear bajo tu responsabilidad.")
+                break
 
     url = f"{SITE_BASE}/oferta/{offer['slug']}"
     first, _ = _owner_first_last(doc.get("owner_name") or "")
@@ -1346,6 +1365,120 @@ async def send_offer_link(request: Request, lead_id: str, body: OfferSendBody):
         upd["$set"] = {"status": "offer_sent"}
     await db.deal_finder_leads.update_one({"_id": doc["_id"]}, upd)
     return {"success": True, "sent": entry}
+
+
+# ═══════════════════════════════════════════════════════════════
+# Búsqueda manual de contacto (independiente de leads)
+# ═══════════════════════════════════════════════════════════════
+
+def _normalize_tracerfy_persons(data: dict) -> list[dict]:
+    out = []
+    for p in (data.get("persons") or [])[:5]:
+        phones, emails = [], []
+        for ph in (p.get("phones") or [])[:8]:
+            num = ph.get("number") or ph.get("phone") or ""
+            if num and not any(x["number"] == num for x in phones):
+                phones.append({"number": num, "type": ph.get("type", ""), "carrier": ph.get("carrier", ""),
+                               "dnc": bool(ph.get("dnc")), "tcpa": bool(ph.get("tcpa"))})
+        for em in (p.get("emails") or [])[:5]:
+            e = em.get("email") if isinstance(em, dict) else str(em)
+            if e and e not in emails:
+                emails.append(e)
+        ma = p.get("mailing_address") or {}
+        out.append({
+            "name": f"{p.get('first_name', '')} {p.get('last_name', '')}".strip().title(),
+            "age": p.get("age"),
+            "deceased": bool(p.get("deceased")),
+            "property_owner": bool(p.get("property_owner")),
+            "phones": phones, "emails": emails,
+            "mailing_address": ", ".join(filter(None, [ma.get("street"), ma.get("city"),
+                                                        f"{ma.get('state', '')} {ma.get('zip', '')}".strip()])),
+        })
+    return out
+
+
+class ContactSearchBody(BaseModel):
+    mode: str             # "name_address" | "address_owner" | "phone_dnc"
+    first_name: str = ""
+    last_name: str = ""
+    street: str = ""
+    city: str = ""
+    state: str = "TX"
+    zip: str = ""
+    phone: str = ""
+
+
+@router.post("/admin/deal-finder/contact-search")
+async def contact_search(request: Request, body: ContactSearchBody):
+    """Búsqueda manual de contacto vía Tracerfy:
+    - name_address: nombre + apellido + dirección → teléfonos/emails (5 créditos/hit)
+    - address_owner: solo dirección → descubre al dueño + contacto (5 créditos/hit)
+    - phone_dnc: teléfono → verifica DNC federal/estatal/litigante (5 créditos)"""
+    await auth_admin(request)
+    api_key = os.environ.get("TRACERFY_API_KEY", "")
+    if not api_key:
+        raise HTTPException(400, "Configura TRACERFY_API_KEY en Configuración → API Keys")
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+
+    if body.mode == "phone_dnc":
+        phone = re.sub(r"\D", "", body.phone)[-10:]
+        if len(phone) != 10:
+            raise HTTPException(422, "Indica un teléfono válido de 10 dígitos")
+        try:
+            async with httpx.AsyncClient(timeout=25) as client:
+                r = await client.post("https://tracerfy.com/v2/api/dnc/lookup/",
+                                      json={"phone": phone}, headers=headers)
+        except httpx.HTTPError:
+            raise HTTPException(502, "Tracerfy no disponible")
+        if r.status_code == 402:
+            raise HTTPException(402, "Sin créditos en Tracerfy")
+        if r.status_code >= 400:
+            raise HTTPException(502, f"Tracerfy respondió {r.status_code}")
+        d = r.json()
+        return {"success": True, "mode": "phone_dnc", "phone": phone,
+                "is_clean": bool(d.get("is_clean")),
+                "national_dnc": bool(d.get("national_dnc")),
+                "state_dnc": bool(d.get("state_dnc")),
+                "state_dnc_list": d.get("state_dnc_list") or [],
+                "litigator": bool(d.get("litigator")),
+                "credits_used": d.get("credits_deducted", 0)}
+
+    if body.mode not in ("name_address", "address_owner"):
+        raise HTTPException(422, "mode inválido")
+    street, city, state, zipc = body.street.strip(), body.city.strip(), body.state.strip().upper(), body.zip.strip()
+    if not street and body.mode:
+        raise HTTPException(422, "Indica la dirección (calle)")
+    if not city or not zipc:
+        # intentar parsear todo desde street si vino completo
+        situs = _parse_situs(street)
+        if situs:
+            street, city, state, zipc = situs["street"], situs["city"], situs["state"], situs["zip"]
+    if not (street and city and state and zipc):
+        raise HTTPException(422, "Dirección incompleta — necesito calle, ciudad, estado y ZIP")
+
+    payload: dict = {"address": street, "city": city, "state": state, "zip": zipc}
+    if body.mode == "name_address":
+        if not body.first_name.strip() or not body.last_name.strip():
+            raise HTTPException(422, "Indica nombre y apellido")
+        payload.update({"find_owner": False, "first_name": body.first_name.strip(),
+                        "last_name": body.last_name.strip()})
+    else:
+        payload["find_owner"] = True
+
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.post("https://tracerfy.com/v1/api/trace/lookup/",
+                                  json=payload, headers=headers)
+    except httpx.HTTPError:
+        raise HTTPException(502, "Tracerfy no disponible")
+    if r.status_code == 402:
+        raise HTTPException(402, "Sin créditos en Tracerfy — recarga en tracerfy.com")
+    if r.status_code >= 400:
+        raise HTTPException(502, f"Tracerfy respondió {r.status_code}")
+    data = r.json()
+    return {"success": True, "mode": body.mode, "hit": bool(data.get("hit")),
+            "persons": _normalize_tracerfy_persons(data),
+            "credits_used": data.get("credits_deducted", 0)}
 
 
 @router.get("/public/oferta/{slug}")
