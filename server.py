@@ -334,6 +334,7 @@ try:
     from rental.auth_router import router as auth_router
     from rental.properties_router import router as properties_router
     from rental.tenant_router import router as tenant_router
+    from rental.dnc_registry_router import router as dnc_registry_router
     from rental.contracts_router import router as contracts_router
     from rental.finances_router import router as finances_router
     from rental.receipt_scanner_router import router as receipt_scanner_router
@@ -396,6 +397,7 @@ try:
     app.include_router(auth_router, prefix="/api")
     app.include_router(properties_router, prefix="/api")
     app.include_router(tenant_router, prefix="/api")
+    app.include_router(dnc_registry_router, prefix="/api")
     app.include_router(contracts_router, prefix="/api")
     app.include_router(finances_router, prefix="/api")
     app.include_router(receipt_scanner_router, prefix="/api")
