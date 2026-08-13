@@ -483,6 +483,7 @@ def _lead_out(doc: dict) -> dict:
         "ai_analysis": doc.get("ai_analysis"),
         "offer_letter": doc.get("offer_letter"),
         "offer": doc.get("offer"),
+        "contact": doc.get("contact"),
         "mail": doc.get("mail"),
         "contract": doc.get("contract"),
         "portal_url": doc.get("portal_url", ""),
@@ -1184,6 +1185,167 @@ async def create_offer(request: Request, lead_id: str, body: OfferBody):
     }
     await db.deal_finder_leads.update_one({"_id": doc["_id"]}, {"$set": {"offer": offer}})
     return {"success": True, "offer": offer, "url": f"{SITE_BASE}/oferta/{slug}"}
+
+
+# ═══════════════════════════════════════════════════════════════
+# Skip Tracing (Tracerfy) — teléfono/email del dueño
+# ═══════════════════════════════════════════════════════════════
+
+def _parse_situs(address: str) -> dict | None:
+    """'1115 S BIRGE, DUMAS TX 79029' → street/city/state/zip."""
+    m = re.match(r"^(.*?),\s*(.+?)\s+([A-Z]{2})\s+(\d{5})", (address or "").strip(), re.I)
+    if not m:
+        return None
+    return {"street": m.group(1).strip(), "city": m.group(2).strip(),
+            "state": m.group(3).upper(), "zip": m.group(4)}
+
+
+def _owner_first_last(owner_name: str) -> tuple[str, str]:
+    """CAD guarda 'APELLIDO NOMBRE SEGUNDO' → (first, last)."""
+    toks = [t for t in re.split(r"[\s,]+", (owner_name or "").strip()) if t]
+    if len(toks) >= 2:
+        return toks[1].title(), toks[0].title()
+    return (toks[0].title(), "") if toks else ("", "")
+
+
+@router.post("/admin/deal-finder/leads/{lead_id}/skip-trace")
+async def skip_trace_lead(request: Request, lead_id: str):
+    """Busca teléfono y email del dueño vía Tracerfy (5 créditos por acierto, 0 si no hay match)."""
+    await auth_admin(request)
+    api_key = os.environ.get("TRACERFY_API_KEY", "")
+    if not api_key:
+        raise HTTPException(400, "Configura TRACERFY_API_KEY en Configuración → API Keys (crea cuenta en tracerfy.com)")
+    db = get_db()
+    doc = await db.deal_finder_leads.find_one({"_id": ObjectId(lead_id)})
+    if not doc:
+        raise HTTPException(404, "Lead no encontrado")
+
+    owner = doc.get("owner_name") or ""
+    if ENTITY_OWNER_RX.search(owner):
+        raise HTTPException(422,
+            "El dueño es una empresa/entidad — el skip tracing es para personas. "
+            "Busca el agente registrado gratis en el Comptroller de Texas "
+            "(comptroller.texas.gov/taxes/franchise/account-status/search) o en SOSDirect.")
+
+    situs = _parse_situs(doc.get("address") or "")
+    if not situs:
+        raise HTTPException(422, "El lead no tiene dirección física completa para rastrear")
+    first, last = _owner_first_last(owner)
+    if not first or not last:
+        raise HTTPException(422, "No se pudo separar nombre/apellido del dueño")
+
+    payload = {"address": situs["street"], "city": situs["city"], "state": situs["state"],
+               "zip": situs["zip"], "find_owner": False, "first_name": first, "last_name": last}
+    base = os.environ.get("TRACERFY_BASE_URL", "https://tracerfy.com/v1/api").rstrip("/")
+    try:
+        async with httpx.AsyncClient(timeout=25) as client:
+            r = await client.post(f"{base}/trace/lookup/", json=payload,
+                                  headers={"Authorization": f"Bearer {api_key}",
+                                           "Content-Type": "application/json"})
+    except httpx.HTTPError:
+        raise HTTPException(502, "Tracerfy no disponible — intenta de nuevo")
+    if r.status_code == 401:
+        raise HTTPException(502, "API key de Tracerfy inválida")
+    if r.status_code == 402:
+        raise HTTPException(402, "Sin créditos en Tracerfy — recarga en tracerfy.com")
+    if r.status_code >= 400:
+        raise HTTPException(502, f"Tracerfy respondió {r.status_code}")
+
+    data = r.json()
+    persons = data.get("persons") or []
+    phones, emails = [], []
+    for p in persons[:3]:
+        for ph in (p.get("phones") or [])[:5]:
+            num = ph.get("number") or ph.get("phone") or ""
+            if num and not any(x["number"] == num for x in phones):
+                phones.append({"number": num, "type": ph.get("type", ""),
+                               "dnc": bool(ph.get("dnc")), "tcpa": bool(ph.get("tcpa"))})
+        for em in (p.get("emails") or [])[:5]:
+            e = em.get("email") if isinstance(em, dict) else str(em)
+            if e and e not in emails:
+                emails.append(e)
+    contact = {
+        "phones": phones[:5], "emails": emails[:5],
+        "hit": bool(data.get("hit") or phones or emails),
+        "credits_used": data.get("credits_deducted", 0),
+        "traced_at": datetime.now(timezone.utc).isoformat(),
+        "source": "tracerfy",
+    }
+    await db.deal_finder_leads.update_one({"_id": doc["_id"]}, {"$set": {"contact": contact}})
+    return {"success": True, "contact": contact}
+
+
+# ═══════════════════════════════════════════════════════════════
+# Enviar link de oferta por Email / SMS
+# ═══════════════════════════════════════════════════════════════
+
+class OfferSendBody(BaseModel):
+    channel: str          # "email" | "sms"
+    to: str
+
+
+@router.post("/admin/deal-finder/leads/{lead_id}/offer/send")
+async def send_offer_link(request: Request, lead_id: str, body: OfferSendBody):
+    await auth_admin(request)
+    if body.channel not in ("email", "sms"):
+        raise HTTPException(422, "channel debe ser email o sms")
+    to = body.to.strip()
+    if not to:
+        raise HTTPException(422, "Indica el destinatario")
+    db = get_db()
+    doc = await db.deal_finder_leads.find_one({"_id": ObjectId(lead_id)})
+    if not doc:
+        raise HTTPException(404, "Lead no encontrado")
+    offer = doc.get("offer") or {}
+    if not offer.get("slug"):
+        raise HTTPException(400, "Primero genera el link de la oferta")
+
+    url = f"{SITE_BASE}/oferta/{offer['slug']}"
+    first, _ = _owner_first_last(doc.get("owner_name") or "")
+    addr = doc.get("address") or "su propiedad"
+    amount = offer.get("amount") or 0
+    amount_txt_es = f"${amount:,.0f} en efectivo" if offer.get("mode") == "amount" and amount else "una oferta en efectivo"
+    amount_txt_en = f"${amount:,.0f} cash" if offer.get("mode") == "amount" and amount else "a cash offer"
+
+    sent_ok = False
+    if body.channel == "sms":
+        sms_body = (f"Hola {first}, soy Yoandy de Ross House Rentals (Dumas, TX). "
+                    f"Le ofrecemos {amount_txt_es} por {addr}. Vea los detalles y responda aqui: {url} "
+                    f"/ Hi {first}, we're offering {amount_txt_en} for your property. Details: {url}")
+        from rental.service_providers_router import _send_sms
+        sent_ok = await _send_sms(to, sms_body)
+        if not sent_ok:
+            raise HTTPException(502, "No se pudo enviar el SMS — verifica las llaves de Twilio en Configuración → API Keys")
+    else:
+        cfg = await db.rental_config.find_one({"type": "company"}) or {}
+        phone = cfg.get("phone") or "(806) 934-2018"
+        html = f"""
+        <div style="font-family:Arial,sans-serif;max-width:560px;margin:0 auto;background:#f8f9fa;padding:24px;border-radius:12px">
+          <h2 style="color:#8B1E3F;margin:0 0 12px">Ross House Rentals LLC</h2>
+          <p>Hola <b>{first or 'propietario'}</b>,</p>
+          <p>Le hacemos <b>{amount_txt_es}</b> por su propiedad en <b>{addr}</b>.
+             Sin comisiones, sin reparaciones, cierre rápido y nosotros pagamos los costos de cierre.</p>
+          <p style="text-align:center;margin:24px 0">
+            <a href="{url}" style="background:#8B1E3F;color:#fff;padding:14px 28px;border-radius:8px;
+               text-decoration:none;font-weight:bold">Ver mi oferta / View my offer</a>
+          </p>
+          <hr style="border:none;border-top:1px solid #ddd;margin:20px 0">
+          <p style="color:#555">Hi <b>{first or 'owner'}</b>, we're making <b>{amount_txt_en}</b> for your property at
+             <b>{addr}</b>. No fees, no repairs, fast closing. Tap the button above to view and respond.</p>
+          <p style="font-size:12px;color:#888">Ross House Rentals LLC · {phone} · {url}</p>
+        </div>"""
+        plain = f"Ross House Rentals: le ofrecemos {amount_txt_es} por {addr}. Vea y responda: {url}"
+        from rental.ai_brain_router import _send_email_branded
+        sent_ok = await _send_email_branded(to, f"💰 Oferta en efectivo por {addr} — Ross House Rentals", html, plain)
+        if not sent_ok:
+            raise HTTPException(502, "No se pudo enviar el email — verifica SendGrid en Configuración → API Keys")
+
+    entry = {"channel": body.channel, "to": to, "at": datetime.now(timezone.utc).isoformat()}
+    upd = {"$push": {"offer.sent_history": entry}}
+    if doc.get("status") in (None, "", "new", "contacted"):
+        upd["$set"] = {"status": "offer_sent"}
+    await db.deal_finder_leads.update_one({"_id": doc["_id"]}, upd)
+    return {"success": True, "sent": entry}
 
 
 @router.get("/public/oferta/{slug}")
