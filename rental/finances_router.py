@@ -195,6 +195,132 @@ async def delete_property_expense(expense_id: str, request: Request):
     return {"success": True, "message": "Gasto eliminado"}
 
 
+@router.get('/admin/property-expenses/annual-report')
+async def annual_expense_report(request: Request, year: int = 0, format: str = "pdf"):
+    """Reporte anual de gastos por propiedad para el contador (PDF o Excel).
+    Agrupa por propiedad y categoría, separa deducibles vs pagados por inquilino."""
+    await auth_admin(request)
+    db = get_db()
+    if not year:
+        year = datetime.utcnow().year
+    q = {"expense_date": {"$gte": f"{year}-01-01", "$lte": f"{year}-12-31"},
+         "status": {"$ne": "cancelled"}}
+    expenses = await db.property_expenses.find(q).sort("expense_date", 1).to_list(5000)
+
+    CAT_ES = {"maintenance": "Mantenimiento", "repair": "Reparaciones", "plumbing": "Plomería",
+              "electrical": "Eléctrica", "pest_control": "Control de Plagas", "landscaping": "Jardinería",
+              "insurance": "Seguros", "taxes": "Impuestos", "supplies": "Suministros",
+              "utilities": "Utilities (agua/basura)", "office": "Gastos de Oficina", "other": "Otros"}
+
+    groups: dict = {}
+    tot_deductible, tot_tenant = 0.0, 0.0
+    for e in expenses:
+        addr = e.get("property_address") or "— Sin propiedad —"
+        deductible = e.get("tax_deductible", True)
+        amt = float(e.get("amount") or 0)
+        g = groups.setdefault(addr, {"cats": {}, "deductible": 0.0, "tenant": 0.0, "rows": []})
+        cat = CAT_ES.get(e.get("category", "other"), e.get("category", "Otros"))
+        g["cats"][cat] = g["cats"].get(cat, 0.0) + amt
+        g["rows"].append(e)
+        if deductible:
+            g["deductible"] += amt
+            tot_deductible += amt
+        else:
+            g["tenant"] += amt
+            tot_tenant += amt
+
+    if format == "xlsx":
+        from openpyxl import Workbook
+        from openpyxl.styles import Font, PatternFill
+        wb = Workbook()
+        ws = wb.active
+        ws.title = f"Gastos {year}"
+        hdr_fill = PatternFill("solid", fgColor="8B1E3F")
+        ws.append([f"Ross House Rentals LLC — Reporte Anual de Gastos {year}"])
+        ws["A1"].font = Font(bold=True, size=14)
+        ws.append([])
+        ws.append(["Fecha", "Propiedad", "Categoría", "Descripción", "Vendor", "Monto", "Deducible", "Recibo #"])
+        for c in ws[3]:
+            c.font = Font(bold=True, color="FFFFFF")
+            c.fill = hdr_fill
+        for addr, g in sorted(groups.items()):
+            for e in g["rows"]:
+                ws.append([e.get("expense_date", ""), addr,
+                           CAT_ES.get(e.get("category", "other"), e.get("category", "")),
+                           e.get("description", "")[:80], e.get("vendor", ""),
+                           float(e.get("amount") or 0),
+                           "SÍ" if e.get("tax_deductible", True) else "NO (inquilino)",
+                           e.get("receipt_number", "")])
+        ws.append([])
+        ws.append(["", "", "", "", "TOTAL DEDUCIBLE", round(tot_deductible, 2)])
+        ws.append(["", "", "", "", "Pagado por inquilinos (no deducible)", round(tot_tenant, 2)])
+        for row in (ws.max_row - 1, ws.max_row):
+            for c in ws[row]:
+                c.font = Font(bold=True)
+        for col, w in zip("ABCDEFGH", [11, 26, 22, 50, 16, 11, 18, 26]):
+            ws.column_dimensions[col].width = w
+        import io
+        buf = io.BytesIO()
+        wb.save(buf)
+        buf.seek(0)
+        from fastapi.responses import StreamingResponse
+        return StreamingResponse(buf, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                 headers={"Content-Disposition": f"attachment; filename=gastos-{year}-rosshouse.xlsx"})
+
+    # PDF
+    import io
+    from reportlab.lib.pagesizes import letter
+    from reportlab.lib.units import inch
+    from reportlab.lib import colors
+    from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    buf = io.BytesIO()
+    docpdf = SimpleDocTemplate(buf, pagesize=letter, topMargin=0.6 * inch, bottomMargin=0.6 * inch)
+    styles = getSampleStyleSheet()
+    brand = colors.HexColor("#8B1E3F")
+    story = [
+        Paragraph(f"<b>Ross House Rentals LLC</b>", ParagraphStyle('t', fontSize=16, textColor=brand)),
+        Paragraph(f"Reporte Anual de Gastos — {year}", styles["Heading2"]),
+        Paragraph(f"Generado: {datetime.utcnow().strftime('%m/%d/%Y')} · Para uso del contador (Schedule E)", styles["Normal"]),
+        Spacer(1, 14),
+    ]
+    for addr, g in sorted(groups.items()):
+        story.append(Paragraph(f"<b>🏠 {addr}</b>", styles["Heading3"]))
+        rows = [["Categoría", "Total"]]
+        for cat, amt in sorted(g["cats"].items(), key=lambda x: -x[1]):
+            rows.append([cat, f"${amt:,.2f}"])
+        rows.append(["Deducible", f"${g['deductible']:,.2f}"])
+        if g["tenant"] > 0:
+            rows.append(["Pagado por inquilino (NO deducible)", f"${g['tenant']:,.2f}"])
+        t = Table(rows, colWidths=[4.2 * inch, 1.6 * inch])
+        t.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), brand),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("FONTSIZE", (0, 0), (-1, -1), 9),
+            ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#cccccc")),
+            ("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"),
+            ("ALIGN", (1, 0), (1, -1), "RIGHT"),
+        ]))
+        story += [t, Spacer(1, 12)]
+    story.append(Spacer(1, 8))
+    tot = Table([["TOTAL DEDUCIBLE DEL AÑO", f"${tot_deductible:,.2f}"],
+                 ["Pagado por inquilinos (no deducible)", f"${tot_tenant:,.2f}"]],
+                colWidths=[4.2 * inch, 1.6 * inch])
+    tot.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#065F46")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTNAME", (0, 0), (-1, -1), "Helvetica-Bold"),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#cccccc")),
+        ("ALIGN", (1, 0), (1, -1), "RIGHT"),
+    ]))
+    story.append(tot)
+    docpdf.build(story)
+    buf.seek(0)
+    from fastapi.responses import StreamingResponse
+    return StreamingResponse(buf, media_type="application/pdf",
+                             headers={"Content-Disposition": f"attachment; filename=gastos-{year}-rosshouse.pdf"})
+
+
 @router.get('/admin/property-performance')
 async def get_property_performance(request: Request):
     """Get performance metrics for all properties (revenue vs expenses)"""

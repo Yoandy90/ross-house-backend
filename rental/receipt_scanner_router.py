@@ -202,7 +202,10 @@ async def tax_report_pdf(request: Request, year: int = 0):
     }
 
     expenses = []
-    async for e in get_db().property_expenses.find({"expense_date": {"$gte": f"{year}-01-01", "$lte": f"{year}-12-31"}}).sort("expense_date", 1):
+    async for e in get_db().property_expenses.find({
+            "expense_date": {"$gte": f"{year}-01-01", "$lte": f"{year}-12-31"},
+            "tax_deductible": {"$ne": False},  # excluir gastos pagados por inquilinos
+    }).sort("expense_date", 1):
         irs = e.get("irs_category") or cat_to_irs.get(e.get("category", "other"), "other")
         expenses.append({
             "property_id": e.get("property_id") or "",

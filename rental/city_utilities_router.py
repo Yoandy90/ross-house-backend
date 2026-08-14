@@ -155,19 +155,25 @@ async def _sync_expense(db, acc: dict, res: dict):
                     {"$set": {"amount": res["balance"], "updated_at": now}})
             return
         prop = await _match_property(db, res.get("address") or acc.get("label", ""))
+        mode = acc.get("expense_mode", "company")  # office | tenant | company
         count = await db.property_expenses.count_documents({})
         await db.property_expenses.insert_one({
             "expense_number": f"EXP-{now.year}-{str(count + 1).zfill(4)}",
             "property_id": str(prop["_id"]) if prop else None,
             "property_address": (prop or {}).get("address") or acc.get("label") or res.get("address", ""),
             "property_number": (prop or {}).get("property_number", ""),
-            "category": "utilities",
-            "description": f"Agua/basura City de Dumas — cuenta {acct} (vence {res['due_date']})",
+            "category": "office" if mode == "office" else "utilities",
+            "description": (f"Gastos de oficina — agua/basura City de Dumas — cuenta {acct} (vence {res['due_date']})"
+                            if mode == "office" else
+                            f"Agua/basura City de Dumas — cuenta {acct} (vence {res['due_date']})"),
             "amount": res["balance"],
             "vendor": "City of Dumas",
             "expense_date": now.strftime("%Y-%m-%d"),
             "receipt_number": ref,
-            "notes": "Registrado automáticamente por el monitor de City de Dumas",
+            "tax_deductible": mode != "tenant",
+            "notes": ("Lo paga el inquilino — solo registro por propiedad, NO deducible"
+                      if mode == "tenant" else
+                      "Registrado automáticamente por el monitor de City de Dumas"),
             "status": "pending",
             "created_at": now, "updated_at": now,
             "created_by": "city-utilities-bot",
@@ -407,19 +413,25 @@ async def add_manual_paid_invoice(request: Request):
     # Registrar también como gasto contable COMPLETADO (para impuestos de fin de año)
     exp_ref = f"CITY-{acct}-MANUAL-{int(now.timestamp())}"
     prop = await _match_property(db, (acc or {}).get("address") or label)
+    mode = (acc or {}).get("expense_mode", "company")  # office | tenant | company
     exp_count = await db.property_expenses.count_documents({})
     await db.property_expenses.insert_one({
         "expense_number": f"EXP-{now.year}-{str(exp_count + 1).zfill(4)}",
         "property_id": str(prop["_id"]) if prop else None,
         "property_address": (prop or {}).get("address") or label,
         "property_number": (prop or {}).get("property_number", ""),
-        "category": "utilities",
-        "description": f"Agua/basura City de Dumas — cuenta {acct} (factura {doc['invoice_number']})",
+        "category": "office" if mode == "office" else "utilities",
+        "description": (f"Gastos de oficina — agua/basura City de Dumas — cuenta {acct} (factura {doc['invoice_number']})"
+                        if mode == "office" else
+                        f"Agua/basura City de Dumas — cuenta {acct} (factura {doc['invoice_number']})"),
         "amount": round(amount, 2),
         "vendor": "City of Dumas",
         "expense_date": paid_at.strftime("%Y-%m-%d"),
         "receipt_number": exp_ref,
-        "notes": "Pago registrado manualmente (Libro de Facturas)",
+        "tax_deductible": mode != "tenant",
+        "notes": ("Lo paga el inquilino — solo registro por propiedad, NO deducible"
+                  if mode == "tenant" else
+                  "Pago registrado manualmente (Libro de Facturas)"),
         "status": "completed",
         "created_at": now, "updated_at": now,
         "created_by": "manual",
