@@ -97,6 +97,47 @@ async def _match_property(db, service_addr: str) -> Optional[dict]:
     return None
 
 
+async def _sync_invoice(db, acc: dict, res: dict):
+    """Libro de facturas de servicios de ciudad (city_utility_invoices).
+    - Saldo > 0: crea/actualiza factura ABIERTA (dedupe por cuenta+vencimiento)
+    - Saldo vuelve a 0: marca las facturas abiertas de esa cuenta como PAGADAS"""
+    now = datetime.now(timezone.utc)
+    acct = acc["account_number"]
+    label = acc.get("label") or res.get("address", "")
+    if res["balance"] > 0 and res.get("due_date"):
+        inv_ref = f"CITY-{acct}-{res['due_date'].replace('/', '-')}"
+        existing = await db.city_utility_invoices.find_one({"invoice_ref": inv_ref})
+        if existing:
+            if existing.get("status") == "open" and \
+                    float(existing.get("amount") or 0) != res["balance"]:
+                await db.city_utility_invoices.update_one(
+                    {"_id": existing["_id"]},
+                    {"$set": {"amount": res["balance"], "updated_at": now}})
+            return
+        count = await db.city_utility_invoices.count_documents({})
+        await db.city_utility_invoices.insert_one({
+            "invoice_number": f"CU-{now.year}-{str(count + 1).zfill(4)}",
+            "invoice_ref": inv_ref,
+            "account_number": acct,
+            "label": label,
+            "address": res.get("address", ""),
+            "amount": res["balance"],
+            "due_date": res["due_date"],
+            "status": "open",
+            "issued_at": now,
+            "detected_at": now,
+            "paid_at": None,
+            "created_at": now, "updated_at": now,
+        })
+        logger.info(f"[city-utils] factura ABIERTA: {acct} ${res['balance']:,.2f} vence {res['due_date']}")
+    elif res["balance"] == 0:
+        r = await db.city_utility_invoices.update_many(
+            {"account_number": acct, "status": "open"},
+            {"$set": {"status": "paid", "paid_at": now, "updated_at": now}})
+        if r.modified_count:
+            logger.info(f"[city-utils] {r.modified_count} factura(s) de {acct} marcadas PAGADAS")
+
+
 async def _sync_expense(db, acc: dict, res: dict):
     """Registra el bill como gasto en /admin/gastos (categoría utilities).
     - Bill nuevo (saldo > 0): crea gasto 'pending' (dedupe por cuenta+vencimiento)
@@ -158,6 +199,10 @@ async def sync_account(db, acc: dict) -> dict:
             await _sync_expense(db, acc, res)
         except Exception as e:
             logger.warning(f"[city-utils] registro de gasto falló para {acc['account_number']}: {e}")
+        try:
+            await _sync_invoice(db, acc, res)
+        except Exception as e:
+            logger.warning(f"[city-utils] registro de factura falló para {acc['account_number']}: {e}")
     else:
         upd.update({
             "status": "verify_failed" if res.get("verify_failed") else "error",
@@ -301,6 +346,74 @@ async def delete_account(account_id: str, request: Request):
 async def manual_sync(request: Request):
     await auth_admin(request)
     return await sync_all_and_alert(get_db(), alert=False)
+
+
+@router.get("/admin/city-utilities/invoices")
+async def list_invoices(request: Request, status: Optional[str] = None):
+    """Libro de facturas de servicios de ciudad (abiertas + pagadas)."""
+    await auth_admin(request)
+    db = get_db()
+    filt: dict = {}
+    if status in ("open", "paid"):
+        filt["status"] = status
+    invoices = [serialize(i) async for i in
+                db.city_utility_invoices.find(filt).sort("issued_at", -1)]
+    total_open = sum(i["amount"] for i in invoices if i["status"] == "open")
+    total_paid = sum(i["amount"] for i in invoices if i["status"] == "paid")
+    return {"success": True, "invoices": invoices,
+            "open_count": sum(1 for i in invoices if i["status"] == "open"),
+            "paid_count": sum(1 for i in invoices if i["status"] == "paid"),
+            "total_open": round(total_open, 2), "total_paid": round(total_paid, 2)}
+
+
+@router.post("/admin/city-utilities/invoices/manual-paid")
+async def add_manual_paid_invoice(request: Request):
+    """Registra una factura YA PAGADA (para pagos hechos antes de que el
+    monitor los detectara). Body: {account_number, amount, paid_date, label?}"""
+    await auth_admin(request)
+    db = get_db()
+    data = await request.json()
+    acct = str(data.get("account_number", "")).strip()
+    amount = float(str(data.get("amount", "0")).replace("$", "").replace(",", "").strip() or 0)
+    paid_date = str(data.get("paid_date", "")).strip()
+    if not acct or amount <= 0:
+        raise HTTPException(status_code=422, detail="Número de cuenta y monto (> 0) requeridos")
+    acc = await db.city_utility_accounts.find_one({"account_number": acct})
+    label = str(data.get("label", "")).strip() or (acc or {}).get("label") or (acc or {}).get("address", "")
+    now = datetime.now(timezone.utc)
+    try:
+        paid_at = datetime.strptime(paid_date, "%Y-%m-%d").replace(tzinfo=timezone.utc) if paid_date else now
+    except Exception:
+        paid_at = now
+    count = await db.city_utility_invoices.count_documents({})
+    doc = {
+        "invoice_number": f"CU-{now.year}-{str(count + 1).zfill(4)}",
+        "invoice_ref": f"CITY-{acct}-MANUAL-{int(now.timestamp())}",
+        "account_number": acct,
+        "label": label,
+        "address": (acc or {}).get("address", ""),
+        "amount": round(amount, 2),
+        "due_date": paid_date,
+        "status": "paid",
+        "issued_at": paid_at,
+        "detected_at": now,
+        "paid_at": paid_at,
+        "manual": True,
+        "created_at": now, "updated_at": now,
+    }
+    ins = await db.city_utility_invoices.insert_one(doc)
+    doc["_id"] = ins.inserted_id
+    return {"success": True, "invoice": serialize(doc)}
+
+
+@router.delete("/admin/city-utilities/invoices/{invoice_id}")
+async def delete_invoice(invoice_id: str, request: Request):
+    await auth_admin(request)
+    from bson import ObjectId
+    r = await get_db().city_utility_invoices.delete_one({"_id": ObjectId(invoice_id)})
+    if not r.deleted_count:
+        raise HTTPException(status_code=404, detail="Factura no encontrada")
+    return {"success": True}
 
 
 # ─── Cron diario (8AM CT) ────────────────────────────────────────
