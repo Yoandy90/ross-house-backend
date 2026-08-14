@@ -403,6 +403,27 @@ async def add_manual_paid_invoice(request: Request):
     }
     ins = await db.city_utility_invoices.insert_one(doc)
     doc["_id"] = ins.inserted_id
+
+    # Registrar también como gasto contable COMPLETADO (para impuestos de fin de año)
+    exp_ref = f"CITY-{acct}-MANUAL-{int(now.timestamp())}"
+    prop = await _match_property(db, (acc or {}).get("address") or label)
+    exp_count = await db.property_expenses.count_documents({})
+    await db.property_expenses.insert_one({
+        "expense_number": f"EXP-{now.year}-{str(exp_count + 1).zfill(4)}",
+        "property_id": str(prop["_id"]) if prop else None,
+        "property_address": (prop or {}).get("address") or label,
+        "property_number": (prop or {}).get("property_number", ""),
+        "category": "utilities",
+        "description": f"Agua/basura City de Dumas — cuenta {acct} (factura {doc['invoice_number']})",
+        "amount": round(amount, 2),
+        "vendor": "City of Dumas",
+        "expense_date": paid_at.strftime("%Y-%m-%d"),
+        "receipt_number": exp_ref,
+        "notes": "Pago registrado manualmente (Libro de Facturas)",
+        "status": "completed",
+        "created_at": now, "updated_at": now,
+        "created_by": "manual",
+    })
     return {"success": True, "invoice": serialize(doc)}
 
 
