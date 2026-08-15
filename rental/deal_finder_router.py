@@ -1367,6 +1367,44 @@ async def send_offer_link(request: Request, lead_id: str, body: OfferSendBody):
     return {"success": True, "sent": entry}
 
 
+@router.get("/admin/deal-finder/sms-log")
+async def sms_delivery_log(request: Request, limit: int = 20):
+    """Diagnóstico: estado REAL de entrega de los últimos SMS en Twilio
+    (queued/sent/delivered/undelivered/failed + código de error del carrier)."""
+    await auth_admin(request)
+    sid = os.environ.get("TWILIO_ACCOUNT_SID")
+    token = os.environ.get("TWILIO_AUTH_TOKEN")
+    if not (sid and token):
+        raise HTTPException(400, "Twilio no configurado — revisa Configuración → API Keys")
+
+    def _fetch():
+        from twilio.rest import Client
+        client = Client(sid, token)
+        acct = client.api.accounts(sid).fetch()
+        try:
+            bal = client.api.accounts(sid).balance.fetch()
+            balance = f"{bal.balance} {bal.currency}"
+        except Exception:
+            balance = None
+        msgs = []
+        for m in client.messages.list(limit=min(limit, 50)):
+            msgs.append({
+                "to": m.to, "from": m.from_, "status": m.status,
+                "error_code": m.error_code, "error_message": m.error_message,
+                "date": m.date_created.isoformat() if m.date_created else None,
+                "body": (m.body or "")[:90],
+            })
+        return {"account_type": acct.type, "account_status": acct.status,
+                "balance": balance, "messages": msgs}
+
+    import anyio
+    try:
+        data = await anyio.to_thread.run_sync(_fetch)
+    except Exception as e:
+        raise HTTPException(502, f"Twilio error: {e}")
+    return data
+
+
 # ═══════════════════════════════════════════════════════════════
 # Búsqueda manual de contacto (independiente de leads)
 # ═══════════════════════════════════════════════════════════════
