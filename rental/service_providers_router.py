@@ -294,7 +294,8 @@ async def _send_email(to_email: str, subject: str, body: str, html_body: Optiona
         return False
 
 
-async def _send_sms(to_phone: str, body: str) -> bool:
+async def _send_sms(to_phone: str, body: str):
+    """Envía SMS vía Twilio. Devuelve el SID del mensaje (truthy) o False."""
     try:
         sid = os.environ.get('TWILIO_ACCOUNT_SID')
         token = os.environ.get('TWILIO_AUTH_TOKEN')
@@ -304,8 +305,8 @@ async def _send_sms(to_phone: str, body: str) -> bool:
         from twilio.rest import Client
         if not to_phone.startswith('+'):
             to_phone = '+1' + re.sub(r'\D', '', to_phone)
-        Client(sid, token).messages.create(body=body[:1500], from_=from_phone, to=to_phone)
-        return True
+        msg = Client(sid, token).messages.create(body=body[:1500], from_=from_phone, to=to_phone)
+        return msg.sid or True
     except Exception as e:
         logger.exception(f"[providers] sms send failed: {e}")
         return False

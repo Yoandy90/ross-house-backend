@@ -1360,11 +1360,85 @@ async def send_offer_link(request: Request, lead_id: str, body: OfferSendBody):
             raise HTTPException(502, "No se pudo enviar el email — verifica SendGrid en Configuración → API Keys")
 
     entry = {"channel": body.channel, "to": to, "at": datetime.now(timezone.utc).isoformat()}
+    if body.channel == "sms" and isinstance(sent_ok, str):
+        entry["sid"] = sent_ok
+        entry["status"] = "accepted"
     upd = {"$push": {"offer.sent_history": entry}}
     if doc.get("status") in (None, "", "new", "contacted"):
         upd["$set"] = {"status": "offer_sent"}
     await db.deal_finder_leads.update_one({"_id": doc["_id"]}, upd)
     return {"success": True, "sent": entry}
+
+
+_SMS_ERROR_HINTS = {
+    30007: "Bloqueado por el filtro anti-spam del carrier. Los SMS de marketing (oferta + link) "
+           "requieren una campaña A2P 10DLC de tipo Marketing registrada en Twilio "
+           "(Console → Messaging → Regulatory Compliance).",
+    30034: "Número no registrado en A2P 10DLC — los carriers de EE.UU. bloquean SMS de números sin campaña registrada.",
+    30003: "El teléfono del destinatario está apagado o fuera de servicio.",
+    30005: "Número desconocido o inactivo.",
+    30006: "El número destino es fijo (landline) y no puede recibir SMS.",
+}
+
+
+@router.post("/admin/deal-finder/leads/{lead_id}/sms-status")
+async def refresh_sms_delivery_status(request: Request, lead_id: str):
+    """Consulta en Twilio el estado REAL de entrega de los SMS del historial de la oferta
+    y lo persiste (delivered / undelivered / failed + código y explicación)."""
+    await auth_admin(request)
+    db = get_db()
+    doc = await db.deal_finder_leads.find_one({"_id": ObjectId(lead_id)})
+    if not doc:
+        raise HTTPException(404, "Lead no encontrado")
+    hist = ((doc.get("offer") or {}).get("sent_history") or [])
+    sms_entries = [h for h in hist if h.get("channel") == "sms"]
+    if not sms_entries:
+        return {"success": True, "sent_history": hist}
+    acct_sid = os.environ.get("TWILIO_ACCOUNT_SID")
+    token = os.environ.get("TWILIO_AUTH_TOKEN")
+    if not (acct_sid and token):
+        raise HTTPException(400, "Twilio no configurado — revisa Configuración → API Keys")
+
+    def _lookup():
+        from twilio.rest import Client
+        client = Client(acct_sid, token)
+        found = {}
+        for h in sms_entries:
+            if h.get("status") in ("delivered", "undelivered", "failed"):
+                continue  # estado final ya conocido
+            try:
+                if h.get("sid"):
+                    m = client.messages(h["sid"]).fetch()
+                else:
+                    # Entradas antiguas sin SID: buscar por número el mensaje más cercano en tiempo
+                    digits = re.sub(r"\D", "", h.get("to", ""))[-10:]
+                    if not digits:
+                        continue
+                    cands = client.messages.list(to=f"+1{digits}", limit=5)
+                    sent_at = datetime.fromisoformat(h["at"])
+                    m = min(cands, key=lambda c: abs((c.date_created - sent_at).total_seconds())
+                            if c.date_created else 1e9, default=None)
+                    if m is None or not m.date_created or abs((m.date_created - sent_at).total_seconds()) > 1200:
+                        continue
+                found[id(h)] = {"sid": m.sid, "status": m.status,
+                                "error_code": m.error_code, "error_message": m.error_message}
+            except Exception:
+                logger.warning(f"[deal-finder] sms-status lookup failed for {h.get('to')}", exc_info=True)
+        return found
+
+    import anyio
+    found = await anyio.to_thread.run_sync(_lookup)
+    changed = False
+    for h in sms_entries:
+        st = found.get(id(h))
+        if st:
+            h.update({k: v for k, v in st.items() if v is not None or k in ("error_code", "error_message")})
+            if st.get("error_code") in _SMS_ERROR_HINTS:
+                h["error_hint"] = _SMS_ERROR_HINTS[st["error_code"]]
+            changed = True
+    if changed:
+        await db.deal_finder_leads.update_one({"_id": doc["_id"]}, {"$set": {"offer.sent_history": hist}})
+    return {"success": True, "sent_history": hist}
 
 
 @router.get("/admin/deal-finder/sms-log")
