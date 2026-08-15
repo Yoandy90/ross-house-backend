@@ -169,7 +169,11 @@ async def validate_lead_contacts(request: Request, lead_id: str):
 
     for ph in phones[:5]:
         if twilio_ok:
-            res = await twilio_line_lookup(ph.get("number", ""))
+            try:
+                res = await twilio_line_lookup(ph.get("number", ""))
+            except Exception as e:
+                logger.exception("validate-contacts lookup crash")
+                raise HTTPException(500, f"lookup error: {type(e).__name__}: {str(e)[:180]}")
             if res:
                 ph["line_type"] = res["line_type"]
                 ph["carrier"] = res.get("carrier")
