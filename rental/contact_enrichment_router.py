@@ -1,0 +1,563 @@
+"""
+Enriquecimiento de contactos y señales de motivación — Deal Finder Premium
+═══════════════════════════════════════════════════════════════════════════
+Nivel 1 · Validación:  Twilio Lookup (tipo de línea) + ZeroBounce (emails)
+Nivel 2 · Cascada:     Tracerfy → BatchData (skip tracing en cadena)
+Nivel 3 · Motivación:  PropertyRadar (probate/divorcio/evicción/pre-foreclosure)
+                       + Obituarios locales (gratis, extracción con IA)
+
+Diseño modular: cada proveedor es un adaptador independiente que se activa
+solo si su API key está configurada (Configuración → API Keys).
+"""
+import logging
+import os
+import re
+import secrets
+import urllib.parse
+from datetime import datetime, timezone, timedelta
+from typing import Optional
+
+import httpx
+from bson import ObjectId
+from fastapi import APIRouter, HTTPException, Request
+from pydantic import BaseModel
+
+from rental.shared import get_db, auth_admin
+
+logger = logging.getLogger(__name__)
+router = APIRouter(tags=["Contact Enrichment"])
+
+MOORE_COUNTY_FIPS = 48341
+LOOKUP_CACHE_DAYS = 90
+
+# ═══════════════════════════════════════════════════════════════
+# Registro de proveedores (para la UI "Fuentes de datos")
+# ═══════════════════════════════════════════════════════════════
+
+PROVIDERS = [
+    {"id": "twilio_lookup", "name": "Twilio Lookup — Tipo de línea", "level": 1,
+     "keys": ["TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN"],
+     "price": "$0.008 por número", "signup": "console.twilio.com",
+     "what": "Detecta si un teléfono es móvil, fijo o VoIP antes de enviar SMS"},
+    {"id": "zerobounce", "name": "ZeroBounce — Validación de emails", "level": 1,
+     "keys": ["ZEROBOUNCE_API_KEY"],
+     "price": "~$0.004 por email", "signup": "zerobounce.net",
+     "what": "Verifica que el email exista y no rebote (protege tu SendGrid)"},
+    {"id": "tracerfy", "name": "Tracerfy — Skip tracing (1ª fuente)", "level": 2,
+     "keys": ["TRACERFY_API_KEY"],
+     "price": "5 créditos por acierto", "signup": "tracerfy.com",
+     "what": "Encuentra teléfonos y emails del dueño"},
+    {"id": "batchdata", "name": "BatchData — Skip tracing (2ª fuente)", "level": 2,
+     "keys": ["BATCHDATA_API_KEY"],
+     "price": "$0.07–0.20 por registro", "signup": "batchdata.com",
+     "what": "Fallback cuando Tracerfy no encuentra contacto; fuerte en datos TCPA"},
+    {"id": "propertyradar", "name": "PropertyRadar — Señales de motivación", "level": 3,
+     "keys": ["PROPERTYRADAR_API_KEY"],
+     "price": "plan desde ~$59/mes (API incluida)", "signup": "propertyradar.com",
+     "what": "Probate, divorcio, evicciones y pre-foreclosure en Moore County"},
+    {"id": "obituaries", "name": "Obituarios locales — Gratis (IA)", "level": 3,
+     "keys": ["EMERGENT_LLM_KEY"],
+     "price": "Gratis (usa tu llave de IA)", "signup": "",
+     "what": "Escanea obituarios de Dumas/Moore County y los cruza con tus leads (posible herencia)"},
+]
+
+
+@router.get("/admin/enrichment/providers")
+async def enrichment_providers(request: Request):
+    await auth_admin(request)
+    out = []
+    for p in PROVIDERS:
+        out.append({**p, "configured": all(os.environ.get(k) for k in p["keys"])})
+    return {"providers": out}
+
+
+# ═══════════════════════════════════════════════════════════════
+# NIVEL 1 · Twilio Lookup (tipo de línea) — con caché de 90 días
+# ═══════════════════════════════════════════════════════════════
+
+def _e164(phone: str) -> str:
+    digits = re.sub(r"\D", "", phone or "")
+    if len(digits) == 10:
+        return "+1" + digits
+    if len(digits) == 11 and digits.startswith("1"):
+        return "+" + digits
+    return ("+" + digits) if digits else ""
+
+
+async def twilio_line_lookup(phone: str) -> Optional[dict]:
+    """Devuelve {line_type, carrier, valid, sms_ok} o None si no hay llaves/falla.
+    Cachea 90 días en phone_lookups para no pagar dos veces por el mismo número."""
+    sid = os.environ.get("TWILIO_ACCOUNT_SID")
+    token = os.environ.get("TWILIO_AUTH_TOKEN")
+    e164 = _e164(phone)
+    if not (sid and token and e164):
+        return None
+    db = get_db()
+    now = datetime.now(timezone.utc)
+    cached = await db.phone_lookups.find_one({"phone": e164, "expires_at": {"$gt": now}})
+    if cached:
+        return {"line_type": cached.get("line_type"), "carrier": cached.get("carrier"),
+                "valid": cached.get("valid"), "sms_ok": cached.get("sms_ok"), "cached": True}
+    try:
+        async with httpx.AsyncClient(timeout=12, auth=(sid, token)) as client:
+            r = await client.get(
+                f"https://lookups.twilio.com/v2/PhoneNumbers/{urllib.parse.quote(e164, safe='')}",
+                params={"Fields": "line_type_intelligence"})
+        r.raise_for_status()
+        data = r.json()
+    except Exception as e:
+        logger.warning(f"[enrichment] twilio lookup failed for {e164}: {e}")
+        return None
+    lti = data.get("line_type_intelligence") or {}
+    line_type = lti.get("type")
+    valid = bool(data.get("valid"))
+    result = {"line_type": line_type, "carrier": lti.get("carrier_name"),
+              "valid": valid, "sms_ok": valid and line_type == "mobile", "cached": False}
+    await db.phone_lookups.update_one({"phone": e164}, {"$set": {
+        "phone": e164, **{k: result[k] for k in ("line_type", "carrier", "valid", "sms_ok")},
+        "checked_at": now, "expires_at": now + timedelta(days=LOOKUP_CACHE_DAYS)}}, upsert=True)
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════
+# NIVEL 1 · ZeroBounce (validación de emails) — con caché
+# ═══════════════════════════════════════════════════════════════
+
+async def zerobounce_validate(email: str) -> Optional[dict]:
+    key = os.environ.get("ZEROBOUNCE_API_KEY")
+    email = (email or "").strip().lower()
+    if not (key and email):
+        return None
+    db = get_db()
+    now = datetime.now(timezone.utc)
+    cached = await db.email_validations.find_one({"email": email, "expires_at": {"$gt": now}})
+    if cached:
+        return {"status": cached.get("status"), "sub_status": cached.get("sub_status"), "cached": True}
+    try:
+        async with httpx.AsyncClient(timeout=35) as client:
+            r = await client.get("https://api.zerobounce.net/v2/validate",
+                                 params={"api_key": key, "email": email, "timeout": 30})
+        r.raise_for_status()
+        data = r.json()
+    except Exception as e:
+        logger.warning(f"[enrichment] zerobounce failed for {email}: {e}")
+        return None
+    result = {"status": data.get("status"), "sub_status": data.get("sub_status"), "cached": False}
+    await db.email_validations.update_one({"email": email}, {"$set": {
+        "email": email, "status": result["status"], "sub_status": result["sub_status"],
+        "checked_at": now, "expires_at": now + timedelta(days=LOOKUP_CACHE_DAYS)}}, upsert=True)
+    return result
+
+
+@router.post("/admin/deal-finder/leads/{lead_id}/validate-contacts")
+async def validate_lead_contacts(request: Request, lead_id: str):
+    """NIVEL 1: valida cada teléfono (móvil/fijo/VoIP vía Twilio Lookup) y cada
+    email (ZeroBounce) del contacto del lead. Persiste el resultado en el lead."""
+    await auth_admin(request)
+    db = get_db()
+    doc = await db.deal_finder_leads.find_one({"_id": ObjectId(lead_id)})
+    if not doc:
+        raise HTTPException(404, "Lead no encontrado")
+    contact = doc.get("contact") or {}
+    phones = contact.get("phones") or []
+    emails = contact.get("emails") or []
+    if not phones and not emails:
+        raise HTTPException(400, "El lead no tiene contacto — corre primero el skip tracing")
+
+    twilio_ok = bool(os.environ.get("TWILIO_ACCOUNT_SID") and os.environ.get("TWILIO_AUTH_TOKEN"))
+    zb_ok = bool(os.environ.get("ZEROBOUNCE_API_KEY"))
+
+    for ph in phones[:5]:
+        if twilio_ok:
+            res = await twilio_line_lookup(ph.get("number", ""))
+            if res:
+                ph["line_type"] = res["line_type"]
+                ph["carrier"] = res.get("carrier")
+                ph["sms_ok"] = res["sms_ok"]
+                ph["line_checked_at"] = datetime.now(timezone.utc).isoformat()
+
+    email_checks = []
+    for em in emails[:5]:
+        entry = {"email": em}
+        if zb_ok:
+            res = await zerobounce_validate(em)
+            if res:
+                entry["status"] = res["status"]
+                entry["sub_status"] = res.get("sub_status")
+        email_checks.append(entry)
+
+    contact["phones"] = phones
+    contact["email_checks"] = email_checks
+    contact["validated_at"] = datetime.now(timezone.utc).isoformat()
+    await db.deal_finder_leads.update_one({"_id": doc["_id"]}, {"$set": {"contact": contact}})
+    return {"success": True, "contact": contact,
+            "twilio_configured": twilio_ok, "zerobounce_configured": zb_ok}
+
+
+# ═══════════════════════════════════════════════════════════════
+# NIVEL 2 · BatchData (2ª fuente de skip tracing)
+# ═══════════════════════════════════════════════════════════════
+
+async def batchdata_trace(owner_name: str, situs: dict) -> Optional[dict]:
+    """Skip trace vía BatchData v3. Devuelve {phones, emails} o None."""
+    key = os.environ.get("BATCHDATA_API_KEY")
+    if not key:
+        return None
+    address = {"street": situs["street"], "state": situs["state"]}
+    if situs.get("city"):
+        address["city"] = situs["city"]
+    if situs.get("zip"):
+        address["zip"] = situs["zip"]
+    payload = [{"name": owner_name, "propertyAddress": address,
+                "includeTCPABlacklistedPhones": False, "dateFormat": "iso-date-time"}]
+    try:
+        async with httpx.AsyncClient(timeout=35) as client:
+            r = await client.post("https://api.batchdata.com/api/v3/property/skip-trace",
+                                  headers={"Authorization": f"Bearer {key}",
+                                           "Content-Type": "application/json",
+                                           "Accept": "application/json"},
+                                  json=payload)
+        if r.status_code in (401, 403):
+            raise HTTPException(502, "API key de BatchData inválida")
+        if r.status_code == 402:
+            raise HTTPException(402, "Sin créditos en BatchData — recarga en batchdata.com")
+        r.raise_for_status()
+        data = r.json()
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.warning(f"[enrichment] batchdata failed: {e}")
+        return None
+    phones, emails = [], []
+    rows = (data.get("result") or {}).get("data") or data.get("data") or []
+    for row in rows if isinstance(rows, list) else []:
+        persons = row.get("persons") or [row]
+        for p in persons[:3]:
+            for ph in (p.get("phones") or [])[:5]:
+                num = ph.get("number") or ph.get("phone") or ""
+                if num and not any(x["number"] == num for x in phones):
+                    phones.append({"number": num, "type": ph.get("type", ""),
+                                   "dnc": bool(ph.get("dnc") or ph.get("dncLitigator")),
+                                   "tcpa": bool(ph.get("tcpa") or ph.get("tcpaBlacklisted"))})
+            for em in (p.get("emails") or [])[:5]:
+                e = em.get("email") if isinstance(em, dict) else str(em)
+                if e and e not in emails:
+                    emails.append(e)
+    return {"phones": phones[:5], "emails": emails[:5]}
+
+
+@router.post("/admin/deal-finder/leads/{lead_id}/skip-trace-cascade")
+async def skip_trace_cascade(request: Request, lead_id: str):
+    """NIVEL 2: cascada de skip tracing. Intenta Tracerfy primero; si no encuentra
+    (o para completar datos faltantes) intenta BatchData. Al final valida las
+    líneas automáticamente con Twilio Lookup si está configurado."""
+    await auth_admin(request)
+    db = get_db()
+    doc = await db.deal_finder_leads.find_one({"_id": ObjectId(lead_id)})
+    if not doc:
+        raise HTTPException(404, "Lead no encontrado")
+
+    from rental.deal_finder_router import _parse_situs, _owner_first_last, ENTITY_OWNER_RX, tracerfy_trace
+
+    owner = doc.get("owner_name") or ""
+    situs = _parse_situs(doc.get("address") or "")
+    if not situs:
+        raise HTTPException(422, "El lead no tiene dirección física completa para rastrear")
+
+    sources_tried, phones, emails = [], [], []
+    contact = doc.get("contact") or {}
+
+    # Paso 1 — Tracerfy (solo personas, no entidades)
+    if os.environ.get("TRACERFY_API_KEY") and not ENTITY_OWNER_RX.search(owner):
+        first, last = _owner_first_last(owner)
+        if first and last:
+            try:
+                t = await tracerfy_trace(situs, first, last)
+                if t:
+                    phones.extend(t["phones"])
+                    emails.extend(t["emails"])
+                    sources_tried.append({"source": "tracerfy", "hit": bool(t["phones"] or t["emails"]),
+                                          "credits_used": t.get("credits_used", 0)})
+            except HTTPException as e:
+                sources_tried.append({"source": "tracerfy", "hit": False, "error": str(e.detail)[:120]})
+
+    # Paso 2 — BatchData (fallback / complemento; también funciona con LLCs)
+    need_more = not phones or not emails
+    if need_more and os.environ.get("BATCHDATA_API_KEY"):
+        try:
+            b = await batchdata_trace(owner, situs)
+        except HTTPException as e:
+            b = None
+            sources_tried.append({"source": "batchdata", "hit": False, "error": str(e.detail)[:120]})
+        if b is not None:
+            added = 0
+            for ph in b["phones"]:
+                if not any(re.sub(r"\D", "", x["number"])[-10:] == re.sub(r"\D", "", ph["number"])[-10:] for x in phones):
+                    phones.append(ph)
+                    added += 1
+            for em in b["emails"]:
+                if em not in emails:
+                    emails.append(em)
+                    added += 1
+            sources_tried.append({"source": "batchdata", "hit": added > 0})
+
+    if not sources_tried:
+        raise HTTPException(400, "Ninguna fuente de skip tracing está configurada — "
+                                 "agrega TRACERFY_API_KEY o BATCHDATA_API_KEY en Configuración → API Keys")
+
+    # Paso 3 — Validación automática de líneas (silenciosa)
+    for ph in phones[:5]:
+        res = await twilio_line_lookup(ph.get("number", ""))
+        if res:
+            ph["line_type"] = res["line_type"]
+            ph["carrier"] = res.get("carrier")
+            ph["sms_ok"] = res["sms_ok"]
+
+    contact.update({
+        "phones": phones[:5], "emails": emails[:5],
+        "hit": bool(phones or emails),
+        "traced_at": datetime.now(timezone.utc).isoformat(),
+        "source": "cascade",
+        "sources": sources_tried,
+    })
+    await db.deal_finder_leads.update_one({"_id": doc["_id"]}, {"$set": {"contact": contact}})
+    return {"success": True, "contact": contact, "sources": sources_tried}
+
+
+# ═══════════════════════════════════════════════════════════════
+# NIVEL 3 · PropertyRadar — señales de motivación
+# ═══════════════════════════════════════════════════════════════
+
+RADAR_CRITERIA = {
+    "probate": "inProbateProperty",
+    "divorce": "inDivorce",
+    "eviction": "hasRecentEviction",
+    "preforeclosure": "isPreforeclosure",
+}
+SIGNAL_LABELS = {
+    "probate": "⚖️ Probate (herencia)",
+    "divorce": "💔 Divorcio",
+    "eviction": "📤 Evicción reciente",
+    "preforeclosure": "🏚️ Pre-foreclosure",
+    "possible_deceased": "🕊️ Posible fallecido",
+}
+
+
+def _norm_street(addr: str) -> str:
+    s = re.sub(r"[^A-Z0-9 ]", "", (addr or "").upper())
+    s = re.sub(r"\b(STREET|AVENUE|DRIVE|LANE|ROAD|BOULEVARD|COURT|PLACE)\b",
+               lambda m: {"STREET": "ST", "AVENUE": "AVE", "DRIVE": "DR", "LANE": "LN",
+                          "ROAD": "RD", "BOULEVARD": "BLVD", "COURT": "CT", "PLACE": "PL"}[m.group(0)], s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+class MotivationScanBody(BaseModel):
+    signals: list[str] = ["probate", "preforeclosure", "divorce", "eviction"]
+    limit: int = 100
+    county_fips: int = MOORE_COUNTY_FIPS
+
+
+@router.post("/admin/deal-finder/motivation-scan")
+async def motivation_scan(request: Request, body: MotivationScanBody):
+    """NIVEL 3: consulta PropertyRadar (Purchase=0, modo preview — sin cargos por
+    registro completo) y cruza los resultados con tus leads por dirección.
+    A los que coinciden les marca las señales de motivación."""
+    await auth_admin(request)
+    key = os.environ.get("PROPERTYRADAR_API_KEY")
+    if not key:
+        raise HTTPException(400, "Configura PROPERTYRADAR_API_KEY en Configuración → API Keys "
+                                 "(crea cuenta en propertyradar.com — la API viene incluida en todos los planes)")
+    signals = [s for s in body.signals if s in RADAR_CRITERIA]
+    if not signals:
+        raise HTTPException(422, "Elige al menos una señal válida")
+
+    criteria = [{"name": "County", "value": [body.county_fips]}]
+    criteria += [{"name": RADAR_CRITERIA[s], "value": True} for s in signals]
+    fields = ["RadarID", "Address", "City", "ZipFive", "Owner",
+              "isPreforeclosure", "inProbateProperty", "inDivorce", "hasRecentEviction"]
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.post("https://api.propertyradar.com/v1/properties",
+                                  params={"Purchase": 0, "Start": 0, "Limit": min(body.limit, 200)},
+                                  headers={"Authorization": f"Bearer {key}", "Accept": "application/json"},
+                                  json={"Criteria": criteria, "Fields": fields})
+        if r.status_code in (401, 403):
+            raise HTTPException(502, "API key de PropertyRadar inválida")
+        if r.status_code == 402:
+            raise HTTPException(402, "Sin balance en PropertyRadar")
+        r.raise_for_status()
+        data = r.json()
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(502, f"PropertyRadar no disponible: {e}")
+
+    results = data.get("results") or []
+    db = get_db()
+    now = datetime.now(timezone.utc).isoformat()
+    matched, unmatched = [], []
+    for prop in results:
+        street = _norm_street(prop.get("Address") or "")
+        if not street:
+            continue
+        prop_signals = [s for s, crit in RADAR_CRITERIA.items() if prop.get(crit)]
+        if not prop_signals:
+            prop_signals = signals
+        lead = await db.deal_finder_leads.find_one(
+            {"address": {"$regex": f"^{re.escape(street)}", "$options": "i"}})
+        if not lead:
+            # segundo intento: normalizando la dirección del lead en memoria es caro;
+            # usamos búsqueda parcial por número + primera palabra de la calle
+            parts = street.split(" ")
+            if len(parts) >= 2:
+                lead = await db.deal_finder_leads.find_one(
+                    {"address": {"$regex": f"^{re.escape(parts[0])}\\s+{re.escape(parts[1])}", "$options": "i"}})
+        if lead:
+            motivation = lead.get("motivation") or {"signals": [], "details": []}
+            new_signals = sorted(set(motivation.get("signals", []) + prop_signals))
+            motivation["signals"] = new_signals
+            motivation["details"] = (motivation.get("details") or []) + [{
+                "source": "propertyradar", "radar_id": prop.get("RadarID"),
+                "signals": prop_signals, "at": now}]
+            motivation["updated_at"] = now
+            await db.deal_finder_leads.update_one({"_id": lead["_id"]}, {"$set": {"motivation": motivation}})
+            matched.append({"lead_id": str(lead["_id"]), "address": lead.get("address"),
+                            "signals": prop_signals})
+        else:
+            unmatched.append({"address": prop.get("Address"), "city": prop.get("City"),
+                              "signals": prop_signals})
+    return {"success": True, "scanned": len(results),
+            "matched": matched, "unmatched": unmatched[:25],
+            "result_count": data.get("resultCount"),
+            "note": "Modo preview (Purchase=0): no se compraron registros de contacto."}
+
+
+# ═══════════════════════════════════════════════════════════════
+# NIVEL 3 · Obituarios locales (GRATIS) — scraping + extracción IA
+# ═══════════════════════════════════════════════════════════════
+
+DEFAULT_OBITUARY_SOURCES = [
+    "https://www.echovita.com/us/obituaries/tx/dumas",
+    "https://www.echovita.com/us/obituaries/tx/cactus",
+    "https://www.echovita.com/us/obituaries/tx/sunray",
+    "https://www.morrisonfuneraldirectors.com/obituaries",
+]
+
+BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/126.0 Safari/537.36")
+
+ECHOVITA_LINK_RX = re.compile(r'href="/us/obituaries/([a-z]{2})/([a-z-]+)/([a-z0-9-]+)-\d+"')
+
+
+def _parse_echovita_links(html: str) -> list:
+    """Los links de echovita traen el nombre del fallecido en la URL — extracción sin IA."""
+    out, seen = [], set()
+    for m in ECHOVITA_LINK_RX.finditer(html):
+        city_slug, name_slug = m.group(2), m.group(3)
+        if name_slug in seen:
+            continue
+        seen.add(name_slug)
+        name = " ".join(p.capitalize() for p in name_slug.split("-") if p)
+        city = " ".join(p.capitalize() for p in city_slug.split("-"))
+        out.append({"name": name, "age": None, "city": city, "date": None})
+    return out
+
+
+async def _llm_extract_obituaries(page_text: str, source_url: str) -> list:
+    api_key = os.environ.get("EMERGENT_LLM_KEY")
+    if not api_key:
+        return []
+    try:
+        from emergentintegrations.llm.chat import LlmChat, UserMessage
+        import json as json_lib
+        chat = LlmChat(api_key=api_key, session_id=f"obit-{secrets.token_hex(6)}",
+                       system_message="Extraes datos estructurados de páginas de obituarios. "
+                                      "Respondes SOLO con JSON válido, sin texto extra.")
+        chat = chat.with_model("anthropic", "claude-sonnet-4-5-20250929")
+        prompt = (f"De este texto de una página de obituarios extrae TODAS las personas fallecidas.\n"
+                  f"Formato JSON EXACTO: [{{\"name\":\"Nombre Apellido\",\"age\":74,\"city\":\"Dumas\",\"date\":\"2026-08-01\"}}]\n"
+                  f"Si no hay fecha exacta usa null. Si no encuentras obituarios devuelve [].\n\n"
+                  f"TEXTO:\n{page_text[:14000]}")
+        raw = await chat.send_message(UserMessage(text=prompt))
+        raw = raw if isinstance(raw, str) else str(raw)
+        m = re.search(r"\[.*\]", raw, re.DOTALL)
+        if not m:
+            return []
+        items = json_lib.loads(m.group(0))
+        return [i for i in items if isinstance(i, dict) and i.get("name")][:50]
+    except Exception as e:
+        logger.warning(f"[enrichment] LLM obituary extract failed for {source_url}: {e}")
+        return []
+
+
+@router.post("/admin/deal-finder/obituary-scan")
+async def obituary_scan(request: Request):
+    """NIVEL 3 (GRATIS): descarga los obituarios locales de Dumas / Moore County,
+    extrae los nombres con IA y los cruza con el nombre del dueño de tus leads.
+    Los que coinciden se marcan como '🕊️ Posible fallecido' (candidato a probate)."""
+    await auth_admin(request)
+    db = get_db()
+    cfg = await db.admin_config.find_one({"type": "enrichment_config"}) or {}
+    sources = cfg.get("obituary_sources") or DEFAULT_OBITUARY_SOURCES
+
+    all_obits = []
+    fetch_errors = []
+    async with httpx.AsyncClient(timeout=25, follow_redirects=True,
+                                 headers={"User-Agent": BROWSER_UA}) as client:
+        for url in sources[:5]:
+            try:
+                r = await client.get(url)
+                r.raise_for_status()
+                if "echovita.com" in url:
+                    obits = _parse_echovita_links(r.text)
+                else:
+                    text = re.sub(r"<script[\s\S]*?</script>|<style[\s\S]*?</style>", " ", r.text)
+                    text = re.sub(r"<[^>]+>", " ", text)
+                    text = re.sub(r"\s+", " ", text).strip()
+                    obits = await _llm_extract_obituaries(text, url)
+                for o in obits:
+                    o["source_url"] = url
+                all_obits.extend(obits)
+            except Exception as e:
+                fetch_errors.append({"url": url, "error": str(e)[:120]})
+
+    # dedupe por nombre
+    seen, obits = set(), []
+    for o in all_obits:
+        k = re.sub(r"\W", "", o["name"].lower())
+        if k not in seen:
+            seen.add(k)
+            obits.append(o)
+
+    # Cruce contra leads: owner_name en CAD viene como "APELLIDO NOMBRE"
+    now = datetime.now(timezone.utc).isoformat()
+    matches = []
+    for o in obits:
+        parts = [p for p in re.split(r"[\s,]+", o["name"].strip()) if len(p) > 1]
+        if len(parts) < 2:
+            continue
+        first, last = parts[0], parts[-1]
+        cursor = db.deal_finder_leads.find(
+            {"owner_name": {"$regex": f"{re.escape(last)}.*{re.escape(first)}|{re.escape(first)}.*{re.escape(last)}",
+                            "$options": "i"}}).limit(3)
+        async for lead in cursor:
+            motivation = lead.get("motivation") or {"signals": [], "details": []}
+            if "possible_deceased" not in motivation.get("signals", []):
+                motivation["signals"] = sorted(set(motivation.get("signals", []) + ["possible_deceased"]))
+            motivation["details"] = (motivation.get("details") or []) + [{
+                "source": "obituary", "obit_name": o["name"], "obit_date": o.get("date"),
+                "obit_city": o.get("city"), "source_url": o.get("source_url"), "at": now}]
+            motivation["updated_at"] = now
+            await db.deal_finder_leads.update_one({"_id": lead["_id"]}, {"$set": {"motivation": motivation}})
+            matches.append({"lead_id": str(lead["_id"]), "address": lead.get("address"),
+                            "owner_name": lead.get("owner_name"), "obituary": o})
+
+    # guardar historial del escaneo
+    await db.admin_config.update_one({"type": "enrichment_config"}, {"$set": {
+        "type": "enrichment_config", "last_obituary_scan": now,
+        "last_obituary_count": len(obits), "last_obituary_matches": len(matches)}}, upsert=True)
+
+    return {"success": True, "obituaries_found": len(obits), "matches": matches,
+            "fetch_errors": fetch_errors,
+            "sources": sources,
+            "sample": obits[:10]}

@@ -399,6 +399,48 @@ async def public_get_services():
 # ADMIN endpoints
 # ============================================================
 
+
+class AdminProviderCreate(BaseModel):
+    name: str = Field(min_length=2, max_length=120)
+    company_name: Optional[str] = None
+    email: str
+    phone: str = Field(min_length=10, max_length=20)
+    services: List[str] = Field(min_items=1, max_items=10)
+    billing_type: str = Field(default='per_hour', pattern='^(per_hour|per_job|both)$')
+    hourly_rate: Optional[float] = None
+    has_insurance: bool = False
+    license_number: Optional[str] = None
+    years_experience: Optional[int] = Field(default=None, ge=0, le=80)
+    language_pref: str = Field(default='es', pattern='^(es|en)$')
+    admin_notes: str = ''
+
+
+@router.post('/admin/service-providers')
+async def admin_create_provider(request: Request, payload: AdminProviderCreate):
+    """Crear un contratista manualmente desde el panel admin (queda ACTIVO de inmediato,
+    listo para dispatch, pagos y 1099-NEC)."""
+    await auth_admin(request)
+    db = get_db()
+    email = payload.email.lower().strip()
+    if '@' not in email or '.' not in email:
+        raise HTTPException(422, "Email inválido")
+    if await db.service_providers.find_one({"email": email}):
+        raise HTTPException(409, "Ya existe un contratista con ese email")
+    bad = [s for s in payload.services if s not in VALID_SERVICES]
+    if bad:
+        raise HTTPException(422, f"Servicios inválidos: {', '.join(bad)}")
+    data = payload.dict()
+    data['email'] = email
+    data.update({
+        '_id': str(uuid.uuid4()),
+        'created_at': datetime.utcnow(), 'updated_at': datetime.utcnow(),
+        'status': 'active', 'rating': 0.0, 'total_jobs': 0, 'completed_jobs': 0,
+        'ratings_history': [], 'dispatch_history': [], 'is_featured': False,
+        'source': 'admin_manual',
+    })
+    await db.service_providers.insert_one(data)
+    return {"success": True, "id": data['_id']}
+
 @router.get('/admin/service-providers/stats')
 async def admin_provider_stats(request: Request):
     await auth_admin(request)

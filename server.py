@@ -390,6 +390,7 @@ try:
     from rental.listing_feed_router import router as listing_feed_router
     from rental.plaid_router import router as plaid_router
     from rental.deal_finder_router import router as deal_finder_router
+    from rental.contact_enrichment_router import router as contact_enrichment_router
     from rental.drip_router import router as drip_router
     from rental.api_keys_router import router as api_keys_router
     from rental.newsletter_pro_router import router as newsletter_pro_router
@@ -451,6 +452,7 @@ try:
     app.include_router(listing_feed_router, prefix="/api")
     app.include_router(plaid_router, prefix="/api")
     app.include_router(deal_finder_router, prefix="/api")
+    app.include_router(contact_enrichment_router, prefix="/api")
     app.include_router(drip_router, prefix="/api")
     app.include_router(api_keys_router, prefix="/api")
     app.include_router(newsletter_pro_router, prefix="/api")

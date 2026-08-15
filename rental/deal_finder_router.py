@@ -484,6 +484,7 @@ def _lead_out(doc: dict) -> dict:
         "offer_letter": doc.get("offer_letter"),
         "offer": doc.get("offer"),
         "contact": doc.get("contact"),
+        "motivation": doc.get("motivation"),
         "mail": doc.get("mail"),
         "contract": doc.get("contract"),
         "portal_url": doc.get("portal_url", ""),
@@ -1208,32 +1209,11 @@ def _owner_first_last(owner_name: str) -> tuple[str, str]:
     return (toks[0].title(), "") if toks else ("", "")
 
 
-@router.post("/admin/deal-finder/leads/{lead_id}/skip-trace")
-async def skip_trace_lead(request: Request, lead_id: str):
-    """Busca teléfono y email del dueño vía Tracerfy (5 créditos por acierto, 0 si no hay match)."""
-    await auth_admin(request)
+async def tracerfy_trace(situs: dict, first: str, last: str) -> dict:
+    """Llama a Tracerfy y devuelve {phones, emails, hit, credits_used}. Lanza HTTPException en error."""
     api_key = os.environ.get("TRACERFY_API_KEY", "")
     if not api_key:
         raise HTTPException(400, "Configura TRACERFY_API_KEY en Configuración → API Keys (crea cuenta en tracerfy.com)")
-    db = get_db()
-    doc = await db.deal_finder_leads.find_one({"_id": ObjectId(lead_id)})
-    if not doc:
-        raise HTTPException(404, "Lead no encontrado")
-
-    owner = doc.get("owner_name") or ""
-    if ENTITY_OWNER_RX.search(owner):
-        raise HTTPException(422,
-            "El dueño es una empresa/entidad — el skip tracing es para personas. "
-            "Busca el agente registrado gratis en el Comptroller de Texas "
-            "(comptroller.texas.gov/taxes/franchise/account-status/search) o en SOSDirect.")
-
-    situs = _parse_situs(doc.get("address") or "")
-    if not situs:
-        raise HTTPException(422, "El lead no tiene dirección física completa para rastrear")
-    first, last = _owner_first_last(owner)
-    if not first or not last:
-        raise HTTPException(422, "No se pudo separar nombre/apellido del dueño")
-
     payload = {"address": situs["street"], "city": situs["city"], "state": situs["state"],
                "zip": situs["zip"], "find_owner": False, "first_name": first, "last_name": last}
     base = os.environ.get("TRACERFY_BASE_URL", "https://tracerfy.com/v1/api").rstrip("/")
@@ -1264,10 +1244,39 @@ async def skip_trace_lead(request: Request, lead_id: str):
             e = em.get("email") if isinstance(em, dict) else str(em)
             if e and e not in emails:
                 emails.append(e)
+    return {"phones": phones[:5], "emails": emails[:5],
+            "hit": bool(data.get("hit") or phones or emails),
+            "credits_used": data.get("credits_deducted", 0)}
+
+
+@router.post("/admin/deal-finder/leads/{lead_id}/skip-trace")
+async def skip_trace_lead(request: Request, lead_id: str):
+    """Busca teléfono y email del dueño vía Tracerfy (5 créditos por acierto, 0 si no hay match)."""
+    await auth_admin(request)
+    db = get_db()
+    doc = await db.deal_finder_leads.find_one({"_id": ObjectId(lead_id)})
+    if not doc:
+        raise HTTPException(404, "Lead no encontrado")
+
+    owner = doc.get("owner_name") or ""
+    if ENTITY_OWNER_RX.search(owner):
+        raise HTTPException(422,
+            "El dueño es una empresa/entidad — el skip tracing es para personas. "
+            "Busca el agente registrado gratis en el Comptroller de Texas "
+            "(comptroller.texas.gov/taxes/franchise/account-status/search) o en SOSDirect.")
+
+    situs = _parse_situs(doc.get("address") or "")
+    if not situs:
+        raise HTTPException(422, "El lead no tiene dirección física completa para rastrear")
+    first, last = _owner_first_last(owner)
+    if not first or not last:
+        raise HTTPException(422, "No se pudo separar nombre/apellido del dueño")
+
+    traced = await tracerfy_trace(situs, first, last)
     contact = {
-        "phones": phones[:5], "emails": emails[:5],
-        "hit": bool(data.get("hit") or phones or emails),
-        "credits_used": data.get("credits_deducted", 0),
+        "phones": traced["phones"], "emails": traced["emails"],
+        "hit": traced["hit"],
+        "credits_used": traced["credits_used"],
         "traced_at": datetime.now(timezone.utc).isoformat(),
         "source": "tracerfy",
     }
@@ -1318,6 +1327,24 @@ async def send_offer_link(request: Request, lead_id: str, body: OfferSendBody):
                         "Enviar SMS puede generar multas TCPA de $500-$1,500. "
                         "Ingresa tu PIN para desbloquear bajo tu responsabilidad.")
                 break
+
+        # ☎️ Bloqueo de líneas fijas: un landline NUNCA recibe SMS (error Twilio 30006)
+        line_type = None
+        for ph in ((doc.get("contact") or {}).get("phones") or []):
+            if re.sub(r"\D", "", ph.get("number", ""))[-10:] == to_digits and ph.get("line_type"):
+                line_type = ph.get("line_type")
+                break
+        if line_type is None:
+            try:
+                from rental.contact_enrichment_router import twilio_line_lookup
+                res = await twilio_line_lookup(to)
+                line_type = (res or {}).get("line_type")
+            except Exception:
+                line_type = None
+        if line_type == "landline":
+            raise HTTPException(422,
+                "☎️ Este número es una línea FIJA (landline) y no puede recibir SMS. "
+                "Usa 📧 Email, llama directamente o envía la carta Lob.")
 
     url = f"{SITE_BASE}/oferta/{offer['slug']}"
     first, _ = _owner_first_last(doc.get("owner_name") or "")

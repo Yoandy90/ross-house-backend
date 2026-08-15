@@ -60,6 +60,12 @@ KEY_REGISTRY = [
     {"key": "RAPIDAPI_KEY", "label": "RapidAPI Key (Mashvisor)", "category": "Mashvisor (Análisis de Mercado)", "secret": True, "placeholder": "xxxxxxxx"},
     # Tracerfy (Skip Tracing)
     {"key": "TRACERFY_API_KEY", "label": "Tracerfy API Key", "category": "Tracerfy (Skip Tracing — contacto de dueños)", "secret": True, "placeholder": "xxxxxxxx"},
+
+    {"key": "BATCHDATA_API_KEY", "label": "BatchData API Key", "category": "BatchData (Skip Tracing — 2ª fuente / cascada)", "secret": True, "placeholder": "xxxxxxxx"},
+
+    {"key": "ZEROBOUNCE_API_KEY", "label": "ZeroBounce API Key", "category": "ZeroBounce (Validación de Emails)", "secret": True, "placeholder": "xxxxxxxx"},
+
+    {"key": "PROPERTYRADAR_API_KEY", "label": "PropertyRadar API Key", "category": "PropertyRadar (Probate / Divorcio / Evicciones)", "secret": True, "placeholder": "xxxxxxxx"},
     # Expo push
     {"key": "EXPO_ACCESS_TOKEN", "label": "Expo Access Token (Push)", "category": "Expo (Notificaciones Push)", "secret": True, "placeholder": "xxxxxxxx"},
 ]
