@@ -500,6 +500,11 @@ async def obituary_scan(request: Request):
     extrae los nombres con IA y los cruza con el nombre del dueño de tus leads.
     Los que coinciden se marcan como '🕊️ Posible fallecido' (candidato a probate)."""
     await auth_admin(request)
+    return {"success": True, **(await run_obituary_scan())}
+
+
+async def run_obituary_scan() -> dict:
+    """Núcleo del escaneo de obituarios (usado por el endpoint y por el cron semanal)."""
     db = get_db()
     cfg = await db.admin_config.find_one({"type": "enrichment_config"}) or {}
     sources = cfg.get("obituary_sources") or DEFAULT_OBITUARY_SOURCES
@@ -535,7 +540,7 @@ async def obituary_scan(request: Request):
 
     # Cruce contra leads: owner_name en CAD viene como "APELLIDO NOMBRE"
     now = datetime.now(timezone.utc).isoformat()
-    matches = []
+    matches, new_matches = [], []
     for o in obits:
         parts = [p for p in re.split(r"[\s,]+", o["name"].strip()) if len(p) > 1]
         if len(parts) < 2:
@@ -546,6 +551,13 @@ async def obituary_scan(request: Request):
                             "$options": "i"}}).limit(3)
         async for lead in cursor:
             motivation = lead.get("motivation") or {"signals": [], "details": []}
+            match_info = {"lead_id": str(lead["_id"]), "address": lead.get("address"),
+                          "owner_name": lead.get("owner_name"), "obituary": o}
+            already = any(d.get("source") == "obituary" and d.get("obit_name") == o["name"]
+                          for d in (motivation.get("details") or []))
+            if already:
+                matches.append(match_info)
+                continue
             if "possible_deceased" not in motivation.get("signals", []):
                 motivation["signals"] = sorted(set(motivation.get("signals", []) + ["possible_deceased"]))
             motivation["details"] = (motivation.get("details") or []) + [{
@@ -553,15 +565,93 @@ async def obituary_scan(request: Request):
                 "obit_city": o.get("city"), "source_url": o.get("source_url"), "at": now}]
             motivation["updated_at"] = now
             await db.deal_finder_leads.update_one({"_id": lead["_id"]}, {"$set": {"motivation": motivation}})
-            matches.append({"lead_id": str(lead["_id"]), "address": lead.get("address"),
-                            "owner_name": lead.get("owner_name"), "obituary": o})
+            matches.append(match_info)
+            new_matches.append(match_info)
 
     # guardar historial del escaneo
     await db.admin_config.update_one({"type": "enrichment_config"}, {"$set": {
         "type": "enrichment_config", "last_obituary_scan": now,
         "last_obituary_count": len(obits), "last_obituary_matches": len(matches)}}, upsert=True)
 
-    return {"success": True, "obituaries_found": len(obits), "matches": matches,
+    return {"obituaries_found": len(obits), "matches": matches, "new_matches": new_matches,
             "fetch_errors": fetch_errors,
             "sources": sources,
             "sample": obits[:10]}
+
+
+# ═══════════════════════════════════════════════════════════════
+# CRON semanal de obituarios — lunes 9AM CT + email si hay nuevos
+# ═══════════════════════════════════════════════════════════════
+
+OBIT_ALERT_EMAIL = "yoandyross@gmail.com"
+_ADMIN_URL = "https://www.rosshouserentals.com/admin/oportunidades"
+
+
+async def _obit_should_run(db) -> bool:
+    from zoneinfo import ZoneInfo
+    cfg = await db.app_settings.find_one({"_id": "obituary_scan_cron"}) or {}
+    if not cfg.get("enabled", True):
+        return False
+    now_ct = datetime.now(ZoneInfo("America/Chicago"))
+    if now_ct.weekday() != int(cfg.get("weekday", 0)) or now_ct.hour != int(cfg.get("hour_ct", 9)):
+        return False
+    last = cfg.get("last_run_at")
+    if last and isinstance(last, datetime):
+        if last.tzinfo is None:
+            last = last.replace(tzinfo=timezone.utc)
+        if (datetime.now(timezone.utc) - last) < timedelta(days=6):
+            return False
+    return True
+
+
+async def _send_obit_alert(db, new_matches: list) -> bool:
+    from rental.ai_brain_router import _send_email_branded
+    cfg = await db.app_settings.find_one({"_id": "obituary_scan_cron"}) or {}
+    to = cfg.get("alert_email") or OBIT_ALERT_EMAIL
+    rows = ""
+    lines = []
+    for m in new_matches[:20]:
+        o = m.get("obituary") or {}
+        rows += (f"<tr><td style='padding:6px 10px;border-bottom:1px solid #eee'><b>{m.get('address','')}</b><br>"
+                 f"<span style='color:#666'>Dueño: {m.get('owner_name','')}</span></td>"
+                 f"<td style='padding:6px 10px;border-bottom:1px solid #eee'>🕊️ {o.get('name','')}"
+                 f"{(' · ' + o['date']) if o.get('date') else ''}{(' · ' + o['city']) if o.get('city') else ''}</td></tr>")
+        lines.append(f"• {m.get('address','')} — dueño {m.get('owner_name','')} — obituario: {o.get('name','')}")
+    html = (f"<h2 style='color:#B91C1C'>🕊️ {len(new_matches)} posible(s) herencia(s) detectada(s)</h2>"
+            f"<p>El escaneo semanal de obituarios encontró coincidencias NUEVAS con dueños de tu radar. "
+            f"Son candidatos a <b>probate</b>: los herederos suelen vender rápido.</p>"
+            f"<table style='border-collapse:collapse;font-size:14px'>{rows}</table>"
+            f"<p><a href='{_ADMIN_URL}' style='background:#B91C1C;color:#fff;padding:10px 18px;"
+            f"border-radius:8px;text-decoration:none;font-weight:bold'>Ver en el Radar</a></p>")
+    plain = f"{len(new_matches)} posibles herencias detectadas:\n" + "\n".join(lines) + f"\n{_ADMIN_URL}"
+    return await _send_email_branded(to, f"🕊️ Radar: {len(new_matches)} posible(s) herencia(s) nueva(s) en Moore County",
+                                     html, plain)
+
+
+async def obituary_scan_loop():
+    """Background: corre el escaneo de obituarios cada lunes 9AM CT (revisa cada 30 min)."""
+    import asyncio
+    logger.info("🕊️ Obituary scan cron started (lunes 9AM CT, checks cada 30 min)")
+    while True:
+        try:
+            db = get_db()
+            if db is not None and await _obit_should_run(db):
+                logger.info("🕊️ Obituary scan cron: firing")
+                result = await run_obituary_scan()
+                new = result.get("new_matches") or []
+                emailed = False
+                if new:
+                    try:
+                        emailed = await _send_obit_alert(db, new)
+                    except Exception:
+                        logger.exception("obit alert email failed")
+                await db.app_settings.update_one({"_id": "obituary_scan_cron"}, {"$set": {
+                    "last_run_at": datetime.now(timezone.utc),
+                    "last_result": {"obituaries": result.get("obituaries_found", 0),
+                                    "matches": len(result.get("matches") or []),
+                                    "new_matches": len(new), "emailed": emailed}}}, upsert=True)
+                logger.info(f"🕊️ Obituary scan done: {result.get('obituaries_found')} obits, "
+                            f"{len(new)} nuevos, email={emailed}")
+        except Exception:
+            logger.exception("obituary scan loop error")
+        await asyncio.sleep(1800)

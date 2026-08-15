@@ -148,6 +148,15 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"   ⚠️ Weekly digest cron not started: {e}")
 
+    # Start obituary scan cron (lunes 9AM CT — probate/herencias)
+    obit_task = None
+    try:
+        from rental.contact_enrichment_router import obituary_scan_loop
+        obit_task = asyncio.create_task(obituary_scan_loop())
+        logger.info("   ✅ Obituary scan cron scheduled")
+    except Exception as e:
+        logger.warning(f"   ⚠️ Obituary scan cron not started: {e}")
+
     # Start Plaid bank sync cron (daily + alertas de movimientos grandes)
     plaid_task = None
     try:
@@ -232,6 +241,13 @@ async def lifespan(app: FastAPI):
         digest_task.cancel()
         try:
             await digest_task
+        except Exception:
+            pass
+
+    if obit_task and not obit_task.done():
+        obit_task.cancel()
+        try:
+            await obit_task
         except Exception:
             pass
 
