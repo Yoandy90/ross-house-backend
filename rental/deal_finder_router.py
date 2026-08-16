@@ -839,10 +839,13 @@ async def list_leads(request: Request, status: Optional[str] = None,
                      city: Optional[str] = None, min_tax: float = 0,
                      min_score: float = 0, min_value: float = 0,
                      classes: Optional[str] = None,
-                     limit: int = 100, skip: int = 0, favorite: int = 0, mailed: int = 0):
+                     limit: int = 100, skip: int = 0, favorite: int = 0, mailed: int = 0,
+                     motivation: Optional[str] = None):
     await auth_admin(request)
     db = get_db()
     filt: dict = {}
+    if motivation:
+        filt["motivation.signals"] = motivation
     if classes:
         cls = [c.strip() for c in classes.split(",") if c.strip()]
         if cls:
