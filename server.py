@@ -157,6 +157,15 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"   ⚠️ Obituary scan cron not started: {e}")
 
+    # Start struck-off request cron (día 1 de cada mes — Tax Office)
+    struckoff_task = None
+    try:
+        from rental.contact_enrichment_router import struckoff_request_loop
+        struckoff_task = asyncio.create_task(struckoff_request_loop())
+        logger.info("   ✅ Struck-off request cron scheduled")
+    except Exception as e:
+        logger.warning(f"   ⚠️ Struck-off cron not started: {e}")
+
     # Start Plaid bank sync cron (daily + alertas de movimientos grandes)
     plaid_task = None
     try:
@@ -248,6 +257,13 @@ async def lifespan(app: FastAPI):
         obit_task.cancel()
         try:
             await obit_task
+        except Exception:
+            pass
+
+    if struckoff_task and not struckoff_task.done():
+        struckoff_task.cancel()
+        try:
+            await struckoff_task
         except Exception:
             pass
 

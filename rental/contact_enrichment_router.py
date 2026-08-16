@@ -562,6 +562,95 @@ async def public_records_import(request: Request, body: PublicRecordsImport):
             "matches": matches, "new_matches": new_matches, "signal": signal}
 
 
+# ═══════════════════════════════════════════════════════════════
+# CRON mensual: solicitud de lista STRUCK-OFF al Tax Office
+# ═══════════════════════════════════════════════════════════════
+
+TAX_OFFICE_EMAIL = "taxoffice@moore-tx.com"
+
+STRUCKOFF_BODY = """Moore County Tax Assessor-Collector:
+
+I hope this message finds you well. Pursuant to the Texas Public Information Act, I would like to respectfully request the current list of STRUCK-OFF properties held in trust by Moore County (properties that did not sell at tax sale and are available for private resale), including for each: property address or legal description, account/geo ID, and minimum bid or taxes owed.
+
+I would also appreciate information on the date of the next scheduled tax sale, if available.
+
+Electronic format (Excel/CSV or PDF) sent to this email is preferred. Please let me know if there are any fees.
+
+Thank you for your time,
+Yoandy Ross
+Ross House Rentals LLC
+(806) 934-2018 · info@rosshouserentals.com"""
+
+
+async def _send_struckoff_request(db) -> dict:
+    from rental.ai_brain_router import _send_email_branded
+    cfg = await db.app_settings.find_one({"_id": "struckoff_request_cron"}) or {}
+    to = cfg.get("to_email") or TAX_OFFICE_EMAIL
+    html = "<p>" + STRUCKOFF_BODY.replace("\n", "<br>") + "</p>"
+    ok = await _send_email_branded(to, "Request: Struck-Off Property List — Moore County (Public Information Act)",
+                                   html, STRUCKOFF_BODY)
+    # copia para el admin con checklist de pendientes
+    pending = []
+    if not os.environ.get("PROPERTYRADAR_API_KEY"):
+        pending.append("🛰️ Falta la llave de PropertyRadar (propertyradar.com → Settings → API) para probate/divorcio/evicción automáticos")
+    pending.append("📱 Verifica el estado de tu campaña A2P 10DLC en Twilio (Console → Messaging → Regulatory Compliance) para desbloquear los SMS")
+    phtml = "".join(f"<li>{p}</li>" for p in pending)
+    admin_html = (f"<h3 style='color:#B91C1C'>🔨 Solicitud struck-off enviada al Tax Office</h3>"
+                  f"<p>Se envió la solicitud mensual de la lista struck-off a <b>{to}</b>. "
+                  f"Cuando respondan, pega la lista en Oportunidades → 🛰️ Datos → Registros públicos (tipo 🔨 Tax Sale).</p>"
+                  f"<p><b>Pendientes del Radar:</b></p><ul>{phtml}</ul>")
+    await _send_email_branded(OBIT_ALERT_EMAIL, "🔨 Enviada solicitud struck-off al Tax Office + pendientes del Radar",
+                              admin_html, f"Solicitud struck-off enviada a {to}. Pendientes: " + " | ".join(pending))
+    return {"sent": ok, "to": to}
+
+
+@router.post("/admin/deal-finder/struckoff-request")
+async def struckoff_request_now(request: Request):
+    """Envía AHORA la solicitud de lista struck-off al Tax Office (además del cron mensual)."""
+    await auth_admin(request)
+    db = get_db()
+    r = await _send_struckoff_request(db)
+    if not r["sent"]:
+        raise HTTPException(502, "No se pudo enviar — revisa SendGrid")
+    await db.app_settings.update_one({"_id": "struckoff_request_cron"},
+                                     {"$set": {"last_run_at": datetime.now(timezone.utc)}}, upsert=True)
+    return {"success": True, **r}
+
+
+async def _struckoff_should_run(db) -> bool:
+    from zoneinfo import ZoneInfo
+    cfg = await db.app_settings.find_one({"_id": "struckoff_request_cron"}) or {}
+    if not cfg.get("enabled", True):
+        return False
+    now_ct = datetime.now(ZoneInfo("America/Chicago"))
+    if now_ct.day != int(cfg.get("day_of_month", 1)) or now_ct.hour != int(cfg.get("hour_ct", 9)):
+        return False
+    last = cfg.get("last_run_at")
+    if last and isinstance(last, datetime):
+        if last.tzinfo is None:
+            last = last.replace(tzinfo=timezone.utc)
+        if (datetime.now(timezone.utc) - last) < timedelta(days=20):
+            return False
+    return True
+
+
+async def struckoff_request_loop():
+    """Background: solicita la lista struck-off al Tax Office el día 1 de cada mes, 9AM CT."""
+    import asyncio
+    logger.info("🔨 Struck-off request cron started (día 1 de cada mes, 9AM CT)")
+    while True:
+        try:
+            db = get_db()
+            if db is not None and await _struckoff_should_run(db):
+                r = await _send_struckoff_request(db)
+                await db.app_settings.update_one({"_id": "struckoff_request_cron"}, {"$set": {
+                    "last_run_at": datetime.now(timezone.utc), "last_result": r}}, upsert=True)
+                logger.info(f"🔨 Struck-off request sent: {r}")
+        except Exception:
+            logger.exception("struckoff request loop error")
+        await asyncio.sleep(1800)
+
+
 TPIA_BODY = """Code Enforcement Department, City of Dumas:
 
 Pursuant to the Texas Public Information Act (Tex. Gov't Code Chapter 552), I respectfully request the following public records:
