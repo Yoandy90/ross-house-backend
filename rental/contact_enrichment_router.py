@@ -437,8 +437,165 @@ async def motivation_scan(request: Request, body: MotivationScanBody):
 
 
 # ═══════════════════════════════════════════════════════════════
-# NIVEL 3 · Obituarios locales (GRATIS) — scraping + extracción IA
+# REGISTROS PÚBLICOS DEL CONDADO — importador universal con IA
+# (probate, evicciones, divorcios, subastas, code violations, vacantes)
 # ═══════════════════════════════════════════════════════════════
+
+PUBLIC_SOURCES = [
+    {"id": "probate", "signal": "probate_confirmed", "name": "⚖️ Corte de Probate — County Clerk",
+     "url": "https://public.lgsonlinesolutions.com/ors.html",
+     "steps": "Guest Login → Court Records → tipo 'Probate' → busca por fecha reciente → copia el índice (nombres/casos) y pégalo aquí"},
+    {"id": "eviction", "signal": "eviction_filed", "name": "📤 Evicciones — JP Court",
+     "url": "https://public.lgsonlinesolutions.com/ors.html",
+     "steps": "Guest Login → Court Records → 'Civil/JP' → casos de eviction → copia el índice y pégalo aquí"},
+    {"id": "divorce", "signal": "divorce_filed", "name": "💔 Divorcios — District Clerk",
+     "url": "https://public.lgsonlinesolutions.com/ors.html",
+     "steps": "Guest Login → Court Records → 'Family/Divorce' → copia el índice y pégalo aquí"},
+    {"id": "tax_sale", "signal": "tax_sale", "name": "🔨 Subastas de impuestos (Tax Sales)",
+     "url": "https://www.co.moore.tx.us/page/moore.Tax.AssessorCollector",
+     "steps": "Pide la lista de próximas tax sales al Tax Office (o al bufete que ejecuta) y pega aquí la lista de propiedades"},
+    {"id": "code_violation", "signal": "code_violation", "name": "🏚️ Code Violations — Ciudad de Dumas",
+     "url": "https://www.ci.dumas.tx.us",
+     "steps": "Usa el botón 'Enviar solicitud TPIA' de abajo; cuando la ciudad responda, pega aquí la lista de multas"},
+    {"id": "vacancy", "signal": "vacant", "name": "📮 Vacantes / Registro de votantes",
+     "url": "https://www.votetexas.gov",
+     "steps": "Pega aquí cualquier lista de direcciones vacantes o padrón que consigas (CSV o texto)"},
+]
+
+PUBLIC_SIGNAL_BY_TYPE = {s["id"]: s["signal"] for s in PUBLIC_SOURCES}
+
+
+@router.get("/admin/deal-finder/public-records/guide")
+async def public_records_guide(request: Request):
+    await auth_admin(request)
+    return {"sources": PUBLIC_SOURCES}
+
+
+class PublicRecordsImport(BaseModel):
+    source_type: str
+    text: str
+
+
+@router.post("/admin/deal-finder/public-records/import")
+async def public_records_import(request: Request, body: PublicRecordsImport):
+    """Pega el índice crudo del portal del condado (o CSV) → la IA lo estructura →
+    se cruza con tus leads por nombre de dueño Y por dirección → badges de motivación."""
+    await auth_admin(request)
+    if body.source_type not in PUBLIC_SIGNAL_BY_TYPE:
+        raise HTTPException(422, f"Tipo inválido. Usa: {', '.join(PUBLIC_SIGNAL_BY_TYPE)}")
+    text = (body.text or "").strip()
+    if len(text) < 20:
+        raise HTTPException(422, "Pega el texto del índice (mínimo unas líneas)")
+    api_key = os.environ.get("EMERGENT_LLM_KEY")
+    if not api_key:
+        raise HTTPException(400, "Falta EMERGENT_LLM_KEY para la extracción con IA")
+
+    from emergentintegrations.llm.chat import LlmChat, UserMessage
+    import json as json_lib
+    chat = LlmChat(api_key=api_key, session_id=f"pubrec-{secrets.token_hex(6)}",
+                   system_message="Extraes datos estructurados de índices de registros públicos de condados de Texas. "
+                                  "Respondes SOLO con JSON válido.")
+    chat = chat.with_model("anthropic", "claude-sonnet-4-5-20250929")
+    prompt = (f"Este texto es un índice de registros de tipo '{body.source_type}' del condado de Moore, TX.\n"
+              f"Extrae TODAS las entradas. Formato JSON EXACTO:\n"
+              f'[{{"name":"APELLIDO NOMBRE o nombre de la parte","address":"direccion si aparece o null",'
+              f'"case_number":"numero de caso o null","date":"YYYY-MM-DD o null"}}]\n'
+              f"Si es una lista de propiedades (tax sale/vacantes) usa address y deja name null.\n"
+              f"Si no hay nada devuelve [].\n\nTEXTO:\n{text[:14000]}")
+    raw = await chat.send_message(UserMessage(text=prompt))
+    raw = raw if isinstance(raw, str) else str(raw)
+    m = re.search(r"\[.*\]", raw, re.DOTALL)
+    records = []
+    if m:
+        try:
+            records = [r for r in json_lib.loads(m.group(0)) if isinstance(r, dict)][:200]
+        except Exception:
+            records = []
+    if not records:
+        return {"success": True, "records_found": 0, "matches": [],
+                "note": "La IA no encontró entradas en el texto pegado"}
+
+    db = get_db()
+    signal = PUBLIC_SIGNAL_BY_TYPE[body.source_type]
+    now = datetime.now(timezone.utc).isoformat()
+    matches, new_matches = [], []
+    for rec in records:
+        lead = None
+        # 1) por dirección
+        addr = _norm_street(rec.get("address") or "")
+        if addr:
+            parts = addr.split(" ")
+            if len(parts) >= 2:
+                lead = await db.deal_finder_leads.find_one(
+                    {"address": {"$regex": f"^{re.escape(parts[0])}\\s+{re.escape(parts[1])}", "$options": "i"}})
+        # 2) por nombre del dueño
+        if lead is None and rec.get("name"):
+            nparts = [p for p in re.split(r"[\s,]+", rec["name"].strip()) if len(p) > 1]
+            if len(nparts) >= 2:
+                a, b = nparts[0], nparts[-1]
+                lead = await db.deal_finder_leads.find_one(
+                    {"owner_name": {"$regex": f"{re.escape(a)}.*{re.escape(b)}|{re.escape(b)}.*{re.escape(a)}",
+                                    "$options": "i"}})
+        if lead is None:
+            continue
+        motivation = lead.get("motivation") or {"signals": [], "details": []}
+        match_info = {"lead_id": str(lead["_id"]), "address": lead.get("address"),
+                      "owner_name": lead.get("owner_name"), "record": rec}
+        dedupe_key = rec.get("case_number") or rec.get("name") or rec.get("address")
+        already = any(d.get("source") == body.source_type and
+                      (d.get("case_number") or d.get("record_name")) == dedupe_key
+                      for d in (motivation.get("details") or []))
+        if already:
+            matches.append(match_info)
+            continue
+        if signal not in motivation.get("signals", []):
+            motivation["signals"] = sorted(set(motivation.get("signals", []) + [signal]))
+        motivation["details"] = (motivation.get("details") or []) + [{
+            "source": body.source_type, "record_name": rec.get("name"),
+            "case_number": rec.get("case_number"), "date": rec.get("date"), "at": now}]
+        motivation["updated_at"] = now
+        await db.deal_finder_leads.update_one({"_id": lead["_id"]}, {"$set": {"motivation": motivation}})
+        matches.append(match_info)
+        new_matches.append(match_info)
+
+    return {"success": True, "records_found": len(records),
+            "matches": matches, "new_matches": new_matches, "signal": signal}
+
+
+TPIA_BODY = """Code Enforcement Department, City of Dumas:
+
+Pursuant to the Texas Public Information Act (Tex. Gov't Code Chapter 552), I respectfully request the following public records:
+
+A list of all code enforcement violations, notices, and citations issued within the City of Dumas during the last 12 months, including for each: property address, type of violation, date issued, and current status.
+
+I request this information in electronic format (Excel/CSV preferred) sent to this email address. If any fees exceed $25, please contact me before processing.
+
+Thank you,
+Yoandy Ross
+Ross House Rentals LLC
+(806) 934-2018 · info@rosshouserentals.com"""
+
+
+class TpiaBody(BaseModel):
+    to_email: Optional[str] = None
+
+
+@router.post("/admin/deal-finder/tpia-request")
+async def send_tpia_request(request: Request, body: TpiaBody):
+    """Envía (o te reenvía como borrador) la solicitud TPIA de code violations a la Ciudad de Dumas."""
+    await auth_admin(request)
+    from rental.ai_brain_router import _send_email_branded
+    to = (body.to_email or "").strip() or "yoandyross@gmail.com"
+    html = "<p>" + TPIA_BODY.replace("\n", "<br>") + "</p>"
+    ok = await _send_email_branded(to, "Public Information Act Request — Code Enforcement Records (City of Dumas)",
+                                   html, TPIA_BODY)
+    if not ok:
+        raise HTTPException(502, "No se pudo enviar el email — revisa SendGrid")
+    return {"success": True, "sent_to": to,
+            "note": "Si lo enviaste a tu propio correo, reenvíalo al email de Code Enforcement de Dumas"}
+
+
+
 
 DEFAULT_OBITUARY_SOURCES = [
     "https://www.echovita.com/us/obituaries/tx/dumas",
