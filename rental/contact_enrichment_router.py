@@ -494,6 +494,20 @@ async def _llm_extract_obituaries(page_text: str, source_url: str) -> list:
         return []
 
 
+@router.get("/admin/deal-finder/obituary-results")
+async def obituary_results(request: Request):
+    """Devuelve la lista del último escaneo de obituarios (para verla en la UI)."""
+    await auth_admin(request)
+    db = get_db()
+    cfg = await db.admin_config.find_one({"type": "enrichment_config"}) or {}
+    return {
+        "last_scan": cfg.get("last_obituary_scan"),
+        "count": cfg.get("last_obituary_count", 0),
+        "obituaries": cfg.get("last_obituaries", []),
+        "matches": cfg.get("last_matches", []),
+    }
+
+
 @router.post("/admin/deal-finder/obituary-scan")
 async def obituary_scan(request: Request):
     """NIVEL 3 (GRATIS): descarga los obituarios locales de Dumas / Moore County,
@@ -568,10 +582,16 @@ async def run_obituary_scan() -> dict:
             matches.append(match_info)
             new_matches.append(match_info)
 
-    # guardar historial del escaneo
+    # guardar historial del escaneo (incluye la lista para verla en la UI)
     await db.admin_config.update_one({"type": "enrichment_config"}, {"$set": {
         "type": "enrichment_config", "last_obituary_scan": now,
-        "last_obituary_count": len(obits), "last_obituary_matches": len(matches)}}, upsert=True)
+        "last_obituary_count": len(obits), "last_obituary_matches": len(matches),
+        "last_obituaries": [{k: o.get(k) for k in ("name", "age", "city", "date", "source_url")} for o in obits[:100]],
+        "last_matches": [{"lead_id": m["lead_id"], "address": m.get("address"),
+                          "owner_name": m.get("owner_name"),
+                          "obit_name": (m.get("obituary") or {}).get("name"),
+                          "obit_date": (m.get("obituary") or {}).get("date")} for m in matches[:100]],
+    }}, upsert=True)
 
     return {"obituaries_found": len(obits), "matches": matches, "new_matches": new_matches,
             "fetch_errors": fetch_errors,
