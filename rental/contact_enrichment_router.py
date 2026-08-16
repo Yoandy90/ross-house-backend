@@ -781,10 +781,29 @@ async def _obit_should_run(db) -> bool:
     return True
 
 
+_REMINDER_HTML = (
+    "<div style='margin-top:18px;padding:14px;background:#FEF3C7;border-radius:10px'>"
+    "<b>📋 Rutina de 2 minutos — Probate oficial:</b><br>"
+    "1. Abre el portal del condado: <a href='https://public.lgsonlinesolutions.com/ors.html'>"
+    "public.lgsonlinesolutions.com/ors.html</a> (Guest Login)<br>"
+    "2. Court Records → tipo <b>Probate</b> → filtra por la última semana → copia el índice<br>"
+    "3. En tu panel: Oportunidades → 🛰️ Datos → <b>📥 Registros públicos</b> → pega y clic en Importar<br>"
+    "El sistema cruza los casos con tus leads y marca ⚖️ <b>Probate CONFIRMADO</b> automáticamente.</div>")
+
+
 async def _send_obit_alert(db, new_matches: list) -> bool:
     from rental.ai_brain_router import _send_email_branded
     cfg = await db.app_settings.find_one({"_id": "obituary_scan_cron"}) or {}
     to = cfg.get("alert_email") or OBIT_ALERT_EMAIL
+    if not new_matches:
+        html = ("<h2 style='color:#B91C1C'>🕊️ Escaneo semanal: sin herencias nuevas</h2>"
+                "<p>El radar de obituarios corrió hoy y no encontró coincidencias nuevas con tus leads.</p>"
+                f"<p><a href='{_ADMIN_URL}'>Ver el Radar</a></p>" + _REMINDER_HTML)
+        plain = ("Escaneo semanal de obituarios: sin herencias nuevas.\n"
+                 "Rutina de 2 min: copia el índice de Probate en public.lgsonlinesolutions.com/ors.html "
+                 "y pégalo en Oportunidades → Datos → Registros públicos.")
+        return await _send_email_branded(to, "🕊️ Radar semanal: sin herencias nuevas — recordatorio de probate",
+                                         html, plain)
     rows = ""
     lines = []
     for m in new_matches[:20]:
@@ -799,7 +818,7 @@ async def _send_obit_alert(db, new_matches: list) -> bool:
             f"Son candidatos a <b>probate</b>: los herederos suelen vender rápido.</p>"
             f"<table style='border-collapse:collapse;font-size:14px'>{rows}</table>"
             f"<p><a href='{_ADMIN_URL}' style='background:#B91C1C;color:#fff;padding:10px 18px;"
-            f"border-radius:8px;text-decoration:none;font-weight:bold'>Ver en el Radar</a></p>")
+            f"border-radius:8px;text-decoration:none;font-weight:bold'>Ver en el Radar</a></p>" + _REMINDER_HTML)
     plain = f"{len(new_matches)} posibles herencias detectadas:\n" + "\n".join(lines) + f"\n{_ADMIN_URL}"
     return await _send_email_branded(to, f"🕊️ Radar: {len(new_matches)} posible(s) herencia(s) nueva(s) en Moore County",
                                      html, plain)
@@ -817,11 +836,10 @@ async def obituary_scan_loop():
                 result = await run_obituary_scan()
                 new = result.get("new_matches") or []
                 emailed = False
-                if new:
-                    try:
-                        emailed = await _send_obit_alert(db, new)
-                    except Exception:
-                        logger.exception("obit alert email failed")
+                try:
+                    emailed = await _send_obit_alert(db, new)  # siempre envía (con o sin novedades + recordatorio probate)
+                except Exception:
+                    logger.exception("obit alert email failed")
                 await db.app_settings.update_one({"_id": "obituary_scan_cron"}, {"$set": {
                     "last_run_at": datetime.now(timezone.utc),
                     "last_result": {"obituaries": result.get("obituaries_found", 0),
