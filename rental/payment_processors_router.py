@@ -224,6 +224,9 @@ def _masked_view(doc: dict) -> dict:
         view["configured"] = view["credentials"][env]["configured"]
         if p == "stripe":
             view["webhook_endpoint"] = f"{base}/api/stripe/webhook"
+        elif p == "helcim":
+            # Helcim no permite la palabra "helcim" en la URL del webhook
+            view["webhook_endpoint"] = f"{base}/api/webhooks/hpay"
         else:
             view["webhook_endpoint"] = f"{base}/api/webhooks/{p}"
         out["processors"][p] = view
