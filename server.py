@@ -426,6 +426,7 @@ try:
     from rental.drip_router import router as drip_router
     from rental.api_keys_router import router as api_keys_router
     from rental.newsletter_pro_router import router as newsletter_pro_router
+    from rental.zelle_router import router as zelle_router
 
     app.include_router(auth_router, prefix="/api")
     app.include_router(properties_router, prefix="/api")
@@ -488,6 +489,7 @@ try:
     app.include_router(drip_router, prefix="/api")
     app.include_router(api_keys_router, prefix="/api")
     app.include_router(newsletter_pro_router, prefix="/api")
+    app.include_router(zelle_router, prefix="/api")
     app.include_router(property_taxes_router, prefix="/api")
     app.include_router(admin_nav_router, prefix="/api")
     # ensure_indexes() awaited inside lifespan startup.

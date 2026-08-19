@@ -39,7 +39,7 @@ from .shared import get_db, auth_admin, auth_tenant_flex
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
-PROCESSORS = ("stripe", "square", "clover")
+PROCESSORS = ("stripe", "square", "clover", "bofa", "helcim")
 SQUARE_VERSION = "2025-10-16"
 SQUARE_BASE = {
     "sandbox": "https://connect.squareupsandbox.com/v2",
@@ -49,6 +49,17 @@ CLOVER_BASE = {
     "sandbox": "https://apisandbox.dev.clover.com",
     "production": "https://api.clover.com",
 }
+# Bank of America Gateway (plataforma CyberSource white-label)
+BOFA_REST_HOST = {
+    "sandbox": "apitest.merchant-services.bankofamerica.com",
+    "production": "api.merchant-services.bankofamerica.com",
+}
+BOFA_SA_ENDPOINT = {
+    "sandbox": "https://testsecureacceptance.merchant-services.bankofamerica.com/pay",
+    "production": "https://secureacceptance.merchant-services.bankofamerica.com/pay",
+}
+# Helcim (un solo endpoint; el testing se hace con cuenta developer separada)
+HELCIM_BASE = "https://api.helcim.com/v2"
 
 # Campos secretos por procesador (se enmascaran en GET y nunca se sobreescriben
 # con valores enmascarados enviados de vuelta por el frontend)
@@ -56,6 +67,8 @@ SECRET_FIELDS = {
     "stripe": {"secret_key", "webhook_secret"},
     "square": {"access_token", "webhook_signature_key"},
     "clover": {"private_key", "webhook_signing_secret"},
+    "bofa": {"p12_base64", "p12_password", "sa_secret_key"},
+    "helcim": {"api_token", "webhook_verifier_token"},
 }
 # Campos de credenciales POR ENTORNO (sandbox / production)
 ENV_FIELDS = {
@@ -64,6 +77,9 @@ ENV_FIELDS = {
                "webhook_signature_key", "webhook_url"},
     "clover": {"merchant_id", "private_key", "webhook_signing_secret",
                "page_config_uuid", "webhook_url"},
+    "bofa": {"merchant_id", "p12_base64", "p12_password",
+             "sa_profile_id", "sa_access_key", "sa_secret_key"},
+    "helcim": {"api_token", "webhook_verifier_token"},
 }
 ALLOWED_FIELDS = ENV_FIELDS  # compat
 ENVS = ("sandbox", "production")
@@ -72,6 +88,9 @@ REQUIRED_TO_ACTIVATE = {
     "stripe": ["secret_key", "publishable_key"],
     "square": ["access_token", "location_id"],
     "clover": ["private_key", "merchant_id"],
+    "bofa": ["merchant_id", "p12_base64", "p12_password",
+             "sa_profile_id", "sa_access_key", "sa_secret_key"],
+    "helcim": ["api_token"],
 }
 # 3D Secure por defecto ACTIVO (obligatorio) — responsabilidad de fraude al banco emisor
 DEFAULT_3DS = {"stripe": True, "square": True}
@@ -89,6 +108,43 @@ def _mask(value: str) -> str:
 def _public_base_url() -> str:
     return (os.environ.get("PUBLIC_API_URL")
             or "https://ross-house-backend-production.up.railway.app").rstrip("/")
+
+
+def _bofa_jwt_headers(cfg: dict, env: str, method: str, path: str,
+                      body: bytes = b"") -> tuple[dict, str]:
+    """Headers JWT (certificado P12, RS256) para el REST API del gateway de BofA.
+    El `kid` es el atributo serialNumber del subject DN del certificado."""
+    from cryptography.hazmat.primitives.serialization import (
+        pkcs12, Encoding, PrivateFormat, NoEncryption)
+    from cryptography.x509.oid import NameOID
+    import jwt as pyjwt
+    p12_bytes = base64.b64decode(cfg.get("p12_base64", ""))
+    key, cert, _chain = pkcs12.load_key_and_certificates(
+        p12_bytes, (cfg.get("p12_password") or "").encode())
+    pem = key.private_bytes(Encoding.PEM, PrivateFormat.PKCS8, NoEncryption())
+    kid = next(a.value for a in cert.subject if a.oid == NameOID.SERIAL_NUMBER)
+    host = BOFA_REST_HOST.get(env, BOFA_REST_HOST["sandbox"])
+    mid = cfg.get("merchant_id", "")
+    now_ts = int(time.time())
+    claims = {"iat": now_ts, "exp": now_ts + 120, "iss": mid, "jti": str(uuid.uuid4()),
+              "request-host": host, "request-method": method.upper(),
+              "request-resource-path": path, "v-c-jwt-version": "2",
+              "v-c-merchant-id": mid}
+    if body:
+        claims["digest"] = base64.b64encode(hashlib.sha256(body).digest()).decode()
+        claims["digestAlgorithm"] = "SHA-256"
+    token = pyjwt.encode(claims, pem, algorithm="RS256",
+                         headers={"kid": kid, "alg": "RS256", "typ": "JWT"})
+    return ({"Authorization": f"Bearer {token}", "Content-Type": "application/json",
+             "Accept": "application/json"}, host)
+
+
+def _sa_sign(fields: dict, secret_key: str) -> str:
+    """Firma HMAC-SHA256 de Secure Acceptance (orden exacto de signed_field_names)."""
+    names = str(fields.get("signed_field_names", "")).split(",")
+    data = ",".join(f"{n}={fields.get(n, '')}" for n in names if n)
+    return base64.b64encode(
+        hmac.new(secret_key.encode(), data.encode(), hashlib.sha256).digest()).decode()
 
 
 async def _get_doc() -> dict:
@@ -194,6 +250,9 @@ async def fee_comparison(request: Request):
         "stripe": {"label": "Stripe", "pct": 0.029, "fixed": 0.30, "rate_label": "2.9% + $0.30"},
         "square": {"label": "Square", "pct": 0.029, "fixed": 0.30, "rate_label": "2.9% + $0.30"},
         "clover": {"label": "Clover", "pct": 0.035, "fixed": 0.10, "rate_label": "3.5% + $0.10"},
+        "bofa": {"label": "Bank of America", "pct": 0.0299, "fixed": 0.30, "rate_label": "≈2.99% + $0.30"},
+        "helcim": {"label": "Helcim", "pct": 0.024, "fixed": 0.25,
+                   "rate_label": "tarjeta ≈2.4% + 25¢ · ACH 0.5% + 25¢ (tope $6)"},
     }
 
     now = datetime.now(timezone.utc)
@@ -474,6 +533,38 @@ async def test_processor(name: str, request: Request):
             data = r.json()
             return {"success": True,
                     "detail": f"Merchant {data.get('name', mid)} verificado"}
+
+        if name == "bofa":
+            if not (cfg.get("p12_base64") and cfg.get("p12_password") and cfg.get("merchant_id")):
+                return {"success": False,
+                        "error": "Faltan Merchant ID, certificado P12 (Base64) o contraseña del P12"}
+            path = "/pts/v2/payments/0000000000000000000000000"
+            headers, host = _bofa_jwt_headers(cfg, cfg.get("environment", "sandbox"), "GET", path)
+            async with httpx.AsyncClient(timeout=20.0) as client:
+                r = await client.get(f"https://{host}{path}", headers=headers)
+            if r.status_code == 401:
+                return {"success": False,
+                        "error": "BofA 401 UNAUTHORIZED: la credencial aún no está activa o el "
+                                 "acceso REST API no está habilitado en la cuenta. Verifica el "
+                                 "estado de la clave en Key Management o contacta a BofA Merchant Support."}
+            if r.status_code in (200, 404):
+                sa_ok = all(cfg.get(f) for f in ("sa_profile_id", "sa_access_key", "sa_secret_key"))
+                return {"success": True,
+                        "detail": "Certificado P12 válido — REST API autenticada correctamente"
+                                  + ("" if sa_ok else ". ⚠️ Falta el perfil Secure Acceptance "
+                                     "(Profile ID, Access Key, Secret Key) para el checkout hospedado")}
+            return {"success": False, "error": f"BofA HTTP {r.status_code}: {r.text[:150]}"}
+
+        if name == "helcim":
+            if not cfg.get("api_token"):
+                return {"success": False, "error": "Falta el API Token de Helcim"}
+            async with httpx.AsyncClient(timeout=20.0) as client:
+                r = await client.get(f"{HELCIM_BASE}/connection-test",
+                                     headers={"api-token": cfg["api_token"],
+                                              "accept": "application/json"})
+            if r.status_code == 200:
+                return {"success": True, "detail": "Helcim conectado correctamente (tarjeta + ACH)"}
+            return {"success": False, "error": f"Helcim HTTP {r.status_code}: {r.text[:150]}"}
     except Exception as e:  # noqa: BLE001
         logger.exception("Processor test failed: %s", name)
         return {"success": False, "error": str(e)[:200]}
@@ -562,6 +653,76 @@ async def create_hosted_checkout(*, amount_cents: int, reference: str,
         return {"processor": "clover", "url": data.get("href", ""),
                 "external_id": data.get("checkoutSessionId", "")}
 
+    if name == "bofa":
+        env = cfg.get("environment", "sandbox")
+        if not all(cfg.get(f) for f in ("sa_profile_id", "sa_access_key", "sa_secret_key")):
+            raise HTTPException(status_code=400,
+                                detail="Bank of America: faltan credenciales de Secure Acceptance")
+        txn_uuid = uuid.uuid4().hex
+        ref_num = f"RHR{int(time.time())}{txn_uuid[:6].upper()}"
+        fields = {
+            "access_key": cfg["sa_access_key"],
+            "profile_id": cfg["sa_profile_id"],
+            "transaction_uuid": txn_uuid,
+            "signed_date_time": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "locale": "en-us",
+            "transaction_type": "sale",
+            "reference_number": ref_num,
+            "amount": f"{amount_cents / 100:.2f}",
+            "currency": "USD",
+            "merchant_defined_data1": (reference or "Pago")[:100],
+        }
+        if customer_email:
+            fields["bill_to_email"] = customer_email
+        if redirect_url:
+            fields["override_custom_receipt_page"] = redirect_url
+            fields["override_custom_cancel_page"] = redirect_url
+        signed_names = list(fields.keys()) + ["signed_field_names", "unsigned_field_names"]
+        fields["unsigned_field_names"] = ""
+        fields["signed_field_names"] = ",".join(signed_names)
+        fields["signature"] = _sa_sign(fields, cfg["sa_secret_key"])
+        sid = uuid.uuid4().hex
+        await get_db().bofa_checkout_sessions.insert_one({
+            "_id": sid,
+            "action": BOFA_SA_ENDPOINT.get(env, BOFA_SA_ENDPOINT["sandbox"]),
+            "fields": fields, "reference": reference,
+            "created_at": datetime.now(timezone.utc)})
+        return {"processor": "bofa",
+                "url": f"{_public_base_url()}/api/public/bofa-checkout/{sid}",
+                "external_id": txn_uuid, "order_id": ref_num}
+
+    if name == "helcim":
+        if not cfg.get("api_token"):
+            raise HTTPException(status_code=400, detail="Helcim: falta el API Token")
+        init_body = {
+            "paymentType": "purchase",
+            "amount": round(amount_cents / 100, 2),
+            "currency": "USD",
+            "paymentMethod": "cc-ach",
+            "confirmationScreen": True,
+        }
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            r = await client.post(f"{HELCIM_BASE}/helcim-pay/initialize",
+                                  headers={"api-token": cfg["api_token"],
+                                           "accept": "application/json"},
+                                  json=init_body)
+        if r.status_code >= 400:
+            raise HTTPException(status_code=502, detail=f"Helcim: {r.text[:200]}")
+        data = r.json()
+        checkout_token = data.get("checkoutToken")
+        secret_token = data.get("secretToken")
+        if not checkout_token or not secret_token:
+            raise HTTPException(status_code=502, detail="Helcim no devolvió tokens de checkout")
+        sid = uuid.uuid4().hex
+        await get_db().helcim_checkout_sessions.insert_one({
+            "_id": sid, "checkout_token": checkout_token, "secret_token": secret_token,
+            "amount_cents": amount_cents, "reference": reference,
+            "redirect_url": redirect_url or "", "status": "pending",
+            "created_at": datetime.now(timezone.utc)})
+        return {"processor": "helcim",
+                "url": f"{_public_base_url()}/api/public/helcim-checkout/{sid}",
+                "external_id": checkout_token, "order_id": sid}
+
     raise HTTPException(status_code=400,
                         detail="El procesador activo es Stripe — usa el flujo Stripe existente")
 
@@ -569,7 +730,8 @@ async def create_hosted_checkout(*, amount_cents: int, reference: str,
 # ─────────────── PAGO DE RENTA MULTI-PROCESADOR (tenants) ───────────────
 
 def _receipt_prefix(processor: str) -> str:
-    return {"square": "SQR", "clover": "CLV", "stripe": "STR"}.get(processor, "PAY")
+    return {"square": "SQR", "clover": "CLV", "stripe": "STR", "bofa": "BOA",
+            "helcim": "HLC"}.get(processor, "PAY")
 
 
 async def _mark_checkout_completed(payment: dict) -> dict:
@@ -740,6 +902,25 @@ async def tenant_checkout_payment_status(payment_id: str, request: Request):
             if r.status_code < 400:
                 status = (r.json().get("status") or "").upper()
                 paid = status in ("PAID", "COMPLETE", "COMPLETED", "APPROVED")
+        elif processor == "bofa" and payment.get("checkout_order_id"):
+            # Buscar la transacción por reference_number en el TSS del gateway
+            search_body = json.dumps({
+                "query": f"clientReferenceInformation.code:{payment['checkout_order_id']}",
+                "limit": 5, "sort": "id:desc", "timezone": "America/Chicago",
+            }, separators=(",", ":")).encode()
+            headers, host = _bofa_jwt_headers(cfg, env, "POST", "/tss/v2/searches", search_body)
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                r = await client.post(f"https://{host}/tss/v2/searches",
+                                      content=search_body, headers=headers)
+            if r.status_code < 400:
+                summaries = ((r.json().get("_embedded") or {}).get("transactionSummaries") or [])
+                paid = any(
+                    str((s.get("applicationInformation") or {}).get("reasonCode", "")) == "100"
+                    for s in summaries)
+        elif processor == "helcim" and payment.get("checkout_order_id"):
+            ses = await get_db().helcim_checkout_sessions.find_one(
+                {"_id": payment["checkout_order_id"]})
+            paid = bool(ses and ses.get("status") == "paid")
     except Exception as e:
         logger.warning("Checkout status check failed (%s): %s", processor, e)
 
@@ -889,3 +1070,186 @@ async def clover_webhook(request: Request):
             [payload.get("checkoutSessionId"), payload.get("id"), payload.get("paymentId")],
             inserted["_id"] if inserted else None)
     return {"received": True}
+
+
+# ─────────────── BANK OF AMERICA (Secure Acceptance) ───────────────
+
+@router.get("/public/bofa-checkout/{session_id}")
+async def bofa_checkout_page(session_id: str):
+    """Página puente: renderiza el formulario firmado de Secure Acceptance y lo
+    auto-envía al checkout hospedado de Bank of America."""
+    import html as html_lib
+    from fastapi.responses import HTMLResponse
+    ses = await get_db().bofa_checkout_sessions.find_one({"_id": session_id})
+    if not ses:
+        raise HTTPException(status_code=404, detail="Sesión de pago no encontrada")
+    inputs = "\n".join(
+        f'<input type="hidden" name="{html_lib.escape(str(k))}" value="{html_lib.escape(str(v))}">'
+        for k, v in ses["fields"].items())
+    page = f"""<!DOCTYPE html>
+<html lang="es"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Redirigiendo a Bank of America…</title>
+<style>body{{font-family:-apple-system,Segoe UI,Roboto,sans-serif;display:flex;align-items:center;
+justify-content:center;height:100vh;margin:0;background:#f6f7f9;color:#1f2937}}
+.box{{text-align:center}}.spin{{width:42px;height:42px;border:4px solid #e5e7eb;border-top-color:#dc2626;
+border-radius:50%;margin:0 auto 16px;animation:s 1s linear infinite}}@keyframes s{{to{{transform:rotate(360deg)}}}}</style>
+</head><body><div class="box"><div class="spin"></div>
+<p>Conectando con el pago seguro de <b>Bank of America</b>…</p></div>
+<form id="bofa" method="post" action="{html_lib.escape(ses['action'])}">
+{inputs}
+</form>
+<script>document.getElementById('bofa').submit();</script>
+</body></html>"""
+    return HTMLResponse(page)
+
+
+@router.post("/webhooks/bofa")
+async def bofa_webhook(request: Request):
+    """Notificación POST de Secure Acceptance (BofA) — verifica firma HMAC-SHA256."""
+    form = {k: str(v) for k, v in (await request.form()).items()}
+    doc = await _get_doc()
+    cfg = _active_creds(doc["processors"].get("bofa", {}))
+    secret = cfg.get("sa_secret_key", "")
+    verified = False
+    if secret and form.get("signed_field_names") and form.get("signature"):
+        expected = _sa_sign(form, secret)
+        verified = hmac.compare_digest(expected, form.get("signature", ""))
+        if not verified:
+            raise HTTPException(status_code=403, detail="Firma de Bank of America inválida")
+
+    event_id = (form.get("transaction_id") or form.get("req_transaction_uuid")
+                or hashlib.sha256(json.dumps(form, sort_keys=True).encode()).hexdigest())
+    db = get_db()
+    if await db.processor_webhook_events.find_one({"event_id": event_id, "processor": "bofa"}):
+        return {"ok": True, "duplicate": True}
+    payload_ids = [v for v in [form.get("req_transaction_uuid"),
+                               form.get("req_reference_number"),
+                               form.get("transaction_id")] if v]
+    await db.processor_webhook_events.insert_one({
+        "processor": "bofa",
+        "event_id": event_id,
+        "type": (form.get("decision") or "notification").lower(),
+        "payload": form,
+        "payload_ids": payload_ids,
+        "verified": verified,
+        "received_at": datetime.now(timezone.utc),
+    })
+    logger.info("BofA SA notificación: decision=%s ref=%s",
+                form.get("decision"), form.get("req_reference_number"))
+    if (form.get("decision") or "").upper() == "ACCEPT":
+        inserted = await db.processor_webhook_events.find_one(
+            {"event_id": event_id, "processor": "bofa"})
+        await _try_complete_from_webhook("bofa", payload_ids,
+                                         inserted["_id"] if inserted else None)
+    return {"ok": True}
+
+
+# ─────────────────── HELCIM (HelcimPay.js Hosted) ───────────────────
+
+_HELCIM_BRIDGE_TEMPLATE = """<!DOCTYPE html>
+<html lang="es"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pago seguro</title>
+<script src="https://secure.helcim.app/helcim-pay/services/start.js"></script>
+<style>body{font-family:-apple-system,Segoe UI,Roboto,sans-serif;display:flex;align-items:center;
+justify-content:center;height:100vh;margin:0;background:#f6f7f9;color:#1f2937}
+.box{text-align:center;padding:20px}.spin{width:42px;height:42px;border:4px solid #e5e7eb;
+border-top-color:#0ea5e9;border-radius:50%;margin:0 auto 16px;animation:s 1s linear infinite}
+@keyframes s{to{transform:rotate(360deg)}}</style></head>
+<body><div class="box"><div class="spin" id="spin"></div><p id="state">Abriendo pago seguro…</p></div>
+<script>
+var checkoutToken = __TOKEN__;
+var redirectUrl = __REDIRECT__;
+var state = document.getElementById('state');
+window.addEventListener('message', function(ev) {
+  if (!ev.data || ev.data.eventName !== 'helcim-pay-js-' + checkoutToken) return;
+  if (ev.data.eventStatus === 'SUCCESS') {
+    state.textContent = 'Confirmando pago…';
+    var raw = typeof ev.data.eventMessage === 'string'
+      ? ev.data.eventMessage : JSON.stringify(ev.data.eventMessage);
+    fetch('/api/public/helcim-complete', {
+      method: 'POST', headers: {'content-type': 'application/json'},
+      body: JSON.stringify({checkout_token: checkoutToken, raw_data_response: raw})
+    }).then(function(r){return r.json();}).then(function(res){
+      state.textContent = res.status === 'paid'
+        ? '✅ ¡Pago exitoso! Puedes volver a la app.'
+        : (res.status === 'ach_pending'
+           ? '🏦 Pago bancario iniciado — se confirmará en 1-3 días hábiles.'
+           : '⚠️ No se pudo confirmar el pago.');
+      document.getElementById('spin').style.display = 'none';
+      if (redirectUrl) setTimeout(function(){ window.location.replace(redirectUrl); }, 2500);
+    }).catch(function(){ state.textContent = '⚠️ Error confirmando el pago.'; });
+  } else if (ev.data.eventStatus === 'ABORTED') {
+    state.textContent = 'Pago cancelado o rechazado. Puedes volver a la app e intentar de nuevo.';
+    document.getElementById('spin').style.display = 'none';
+  }
+});
+appendHelcimPayIframe(checkoutToken, true);
+</script></body></html>"""
+
+
+@router.get("/public/helcim-checkout/{session_id}")
+async def helcim_checkout_page(session_id: str):
+    """Página puente que renderiza el modal HelcimPay (tarjeta + ACH)."""
+    from fastapi.responses import HTMLResponse
+    ses = await get_db().helcim_checkout_sessions.find_one({"_id": session_id})
+    if not ses:
+        raise HTTPException(status_code=404, detail="Sesión de pago no encontrada")
+    page = (_HELCIM_BRIDGE_TEMPLATE
+            .replace("__TOKEN__", json.dumps(ses["checkout_token"]))
+            .replace("__REDIRECT__", json.dumps(ses.get("redirect_url") or "")))
+    return HTMLResponse(page)
+
+
+@router.post("/public/helcim-complete")
+async def helcim_complete(request: Request):
+    """Valida la respuesta de HelcimPay con el hash (secretToken) y completa el pago."""
+    body = await request.json()
+    checkout_token = body.get("checkout_token", "")
+    ses = await get_db().helcim_checkout_sessions.find_one({"checkout_token": checkout_token})
+    if not ses:
+        raise HTTPException(status_code=400, detail="Checkout desconocido")
+    if ses.get("status") == "paid":
+        return {"status": "paid", "transaction_id": ses.get("transaction_id")}
+
+    raw = body.get("raw_data_response") or ""
+    try:
+        outer = json.loads(raw) if isinstance(raw, str) else raw
+        envelope = outer.get("data", outer)
+        tx = envelope["data"]
+        supplied_hash = envelope["hash"]
+    except (TypeError, ValueError, KeyError):
+        raise HTTPException(status_code=400, detail="Respuesta de Helcim malformada")
+
+    canonical = json.dumps(tx, separators=(",", ":"), ensure_ascii=True)
+    expected = hashlib.sha256((canonical + ses["secret_token"]).encode()).hexdigest()
+    if not hmac.compare_digest(expected, supplied_hash):
+        raise HTTPException(status_code=400, detail="Hash de transacción inválido")
+
+    # Verificar monto y moneda contra la sesión (no confiar en el navegador)
+    try:
+        returned_cents = int(round(float(tx.get("amount", 0)) * 100))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Monto inválido")
+    if returned_cents != ses["amount_cents"] or (tx.get("currency") or "USD") != "USD":
+        raise HTTPException(status_code=400, detail="Monto o moneda no coinciden")
+
+    status = str(tx.get("status", "")).upper()
+    if status in ("APPROVED", "APPROVAL"):
+        new_status = "paid"
+    elif tx.get("statusAuth") == "PENDING" or tx.get("statusClearing") == "OPENED":
+        new_status = "ach_pending"  # ACH: no marcar pagado hasta compensación
+    else:
+        new_status = "failed"
+
+    txn_id = str(tx.get("transactionId") or tx.get("cardTransactionId") or "")
+    await get_db().helcim_checkout_sessions.update_one(
+        {"_id": ses["_id"], "status": {"$ne": "paid"}},
+        {"$set": {"status": new_status, "transaction_id": txn_id,
+                  "helcim_transaction": tx, "updated_at": datetime.now(timezone.utc)}})
+    logger.info("Helcim checkout %s → %s (tx %s)", ses["_id"], new_status, txn_id)
+    if new_status == "paid":
+        await _try_complete_from_webhook(
+            "helcim", [checkout_token, ses["_id"], txn_id], None)
+    return {"status": new_status, "transaction_id": txn_id}
