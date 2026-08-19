@@ -1253,3 +1253,57 @@ async def helcim_complete(request: Request):
         await _try_complete_from_webhook(
             "helcim", [checkout_token, ses["_id"], txn_id], None)
     return {"status": new_status, "transaction_id": txn_id}
+
+
+@router.post("/webhooks/hpay")
+async def helcim_webhook(request: Request):
+    """Webhook de Helcim (URL sin la palabra 'helcim' — requisito de Helcim).
+    Verifica firma HMAC-SHA256 sobre 'webhook-id.webhook-timestamp.body'."""
+    raw = await request.body()
+    wh_id = request.headers.get("webhook-id", "")
+    wh_ts = request.headers.get("webhook-timestamp", "")
+    wh_sig = request.headers.get("webhook-signature", "")
+    doc = await _get_doc()
+    cfg = _active_creds(doc["processors"].get("helcim", {}))
+    verifier = cfg.get("webhook_verifier_token", "")
+    verified = False
+    if verifier and wh_id and wh_sig:
+        try:
+            key = base64.b64decode(verifier)
+            signed = f"{wh_id}.{wh_ts}.".encode() + raw
+            expected = base64.b64encode(hmac.new(key, signed, hashlib.sha256).digest()).decode()
+            candidates = [p.split(",", 1)[-1] for p in wh_sig.split(" ")]
+            verified = any(hmac.compare_digest(expected, c) for c in candidates)
+        except Exception:  # noqa: BLE001
+            verified = False
+        if not verified:
+            raise HTTPException(status_code=403, detail="Firma de Helcim inválida")
+
+    try:
+        payload = json.loads(raw or b"{}")
+    except ValueError:
+        payload = {}
+    event_id = wh_id or hashlib.sha256(raw).hexdigest()
+    db = get_db()
+    if await db.processor_webhook_events.find_one({"event_id": event_id, "processor": "helcim"}):
+        return {"ok": True, "duplicate": True}
+    txn_id = str(payload.get("id") or "")
+    await db.processor_webhook_events.insert_one({
+        "processor": "helcim", "event_id": event_id,
+        "type": payload.get("type", "notification"),
+        "payload": payload, "payload_ids": [txn_id] if txn_id else [],
+        "verified": verified, "received_at": datetime.now(timezone.utc)})
+    logger.info("Helcim webhook: type=%s tx=%s verified=%s",
+                payload.get("type"), txn_id, verified)
+
+    # Redundancia: si la sesión de checkout ya conoce este transactionId, confirmar pago
+    if payload.get("type") == "cardTransaction" and txn_id:
+        ses = await db.helcim_checkout_sessions.find_one({"transaction_id": txn_id})
+        if ses:
+            if ses.get("status") != "paid":
+                await db.helcim_checkout_sessions.update_one(
+                    {"_id": ses["_id"]}, {"$set": {"status": "paid",
+                                                   "updated_at": datetime.now(timezone.utc)}})
+            await _try_complete_from_webhook(
+                "helcim", [ses["checkout_token"], ses["_id"], txn_id], None)
+    return {"ok": True}
