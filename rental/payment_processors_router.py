@@ -1177,9 +1177,11 @@ window.addEventListener('message', function(ev) {
     }).then(function(r){return r.json();}).then(function(res){
       state.textContent = res.status === 'paid'
         ? '✅ ¡Pago exitoso! Puedes volver a la app.'
-        : (res.status === 'ach_pending'
+        : (res.status === 'verified'
+           ? '💾 ¡Método de pago guardado! Vuelve a la app.'
+           : (res.status === 'ach_pending'
            ? '🏦 Pago bancario iniciado — se confirmará en 1-3 días hábiles.'
-           : '⚠️ No se pudo confirmar el pago.');
+           : '⚠️ No se pudo confirmar el pago.'));
       document.getElementById('spin').style.display = 'none';
       if (redirectUrl) setTimeout(function(){ window.location.replace(redirectUrl); }, 2500);
     }).catch(function(){ state.textContent = '⚠️ Error confirmando el pago.'; });
@@ -1215,6 +1217,8 @@ async def helcim_complete(request: Request):
         raise HTTPException(status_code=400, detail="Checkout desconocido")
     if ses.get("status") == "paid":
         return {"status": "paid", "transaction_id": ses.get("transaction_id")}
+    if ses.get("status") == "verified":
+        return {"status": "verified"}
 
     raw = body.get("raw_data_response") or ""
     try:
@@ -1229,6 +1233,27 @@ async def helcim_complete(request: Request):
     expected = hashlib.sha256((canonical + ses["secret_token"]).encode()).hexdigest()
     if not hmac.compare_digest(expected, supplied_hash):
         raise HTTPException(status_code=400, detail="Hash de transacción inválido")
+
+    # Sesión de VERIFICACIÓN (guardar método de pago, sin cobro)
+    if ses.get("purpose") == "verify":
+        card_token = tx.get("cardToken") or (tx.get("cardData") or {}).get("cardToken", "")
+        if str(tx.get("status", "")).upper() not in ("APPROVED", "APPROVAL") or not card_token:
+            return {"status": "failed"}
+        masked = str(tx.get("cardNumber") or "")
+        await get_db().helcim_saved_methods.insert_one({
+            "tenant_id": ses.get("tenant_id", ""),
+            "card_token": card_token,
+            "customer_code": str(tx.get("customerCode") or ""),
+            "brand": tx.get("cardType") or "Tarjeta",
+            "last4": masked[-4:] if masked else "",
+            "type": "card",
+            "created_at": datetime.now(timezone.utc)})
+        await get_db().helcim_checkout_sessions.update_one(
+            {"_id": ses["_id"]}, {"$set": {"status": "verified",
+                                           "updated_at": datetime.now(timezone.utc)}})
+        logger.info("💾 Método Helcim guardado para tenant %s (••••%s)",
+                    ses.get("tenant_id"), masked[-4:] if masked else "?")
+        return {"status": "verified"}
 
     # Verificar monto y moneda contra la sesión (no confiar en el navegador)
     try:

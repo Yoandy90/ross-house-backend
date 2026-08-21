@@ -84,6 +84,38 @@ async def _process_autopay_for_config(db, autopay):
     if total <= 0:
         return {"skipped": True, "reason": "zero_amount"}
 
+    # ── Rama HELCIM: cobro con token guardado ──
+    if autopay.get("processor") == "helcim" and autopay.get("helcim_card_token"):
+        try:
+            from .helcim_vault_router import helcim_purchase_with_token
+            from .payment_processors_router import _get_doc, _active_creds
+            cfg = _active_creds((await _get_doc())["processors"].get("helcim", {}))
+            tx = await helcim_purchase_with_token(
+                cfg.get("api_token", ""), int(round(total * 100)),
+                autopay["helcim_card_token"], autopay.get("helcim_customer_code", ""))
+            status_tx = str(tx.get("status", "")).upper()
+            await db.autopay_config.update_one({"_id": autopay["_id"]}, {"$set": {
+                "last_attempt_date": now,
+                "last_result": status_tx or "DECLINED"}})
+            if status_tx in ("APPROVED", "APPROVAL"):
+                receipt = f"HLC-AUTO-{now.strftime('%Y%m%d')}-{user_id[-4:]}"
+                await db.rental_payments.update_one({"_id": pending["_id"]}, {"$set": {
+                    "status": "completed", "payment_method": "helcim_autopay",
+                    "receipt_number": receipt,
+                    "reference_number": str(tx.get("transactionId", "")),
+                    "total_paid": total, "payment_date": now.isoformat(),
+                    "updated_at": now}})
+                logger.info("🔁💳 Autopago Helcim OK: user %s $%.2f (%s)", user_id, total, receipt)
+                return {"charged": True, "processor": "helcim", "receipt": receipt}
+            await db.autopay_config.update_one({"_id": autopay["_id"]},
+                                               {"$inc": {"retry_count": 1}})
+            return {"charged": False, "processor": "helcim", "reason": status_tx}
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Autopago Helcim falló user %s: %s", user_id, e)
+            await db.autopay_config.update_one({"_id": autopay["_id"]}, {"$set": {
+                "last_attempt_date": now, "last_result": f"error: {str(e)[:120]}"}})
+            return {"charged": False, "processor": "helcim", "reason": str(e)[:120]}
+
     # Load Stripe key from rental_config
     config = await db.rental_config.find_one({"type": "company"}) or {}
     sk = config.get("stripe_secret_key") or os.environ.get("STRIPE_SECRET_KEY", "")

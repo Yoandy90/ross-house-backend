@@ -435,6 +435,7 @@ try:
     from rental.newsletter_pro_router import router as newsletter_pro_router
     from rental.zelle_router import router as zelle_router
     from rental.client_radar_router import router as client_radar_router
+    from rental.helcim_vault_router import router as helcim_vault_router
 
     app.include_router(auth_router, prefix="/api")
     app.include_router(properties_router, prefix="/api")
@@ -499,6 +500,7 @@ try:
     app.include_router(newsletter_pro_router, prefix="/api")
     app.include_router(zelle_router, prefix="/api")
     app.include_router(client_radar_router, prefix="/api")
+    app.include_router(helcim_vault_router, prefix="/api")
     app.include_router(property_taxes_router, prefix="/api")
     app.include_router(admin_nav_router, prefix="/api")
     # ensure_indexes() awaited inside lifespan startup.
