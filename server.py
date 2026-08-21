@@ -150,6 +150,13 @@ async def lifespan(app: FastAPI):
 
     # Start obituary scan cron (lunes 9AM CT — probate/herencias)
     obit_task = None
+    radar_task = None
+    try:
+        from rental.client_radar_router import client_radar_scan_loop
+        radar_task = asyncio.create_task(client_radar_scan_loop())
+        logger.info("   ✅ Client radar cron scheduled")
+    except Exception as e:
+        logger.warning(f"   ⚠️ Client radar cron not started: {e}")
     try:
         from rental.contact_enrichment_router import obituary_scan_loop
         obit_task = asyncio.create_task(obituary_scan_loop())
@@ -427,6 +434,7 @@ try:
     from rental.api_keys_router import router as api_keys_router
     from rental.newsletter_pro_router import router as newsletter_pro_router
     from rental.zelle_router import router as zelle_router
+    from rental.client_radar_router import router as client_radar_router
 
     app.include_router(auth_router, prefix="/api")
     app.include_router(properties_router, prefix="/api")
@@ -490,6 +498,7 @@ try:
     app.include_router(api_keys_router, prefix="/api")
     app.include_router(newsletter_pro_router, prefix="/api")
     app.include_router(zelle_router, prefix="/api")
+    app.include_router(client_radar_router, prefix="/api")
     app.include_router(property_taxes_router, prefix="/api")
     app.include_router(admin_nav_router, prefix="/api")
     # ensure_indexes() awaited inside lifespan startup.
