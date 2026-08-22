@@ -255,6 +255,11 @@ async def admin_zelle_confirm(sub_id: str, request: Request):
         "confirmed_at": now, "receipt_number": receipt,
         "rental_payment_id": payment_id, "updated_at": now}})
     logger.info("✅ Zelle confirmado: %s — %s $%.2f", s.get("tenant_name"), receipt, s["amount"])
+    from rental.security import audit_log
+    await audit_log(admin_user_id=admin.get("_id", admin.get("id", "")),
+                    action="zelle_payment_confirmed", resource_type="zelle_submission",
+                    resource_id=sub_id, request=request,
+                    metadata={"amount": s["amount"], "receipt": receipt})
     return {"success": True, "receipt_number": receipt, "payment_id": payment_id}
 
 
@@ -269,4 +274,9 @@ async def admin_zelle_reject(sub_id: str, request: Request):
                   "rejected_by": admin.get("email", "admin"), "updated_at": now}})
     if not r.modified_count:
         raise HTTPException(status_code=400, detail="No se pudo rechazar (¿ya procesado?)")
+    from rental.security import audit_log
+    await audit_log(admin_user_id=admin.get("_id", admin.get("id", "")),
+                    action="zelle_payment_rejected", resource_type="zelle_submission",
+                    resource_id=sub_id, request=request,
+                    metadata={"reason": data.get("reason", "")})
     return {"success": True}

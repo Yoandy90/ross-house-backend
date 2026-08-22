@@ -17,6 +17,7 @@ import bcrypt
 from rental.shared import (
     get_db, auth_admin, auth_marketplace, auth_tenant,
     serialize, create_marketplace_token, create_tenant_token,
+    create_session_token,
     send_rental_push_to_user, send_rental_push_to_admins,
     TENANT_JWT_SECRET,
 )
@@ -238,7 +239,7 @@ async def marketplace_register(request: Request):
     except Exception as e:
         logging.warning(f"Could not send welcome email: {e}")
 
-    token = create_marketplace_token(user_id, email, role)
+    token = await create_session_token(user_id, email, role, request)
 
     return {
         "success": True,
@@ -263,10 +264,17 @@ async def marketplace_login(request: Request):
     # Rate limiting (per IP/process — defense in depth alongside DB lockout)
     client_ip = request.client.host if request.client else "unknown"
     check_rate_limit(client_ip, "login")
+    from rental.security import check_rate_limit_persistent, hash_ip
+    await check_rate_limit_persistent("login", hash_ip(client_ip),
+                                      max_requests=20, window_seconds=300)
 
     body = await request.json()
     email = body.get("email", "").strip().lower()
     password = body.get("password", "").strip()
+    if email:
+        # Per-account persistent limit (email normalized — anti brute-force)
+        await check_rate_limit_persistent("login-acct", email,
+                                          max_requests=10, window_seconds=300)
 
     # Never reveal which field was wrong.
     if not email or not password or len(password) > MAX_PASSWORD_LEN:
@@ -317,7 +325,7 @@ async def marketplace_login(request: Request):
     if role == "admin":
         raise HTTPException(status_code=403, detail="admin_2fa_required")
 
-    token = create_marketplace_token(user_id, email, role)
+    token = await create_session_token(user_id, email, role, request)
 
     return {
         "success": True,
@@ -343,6 +351,9 @@ async def forgot_password(request: Request):
     # Rate limiting - stricter for password reset (3 per minute)
     client_ip = request.client.host if request.client else "unknown"
     check_rate_limit(client_ip, "forgot-password")
+    from rental.security import check_rate_limit_persistent, hash_ip
+    await check_rate_limit_persistent("forgot-password", hash_ip(client_ip),
+                                      max_requests=5, window_seconds=600)
     
     data = await request.json()
 
@@ -398,6 +409,9 @@ async def reset_password(request: Request):
     data = await request.json()
     email = data.get("email", "").strip().lower()
     code = data.get("code", "").strip()
+    from rental.security import check_rate_limit_persistent, client_ip_hash
+    await check_rate_limit_persistent("reset-password", client_ip_hash(request),
+                                      max_requests=10, window_seconds=600)
     new_password = data.get("new_password", "").strip()
 
     if not email or not code or not new_password:
@@ -497,9 +511,10 @@ async def rental_phone_send_otp(request: Request):
     # SEC-004: per-IP rate limit (protects Twilio budget + prevents SMS bombing
     # of arbitrary victim numbers). Max 8 SMS from same IP per 15 min.
     client_ip = request.client.host if request.client else 'unknown'
+    from rental.security import hash_ip
     fifteen_min_ago = datetime.utcnow() - timedelta(minutes=15)
     ip_recent = await get_db().phone_otps.count_documents({
-        'ip_address': client_ip,
+        'ip_address': hash_ip(client_ip),
         'source': 'rental',
         'created_at': {'$gte': fifteen_min_ago},
     })
@@ -519,14 +534,24 @@ async def rental_phone_send_otp(request: Request):
     code = f'{random.randint(100000, 999999)}'
     now = datetime.utcnow()
     expires_at = now + timedelta(minutes=5)
-    
+
+    # Phase 1 hardening: persistent rate limit (survives restarts/replicas)
+    from rental.security import check_rate_limit_persistent, hash_otp, client_ip_hash
+    await check_rate_limit_persistent("send-otp", client_ip_hash(request),
+                                      max_requests=8, window_seconds=900)
+    # New code invalidates ALL previous active codes for this phone
+    await get_db().phone_otps.update_many(
+        {'phone': phone, 'source': 'rental', 'verified': False},
+        {'$set': {'invalidated': True}})
+
     await get_db().phone_otps.insert_one({
         'phone': phone,
-        'code': code,
+        'code_hash': hash_otp(code),  # NEVER store the OTP in plaintext
         'expires_at': expires_at,
         'created_at': now,
         'verified': False,
-        'ip_address': client_ip,
+        'invalidated': False,
+        'ip_address': client_ip_hash(request),  # hashed — no raw IP
         'attempts': 0,
         'source': 'rental',
     })
@@ -608,13 +633,19 @@ async def rental_phone_verify_otp(request: Request):
         raise HTTPException(status_code=400, detail='Código de 6 dígitos requerido')
     
     now = datetime.utcnow()
-    
+
+    # Phase 1: persistent verify rate limit per phone (anti brute-force)
+    from rental.security import check_rate_limit_persistent, hash_otp
+    await check_rate_limit_persistent("verify-otp", phone,
+                                      max_requests=10, window_seconds=600)
+
     # Find the most recent valid OTP for this phone
     otp_record = await get_db().phone_otps.find_one(
         {
             'phone': phone,
-            'code': code,
+            'code_hash': hash_otp(code),
             'verified': False,
+            'invalidated': {'$ne': True},
             'source': 'rental',
             'expires_at': {'$gt': now},
             'attempts': {'$lt': 5},
@@ -703,7 +734,7 @@ async def rental_phone_verify_otp(request: Request):
     user_id = str(user['_id'])
     email = user.get('email', '')
     role = user.get('role', 'tenant')
-    token = create_marketplace_token(user_id, email, role)
+    token = await create_session_token(user_id, email, role, request)
     
     # Clean up old OTPs
     await get_db().phone_otps.delete_many({
