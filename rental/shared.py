@@ -179,6 +179,11 @@ async def _validate_session_claims(payload: dict) -> None:
     unexpired session owned by the same user."""
     sid = payload.get("sid")
     if not sid:
+        # P1B-5: legacy grace period. Set REQUIRE_SESSION_SID=true in Railway
+        # AFTER the cutoff (30 días post-deploy de Phase 1) to reject sid-less
+        # tokens. Until then legacy tokens remain valid to their natural exp.
+        if os.environ.get("REQUIRE_SESSION_SID", "").lower() == "true":
+            raise HTTPException(status_code=401, detail="session_invalid")
         return  # legacy token — valid until natural exp
     if not isinstance(sid, str) or len(sid) != 32:
         raise HTTPException(status_code=401, detail="session_invalid")
@@ -194,8 +199,13 @@ async def _validate_session_claims(payload: dict) -> None:
         raise HTTPException(status_code=401, detail="session_expired")
     if str(ses.get("user_id")) != str(payload.get("user_id", "")):
         raise HTTPException(status_code=401, detail="session_invalid")
-    await get_db().auth_sessions.update_one(
-        {"sid": sid}, {"$set": {"last_seen_at": datetime.now(timezone.utc)}})
+    # P1B-3: throttled last_seen — write at most once per 5 minutes per session
+    last = ses.get("last_seen_at")
+    if isinstance(last, datetime) and last.tzinfo is None:
+        last = last.replace(tzinfo=timezone.utc)
+    if not last or (datetime.now(timezone.utc) - last).total_seconds() > 300:
+        await get_db().auth_sessions.update_one(
+            {"sid": sid}, {"$set": {"last_seen_at": datetime.now(timezone.utc)}})
 
 
 async def auth_marketplace(request: Request):
