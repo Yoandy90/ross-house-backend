@@ -209,6 +209,14 @@ async def admin_login_step1(request: Request):
     # La protección contra fuerza bruta la da el lockout de cuenta (abajo).
     await verify_turnstile_token(captcha_token, request, optional=True)
 
+    # P1B-1: persistent rate limits (Mongo — survive restarts/replicas).
+    # Limits: step1 → 10/10min per hashed IP + 5/10min per account (email).
+    from rental.security import check_rate_limit_persistent, client_ip_hash
+    await check_rate_limit_persistent("admin-2fa-step1", client_ip_hash(request),
+                                      max_requests=10, window_seconds=600)
+    await check_rate_limit_persistent("admin-2fa-step1-acct", email,
+                                      max_requests=5, window_seconds=600)
+
     db = get_db()
     user = await db.app_users.find_one({"email": {"$regex": f"^{re.escape(email)}$", "$options": "i"}})
     if not user or user.get("role") != "admin":
@@ -342,6 +350,14 @@ async def admin_login_step2(request: Request):
 
     if not challenge_id or not code:
         raise HTTPException(status_code=400, detail="Datos incompletos")
+
+    # P1B-1: persistent OTP verification limits — 15/10min per hashed IP +
+    # 10/10min per challenge (anti brute-force del código de 6 dígitos).
+    from rental.security import check_rate_limit_persistent, client_ip_hash
+    await check_rate_limit_persistent("admin-2fa-step2", client_ip_hash(request),
+                                      max_requests=15, window_seconds=600)
+    await check_rate_limit_persistent("admin-2fa-step2-chal", challenge_id,
+                                      max_requests=10, window_seconds=600)
 
     db = get_db()
     ch = await db.admin_otp_challenges.find_one({"challenge_id": challenge_id})

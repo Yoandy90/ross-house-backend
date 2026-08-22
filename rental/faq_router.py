@@ -11,6 +11,8 @@ from datetime import datetime, timezone
 from bson import ObjectId
 import logging
 
+from rental.shared import auth_admin
+
 logger = logging.getLogger("faq")
 
 router = APIRouter(prefix="/admin/faqs", tags=["FAQ Management"])
@@ -47,7 +49,8 @@ async def get_public_faqs(lang: str = Query(default="es", description="Language:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @router.get("")
-async def list_faqs():
+async def list_faqs(request: Request):
+    await auth_admin(request)  # P1B-4: era público por error
     """List all FAQs for admin management."""
     from rental.shared import get_db
     db = get_db()
@@ -73,6 +76,7 @@ async def list_faqs():
 
 @router.post("")
 async def create_faq(request: Request):
+    await auth_admin(request)
     """Create a new FAQ entry."""
     from rental.shared import get_db
     db = get_db()
@@ -106,6 +110,7 @@ async def create_faq(request: Request):
 
 @router.put("/{faq_id}")
 async def update_faq(faq_id: str, request: Request):
+    await auth_admin(request)
     """Update an existing FAQ."""
     from rental.shared import get_db
     db = get_db()
@@ -129,7 +134,8 @@ async def update_faq(faq_id: str, request: Request):
 
 
 @router.delete("/{faq_id}")
-async def delete_faq(faq_id: str):
+async def delete_faq(faq_id: str, request: Request):
+    await auth_admin(request)
     """Delete a FAQ."""
     from rental.shared import get_db
     db = get_db()
@@ -143,7 +149,8 @@ async def delete_faq(faq_id: str):
 
 
 @router.post("/seed")
-async def seed_default_faqs():
+async def seed_default_faqs(request: Request):
+    await auth_admin(request)
     """Seed default FAQs if collection is empty."""
     from rental.shared import get_db
     db = get_db()
