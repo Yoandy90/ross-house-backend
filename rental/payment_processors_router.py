@@ -325,7 +325,11 @@ async def fee_comparison(request: Request):
 async def save_processor(name: str, request: Request):
     """Guardar credenciales de un procesador en un entorno (body.environment =
     sandbox|production; default: entorno activo). Ignora valores enmascarados."""
-    await auth_admin(request)
+    admin = await auth_admin(request)
+    from rental.security import audit_log
+    await audit_log(admin_user_id=admin.get("_id", admin.get("id", "")),
+                    action="processor_config_updated", resource_type="payment_config",
+                    resource_id=name, request=request)
     if name not in PROCESSORS:
         raise HTTPException(status_code=404, detail="Procesador desconocido")
     data = await request.json()
@@ -471,6 +475,10 @@ async def activate_processor(name: str, request: Request):
         {"type": "company"}, {"$set": {"stripe_enabled": name == "stripe"}}, upsert=True)
 
     fresh = await _get_doc()
+    from rental.security import audit_log
+    await audit_log(admin_user_id=admin.get("_id", admin.get("id", "")),
+                    action="processor_activated", resource_type="payment_config",
+                    resource_id=name, request=request)
     return {"success": True,
             "message": f"{name.title()} es ahora el procesador de pagos activo",
             **_masked_view(fresh)}

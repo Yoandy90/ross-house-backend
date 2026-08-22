@@ -61,12 +61,13 @@ async def auth_admin(request: Request):
     # ── Try JWT first (marketplace tokens) ──
     try:
         payload = jwt.decode(token, TENANT_JWT_SECRET, algorithms=["HS256"])
-        if payload.get("type") == "marketplace" and payload.get("role") == "admin":
-            user = await db.app_users.find_one({"_id": ObjectId(payload["user_id"])})
-            if user and user.get("role") == "admin":
-                return serialize(user)
     except (jwt.ExpiredSignatureError, jwt.InvalidTokenError, Exception):
-        pass  # Fall through to session-based auth
+        payload = None  # Fall through to session-based auth
+    if payload and payload.get("type") == "marketplace" and payload.get("role") == "admin":
+        await _validate_session_claims(payload)  # raises 401 if sid revoked/expired
+        user = await db.app_users.find_one({"_id": ObjectId(payload["user_id"])})
+        if user and user.get("role") == "admin":
+            return serialize(user)
 
     # ── Fallback: session-based auth ──
     session = await db.user_sessions.find_one({'session_token': token})
@@ -104,7 +105,10 @@ def create_tenant_token(tenant_id: str, email: str):
 
 
 def create_marketplace_token(user_id: str, email: str, role: str):
-    """Create JWT token for marketplace user (any role)"""
+    """LEGACY: JWT without server-side session (no sid). Kept ONLY for
+    backward compatibility of already-issued tokens; new logins must use
+    create_session_token(). Retirement: 30 days after Phase 1 deploy (max
+    natural expiry of outstanding tokens)."""
     payload = {
         "user_id": user_id,
         "email": email,
@@ -113,6 +117,85 @@ def create_marketplace_token(user_id: str, email: str, role: str):
         "type": "marketplace"
     }
     return jwt.encode(payload, TENANT_JWT_SECRET, algorithm="HS256")
+
+
+# ══════════════════════════ SERVER-SIDE SESSIONS (Phase 1) ══════════════════════════
+
+SESSION_TTL_DAYS = 30
+
+
+async def create_session(user_id: str, role: str, request=None,
+                         device_name: str = "", platform: str = "",
+                         app_version: str = "") -> str:
+    """Create a server-side session and return its sid."""
+    import uuid as _uuid
+    import hashlib as _hashlib
+    sid = _uuid.uuid4().hex
+    now = datetime.now(timezone.utc)
+    ip = request.client.host if (request and request.client) else "unknown"
+    salt = os.environ.get("VISITOR_IP_SALT", "rhr-static-salt")
+    ua = (request.headers.get("user-agent", "") if request else "")[:200]
+    await get_db().auth_sessions.insert_one({
+        "sid": sid,
+        "user_id": str(user_id),
+        "role": role,
+        "created_at": now,
+        "last_seen_at": now,
+        "expires_at": now + timedelta(days=SESSION_TTL_DAYS),
+        "revoked_at": None,
+        "revoked_reason": None,
+        "device_name": device_name or (request.headers.get("x-device-name", "")[:80] if request else ""),
+        "platform": platform or (request.headers.get("x-platform", "")[:40] if request else ""),
+        "app_version": app_version or (request.headers.get("x-app-version", "")[:40] if request else ""),
+        "ip_hash": _hashlib.sha256(f"{salt}:{ip}".encode()).hexdigest()[:32],
+        "user_agent": ua,
+    })
+    return sid
+
+
+async def create_session_token(user_id: str, email: str, role: str,
+                               request=None) -> str:
+    """Phase 1 token factory: server-side session + JWT bound via sid/jti."""
+    import uuid as _uuid
+    sid = await create_session(user_id, role, request)
+    now = datetime.utcnow()
+    payload = {
+        "user_id": str(user_id),
+        "sub": str(user_id),
+        "email": email,
+        "role": role,
+        "sid": sid,
+        "jti": _uuid.uuid4().hex,
+        "iat": now,
+        "exp": now + timedelta(days=SESSION_TTL_DAYS),
+        "type": "marketplace",
+    }
+    return jwt.encode(payload, TENANT_JWT_SECRET, algorithm="HS256")
+
+
+async def _validate_session_claims(payload: dict) -> None:
+    """Central sid validation. Tokens WITHOUT sid = legacy (allowed during the
+    30-day migration window). Tokens WITH sid must map to a live, unrevoked,
+    unexpired session owned by the same user."""
+    sid = payload.get("sid")
+    if not sid:
+        return  # legacy token — valid until natural exp
+    if not isinstance(sid, str) or len(sid) != 32:
+        raise HTTPException(status_code=401, detail="session_invalid")
+    ses = await get_db().auth_sessions.find_one({"sid": sid})
+    if not ses:
+        raise HTTPException(status_code=401, detail="session_invalid")
+    if ses.get("revoked_at") is not None:
+        raise HTTPException(status_code=401, detail="session_revoked")
+    exp = ses.get("expires_at")
+    if isinstance(exp, datetime) and exp.tzinfo is None:
+        exp = exp.replace(tzinfo=timezone.utc)
+    if exp and exp < datetime.now(timezone.utc):
+        raise HTTPException(status_code=401, detail="session_expired")
+    if str(ses.get("user_id")) != str(payload.get("user_id", "")):
+        raise HTTPException(status_code=401, detail="session_invalid")
+    await get_db().auth_sessions.update_one(
+        {"sid": sid}, {"$set": {"last_seen_at": datetime.now(timezone.utc)}})
 
 
 async def auth_marketplace(request: Request):
@@ -127,6 +210,7 @@ async def auth_marketplace(request: Request):
         ptype = payload.get("type", "")
 
         if ptype == "marketplace":
+            await _validate_session_claims(payload)  # sid binding (Phase 1)
             user = await db.app_users.find_one({"_id": ObjectId(payload["user_id"])})
             if not user:
                 user = await db.tenants.find_one({"_id": ObjectId(payload["user_id"])})
@@ -148,8 +232,28 @@ async def auth_marketplace(request: Request):
 
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Token expirado")
+    except HTTPException:
+        raise  # session_revoked / session_expired / session_invalid — do not mask
     except Exception as e:
         raise HTTPException(status_code=401, detail=f"Token inválido: {str(e)}")
+
+
+# ══════════════════ CENTRAL AUTHORIZATION PRIMITIVES (Phase 1) ══════════════════
+# Prefer these names in new/refactored routers. They wrap the (already
+# centralized) validators above — single point for sid/revocation checks.
+
+require_authenticated_user = auth_marketplace
+require_admin = auth_admin
+
+
+def require_role(*roles):
+    """Dependency factory: user must be authenticated AND have one of `roles`."""
+    async def _dep(request: Request):
+        user = await auth_marketplace(request)
+        if user.get("role") not in roles:
+            raise HTTPException(status_code=403, detail="Permiso denegado")
+        return user
+    return _dep
 
 
 async def auth_tenant(request: Request):

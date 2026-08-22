@@ -180,7 +180,11 @@ def test_06_rate_limiter_unit_429():
 # ══════════════════════ PHONE OTP ══════════════════════
 
 class _FakeTwilioMessages:
+    last_body = ""
+
     def create(self, **kw):
+        _FakeTwilioMessages.last_body = kw.get("body", "")
+
         class M:
             sid = "SMtest"
         return M()
@@ -192,6 +196,7 @@ class _FakeTwilioClient:
 
 
 def test_07_otp_request_twilio_mocked(ctx, monkeypatch):
+    import re
     import twilio.rest
     monkeypatch.setattr(twilio.rest, "Client", _FakeTwilioClient)
     r = run(ctx, _req(ctx, "POST", "/api/rental/phone/send-otp",
@@ -199,7 +204,10 @@ def test_07_otp_request_twilio_mocked(ctx, monkeypatch):
     assert r.status_code == 200, r.text
     doc = run(ctx, ctx["db"].phone_otps.find_one({"phone": "+18065550101"}))
     assert doc and doc["attempts"] == 0 and doc["verified"] is False
-    ctx["otp_code"] = doc["code"]
+    assert "code" not in doc and doc.get("code_hash")  # OTP never in plaintext
+    m = re.search(r"(\d{6})", _FakeTwilioMessages.last_body)
+    assert m, "OTP code not found in mocked SMS body"
+    ctx["otp_code"] = m.group(1)
 
 
 def test_08_otp_wrong_code(ctx):
@@ -212,8 +220,10 @@ def test_08_otp_wrong_code(ctx):
 
 def test_09_otp_expired(ctx):
     async def check():
+        from rental.security import hash_otp
         await ctx["db"].phone_otps.insert_one({
-            "phone": "+18065550202", "code": "123456", "verified": False,
+            "phone": "+18065550202", "code_hash": hash_otp("123456"),
+            "verified": False, "invalidated": False,
             "source": "rental", "attempts": 0,
             "expires_at": datetime.utcnow() - timedelta(minutes=1),
             "created_at": datetime.utcnow() - timedelta(minutes=6)})

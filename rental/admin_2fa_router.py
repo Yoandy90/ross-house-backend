@@ -49,7 +49,7 @@ from dotenv import load_dotenv
 
 from rental.shared import (
     get_db, auth_admin, serialize,
-    create_marketplace_token, TENANT_JWT_SECRET,
+    create_marketplace_token, create_session_token, TENANT_JWT_SECRET,
 )
 from rental.turnstile_helper import verify_turnstile_token
 
@@ -245,8 +245,12 @@ async def admin_login_step1(request: Request):
 
     # ── Skip 2FA if user has it disabled (admin override). ──
     if not settings.get("enabled", True):
-        token = create_marketplace_token(user_id, email, "admin")
+        token = await create_session_token(user_id, email, "admin", request)
         logger.info(f"[admin-2fa] {email} logged in with 2FA disabled")
+        from rental.security import audit_log
+        await audit_log(admin_user_id=user_id, action="admin_login",
+                        resource_type="auth", result="success_2fa_disabled",
+                        request=request)
         return {
             "step": "complete",
             "token": token,
@@ -266,7 +270,7 @@ async def admin_login_step1(request: Request):
                 {"$set": {"last_used_at": _now_utc(),
                           "last_ip": (request.client.host if request.client else None)}},
             )
-            token = create_marketplace_token(user_id, email, "admin")
+            token = await create_session_token(user_id, email, "admin", request)
             return {
                 "step": "complete",
                 "token": token,
@@ -368,7 +372,10 @@ async def admin_login_step2(request: Request):
     if not user or user.get("role") != "admin":
         raise HTTPException(status_code=401, detail="Cuenta no válida")
 
-    token = create_marketplace_token(str(user["_id"]), user["email"], "admin")
+    token = await create_session_token(str(user["_id"]), user["email"], "admin", request)
+    from rental.security import audit_log
+    await audit_log(admin_user_id=str(user["_id"]), action="admin_login",
+                    resource_type="auth", result="success", request=request)
 
     trusted_device_id = None
     if remember_device:

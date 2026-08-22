@@ -62,6 +62,21 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"   ⚠️ Object Storage deferred: {e}")
 
+    # Ensure Phase 1 security indexes (sessions, rate limit TTL, audit logs)
+    try:
+        await db.auth_sessions.create_index("sid", unique=True)
+        await db.auth_sessions.create_index("user_id")
+        await db.auth_sessions.create_index("expires_at")
+        await db.auth_sessions.create_index("revoked_at")
+        await db.rate_limit_events.create_index("created_at", expireAfterSeconds=3600)
+        await db.rate_limit_events.create_index([("endpoint", 1), ("key", 1), ("created_at", -1)])
+        await db.admin_audit_logs.create_index([("timestamp", -1)])
+        await db.admin_audit_logs.create_index([("admin_user_id", 1), ("timestamp", -1)])
+        await db.admin_audit_logs.create_index([("action", 1), ("timestamp", -1)])
+        logger.info("   ✅ Phase 1 security indexes ready")
+    except Exception as e:
+        logger.warning(f"   ⚠️ Security indexes deferred: {e}")
+
     # Ensure Mashvisor cache indexes
     try:
         from rental.mashvisor_cache import ensure_indexes as cache_ensure_indexes
@@ -438,6 +453,8 @@ try:
     from rental.helcim_vault_router import router as helcim_vault_router
 
     app.include_router(auth_router, prefix="/api")
+    from rental.sessions_router import router as sessions_router
+    app.include_router(sessions_router, prefix="/api")
     app.include_router(properties_router, prefix="/api")
     app.include_router(tenant_router, prefix="/api")
     app.include_router(dnc_registry_router, prefix="/api")
