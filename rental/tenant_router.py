@@ -2021,9 +2021,16 @@ async def get_tenant_payment_config(request: Request):
         late_fee = float(contract.get("late_fee_amount", 0) or 0) if not current_paid else 0
         amount_due = rent_amount
 
+    try:
+        from .payment_processors_router import get_active_processor
+        active_processor, _ = await get_active_processor()
+    except Exception:
+        active_processor = "stripe"
+
     return {
         "success": True,
         "stripe_enabled": bool(config.get("stripe_enabled", False) and config.get("stripe_secret_key")),
+        "active_processor": active_processor,
         "rent_amount": rent_amount,
         "late_fee": late_fee,
         "amount_due": amount_due,

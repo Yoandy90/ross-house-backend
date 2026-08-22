@@ -598,7 +598,8 @@ async def public_payment_processor():
 
 async def create_hosted_checkout(*, amount_cents: int, reference: str,
                                  customer_email: str = "",
-                                 redirect_url: str = "") -> dict:
+                                 redirect_url: str = "",
+                                 payment_method: str = "cc-ach") -> dict:
     """Crea un checkout hospedado con el procesador ACTIVO (square/clover).
 
     Devuelve {processor, url, external_id}. Para stripe, los flujos existentes
@@ -701,7 +702,7 @@ async def create_hosted_checkout(*, amount_cents: int, reference: str,
             "paymentType": "purchase",
             "amount": round(amount_cents / 100, 2),
             "currency": "USD",
-            "paymentMethod": "cc-ach",
+            "paymentMethod": payment_method if payment_method in ("cc", "ach", "cc-ach") else "cc-ach",
             "confirmationScreen": True,
         }
         async with httpx.AsyncClient(timeout=20.0) as client:
@@ -822,6 +823,7 @@ async def tenant_create_checkout_payment(request: Request):
             reference=reference,
             customer_email=tenant.get("email", ""),
             redirect_url="https://www.rosshouserentals.com/pago-exitoso",
+            payment_method=(data.get("payment_method") or "cc-ach"),
         )
 
     payment_doc = {
