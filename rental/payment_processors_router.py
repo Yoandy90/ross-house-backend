@@ -710,6 +710,13 @@ async def create_hosted_checkout(*, amount_cents: int, reference: str,
                                   headers={"api-token": cfg["api_token"],
                                            "accept": "application/json"},
                                   json=init_body)
+            # Fee Saver exige cc-ach: si un método único falla, reintentar con ambos
+            if r.status_code >= 400 and init_body["paymentMethod"] != "cc-ach":
+                init_body["paymentMethod"] = "cc-ach"
+                r = await client.post(f"{HELCIM_BASE}/helcim-pay/initialize",
+                                      headers={"api-token": cfg["api_token"],
+                                               "accept": "application/json"},
+                                      json=init_body)
         if r.status_code >= 400:
             raise HTTPException(status_code=502, detail=f"Helcim: {r.text[:200]}")
         data = r.json()
