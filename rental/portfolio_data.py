@@ -137,3 +137,110 @@ def unrealized_gain_preview(current_estimated_value, cost_basis: dict) -> dict:
         return {'value': None, 'status': INSUFFICIENT, 'notes': ['inputs missing']}
     return {'value': float(current_estimated_value) - cost_basis['value'],
             'status': cost_basis['status'], 'notes': cost_basis['notes']}
+
+
+# ── Etapa 4C: professional analysis (acquisition/valuation/operations/performance) ──
+_STATUS_RANK = {COMPLETE: 0, PARTIAL: 1, INSUFFICIENT: 2}
+
+
+def _worst(*statuses: str) -> str:
+    return max(statuses, key=lambda s: _STATUS_RANK[s])
+
+
+def acquisition_costs_resolved(canonical_sum: float, closing_costs_manual) -> dict:
+    """Anti-double-counting (approved rule): canonical ACQUISITION_COST expenses WIN;
+    manual closing_costs is a FALLBACK only when no canonical docs exist. Never summed.
+    NOTE: manual closing_costs == 0 is ambiguous (legacy create default was 0), so 0
+    is treated as 'not provided' for the manual fallback ONLY. Canonical docs are the
+    reliable source for explicit zero/values."""
+    if canonical_sum > 0:
+        return {'value': canonical_sum, 'status': COMPLETE, 'source': 'canonical',
+                'notes': ['recorded ACQUISITION_COST expenses']}
+    if closing_costs_manual not in (None, 0):
+        return {'value': float(closing_costs_manual), 'status': PARTIAL, 'source': 'manual_fallback',
+                'notes': ['manual closing_costs fallback — no detailed acquisition expenses recorded']}
+    return {'value': None, 'status': INSUFFICIENT, 'source': None,
+            'notes': ['acquisition costs NOT RECORDED']}
+
+
+def professional_analysis(*, purchase_price, closing_costs_manual, current_estimated_value,
+                          arv, loan_balance, summary: dict, income_t12: float,
+                          months_with_data: int, property_status: str = '') -> dict:
+    """Pure Etapa 4C professional metrics. NEVER invents data:
+    null = NOT RECORDED, 0 = literal zero, partial history is NEVER annualized."""
+    renovation_in_progress = (property_status or '').lower() == 'maintenance'
+
+    # ── Acquisition ──
+    acq = acquisition_costs_resolved(summary['acquisition_costs'], closing_costs_manual)
+    capex = {'value': summary['capital_improvements'],
+             'status': PARTIAL if renovation_in_progress else COMPLETE,
+             'notes': ['Only recorded expenses are included.']}
+    acb = cost_basis_preview(purchase_price, acq['value'], capex['value'])
+    if acb['value'] is not None and capex['status'] == PARTIAL:
+        acb = {'value': acb['value'], 'status': PARTIAL,
+               'notes': acb['notes'] + ['renovation expenses incomplete']}
+
+    # ── Valuation ──
+    equity = equity_preview(current_estimated_value, loan_balance)
+    gain = unrealized_gain_preview(current_estimated_value, acb)
+
+    # ── Operations (actual collected, actual operating; NEVER annualized) ──
+    income_status = COMPLETE if months_with_data >= 12 else (PARTIAL if months_with_data > 0 else INSUFFICIENT)
+    income = {'value': income_t12, 'status': income_status, 'months_with_data': months_with_data,
+              'notes': ([] if income_status == COMPLETE else
+                        [f'Partial history — {months_with_data} month(s) recorded, not annualized']
+                        if months_with_data > 0 else ['No income history recorded'])}
+    opex = {'value': summary['operating_expenses'], 'notes': ['Recorded OPERATING expenses only.']}
+    if months_with_data == 0:
+        noi = {'value': None, 'status': INSUFFICIENT, 'notes': ['No income history recorded']}
+    else:
+        noi = {'value': income_t12 - summary['operating_expenses'], 'status': income_status,
+               'notes': income['notes']}
+
+    # ── Performance ──
+    if current_estimated_value is None:
+        cap_rate = {'value': None, 'status': INSUFFICIENT, 'notes': ['Current property value required']}
+    elif noi['value'] is None:
+        cap_rate = {'value': None, 'status': INSUFFICIENT, 'notes': ['NOI unavailable']}
+    else:
+        cap_rate = {'value': (noi['value'] / float(current_estimated_value)) * 100.0,
+                    'status': noi['status'], 'notes': noi['notes']}
+    # Cash invested = Purchase + Acquisition + Recorded Capital Improvements (== ACB components)
+    if acb['value'] is None or noi['value'] is None or acb['value'] <= 0:
+        coc = {'value': None, 'status': INSUFFICIENT,
+               'notes': ['cash invested or NOI unavailable']}
+    else:
+        coc = {'value': (noi['value'] / acb['value']) * 100.0,
+               'status': _worst(noi['status'], acb['status'], capex['status']),
+               'notes': ['Cash invested = purchase + acquisition + recorded capital improvements']}
+
+    # ── Missing data (DERIVED from data state, never hardcoded per property) ──
+    missing = []
+    if current_estimated_value is None:
+        missing.append('current_estimated_value')
+    if arv is None:
+        missing.append('arv')
+    if loan_balance is None:
+        missing.append('loan_balance')
+    if acq['value'] is None:
+        missing.append('acquisition_costs')
+    if renovation_in_progress:
+        missing.append('renovation_expenses')
+    if months_with_data < 12:
+        missing.append('income_history')
+
+    statuses = {'adjusted_cost_basis': acb['status'], 'equity': equity['status'],
+                'unrealized_gain': gain['status'], 'noi_t12': noi['status'],
+                'cap_rate': cap_rate['status'], 'cash_on_cash': coc['status'],
+                'collected_income_t12': income['status'],
+                'capital_improvements': capex['status'], 'acquisition_costs': acq['status']}
+    return {
+        'acquisition': {'purchase_price': purchase_price, 'acquisition_costs': acq,
+                        'capital_improvements': capex, 'adjusted_cost_basis': acb},
+        'valuation': {'current_estimated_value': current_estimated_value, 'arv': arv,
+                      'loan_balance': loan_balance, 'equity': equity, 'unrealized_gain': gain},
+        'operations': {'collected_income_t12': income, 'operating_expenses_t12': opex, 'noi_t12': noi},
+        'performance': {'cap_rate': cap_rate, 'cash_on_cash': coc},
+        'data_quality': {'overall': _worst(*statuses.values()), 'metrics': statuses},
+        'missing_data': missing,
+    }

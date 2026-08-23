@@ -573,7 +573,8 @@ async def investment_analysis_preview(investment_id: str, request: Request):
     await auth_admin(request)
     from rental.portfolio_data import (property_expense_summary, collected_income_t12,
                                        cost_basis_preview, equity_preview,
-                                       unrealized_gain_preview, noi_inputs)
+                                       unrealized_gain_preview, noi_inputs,
+                                       professional_analysis)
     try:
         inv = await get_db().investments.find_one({"_id": ObjectId(investment_id)})
     except Exception:
@@ -596,8 +597,22 @@ async def investment_analysis_preview(investment_id: str, request: Request):
     pay_months = len({p["payment_date"].strftime("%Y-%m") async for p in get_db().rental_payments.find(
         {"property_id": pid, "status": {"$in": ["completed", "paid"]}}, {"payment_date": 1})}) if pid else 0
     income_status = "COMPLETE" if pay_months >= 12 else ("PARTIAL" if pay_months > 0 else "INSUFFICIENT_DATA")
+    # Etapa 4C: structured professional sections (ADDITIVE — legacy keys preserved)
+    prop_status = ""
+    if pid:
+        try:
+            prop_doc = await get_db().properties.find_one({"_id": ObjectId(pid)}, {"status": 1})
+        except Exception:
+            prop_doc = await get_db().properties.find_one({"_id": pid}, {"status": 1})
+        prop_status = (prop_doc or {}).get("status", "")
+    v2 = professional_analysis(
+        purchase_price=inv.get("purchase_price"), closing_costs_manual=closing_manual,
+        current_estimated_value=cev, arv=inv.get("arv"), loan_balance=loan,
+        summary=summary, income_t12=income, months_with_data=pay_months,
+        property_status=prop_status)
     return {
         "preview": True,
+        "schema": "4c-v1",
         "purchase_price": inv.get("purchase_price"),
         "closing_costs_manual": closing_manual,
         "acquisition_costs_recorded": acq_recorded,
@@ -612,4 +627,5 @@ async def investment_analysis_preview(investment_id: str, request: Request):
         "unrealized_gain": unrealized_gain_preview(cev, cb),
         "collected_income_t12": {"value": income, "status": income_status, "months_with_data": pay_months},
         "noi_t12_preview": noi_inputs(income, summary),
+        **v2,
     }
