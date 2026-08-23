@@ -8,8 +8,8 @@ from bson import ObjectId
 
 sys.path.insert(0, os.path.dirname(__file__))
 from etapa4c_plan import (CLOSING_CHARGES_812, INSPECTION_CHARGES_812, COMMON_FIELDS,
-                          INVESTMENT_UPDATES_812, KEEP_812, REVIEW, DO_NOT_IMPORT,
-                          INV_812, PROP_812)
+                          INVESTMENT_UPDATES_812, INVESTMENT_UPDATES_OAK, KEEP_812,
+                          REVIEW, DO_NOT_IMPORT, INV_812, PROP_812, INV_OAK)
 load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
 
 
@@ -39,9 +39,12 @@ async def main():
     print(f"  Total closing: ${sum(c['amount'] for c in CLOSING_CHARGES_812):.2f} (esperado 1043.50)")
     print(f"  Total inspection: ${sum(c['amount'] for c in INSPECTION_CHARGES_812):.2f} (esperado 785.00)")
 
-    print("\n── UPDATE (investments 812) ──")
+    print("\n── UPDATE (investments) ──")
+    oak = await db.investments.find_one({"_id": ObjectId(INV_OAK)})
     for k, v in INVESTMENT_UPDATES_812.items():
-        print(f"  UPDATE {k}: {inv.get(k, '<ABSENT>')} -> {v}  (0 EXPLÍCITO, compra CASH confirmada)")
+        print(f"  UPDATE 812 {k}: {inv.get(k, '<ABSENT>')} -> {v}  (0 EXPLÍCITO, compra CASH confirmada por el dueño)")
+    for k, v in INVESTMENT_UPDATES_OAK.items():
+        print(f"  UPDATE 121 Oak {k}: {oak.get(k, '<ABSENT>')} -> {v}  (0 EXPLÍCITO, compra CASH confirmada por el dueño)")
 
     print("\n── KEEP ──")
     for k, v in KEEP_812.items():

@@ -10,7 +10,8 @@ from rental.normalization import propose_treatment, CAPITAL_IMPROVEMENT
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
 from etapa4c_plan import (CLOSING_CHARGES_812, INSPECTION_CHARGES_812, COMMON_FIELDS,
-                          INVESTMENT_UPDATES_812, KEEP_812, PROP_812)
+                          INVESTMENT_UPDATES_812, INVESTMENT_UPDATES_OAK, KEEP_812,
+                          DO_NOT_IMPORT, PROP_812)
 
 PID = PROP_812
 EMPTY = {'property_expenses_total': 0.0, 'operating_expenses': 0.0, 'capital_improvements': 0.0,
@@ -227,3 +228,56 @@ def test_27_backward_compatible_structure():
                   summary=summary(acquisition_costs=1043.50, capital_improvements=149.24),
                   property_status='maintenance')['performance']['cash_on_cash']
     assert coc['status'] in (PARTIAL, INSUFFICIENT)
+
+
+# ═══ Post-apply (checkpoint 1 aprobado): decisiones humanas confirmadas ═══
+
+# 28. loan_balance = 0 explícito autorizado para AMBAS (cash, confirmación del dueño)
+def test_28_both_loan_balances_zero():
+    assert INVESTMENT_UPDATES_812 == {'loan_balance': 0.0}
+    assert INVESTMENT_UPDATES_OAK == {'loan_balance': 0.0}
+
+
+# 29. Option Fee $100 NO importado como expense separado (metadata de auditoría solamente)
+def test_29_option_fee_not_imported():
+    option = [d for d in DO_NOT_IMPORT if 'Option Fee' in d['item']]
+    assert len(option) == 1
+    all_amounts = [c['amount'] for c in CLOSING_CHARGES_812 + INSPECTION_CHARGES_812]
+    assert 100.0 not in all_amounts  # jamás en el plan de creates
+
+
+# 30. Inspección $785 contada UNA sola vez: 3 líneas con source_document compartido,
+#     sin registro adicional por el total
+def test_30_inspection_counted_once():
+    srcs = {c['source_document'] for c in INSPECTION_CHARGES_812}
+    assert len(srcs) == 1  # misma factura
+    assert sum(c['amount'] for c in INSPECTION_CHARGES_812) == pytest.approx(785.00)
+    assert 785.00 not in [c['amount'] for c in INSPECTION_CHARGES_812]  # no existe línea "total"
+
+
+# 31. Total de adquisición 812 = 1043.50 (settlement) + 785 (inspección) = 1828.50
+def test_31_total_acquisition_812():
+    total = sum(c['amount'] for c in CLOSING_CHARGES_812) + sum(c['amount'] for c in INSPECTION_CHARGES_812)
+    assert total == pytest.approx(1828.50)
+    assert sum(c['amount'] for c in CLOSING_CHARGES_812) == pytest.approx(1043.50)
+
+
+# 32. ACB 812 post-apply = 108000 + 1828.50 + 149.24 = 109977.74, y PARTIAL (obra incompleta)
+def test_32_acb_812_post_apply():
+    a = analyze(summary=summary(acquisition_costs=1828.50, capital_improvements=149.24),
+                loan_balance=0.0, property_status='maintenance')
+    acb = a['acquisition']['adjusted_cost_basis']
+    assert acb['value'] == pytest.approx(109977.74)
+    assert acb['status'] == PARTIAL  # NUNCA COMPLETE mientras la remodelación esté incompleta
+    assert 'renovation expenses incomplete' in acb['notes']
+
+
+# 33. Flag de remodelación parcial derivado del estado (maintenance ⇒ capex PARTIAL + alerta)
+def test_33_partial_renovation_flag():
+    a = analyze(summary=summary(acquisition_costs=1828.50, capital_improvements=149.24),
+                loan_balance=0.0, property_status='maintenance')
+    assert a['acquisition']['capital_improvements']['status'] == PARTIAL
+    assert 'renovation_expenses' in a['missing_data']
+    # con loan_balance=0 y acquisition registrada, esas alertas desaparecen
+    assert 'loan_balance' not in a['missing_data']
+    assert 'acquisition_costs' not in a['missing_data']
