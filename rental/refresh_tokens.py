@@ -29,10 +29,11 @@ from datetime import datetime, timezone, timedelta
 
 GRACE_SECONDS = 60
 ROTATED_HASHES_CAP = 10
+CONSUMED_COLLECTION = "consumed_refresh_hashes"  # detección de reuse ANTIGUO (> cap), TTL
 
 # Acciones que puede decidir la lógica pura
 ROTATE = "ROTATE"                 # hash actual válido → rotar
-GRACE_ROTATE = "GRACE_ROTATE"     # prev hash dentro de grace → carrera legítima, rotar
+GRACE_ROTATE = "GRACE_ROTATE"     # prev hash dentro de grace → carrera legítima, respuesta IDEMPOTENTE
 REUSE_DETECTED = "REUSE_DETECTED" # token rotado viejo / prev fuera de grace → revocar familia
 BOOTSTRAP = "BOOTSTRAP"           # sesión sin refresh aún → emitir primer refresh (1 sola vez)
 DENY = "DENY"                     # revocada/expirada/mismatch → 401 genérico
@@ -48,8 +49,34 @@ def legacy_user_sessions_allowed() -> bool:
 
 
 def generate_refresh_token() -> str:
-    """256 bits CSPRNG, url-safe. El valor raw JAMÁS se persiste ni se loggea."""
+    """256 bits CSPRNG, url-safe. Solo para BOOTSTRAP (generación 1).
+    El valor raw JAMÁS se persiste ni se loggea."""
     return secrets.token_urlsafe(32)
+
+
+def _derive_key() -> bytes:
+    """Clave HMAC para la cadena determinista. Dedicada (REFRESH_DERIVE_KEY) o
+    derivada del secreto JWT — nunca se expone."""
+    dedicated = os.environ.get("REFRESH_DERIVE_KEY")
+    base = dedicated or (os.environ.get("TENANT_JWT_SECRET", "") + ":refresh-derive-v1")
+    return hashlib.sha256(base.encode()).digest()
+
+
+def next_refresh_token(presented_raw: str) -> str:
+    """CADENA DETERMINISTA (D1): R_{n+1} = HMAC-SHA256(K, R_n), url-safe.
+
+    Por qué es segura e idempotente:
+    - El retry legítimo (mismo R_n dentro de grace) RE-DERIVA exactamente el MISMO
+      R_{n+1} ⇒ respuesta idempotente sin guardar el raw en servidor y sin generar
+      R3 ni invalidar R2.
+    - Derivar hacia adelante exige la clave K del servidor (256 bits): un atacante
+      con R_n NO puede computar R_{n+1}.
+    - La entropía de la cadena hereda los 256 bits CSPRNG del bootstrap R1.
+    - Compromiso de K equivale al compromiso del secreto JWT (mismo perímetro)."""
+    import hmac as _hmac
+    import base64 as _b64
+    digest = _hmac.new(_derive_key(), presented_raw.encode(), hashlib.sha256).digest()
+    return _b64.urlsafe_b64encode(digest).rstrip(b"=").decode()
 
 
 def hash_refresh_token(raw: str) -> str:
