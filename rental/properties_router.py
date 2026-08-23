@@ -2177,3 +2177,28 @@ async def admin_section8_inspections(request: Request):
 
 
 
+
+
+@router.get('/admin/properties/{property_id}/ownership-history')
+async def admin_get_ownership_history(property_id: str, request: Request):
+    """Ownership history (aditivo). Solo lectura, Admin-only.
+    Campos legacy (owner_id/owner_name/owner_entity) NO se exponen aquí para
+    mantener separados los conceptos de contacto vs titular legal."""
+    await auth_admin(request)
+    try:
+        prop = await get_db().properties.find_one(
+            {"_id": ObjectId(property_id)},
+            {"address": 1, "ownership_history": 1, "owner_display_name": 1,
+             "owner_entity": 1, "ownership_history_updated_at": 1})
+    except Exception:
+        prop = None
+    if not prop:
+        raise HTTPException(status_code=404, detail="Propiedad no encontrada")
+    return {
+        "property_id": property_id,
+        "address": prop.get("address", ""),
+        "current_legal_owner": prop.get("owner_display_name") or None,
+        "owner_entity": prop.get("owner_entity") or "unknown",
+        "ownership_history": serialize(prop.get("ownership_history", [])),
+        "updated_at": str(prop.get("ownership_history_updated_at") or ""),
+    }
