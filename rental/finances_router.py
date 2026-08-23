@@ -140,6 +140,11 @@ async def create_property_expense(request: Request):
         # Explicit value from UI wins; otherwise derived only for unambiguous
         # categories; ambiguous ones (repair/appliance/other) stay None.
         "accounting_treatment": propose_treatment(data.get('category'), data.get('accounting_treatment')),
+        # Expense scope: PROPERTY expenses require property_id; expenses without
+        # a property are BUSINESS (office/company) — never fake properties.
+        "expense_scope": ('PROPERTY' if property_id else 'BUSINESS')
+                         if str(data.get('expense_scope', '')).upper() not in ('PROPERTY', 'BUSINESS')
+                         else str(data.get('expense_scope')).upper(),
         "created_at": now,
         "updated_at": now,
         "created_by": user.get('email', 'admin'),
