@@ -584,10 +584,12 @@ async def investment_analysis_preview(investment_id: str, request: Request):
     summary = await property_expense_summary(get_db(), pid) if pid else {
         "property_expenses_total": 0.0, "operating_expenses": 0.0, "capital_improvements": 0.0,
         "acquisition_costs": 0.0, "unclassified": 0.0, "business_expenses_excluded": 0.0}
-    # Acquisition: canonical = property_expenses ACQUISITION_COST; manual closing_costs shown apart
+    # Anti-double-counting rule (approved): canonical ACQUISITION_COST expenses
+    # win; the manual closing_costs field is a FALLBACK only when no detailed
+    # acquisition expenses exist. They are never summed together.
     acq_recorded = summary["acquisition_costs"] if summary["acquisition_costs"] > 0 else None
     closing_manual = inv.get("closing_costs")  # may be absent/None on legacy
-    acquisition = closing_manual if closing_manual not in (None, 0) else acq_recorded
+    acquisition = acq_recorded if acq_recorded is not None else (closing_manual if closing_manual not in (None, 0) else None)
     cb = cost_basis_preview(inv.get("purchase_price"), acquisition, summary["capital_improvements"])
     cev, loan = inv.get("current_estimated_value"), inv.get("loan_balance")
     income = await collected_income_t12(get_db(), pid) if pid else 0.0
