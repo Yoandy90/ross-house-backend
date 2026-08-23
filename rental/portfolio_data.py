@@ -111,3 +111,29 @@ async def property_expense_summary(db, property_id: str) -> dict:
         {}, {'amount': 1, 'property_id': 1, 'expense_scope': 1,
              'accounting_treatment': 1, 'migrated_from': 1, 'legacy_source': 1})]
     return summarize_expenses(docs, property_id)
+
+
+# ── Etapa 4B: valuation previews + data-quality badges (PREVIEW ONLY) ────────
+COMPLETE, PARTIAL, INSUFFICIENT = 'COMPLETE', 'PARTIAL', 'INSUFFICIENT_DATA'
+
+
+def cost_basis_preview(purchase_price, acquisition_costs, capital_improvements) -> dict:
+    total, unknowns = adjusted_cost_basis(purchase_price, acquisition_costs, capital_improvements)
+    if total is None:
+        return {'value': None, 'status': INSUFFICIENT, 'notes': unknowns}
+    return {'value': total, 'status': PARTIAL if unknowns else COMPLETE, 'notes': unknowns}
+
+
+def equity_preview(current_estimated_value, loan_balance) -> dict:
+    if current_estimated_value is None:
+        return {'value': None, 'status': INSUFFICIENT, 'notes': ['current_estimated_value NOT RECORDED']}
+    if loan_balance is None:
+        return {'value': None, 'status': INSUFFICIENT, 'notes': ['loan_balance NOT RECORDED']}
+    return {'value': float(current_estimated_value) - float(loan_balance), 'status': COMPLETE, 'notes': []}
+
+
+def unrealized_gain_preview(current_estimated_value, cost_basis: dict) -> dict:
+    if current_estimated_value is None or cost_basis['value'] is None:
+        return {'value': None, 'status': INSUFFICIENT, 'notes': ['inputs missing']}
+    return {'value': float(current_estimated_value) - cost_basis['value'],
+            'status': cost_basis['status'], 'notes': cost_basis['notes']}

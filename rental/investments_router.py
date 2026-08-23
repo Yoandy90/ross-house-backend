@@ -309,10 +309,19 @@ async def admin_update_investment(inv_id: str, request: Request):
         update["property_id"] = await _validated_property_id(data.get("property_id"))
         update["schema_version"] = SCHEMA_VERSION_NORMALIZED
     if "closing_costs" in data:
-        update["closing_costs"] = float(data.get("closing_costs") or 0)
+        v = float(data.get("closing_costs") or 0)
+        if v < 0:
+            raise HTTPException(status_code=400, detail="closing_costs debe ser >= 0")
+        update["closing_costs"] = v
     for vfield in ("current_estimated_value", "arv", "loan_balance"):
         if vfield in data:
-            update[vfield] = float(data[vfield]) if data.get(vfield) not in (None, "") else None
+            if data.get(vfield) in (None, ""):
+                update[vfield] = None  # null = Not recorded (never coerced to 0)
+            else:
+                v = float(data[vfield])
+                if v < 0:
+                    raise HTTPException(status_code=400, detail=f"{vfield} debe ser >= 0")
+                update[vfield] = v
 
     await get_db().investments.update_one({"_id": ObjectId(inv_id)}, {"$set": update})
     return {"success": True, "message": "Inversión actualizada"}
@@ -555,3 +564,52 @@ async def admin_convert_investment_to_rental(inv_id: str, request: Request):
 
 
 
+
+
+@router.get("/admin/investments/{investment_id}/analysis")
+async def investment_analysis_preview(investment_id: str, request: Request):
+    """Admin PREVIEW ONLY (Etapa 4B): cost basis / equity / unrealized gain +
+    data-quality badges. Does NOT replace any visible metric."""
+    await auth_admin(request)
+    from rental.portfolio_data import (property_expense_summary, collected_income_t12,
+                                       cost_basis_preview, equity_preview,
+                                       unrealized_gain_preview, noi_inputs)
+    try:
+        inv = await get_db().investments.find_one({"_id": ObjectId(investment_id)})
+    except Exception:
+        raise HTTPException(status_code=400, detail="ID inválido")
+    if not inv:
+        raise HTTPException(status_code=404, detail="Inversión no encontrada")
+    pid = inv.get("property_id") or ""
+    summary = await property_expense_summary(get_db(), pid) if pid else {
+        "property_expenses_total": 0.0, "operating_expenses": 0.0, "capital_improvements": 0.0,
+        "acquisition_costs": 0.0, "unclassified": 0.0, "business_expenses_excluded": 0.0}
+    # Anti-double-counting rule (approved): canonical ACQUISITION_COST expenses
+    # win; the manual closing_costs field is a FALLBACK only when no detailed
+    # acquisition expenses exist. They are never summed together.
+    acq_recorded = summary["acquisition_costs"] if summary["acquisition_costs"] > 0 else None
+    closing_manual = inv.get("closing_costs")  # may be absent/None on legacy
+    acquisition = acq_recorded if acq_recorded is not None else (closing_manual if closing_manual not in (None, 0) else None)
+    cb = cost_basis_preview(inv.get("purchase_price"), acquisition, summary["capital_improvements"])
+    cev, loan = inv.get("current_estimated_value"), inv.get("loan_balance")
+    income = await collected_income_t12(get_db(), pid) if pid else 0.0
+    pay_months = len({p["payment_date"].strftime("%Y-%m") async for p in get_db().rental_payments.find(
+        {"property_id": pid, "status": {"$in": ["completed", "paid"]}}, {"payment_date": 1})}) if pid else 0
+    income_status = "COMPLETE" if pay_months >= 12 else ("PARTIAL" if pay_months > 0 else "INSUFFICIENT_DATA")
+    return {
+        "preview": True,
+        "purchase_price": inv.get("purchase_price"),
+        "closing_costs_manual": closing_manual,
+        "acquisition_costs_recorded": acq_recorded,
+        "recorded_capital_improvements": summary["capital_improvements"],
+        "operating_expenses": summary["operating_expenses"],
+        "business_expenses_excluded": summary["business_expenses_excluded"],
+        "adjusted_cost_basis": cb,
+        "current_estimated_value": cev,
+        "arv": inv.get("arv"),
+        "loan_balance": loan,
+        "equity": equity_preview(cev, loan),
+        "unrealized_gain": unrealized_gain_preview(cev, cb),
+        "collected_income_t12": {"value": income, "status": income_status, "months_with_data": pay_months},
+        "noi_t12_preview": noi_inputs(income, summary),
+    }
