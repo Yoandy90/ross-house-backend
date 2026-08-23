@@ -163,6 +163,8 @@ async def _sync_expense(db, acc: dict, res: dict):
             "property_address": (prop or {}).get("address") or acc.get("label") or res.get("address", ""),
             "property_number": (prop or {}).get("property_number", ""),
             "category": "office" if mode == "office" else "utilities",
+            "expense_scope": "BUSINESS" if (mode == "office" or not prop) else "PROPERTY",
+            "accounting_treatment": None if mode == "office" else "OPERATING",
             "description": (f"Gastos de oficina — agua/basura City de Dumas — cuenta {acct} (vence {res['due_date']})"
                             if mode == "office" else
                             f"Agua/basura City de Dumas — cuenta {acct} (vence {res['due_date']})"),
@@ -421,6 +423,8 @@ async def add_manual_paid_invoice(request: Request):
         "property_address": (prop or {}).get("address") or label,
         "property_number": (prop or {}).get("property_number", ""),
         "category": "office" if mode == "office" else "utilities",
+        "expense_scope": "BUSINESS" if (mode == "office" or not prop) else "PROPERTY",
+        "accounting_treatment": None if mode == "office" else "OPERATING",
         "description": (f"Gastos de oficina — agua/basura City de Dumas — cuenta {acct} (factura {doc['invoice_number']})"
                         if mode == "office" else
                         f"Agua/basura City de Dumas — cuenta {acct} (factura {doc['invoice_number']})"),

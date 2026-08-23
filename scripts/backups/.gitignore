@@ -1,0 +1,2 @@
+# Logical backups contain production record snapshots — keep local, do not commit
+*.json
