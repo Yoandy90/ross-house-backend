@@ -2194,11 +2194,16 @@ async def admin_get_ownership_history(property_id: str, request: Request):
         prop = None
     if not prop:
         raise HTTPException(status_code=404, detail="Propiedad no encontrada")
+    history = prop.get("ownership_history", [])
+    for e in history:
+        for k, v in list(e.items()):
+            if isinstance(v, datetime):
+                e[k] = v.isoformat()
     return {
         "property_id": property_id,
         "address": prop.get("address", ""),
         "current_legal_owner": prop.get("owner_display_name") or None,
         "owner_entity": prop.get("owner_entity") or "unknown",
-        "ownership_history": serialize(prop.get("ownership_history", [])),
+        "ownership_history": history,
         "updated_at": str(prop.get("ownership_history_updated_at") or ""),
     }
