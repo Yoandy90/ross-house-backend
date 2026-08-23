@@ -69,7 +69,12 @@ async def auth_admin(request: Request):
         if user and user.get("role") == "admin":
             return serialize(user)
 
-    # ── Fallback: session-based auth ──
+    # ── Fallback: session-based auth (LEGACY user_sessions, tokens raw) ──
+    # Aislado detrás de ALLOW_LEGACY_USER_SESSIONS (default true = compatible).
+    # Fase B del rollout de Refresh Tokens lo apagará (false ⇒ solo sid moderno).
+    from rental.refresh_tokens import legacy_user_sessions_allowed
+    if not legacy_user_sessions_allowed():
+        raise HTTPException(status_code=401, detail="Sesión inválida")
     session = await db.user_sessions.find_one({'session_token': token})
     if not session:
         raise HTTPException(status_code=401, detail="Sesión inválida")

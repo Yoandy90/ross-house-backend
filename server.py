@@ -455,6 +455,8 @@ try:
     app.include_router(auth_router, prefix="/api")
     from rental.sessions_router import router as sessions_router
     app.include_router(sessions_router, prefix="/api")
+    from rental.refresh_router import router as refresh_router
+    app.include_router(refresh_router, prefix="/api")
     app.include_router(properties_router, prefix="/api")
     app.include_router(tenant_router, prefix="/api")
     app.include_router(dnc_registry_router, prefix="/api")
