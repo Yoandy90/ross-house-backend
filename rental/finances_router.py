@@ -8,6 +8,7 @@ from typing import Optional, List
 from bson import ObjectId
 from fastapi import APIRouter, HTTPException, Request
 
+from rental.normalization import propose_treatment
 from rental.shared import (
     get_db, auth_admin, auth_marketplace, auth_tenant,
     serialize, create_marketplace_token, create_tenant_token,
@@ -135,6 +136,10 @@ async def create_property_expense(request: Request):
         "receipt_id": data.get('receipt_id', ''),
         "notes": data.get('notes', ''),
         "status": data.get('status', 'paid'),  # paid, pending, cancelled
+        # Accounting treatment (OPERATING | CAPITAL_IMPROVEMENT | ACQUISITION_COST).
+        # Explicit value from UI wins; otherwise derived only for unambiguous
+        # categories; ambiguous ones (repair/appliance/other) stay None.
+        "accounting_treatment": propose_treatment(data.get('category'), data.get('accounting_treatment')),
         "created_at": now,
         "updated_at": now,
         "created_by": user.get('email', 'admin'),

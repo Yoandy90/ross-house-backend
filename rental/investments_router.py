@@ -15,9 +15,50 @@ from rental.shared import (
     TENANT_JWT_SECRET,
 )
 
+from rental.normalization import SCHEMA_VERSION_NORMALIZED, VALID_TREATMENTS, propose_treatment
+
 router = APIRouter()
 
 INVESTMENT_PHASES = ["adquirida", "en_remodelacion", "en_venta", "vendida", "converted_to_rental"]
+
+
+async def _validated_property_id(raw) -> str:
+    """Validate an optional property_id against the properties collection."""
+    pid = (raw or "").strip() if isinstance(raw, str) else ""
+    if not pid:
+        return ""
+    try:
+        prop = await get_db().properties.find_one({"_id": ObjectId(pid)}, {"_id": 1})
+    except Exception:
+        raise HTTPException(status_code=400, detail="property_id inválido")
+    if not prop:
+        raise HTTPException(status_code=404, detail="Propiedad no encontrada para property_id")
+    return pid
+
+
+async def _hydrate_from_property(doc: dict) -> dict:
+    """If the investment is linked (property_id), the PROPERTY record is the
+    source of truth for physical data. Legacy snapshot fields are preserved
+    under *_snapshot. Backward compatible: unlinked records are untouched."""
+    pid = doc.get("property_id") or ""
+    if not pid:
+        return doc
+    try:
+        prop = await get_db().properties.find_one({"_id": ObjectId(pid)})
+    except Exception:
+        prop = None
+    if not prop:
+        return doc  # dangling link: keep legacy behavior, do not fail
+    for field, pfield in (("address", "address"), ("city", "city"), ("state", "state"),
+                          ("zip_code", "zip_code"), ("bedrooms", "bedrooms"), ("bathrooms", "bathrooms")):
+        legacy = doc.get(field)
+        canonical = prop.get(pfield)
+        if canonical not in (None, ""):
+            if legacy not in (None, "") and legacy != canonical:
+                doc[f"{field}_snapshot"] = legacy
+            doc[field] = canonical
+    doc["linked_property_id"] = pid
+    return doc
 
 
 @router.post('/admin/investments')
@@ -56,6 +97,15 @@ async def admin_create_investment(request: Request):
         "sale_date": "",
         "buyer_name": "",
         "agent_commission": 0,
+        # ── Normalized model (schema v2): PROPERTY is the physical source of truth ──
+        "property_id": await _validated_property_id(data.get("property_id")),
+        "schema_version": SCHEMA_VERSION_NORMALIZED,
+        # ── Valuation fields (prepared, NOT yet used by visible metrics) ──
+        "closing_costs": float(data.get("closing_costs") or 0),
+        "current_estimated_value": (float(data["current_estimated_value"])
+                                    if data.get("current_estimated_value") not in (None, "") else None),
+        "arv": (float(data["arv"]) if data.get("arv") not in (None, "") else None),
+        "loan_balance": (float(data["loan_balance"]) if data.get("loan_balance") not in (None, "") else None),
         "created_at": datetime.utcnow(),
         "updated_at": datetime.utcnow(),
     }
@@ -146,6 +196,7 @@ async def admin_list_investments(request: Request):
     investments = []
     async for inv in cursor:
         doc = serialize(inv)
+        doc = await _hydrate_from_property(doc)
         expenses = doc.get("expenses", [])
         total_expenses = sum(e.get("amount", 0) for e in expenses)
         purchase = doc.get("purchase_price", 0)
@@ -177,6 +228,8 @@ async def admin_list_investments(request: Request):
             "purchase_date": doc.get("purchase_date", ""),
             "sale_date": doc.get("sale_date", ""),
             "created_at": doc.get("created_at", ""),
+            "property_id": doc.get("property_id", ""),
+            "schema_version": doc.get("schema_version", 1),
         })
 
     return {"success": True, "investments": investments, "count": len(investments)}
@@ -194,6 +247,7 @@ async def admin_get_investment(inv_id: str, request: Request):
         raise HTTPException(status_code=404, detail="Inversión no encontrada")
 
     doc = serialize(inv)
+    doc = await _hydrate_from_property(doc)
     expenses = doc.get("expenses", [])
     total_expenses = sum(e.get("amount", 0) for e in expenses)
     purchase = doc.get("purchase_price", 0)
@@ -249,6 +303,16 @@ async def admin_update_investment(inv_id: str, request: Request):
                 update[field] = float(data[field])
             else:
                 update[field] = data[field]
+
+    # ── Normalized model: optional link + valuation fields (schema v2) ──
+    if "property_id" in data:
+        update["property_id"] = await _validated_property_id(data.get("property_id"))
+        update["schema_version"] = SCHEMA_VERSION_NORMALIZED
+    if "closing_costs" in data:
+        update["closing_costs"] = float(data.get("closing_costs") or 0)
+    for vfield in ("current_estimated_value", "arv", "loan_balance"):
+        if vfield in data:
+            update[vfield] = float(data[vfield]) if data.get(vfield) not in (None, "") else None
 
     await get_db().investments.update_one({"_id": ObjectId(inv_id)}, {"$set": update})
     return {"success": True, "message": "Inversión actualizada"}
