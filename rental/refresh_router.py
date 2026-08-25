@@ -24,6 +24,7 @@ from pydantic import BaseModel
 
 from .shared import get_db, TENANT_JWT_SECRET, SESSION_TTL_DAYS
 from .security import audit_log, check_rate_limit_persistent
+from .auth_metrics import bump
 from .refresh_tokens import (refresh_enabled, generate_refresh_token, hash_refresh_token,
                              next_refresh_token, classify_refresh_attempt, rotation_update,
                              bootstrap_update, reuse_revocation_update, CONSUMED_COLLECTION,
@@ -139,11 +140,15 @@ async def refresh(request: Request, body: RefreshRequest):
             # D2: reuse ANTIGUO (>cap de rotated_hashes) — buscar en consumidos
             consumed = await db[CONSUMED_COLLECTION].find_one({"hash": presented_hash})
             if consumed:
+                await bump("refresh_reuse_detected")
                 await _revoke_family_for_reuse(consumed["sid"], consumed.get("user_id", ""), request)
+            else:
+                await bump("refresh_denied")
             raise GENERIC_401
     else:
         session = await _session_from_bearer(request)
         if session is None:
+            await bump("refresh_denied")
             raise GENERIC_401
 
     await check_rate_limit_persistent("auth_refresh", session.get("sid", "?"),
@@ -152,10 +157,12 @@ async def refresh(request: Request, body: RefreshRequest):
     action = classify_refresh_attempt(session, presented_hash)
 
     if action == REUSE_DETECTED:
+        await bump("refresh_reuse_detected")
         await _revoke_family_for_reuse(session["sid"], session.get("user_id", ""), request)
         raise GENERIC_401
 
     if action == DENY:
+        await bump("refresh_denied")
         raise GENERIC_401
 
     email = await _user_email(session)
@@ -173,8 +180,10 @@ async def refresh(request: Request, body: RefreshRequest):
         rederived = next_refresh_token(body.refresh_token)
         if hash_refresh_token(rederived) != session.get("refresh_token_hash"):
             # La cadena avanzó más allá (R_{n+1} ya fue consumido): generación vieja
+            await bump("refresh_reuse_detected")
             await _revoke_family_for_reuse(session["sid"], session.get("user_id", ""), request)
             raise GENERIC_401
+        await bump("refresh_grace_served")
         return {"success": True, "access_token": _issue_access(session, email),
                 "refresh_token": rederived, "token_type": "bearer"}
 
@@ -191,10 +200,14 @@ async def refresh(request: Request, body: RefreshRequest):
 
     res = await db.auth_sessions.update_one(guard, {"$set": update})
     if res.modified_count != 1:
+        await bump("refresh_denied")
         raise GENERIC_401  # carrera perdida / revocada en el interín
 
     if action == ROTATE:
         await _mark_consumed(presented_hash, session)  # D2: registro permanente hasta expiry
+        await bump("refresh_rotate_ok")
+    else:
+        await bump("refresh_bootstrap_ok")
 
     return {
         "success": True,
