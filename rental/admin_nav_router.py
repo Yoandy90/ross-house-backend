@@ -38,9 +38,12 @@ async def nav_summary(request: Request):
     }
     bank_unmatched = await db.bank_transactions.count_documents(
         {"match.status": "unmatched"})
+    manual_confirmations = await db.manual_payment_confirmations.count_documents(
+        {"status": {"$in": ["submitted", "under_review"]}})
 
     total = (new_applications + open_maintenance + pending_signatures +
-             late_payments + delinquent_taxes["count"] + bank_unmatched)
+             late_payments + delinquent_taxes["count"] + bank_unmatched +
+             manual_confirmations)
     return {
         "success": True,
         "total": total,
@@ -50,6 +53,7 @@ async def nav_summary(request: Request):
         "late_payments": late_payments,
         "delinquent_taxes": delinquent_taxes,
         "bank_unmatched": bank_unmatched,
+        "manual_confirmations": manual_confirmations,
     }
 
 

@@ -129,6 +129,8 @@ async def marketplace_get_notifications(request: Request):
             "id": str(n["_id"]),
             "title": n.get("title", ""),
             "body": n.get("body", ""),
+            "title_en": n.get("title_en", ""),
+            "body_en": n.get("body_en", ""),
             "type": n.get("type", ""),
             "read": user_id in n.get("read_by", []),
             "data": n.get("data", {}),
