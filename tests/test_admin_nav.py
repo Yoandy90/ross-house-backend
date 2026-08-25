@@ -67,11 +67,13 @@ def test_nav_summary(ctx):
     assert r.status_code == 200, r.text
     d = r.json()
     for key in ("total", "new_applications", "open_maintenance",
-                "pending_signatures", "late_payments", "delinquent_taxes"):
+                "pending_signatures", "late_payments", "delinquent_taxes",
+                "bank_unmatched", "manual_confirmations"):
         assert key in d
     assert d["total"] == (d["new_applications"] + d["open_maintenance"] +
                           d["pending_signatures"] + d["late_payments"] +
-                          d["delinquent_taxes"]["count"])
+                          d["delinquent_taxes"]["count"] +
+                          d["bank_unmatched"] + d["manual_confirmations"])
     # 121 Oak is delinquent right now
     assert d["delinquent_taxes"]["count"] >= 1
     assert d["delinquent_taxes"]["total_due"] > 4000

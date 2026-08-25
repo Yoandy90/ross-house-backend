@@ -17,14 +17,44 @@ from datetime import datetime, timezone
 from bson import ObjectId
 from fastapi import APIRouter, HTTPException, Request
 
-from .shared import get_db, auth_admin, auth_tenant_flex
+from .shared import (
+    get_db, auth_admin, auth_tenant_flex,
+    send_rental_push_to_user, send_rental_push_to_admins,
+)
 
 router = APIRouter()
 logger = logging.getLogger("manual_confirmations")
 
 METHODS = {"cashapp", "money_order", "bank_transfer"}
+METHOD_LABEL = {"cashapp": "Cash App", "money_order": "Money Order",
+                "bank_transfer": "Bank Transfer"}
 MAX_RECEIPT_B64 = 8_000_000  # ~6 MB imagen (igual que Zelle)
 LIVE_STATUSES = ["submitted", "under_review", "approved"]
+
+
+async def _notify(*, title: str, body: str, title_en: str, body_en: str,
+                  ntype: str, data: dict, user_id: str = "", target: str = ""):
+    """Notificación interna (rental_notifications) + push best-effort.
+    Recipiente derivado SIEMPRE del servidor (nunca del body del tenant).
+    Nunca incluye receipt/base64 ni datos bancarios. Nunca rompe el flujo."""
+    now = datetime.now(timezone.utc)
+    try:
+        doc = {"title": title, "body": body, "title_en": title_en, "body_en": body_en,
+               "type": ntype, "data": data, "read_by": [], "created_at": now}
+        if user_id:
+            doc["user_id"] = user_id
+        else:
+            doc["target"] = target or "admin"
+        await get_db().rental_notifications.insert_one(doc)
+    except Exception as e:
+        logger.warning("notify insert error: %s", e)
+    try:
+        if user_id:
+            await send_rental_push_to_user(user_id, title, body, data)
+        else:
+            await send_rental_push_to_admins(title, body, data)
+    except Exception as e:
+        logger.warning("notify push error: %s", e)
 
 
 async def _active_contract(tenant: dict):
@@ -108,6 +138,21 @@ async def tenant_submit_confirmation(request: Request):
     r = await db.manual_payment_confirmations.insert_one(doc)
     logger.info("📩 Confirmación manual %s de %s — $%.2f %s/%s",
                 method, tenant.get("name"), amount, period_month, period_year)
+
+    # Notificación interna al admin (sin receipt, sin datos bancarios)
+    mm = f"{period_month:02d}/{period_year}"
+    summary = (f"{tenant.get('name', '')} · {METHOD_LABEL[method]} · ${amount:,.2f}"
+               f" · {contract.get('property_address', '')} · {mm}")
+    await _notify(
+        target="admin",
+        title="Nueva confirmación de pago recibida",
+        body=summary,
+        title_en="New payment confirmation received",
+        body_en=summary,
+        ntype="manual_confirmation_new",
+        data={"type": "manual_confirmation_new", "confirmation_id": str(r.inserted_id),
+              "method": method, "amount": amount,
+              "period_month": period_month, "period_year": period_year})
     return {"success": True, "id": str(r.inserted_id), "status": "submitted"}
 
 
@@ -201,6 +246,18 @@ async def admin_approve(cid: str, request: Request):
                     action="manual_payment_approved", resource_type="manual_confirmation",
                     resource_id=cid, request=request,
                     metadata={"amount": s["amount"], "method": s["method"], "receipt": receipt})
+
+    # Notificación interna al tenant — solo en la transición real (doble click = 1 sola)
+    mm = f"{s['period_month']:02d}/{s['period_year']}"
+    await _notify(
+        user_id=s["tenant_id"],
+        title="Tu confirmación de pago fue aprobada.",
+        body=f"{METHOD_LABEL[s['method']]} · ${s['amount']:,.2f} · {mm} · Recibo {receipt}",
+        title_en="Your payment confirmation was approved.",
+        body_en=f"{METHOD_LABEL[s['method']]} · ${s['amount']:,.2f} · {mm} · Receipt {receipt}",
+        ntype="manual_confirmation_approved",
+        data={"type": "manual_confirmation_approved", "confirmation_id": cid,
+              "receipt_number": receipt})
     return {"success": True, "receipt_number": receipt, "payment_id": payment_id}
 
 
@@ -209,11 +266,32 @@ async def admin_reject(cid: str, request: Request):
     admin = await auth_admin(request)
     data = await request.json()
     now = datetime.now(timezone.utc)
-    r = await get_db().manual_payment_confirmations.update_one(
+    db = get_db()
+    s = await db.manual_payment_confirmations.find_one({"_id": ObjectId(cid)})
+    if not s:
+        raise HTTPException(status_code=404, detail="No encontrado")
+    reason = str(data.get("reason", ""))[:300]
+    r = await db.manual_payment_confirmations.update_one(
         {"_id": ObjectId(cid), "status": {"$in": ["submitted", "under_review"]}},
-        {"$set": {"status": "rejected", "reject_reason": str(data.get("reason", ""))[:300],
+        {"$set": {"status": "rejected", "reject_reason": reason,
                   "reviewed_by": admin.get("email", "admin"), "reviewed_at": now,
                   "updated_at": now}})
     if not r.modified_count:
         raise HTTPException(status_code=400, detail="No se pudo rechazar (estado inválido)")
+
+    # Notificación interna al tenant — reason visible, sin notas internas de admin
+    body_es = "Tu confirmación de pago fue rechazada."
+    body_en = "Your payment confirmation was rejected."
+    if reason:
+        body_es += f" Motivo: {reason}"
+        body_en += f" Reason: {reason}"
+    await _notify(
+        user_id=s["tenant_id"],
+        title="Tu confirmación de pago fue rechazada.",
+        body=body_es,
+        title_en="Your payment confirmation was rejected.",
+        body_en=body_en,
+        ntype="manual_confirmation_rejected",
+        data={"type": "manual_confirmation_rejected", "confirmation_id": cid,
+              "reason": reason})
     return {"success": True}
