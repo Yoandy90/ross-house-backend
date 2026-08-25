@@ -78,6 +78,9 @@ async def auth_admin(request: Request):
     session = await db.user_sessions.find_one({'session_token': token})
     if not session:
         raise HTTPException(status_code=401, detail="Sesión inválida")
+    # C1 observability: fallback legacy efectivamente usado (agregado, sin PII)
+    from rental.auth_metrics import bump as _bump
+    await _bump("legacy_fallback_used")
 
     expires_at = session['expires_at']
     if isinstance(expires_at, datetime) and expires_at.tzinfo is None:
@@ -187,8 +190,11 @@ async def _validate_session_claims(payload: dict) -> None:
         # P1B-5: legacy grace period. Set REQUIRE_SESSION_SID=true in Railway
         # AFTER the cutoff (30 días post-deploy de Phase 1) to reject sid-less
         # tokens. Until then legacy tokens remain valid to their natural exp.
+        from rental.auth_metrics import bump as _bump
         if os.environ.get("REQUIRE_SESSION_SID", "").lower() == "true":
+            await _bump("sidless_token_rejected")
             raise HTTPException(status_code=401, detail="session_invalid")
+        await _bump("sidless_token_accepted")
         return  # legacy token — valid until natural exp
     if not isinstance(sid, str) or len(sid) != 32:
         raise HTTPException(status_code=401, detail="session_invalid")
