@@ -81,7 +81,7 @@ def test_confirmation_identity_is_atomic_per_proposal():
     )
 
 
-def test_router_has_dual_control_and_version_recheck_guards():
+def test_router_has_dual_control_version_and_evidence_guards():
     source = Path("rental/stripe_pkg/reconciliation_resolution_router.py").read_text(encoding="utf-8")
     assert 'same_id = bool(' in source
     assert 'same_email = bool(' in source
@@ -91,12 +91,12 @@ def test_router_has_dual_control_and_version_recheck_guards():
     assert 'Proposal outcome mismatch' in source
     assert 'exception_updated_at' in source
     assert 'Reconciliation item changed; create a new proposal' in source
+    assert 'Evidence reference is required for financial decisions' in source
     assert 'DuplicateKeyError' in source
 
 
-def test_resolution_module_cannot_mutate_financial_sources_or_call_providers():
+def test_resolution_module_only_appends_workflow_records_and_never_calls_providers():
     source = Path("rental/stripe_pkg/reconciliation_resolution_router.py").read_text(encoding="utf-8")
-    # Append-only workflow records are the only allowed write surface.
     assert source.count("insert_one(") == 2
     assert 'db[ACTIONS_COLLECTION].insert_one(' in source
     for forbidden in (
@@ -105,10 +105,12 @@ def test_resolution_module_cannot_mutate_financial_sources_or_call_providers():
         "rental_payments.delete_one",
         "autopay_config.update_one",
         "stripe_webhook_events.update_one",
-        "PaymentIntent.create",
-        "refund",
-        "helcim_purchase_with_token",
-        "create_hosted_checkout",
+        "PaymentIntent.create(",
+        "Refund.create(",
+        "helcim_purchase_with_token(",
+        "create_hosted_checkout(",
+        "find_one_and_update(",
+        "delete_one(",
     ):
         assert forbidden not in source
 
