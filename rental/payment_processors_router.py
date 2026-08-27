@@ -19,6 +19,7 @@ from fastapi import APIRouter, HTTPException, Request
 from pymongo.errors import DuplicateKeyError
 
 from . import payment_processors_core as core
+from .hosted_rent_charge import resolve_hosted_rent_charge
 from .webhook_settlement_policy import (
     bofa_webhook_can_settle,
     clover_webhook_can_settle,
@@ -130,14 +131,22 @@ async def tenant_create_checkout_payment(request: Request):
     if legacy_open and legacy_open.get("_id") != claim_id:
         return _existing_checkout_response(legacy_open)
 
-    contract_rent = float(contract.get("rent_amount") or 0)
-    late_fee = float(data.get("late_fee") or 0)
-    amount = contract_rent if contract_rent > 0 else float(
-        data.get("rent_amount") or data.get("amount") or 0
-    )
-    total = amount + late_fee
-    if total <= 0:
-        raise HTTPException(status_code=400, detail="Monto inválido")
+    # Financial values are resolved from the canonical monthly rent invoice.
+    # The tenant body may choose the payment method, but it cannot choose rent,
+    # late fees or the amount sent to the processor.
+    try:
+        charge = await resolve_hosted_rent_charge(
+            db, contract, now.replace(tzinfo=timezone.utc)
+        )
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(
+            status_code=409,
+            detail="La renta actual no está disponible para cobro",
+        ) from exc
+
+    amount = charge["amount"]
+    late_fee = charge["late_fee"]
+    total = charge["outstanding"]
 
     claim_doc = {
         "_id": claim_id,
@@ -145,6 +154,9 @@ async def tenant_create_checkout_payment(request: Request):
         "property_id": str(contract.get("property_id", "")),
         "tenant_id": str(tenant["_id"]),
         "tenant_name": tenant.get("name", ""),
+        "invoice_id": charge["invoice_id"],
+        "invoice_total_due": charge["total_due"],
+        "invoice_total_paid": charge["total_paid"],
         "amount": amount,
         "late_fee": late_fee,
         "total_paid": total,
