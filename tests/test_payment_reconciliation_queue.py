@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from rental.stripe_pkg.reconciliation_queue_router import (
@@ -7,6 +7,7 @@ from rental.stripe_pkg.reconciliation_queue_router import (
     STRIPE_RECONCILIATION_STATUSES,
     _autopay_item,
     _hosted_item,
+    _priority,
     _stripe_item,
 )
 
@@ -84,6 +85,54 @@ def test_autopay_mapper_never_exposes_saved_payment_credentials():
     assert "helcim_customer_code" not in item
 
 
+def test_priority_keeps_fresh_creating_checkout_low_then_escalates_with_age():
+    now = datetime(2026, 8, 27, 18, 0, tzinfo=timezone.utc)
+    fresh = _priority({
+        "status": "creating_checkout",
+        "updated_at": (now - timedelta(seconds=30)).isoformat(),
+    }, now)
+    medium = _priority({
+        "status": "creating_checkout",
+        "updated_at": (now - timedelta(minutes=10)).isoformat(),
+    }, now)
+    high = _priority({
+        "status": "creating_checkout",
+        "updated_at": (now - timedelta(hours=2)).isoformat(),
+    }, now)
+    assert fresh["severity"] == "low"
+    assert medium["severity"] == "medium"
+    assert high["severity"] == "high"
+    assert fresh["age_seconds"] == 30
+
+
+def test_priority_reconciliation_required_is_critical_and_old_high_escalates():
+    now = datetime(2026, 8, 27, 18, 0, tzinfo=timezone.utc)
+    critical = _priority({
+        "status": "reconciliation_required",
+        "updated_at": now.isoformat(),
+    }, now)
+    aged = _priority({
+        "status": "amount_mismatch",
+        "updated_at": (now - timedelta(days=2)).isoformat(),
+    }, now)
+    assert critical["severity"] == "critical"
+    assert aged["severity"] == "critical"
+    assert aged["age_seconds"] == 172800
+
+
+def test_priority_handles_naive_datetime_and_unknown_timestamp_fail_safely():
+    now = datetime(2026, 8, 27, 18, 0, tzinfo=timezone.utc)
+    naive = _priority({
+        "status": "invalid_metadata",
+        "updated_at": datetime(2026, 8, 27, 17, 0),
+    }, now)
+    unknown = _priority({"status": "invalid_metadata", "updated_at": "not-a-date"}, now)
+    assert naive["age_seconds"] == 3600
+    assert naive["severity"] == "medium"
+    assert unknown["age_seconds"] is None
+    assert unknown["severity"] == "medium"
+
+
 def test_router_is_admin_only_and_read_only_by_contract():
     source = Path("rental/stripe_pkg/reconciliation_queue_router.py").read_text(encoding="utf-8")
     assert '@router.get("/admin/payment-reconciliation")' in source
@@ -93,6 +142,14 @@ def test_router_is_admin_only_and_read_only_by_contract():
     assert ".delete_one(" not in source
     assert ".replace_one(" not in source
     assert '"read_only": True' in source
+
+
+def test_queue_applies_db_limits_and_returns_severity_summary():
+    source = Path("rental/stripe_pkg/reconciliation_queue_router.py").read_text(encoding="utf-8")
+    assert source.count(".limit(safe_limit)") == 3
+    assert '"by_severity": by_severity' in source
+    assert '"age_seconds": age_seconds' in source
+    assert '"severity": _SEVERITY_LABELS[score]' in source
 
 
 def test_stripe_aggregator_includes_queue_without_changing_webhook_override():
