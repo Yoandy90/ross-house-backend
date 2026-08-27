@@ -8,9 +8,9 @@ from fastapi import FastAPI, HTTPException
 from httpx import AsyncClient, ASGITransport
 from mongomock_motor import AsyncMongoMockClient
 
-# Igual que test_phase0_auth: fijar el secret ANTES de importar rental.shared
-# (constante de módulo) para no romper suites que corren juntas.
-os.environ.setdefault("TENANT_JWT_SECRET", "phase0-test-secret-do-not-use-in-prod")
+# tests/conftest.py fija TENANT_JWT_SECRET antes de importar cualquier módulo rental.*.
+# Este setdefault queda como compatibilidad para ejecución directa fuera de pytest.
+os.environ.setdefault("TENANT_JWT_SECRET", "phase1-test-secret-do-not-use-in-prod")
 
 import rental.auth_metrics as am  # noqa: E402
 import rental.shared as shared  # noqa: E402
@@ -43,6 +43,11 @@ def clean():
 
 def client():
     return AsyncClient(transport=ASGITransport(app=app), base_url="http://t")
+
+
+def test_0_suite_secret_matches_shared_import():
+    """Guard contra regresión por orden de import entre suites de auth."""
+    assert os.environ["TENANT_JWT_SECRET"] == shared.TENANT_JWT_SECRET
 
 
 @pytest.mark.asyncio
