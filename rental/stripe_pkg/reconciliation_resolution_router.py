@@ -124,6 +124,8 @@ async def propose_reconciliation_resolution(source: str, item_id: str, request: 
     if len(reason) < 12:
         raise HTTPException(status_code=400, detail="A detailed reason is required")
     evidence_reference = _clean_text(data.get("evidence_reference"), max_len=240)
+    if outcome != "dismiss_non_financial" and len(evidence_reference) < 3:
+        raise HTTPException(status_code=400, detail="Evidence reference is required for financial decisions")
 
     proposer = _admin_identity(admin)
     if not proposer["id"] and not proposer["email"]:
@@ -140,8 +142,6 @@ async def propose_reconciliation_resolution(source: str, item_id: str, request: 
         proposer=proposer,
     )
     digest = _proposal_digest(immutable)
-    # One immutable proposal per exact exception version. If the source row gets
-    # a new updated_at/status, a new version can be proposed safely.
     proposal_id = _deterministic_object_id(
         "recon-proposal",
         source,
@@ -206,7 +206,6 @@ async def confirm_reconciliation_resolution(proposal_id: str, request: Request):
     if str(data.get("expected_outcome") or "") != str(proposal.get("outcome") or ""):
         raise HTTPException(status_code=409, detail="Proposal outcome mismatch")
 
-    # Re-check the same source exception version immediately before confirmation.
     exception = await _active_exception(db, str(proposal.get("source") or ""), str(proposal.get("item_id") or ""))
     if (
         exception is None
