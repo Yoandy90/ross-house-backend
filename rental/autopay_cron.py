@@ -4,16 +4,14 @@ Runs every 6h. On each run:
   1. Fetches all autopay_config docs with enabled=true
   2. For each one, checks if today's day matches day_of_month
   3. Looks for a pending rental_payment for the current period
-  4. Creates a Stripe PaymentIntent with off_session=true + confirm=true
-     using the saved payment_method_id
-  5. On success: marks the rental_payment as completed (via the webhook path
-     in stripe_router that already handles payment_intent.succeeded)
-  6. On failure: increments retry_count, alerts the tenant (optional), and
-     marks the payment as 'late' if past grace period
+  4. Atomically claims the monthly attempt BEFORE any processor charge
+  5. Charges the configured saved method
+  6. Records the provider result; successful Stripe payments are finalized by webhook
 
-Idempotency: the run is safe to invoke multiple times per day. Each charge
-attempt is gated by a daily marker (last_attempt_date) to prevent duplicate
-charges if the cron runs more than once per day.
+Financial-integrity rule: the Mongo claim is the primary concurrency lock. Once
+claimed, an ambiguous processor/network failure is NOT automatically retried in
+the same month because the remote charge may actually have succeeded. Stripe
+also receives a deterministic idempotency key as a second line of defense.
 """
 import asyncio
 import logging
@@ -21,6 +19,49 @@ import os
 from datetime import datetime, timezone
 
 DEFAULT_INTERVAL_SECONDS = 6 * 60 * 60  # 6 hours
+logger = logging.getLogger(__name__)
+
+
+def _month_bounds(now: datetime) -> tuple[datetime, datetime]:
+    """UTC boundaries for the calendar month containing ``now``."""
+    month_start = datetime(now.year, now.month, 1, tzinfo=timezone.utc)
+    if now.month == 12:
+        next_month = datetime(now.year + 1, 1, 1, tzinfo=timezone.utc)
+    else:
+        next_month = datetime(now.year, now.month + 1, 1, tzinfo=timezone.utc)
+    return month_start, next_month
+
+
+def _stripe_autopay_idempotency_key(payment_id, now: datetime) -> str:
+    """Stable Stripe key for one rental payment in one calendar month."""
+    return f"autopay:{payment_id}:{now.year}-{now.month:02d}"
+
+
+async def _claim_monthly_attempt(db, autopay_id, now: datetime) -> bool:
+    """Atomically reserve this config's one charge attempt for the month.
+
+    Only one concurrent worker can match and update the document. The claim is
+    intentionally retained on provider/network errors because their outcome may
+    be ambiguous; automatic retry could otherwise double-charge the tenant.
+    """
+    month_start, next_month = _month_bounds(now)
+    result = await db.autopay_config.update_one(
+        {
+            "_id": autopay_id,
+            "enabled": True,
+            "$or": [
+                {"last_attempt_date": {"$exists": False}},
+                {"last_attempt_date": None},
+                {"last_attempt_date": {"$lt": month_start}},
+                {"last_attempt_date": {"$gte": next_month}},
+            ],
+        },
+        {"$set": {
+            "last_attempt_date": now,
+            "last_attempt_status": "processing",
+        }},
+    )
+    return result.modified_count == 1
 
 
 async def _process_autopay_for_config(db, autopay):
@@ -33,7 +74,8 @@ async def _process_autopay_for_config(db, autopay):
     if today_day < target_day:
         return {"skipped": True, "reason": f"not_yet_day_{target_day}"}
 
-    # Idempotency: don't double-charge in the same calendar month
+    # Fast-path only. The authoritative concurrency check is the atomic claim
+    # immediately before the processor call.
     last_attempt = autopay.get("last_attempt_date")
     if last_attempt and isinstance(last_attempt, datetime):
         if last_attempt.year == now.year and last_attempt.month == now.month:
@@ -50,8 +92,6 @@ async def _process_autopay_for_config(db, autopay):
         "status": {"$in": ["active", "activo"]},
     })
     if not contract:
-        # Try via tenants table linking
-        from bson import ObjectId as _OID
         try:
             tenant_doc = await db.tenants.find_one({"app_user_id": user_id})
             if tenant_doc:
@@ -80,22 +120,34 @@ async def _process_autopay_for_config(db, autopay):
     base_amount = float(pending.get("amount") or 0)
     late_fee = float(pending.get("late_fee") or 0)
     total = base_amount + late_fee
-
     if total <= 0:
         return {"skipped": True, "reason": "zero_amount"}
 
-    # ── Rama HELCIM: cobro con token guardado ──
+    autopay_id = autopay.get("_id")
+    if autopay_id is None:
+        logger.error("Autopay config without _id cannot be safely claimed")
+        return {"skipped": True, "reason": "missing_autopay_id"}
+
+    # ── HELCIM: saved-card token charge ──
     if autopay.get("processor") == "helcim" and autopay.get("helcim_card_token"):
         try:
             from .helcim_vault_router import helcim_purchase_with_token
             from .payment_processors_router import _get_doc, _active_creds
             cfg = _active_creds((await _get_doc())["processors"].get("helcim", {}))
+            api_token = cfg.get("api_token", "")
+            if not api_token:
+                return {"skipped": True, "reason": "helcim_not_configured"}
+
+            # P0: claim before the first provider-side operation.
+            if not await _claim_monthly_attempt(db, autopay_id, now):
+                return {"skipped": True, "reason": "already_attempted_this_month"}
+
             tx = await helcim_purchase_with_token(
-                cfg.get("api_token", ""), int(round(total * 100)),
+                api_token, int(round(total * 100)),
                 autopay["helcim_card_token"], autopay.get("helcim_customer_code", ""))
             status_tx = str(tx.get("status", "")).upper()
-            await db.autopay_config.update_one({"_id": autopay["_id"]}, {"$set": {
-                "last_attempt_date": now,
+            await db.autopay_config.update_one({"_id": autopay_id}, {"$set": {
+                "last_attempt_status": status_tx or "DECLINED",
                 "last_result": status_tx or "DECLINED"}})
             if status_tx in ("APPROVED", "APPROVAL"):
                 receipt = f"HLC-AUTO-{now.strftime('%Y%m%d')}-{user_id[-4:]}"
@@ -105,16 +157,21 @@ async def _process_autopay_for_config(db, autopay):
                     "reference_number": str(tx.get("transactionId", "")),
                     "total_paid": total, "payment_date": now.isoformat(),
                     "updated_at": now}})
-                logger.info("🔁💳 Autopago Helcim OK: user %s $%.2f (%s)", user_id, total, receipt)
-                return {"charged": True, "processor": "helcim", "receipt": receipt}
-            await db.autopay_config.update_one({"_id": autopay["_id"]},
+                logger.info("Autopago Helcim OK: user %s $%.2f (%s)", user_id, total, receipt)
+                return {"charged": True, "success": True,
+                        "processor": "helcim", "receipt": receipt}
+            await db.autopay_config.update_one({"_id": autopay_id},
                                                {"$inc": {"retry_count": 1}})
-            return {"charged": False, "processor": "helcim", "reason": status_tx}
+            return {"charged": False, "success": False,
+                    "processor": "helcim", "reason": status_tx}
         except Exception as e:  # noqa: BLE001
             logger.warning("Autopago Helcim falló user %s: %s", user_id, e)
-            await db.autopay_config.update_one({"_id": autopay["_id"]}, {"$set": {
-                "last_attempt_date": now, "last_result": f"error: {str(e)[:120]}"}})
-            return {"charged": False, "processor": "helcim", "reason": str(e)[:120]}
+            # Keep the prior monthly claim: provider outcome may be ambiguous.
+            await db.autopay_config.update_one({"_id": autopay_id}, {"$set": {
+                "last_attempt_status": "failed_unknown",
+                "last_result": f"error: {str(e)[:120]}"}})
+            return {"charged": False, "success": False,
+                    "processor": "helcim", "reason": str(e)[:120]}
 
     # Load Stripe key from rental_config
     config = await db.rental_config.find_one({"type": "company"}) or {}
@@ -133,12 +190,17 @@ async def _process_autopay_for_config(db, autopay):
     if not customer_id:
         return {"skipped": True, "reason": "no_stripe_customer"}
 
-    # Charge with Stripe (off-session)
+    # P0: atomic DB claim occurs after all local prerequisites but before charge.
+    if not await _claim_monthly_attempt(db, autopay_id, now):
+        return {"skipped": True, "reason": "already_attempted_this_month"}
+
+    # Charge with Stripe (off-session). The deterministic provider idempotency
+    # key protects against ambiguous client/network retries at Stripe as well.
     try:
         import stripe
         stripe.api_key = sk
         intent = stripe.PaymentIntent.create(
-            amount=int(total * 100),
+            amount=int(round(total * 100)),
             currency="usd",
             customer=customer_id,
             payment_method=payment_method_id,
@@ -159,34 +221,37 @@ async def _process_autopay_for_config(db, autopay):
                 "rent_amount": str(base_amount),
                 "late_fee": str(late_fee),
             },
+            idempotency_key=_stripe_autopay_idempotency_key(pending["_id"], now),
         )
 
-        # Mark attempt as successful; the rental_payments doc will be updated
-        # by the existing webhook handler when payment_intent.succeeded arrives.
+        # The rental_payments doc is finalized by the existing succeeded webhook.
         await db.autopay_config.update_one(
-            {"_id": autopay["_id"]},
+            {"_id": autopay_id},
             {"$set": {
-                "last_attempt_date": now,
                 "last_attempt_status": intent.status,
                 "last_attempt_intent_id": intent.id,
                 "last_attempt_amount": total,
             }, "$inc": {"successful_charges": 1}},
         )
-        logging.info(f"✅ Autopay charged ${total} for tenant {autopay.get('user_email')} (PI: {intent.id}, status: {intent.status})")
-        return {"success": True, "amount": total, "intent_id": intent.id, "status": intent.status}
+        logger.info("Autopay charged $%.2f for tenant %s (PI: %s, status: %s)",
+                    total, autopay.get("user_email"), intent.id, intent.status)
+        return {"success": True, "charged": True, "amount": total,
+                "intent_id": intent.id, "status": intent.status}
 
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         err_str = str(e)
+        # Never release the monthly claim here. Stripe may have accepted the
+        # charge even when the local request ended with a transport exception.
         await db.autopay_config.update_one(
-            {"_id": autopay["_id"]},
+            {"_id": autopay_id},
             {"$set": {
-                "last_attempt_date": now,
-                "last_attempt_status": "failed",
+                "last_attempt_status": "failed_unknown",
                 "last_attempt_error": err_str[:500],
             }, "$inc": {"failed_charges": 1}},
         )
-        logging.error(f"❌ Autopay charge failed for {autopay.get('user_email')}: {err_str}")
-        return {"success": False, "error": err_str}
+        logger.error("Autopay charge failed for %s: %s",
+                     autopay.get("user_email"), err_str)
+        return {"success": False, "charged": False, "error": err_str}
 
 
 async def run_once(db):
@@ -207,26 +272,26 @@ async def run_once(db):
                 stats["skipped"] += 1
                 reason = result.get("reason", "unknown")
                 stats["skip_reasons"][reason] = stats["skip_reasons"].get(reason, 0) + 1
-            elif result.get("success"):
+            elif result.get("success") or result.get("charged"):
                 stats["charged"] += 1
             else:
                 stats["failed"] += 1
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             stats["failed"] += 1
-            logging.exception(f"Autopay processing error: {e}")
-    logging.info(f"🔁 Autopay run complete: {stats}")
+            logger.exception("Autopay processing error: %s", e)
+    logger.info("Autopay run complete: %s", stats)
     return stats
 
 
 async def autopay_loop():
     """Background task — runs forever every 6h."""
     from rental.shared import get_db
-    logging.info("🚀 Autopay loop started")
+    logger.info("Autopay loop started")
     while True:
         try:
             db = get_db()
             if db is not None:
                 await run_once(db)
-        except Exception as e:
-            logging.exception(f"Autopay loop iteration failed: {e}")
+        except Exception as e:  # noqa: BLE001
+            logger.exception("Autopay loop iteration failed: %s", e)
         await asyncio.sleep(DEFAULT_INTERVAL_SECONDS)
