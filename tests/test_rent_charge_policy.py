@@ -58,8 +58,8 @@ def test_legacy_invoice_falls_back_to_amount_plus_server_fee():
     assert result["outstanding"] == 860.0
 
 
-@pytest.mark.parametrize("status", ["paid", "completed", "cancelled", "canceled"])
-def test_settled_or_cancelled_invoice_never_has_chargeable_balance(status):
+@pytest.mark.parametrize("status", ["paid", "completed", "cancelled", "canceled", "mystery"])
+def test_non_chargeable_invoice_never_exposes_balance(status):
     result = invoice_balance({
         "status": status,
         "amount": 1000,
@@ -84,9 +84,18 @@ class _Payments:
         self.docs = list(docs)
         self.queries = []
 
+    @staticmethod
+    def _matches_status(doc, query):
+        status_filter = query.get("status", {})
+        allowed = status_filter.get("$in") if isinstance(status_filter, dict) else None
+        return allowed is None or doc.get("status") in allowed
+
     async def find_one(self, query):
         self.queries.append(query)
-        return self.docs.pop(0) if self.docs else None
+        for doc in self.docs:
+            if self._matches_status(doc, query):
+                return doc
+        return None
 
 
 class _DB:
@@ -95,7 +104,7 @@ class _DB:
 
 
 @pytest.mark.asyncio
-async def test_existing_invoice_is_returned_without_generation():
+async def test_existing_partial_invoice_is_returned_without_generation():
     invoice = {
         "_id": "invoice-1",
         "status": "partial",
@@ -112,4 +121,35 @@ async def test_existing_invoice_is_returned_without_generation():
     )
     assert result["invoice_id"] == "invoice-1"
     assert result["outstanding"] == 800.0
+    # Settled lookup first, then chargeable lookup.
+    assert len(db.rental_payments.queries) == 2
+
+
+@pytest.mark.asyncio
+async def test_completed_payment_wins_over_stale_pending_duplicate():
+    stale_pending = {
+        "_id": "pending-1",
+        "status": "pending",
+        "amount": 1000,
+        "late_fee": 50,
+        "total_due": 1050,
+        "total_paid": 0,
+    }
+    completed = {
+        "_id": "paid-1",
+        "status": "completed",
+        "amount": 1000,
+        "late_fee": 50,
+        "total_due": 1050,
+        "total_paid": 1050,
+    }
+    db = _DB([stale_pending, completed])
+    result = await resolve_current_rent_charge(
+        db,
+        {"_id": "contract-1"},
+        datetime(2026, 8, 27, tzinfo=timezone.utc),
+    )
+    assert result["invoice_id"] == "paid-1"
+    assert result["status"] == "completed"
+    assert result["outstanding"] == 0.0
     assert len(db.rental_payments.queries) == 1
