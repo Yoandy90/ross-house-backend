@@ -10,6 +10,22 @@ from rental.stripe_pkg.helpers import _get_or_create_stripe_customer
 router = APIRouter()
 
 
+def _stripe_payment_identity_query(payment_intent_id: str) -> dict:
+    """Match both historical field names used for Stripe PaymentIntent IDs."""
+    return {"$or": [
+        {"stripe_payment_intent_id": payment_intent_id},
+        {"stripe_payment_intent": payment_intent_id},
+        {"reference_number": payment_intent_id},
+    ]}
+
+
+def _intent_belongs_to_tenant(metadata, tenant_id) -> bool:
+    """A tenant may only confirm the PaymentIntent created for that tenant."""
+    if not hasattr(metadata, "get"):
+        return False
+    return bool(metadata.get("tenant_id")) and str(metadata.get("tenant_id")) == str(tenant_id)
+
+
 @router.post('/tenant/create-stripe-payment')
 async def tenant_create_stripe_payment(request: Request):
     """Tenant: Create a Stripe PaymentIntent for rent payment (with optional Connect split)"""
@@ -180,7 +196,13 @@ async def tenant_create_stripe_payment(request: Request):
 
 @router.post('/tenant/confirm-stripe-payment')
 async def tenant_confirm_stripe_payment(request: Request):
-    """Tenant: Confirm a successful Stripe payment and create the payment record"""
+    """Verify tenant-owned Stripe success; signed webhook owns financial writes.
+
+    This endpoint intentionally does NOT create or complete rental_payments.
+    Having both the mobile confirmation and Stripe webhook write financial rows
+    caused duplicate records and a race. Stripe's signed succeeded webhook is the
+    single authoritative writer; the client only needs a success acknowledgement.
+    """
     tenant = await auth_tenant_flex(request)
     data = await request.json()
 
@@ -188,10 +210,8 @@ async def tenant_confirm_stripe_payment(request: Request):
     if not payment_intent_id:
         raise HTTPException(status_code=400, detail="payment_intent_id requerido")
 
-    # Verify with Stripe
     config = await get_db().rental_config.find_one({"type": "company"}) or {}
     stripe_secret = config.get("stripe_secret_key", "")
-
     if not stripe_secret:
         raise HTTPException(status_code=400, detail="Stripe no configurado")
 
@@ -203,51 +223,55 @@ async def tenant_confirm_stripe_payment(request: Request):
         if intent.status != "succeeded":
             raise HTTPException(status_code=400, detail=f"Pago no completado. Estado: {intent.status}")
 
-        meta = intent.metadata
-        now = datetime.utcnow()
+        meta = intent.metadata or {}
+        if not _intent_belongs_to_tenant(meta, tenant["_id"]):
+            logging.warning(
+                "Stripe confirm ownership mismatch: PI %s tenant=%s metadata_tenant=%s",
+                payment_intent_id, tenant.get("_id"), meta.get("tenant_id") if hasattr(meta, "get") else None)
+            raise HTTPException(status_code=403, detail="El pago no pertenece a este inquilino")
 
-        # Check for duplicate
-        existing = await get_db().rental_payments.find_one({"stripe_payment_intent": payment_intent_id})
+        contract_id = str(meta.get("contract_id") or "")
+        if not contract_id:
+            raise HTTPException(status_code=400, detail="PaymentIntent sin contrato asociado")
+
+        # Defense in depth: metadata contract must also belong to this tenant.
+        try:
+            contract_oid = ObjectId(contract_id)
+        except Exception:
+            raise HTTPException(status_code=400, detail="Contrato de PaymentIntent inválido")
+        contract = await get_db().rental_contracts.find_one({
+            "_id": contract_oid,
+            "tenant_id": tenant["_id"],
+        })
+        if not contract:
+            raise HTTPException(status_code=403, detail="El contrato del pago no pertenece a este inquilino")
+
+        # The webhook may already have written the payment. Match both historical
+        # field names plus reference_number so legacy records are recognized.
+        existing = await get_db().rental_payments.find_one(
+            _stripe_payment_identity_query(payment_intent_id))
         if existing:
-            return {"success": True, "message": "Pago ya registrado", "payment_id": str(existing["_id"])}
+            if str(existing.get("tenant_id", "")) != str(tenant["_id"]):
+                raise HTTPException(status_code=403, detail="Registro de pago pertenece a otro inquilino")
+            return {
+                "success": True,
+                "message": "Pago ya registrado",
+                "payment_id": str(existing["_id"]),
+                "receipt_number": existing.get("receipt_number", ""),
+                "amount": float(existing.get("total_paid") or intent.amount / 100),
+                "processing": False,
+            }
 
-        amount = float(meta.get("rent_amount", 0))
-        late_fee = float(meta.get("late_fee", 0))
-        total = intent.amount / 100  # Convert from cents
-
-        receipt_number = f"STR-{now.strftime('%Y%m%d')}-{str(tenant['_id'])[-4:]}"
-
-        payment = {
-            "contract_id": meta.get("contract_id", ""),
-            "property_id": meta.get("property_id", ""),
-            "tenant_id": str(tenant["_id"]),
-            "tenant_name": tenant.get("name", ""),
-            "amount": amount,
-            "late_fee": late_fee,
-            "total_paid": total,
-            "payment_method": "stripe",
-            "reference_number": payment_intent_id,
-            "stripe_payment_intent": payment_intent_id,
-            "receipt_number": receipt_number,
-            "period_month": meta.get("period_month", now.strftime('%B').lower()),
-            "period_year": int(meta.get("period_year", now.year)),
-            "payment_date": now.isoformat(),
-            "status": "completed",
-            "submitted_by": "tenant_stripe",
-            "submitted_at": now,
-            "created_at": now,
-            "updated_at": now,
-        }
-
-        result = await get_db().rental_payments.insert_one(payment)
-        logging.info(f"✅ Stripe payment confirmed: {receipt_number} for {tenant.get('name')} - ${total}")
-
+        # No DB write here. Stripe retries signed webhooks until acknowledged;
+        # this avoids a second financial writer and the webhook/app insert race.
+        logging.info("Stripe PI %s verified for tenant %s; awaiting webhook record",
+                     payment_intent_id, tenant.get("_id"))
         return {
             "success": True,
-            "message": "Pago procesado exitosamente con Stripe",
-            "payment_id": str(result.inserted_id),
-            "receipt_number": receipt_number,
-            "amount": total,
+            "message": "Pago verificado; registrando recibo",
+            "payment_intent_id": payment_intent_id,
+            "amount": intent.amount / 100,
+            "processing": True,
         }
 
     except HTTPException:
