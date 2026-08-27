@@ -19,6 +19,21 @@ def _intent_belongs_to_tenant(metadata, tenant_id) -> bool:
     return bool(metadata.get("tenant_id")) and str(metadata.get("tenant_id")) == str(tenant_id)
 
 
+def _native_rent_pi_idempotency_key(charge: dict) -> str:
+    """Stable Stripe idempotency key for one canonical invoice balance snapshot."""
+    invoice_id = str(charge.get("invoice_id") or "").strip()
+    if not invoice_id:
+        raise ValueError("canonical invoice id required")
+
+    def cents(name: str) -> int:
+        return int(round(float(charge.get(name) or 0) * 100))
+
+    return (
+        f"native-rent:{invoice_id}:"
+        f"{cents('total_due')}:{cents('total_paid')}:{cents('outstanding')}"
+    )
+
+
 @router.post('/tenant/create-stripe-payment')
 async def tenant_create_stripe_payment(request: Request):
     """Tenant: create a native Stripe PaymentIntent for the canonical rent balance."""
@@ -54,6 +69,11 @@ async def tenant_create_stripe_payment(request: Request):
     amount = float(charge.get("amount") or 0)
     late_fee = float(charge.get("late_fee") or 0)
     if total <= 0:
+        raise HTTPException(status_code=409, detail="La renta actual no está disponible para cobro")
+
+    try:
+        idempotency_key = _native_rent_pi_idempotency_key(charge)
+    except ValueError:
         raise HTTPException(status_code=409, detail="La renta actual no está disponible para cobro")
 
     try:
@@ -133,7 +153,10 @@ async def tenant_create_stripe_payment(request: Request):
         if config.get("stripe_3ds_enabled"):
             intent_params["payment_method_options"] = {"card": {"request_three_d_secure": "any"}}
 
-        intent = stripe.PaymentIntent.create(**intent_params)
+        intent = stripe.PaymentIntent.create(
+            **intent_params,
+            idempotency_key=idempotency_key,
+        )
 
         if stripe_customer_id:
             try:
