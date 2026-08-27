@@ -1,9 +1,11 @@
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-import pytest
-
 from rental.stripe_pkg.reconciliation_workflow_router import (
+    EXECUTION_STALE_SECONDS,
+    OUTCOME_CAPABILITIES,
     WORKFLOW_STATES,
+    _execution_capability,
     _workflow_state,
     _workflow_summary,
 )
@@ -31,6 +33,36 @@ def test_workflow_state_progression():
     assert _workflow_state(confirmation, claim, review) == "requires_review"
 
 
+def test_stale_execution_claim_becomes_requires_review_without_mutation():
+    now = datetime(2026, 8, 27, 20, 0, tzinfo=timezone.utc)
+    fresh = {"_id": "x1", "created_at": now - timedelta(seconds=EXECUTION_STALE_SECONDS - 1)}
+    stale = {"_id": "x2", "created_at": now - timedelta(seconds=EXECUTION_STALE_SECONDS)}
+    confirmation = {"_id": "c1"}
+    assert _workflow_state(confirmation, fresh, None, now=now) == "execution_started"
+    assert _workflow_state(confirmation, stale, None, now=now) == "requires_review"
+
+
+def test_outcome_capabilities_never_include_provider_calls():
+    assert set(OUTCOME_CAPABILITIES) == {
+        "provider_confirmed_paid",
+        "provider_confirmed_not_paid",
+        "needs_refund_review",
+        "needs_manual_credit_review",
+        "dismiss_non_financial",
+    }
+    paid = _execution_capability("provider_confirmed_paid")
+    assert paid == {
+        "mode": "local_invoice_completion",
+        "financial_write": True,
+        "requires_exact_invoice": True,
+        "provider_call": False,
+    }
+    for outcome, capability in OUTCOME_CAPABILITIES.items():
+        assert capability["provider_call"] is False
+        if outcome != "provider_confirmed_paid":
+            assert capability["financial_write"] is False
+
+
 def test_summary_marks_second_and_third_admin_requirements():
     proposal = {
         "_id": "p1",
@@ -50,12 +82,27 @@ def test_summary_marks_second_and_third_admin_requirements():
     assert proposed["requires_second_admin"] is True
     assert proposed["requires_third_admin"] is False
     assert proposed["state"] == "proposed"
+    assert proposed["capability"]["requires_exact_invoice"] is True
 
     confirmation = {"_id": "c1", "confirmer": {"id": "b", "email": "b@example.com"}}
     confirmed = _workflow_summary(proposal, confirmation, None, None)
     assert confirmed["requires_second_admin"] is False
     assert confirmed["requires_third_admin"] is True
     assert confirmed["state"] == "confirmed"
+
+
+def test_summary_marks_stale_claim_as_recovery_required():
+    now = datetime(2026, 8, 27, 20, 0, tzinfo=timezone.utc)
+    proposal = {
+        "_id": "p1", "source": "autopay", "item_id": "a1",
+        "outcome": "provider_confirmed_not_paid",
+    }
+    confirmation = {"_id": "c1"}
+    claim = {"_id": "x1", "created_at": now - timedelta(minutes=10), "executor": {"id": "c"}}
+    summary = _workflow_summary(proposal, confirmation, claim, None, now=now)
+    assert summary["state"] == "requires_review"
+    assert summary["recovery_required"] is True
+    assert summary["execution_claim_age_seconds"] == 600
 
 
 def test_summary_does_not_spread_arbitrary_source_fields():
