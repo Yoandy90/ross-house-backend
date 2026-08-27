@@ -290,7 +290,10 @@ async def helcim_webhook(request: Request):
         webhook_signature=wh_sig,
         verifier_token=verifier,
     )
-    if verifier and not verified:
+    # Missing signatures may be stored/deduplicated for diagnostics, but they are
+    # never allowed to trigger provider lookup or settlement. A supplied invalid
+    # signature is rejected explicitly.
+    if verifier and wh_sig and not verified:
         raise HTTPException(status_code=403, detail="Firma de Helcim inválida")
 
     try:
