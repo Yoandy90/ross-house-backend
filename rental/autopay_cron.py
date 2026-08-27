@@ -156,6 +156,14 @@ async def _process_autopay_for_config(db, autopay):
                     }},
                 )
                 if result.modified_count != 1:
+                    await db.autopay_config.update_one(
+                        {"_id": autopay_id},
+                        {"$set": {
+                            "last_attempt_status": "reconciliation_required",
+                            "last_result": "invoice_reconciliation_required",
+                            "last_attempt_amount": total,
+                        }},
+                    )
                     logger.error("Helcim autopay charged but invoice transition was not applied: %s", invoice_id)
                     return {"charged": True, "success": False, "processor": "helcim",
                             "reason": "invoice_reconciliation_required"}
