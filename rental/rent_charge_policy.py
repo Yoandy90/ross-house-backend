@@ -9,7 +9,8 @@ from datetime import datetime, timezone
 from typing import Any
 
 CHARGEABLE_STATUSES = frozenset({"pending", "late", "partial"})
-SETTLED_STATUSES = frozenset({"paid", "completed", "cancelled", "canceled"})
+SETTLED_STATUSES = frozenset({"paid", "completed"})
+NON_CHARGEABLE_STATUSES = frozenset({"cancelled", "canceled"})
 
 
 def current_period_query(contract_id: Any, now: datetime | None = None) -> dict:
@@ -25,6 +26,10 @@ def current_period_query(contract_id: Any, now: datetime | None = None) -> dict:
     }
 
 
+def _status_query(base: dict, statuses) -> dict:
+    return {**base, "status": {"$in": list(statuses)}}
+
+
 def invoice_balance(invoice: dict) -> dict:
     """Return normalized invoice financials without trusting client values.
 
@@ -32,15 +37,16 @@ def invoice_balance(invoice: dict) -> dict:
     ``total_due`` is the authoritative gross due when present, and
     ``total_paid`` represents prior partial payments.
     """
-    status = str(invoice.get("status") or "pending").lower()
+    status = str(invoice.get("status") or "").lower()
     amount = max(float(invoice.get("amount") or 0), 0.0)
     late_fee = max(float(invoice.get("late_fee") or 0), 0.0)
     total_due = max(float(invoice.get("total_due") or (amount + late_fee)), 0.0)
     total_paid = max(float(invoice.get("total_paid") or 0), 0.0)
 
-    outstanding = max(total_due - total_paid, 0.0)
-    if status in SETTLED_STATUSES:
-        outstanding = 0.0
+    # Fail closed: only explicitly chargeable invoice states expose a balance.
+    outstanding = 0.0
+    if status in CHARGEABLE_STATUSES:
+        outstanding = max(total_due - total_paid, 0.0)
 
     return {
         "status": status,
@@ -52,15 +58,27 @@ def invoice_balance(invoice: dict) -> dict:
     }
 
 
+async def _find_current_invoice(db, contract_id: Any, now: datetime) -> dict | None:
+    base = current_period_query(contract_id, now)
+
+    # A successful payment for the period wins over any stale pending duplicate.
+    settled = await db.rental_payments.find_one(_status_query(base, SETTLED_STATUSES))
+    if settled is not None:
+        return settled
+
+    return await db.rental_payments.find_one(_status_query(base, CHARGEABLE_STATUSES))
+
+
 async def resolve_current_rent_charge(db, contract: dict, now: datetime | None = None) -> dict:
     """Ensure/read the current invoice and return its server-side charge snapshot.
 
     If the cron has not created the invoice yet, reuse its existing idempotent
     generator instead of inventing a second late-fee or due-date calculation.
+    Paid/completed records are checked first so stale pending duplicates cannot
+    cause a second charge for the same period.
     """
     now = now or datetime.now(timezone.utc)
-    query = current_period_query(contract.get("_id"), now)
-    invoice = await db.rental_payments.find_one(query)
+    invoice = await _find_current_invoice(db, contract.get("_id"), now)
 
     if invoice is None:
         from .rent_payment_cron import ensure_current_period_payment
@@ -68,10 +86,12 @@ async def resolve_current_rent_charge(db, contract: dict, now: datetime | None =
         result = await ensure_current_period_payment(db, contract)
         if result.startswith("skip_"):
             raise ValueError(f"current rent invoice unavailable: {result}")
-        invoice = await db.rental_payments.find_one(query)
+        invoice = await _find_current_invoice(db, contract.get("_id"), now)
 
     if invoice is None:
-        raise RuntimeError("current rent invoice was not created")
+        # Existing cancelled/unknown-state documents are intentionally not
+        # converted into a charge. Manual reconciliation is safer than billing.
+        raise RuntimeError("current rent invoice is not in a chargeable state")
 
     balance = invoice_balance(invoice)
     return {
