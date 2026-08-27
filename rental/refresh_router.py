@@ -45,7 +45,7 @@ class RefreshRequest(BaseModel):
 _indexes_ready = False
 
 
-def _next_refresh_or_503(presented_raw: str) -> str:
+async def _next_refresh_or_503(presented_raw: str) -> str:
     """Deriva R_(n+1) o falla de forma segura ante configuración incompleta.
 
     Solo captura RefreshConfigurationError. Errores inesperados siguen propagándose
@@ -54,6 +54,7 @@ def _next_refresh_or_503(presented_raw: str) -> str:
     try:
         return next_refresh_token(presented_raw)
     except RefreshConfigurationError:
+        await bump("refresh_config_error")
         logger.error("refresh token derivation unavailable due to server configuration")
         raise GENERIC_503
 
@@ -143,7 +144,6 @@ async def refresh(request: Request, body: RefreshRequest):
     await _ensure_indexes()
     presented_hash = hash_refresh_token(body.refresh_token) if body.refresh_token else None
 
-    # Localizar sesión: por hash del refresh, o por bearer sid (bootstrap)
     session = None
     if presented_hash:
         session = await db.auth_sessions.find_one({"$or": [
@@ -152,7 +152,6 @@ async def refresh(request: Request, body: RefreshRequest):
             {"rotated_hashes": presented_hash},
         ]})
         if session is None:
-            # D2: reuse ANTIGUO (>cap de rotated_hashes) — buscar en consumidos
             consumed = await db[CONSUMED_COLLECTION].find_one({"hash": presented_hash})
             if consumed:
                 await bump("refresh_reuse_detected")
@@ -184,17 +183,9 @@ async def refresh(request: Request, body: RefreshRequest):
     if not email:
         raise GENERIC_401
 
-    # ── D1: semántica exacta de grace — RESPUESTA IDEMPOTENTE ──
-    # Request B (replay de R_n dentro de 60s): re-derivamos R_{n+1} con la cadena
-    # HMAC determinista y devolvemos EL MISMO refresh que recibió Request A.
-    # NO se rota de nuevo, NO se genera R3, R2 sigue siendo el token vigente,
-    # NO hace falta almacenar R2 raw (se re-deriva de R_n + clave del servidor).
-    # Replay repetido de R_n durante la grace siempre produce la MISMA respuesta
-    # (cero acuñación de tokens nuevos). Pasada la grace, R_n ⇒ REUSE ⇒ revocación.
     if action == GRACE_ROTATE:
-        rederived = _next_refresh_or_503(body.refresh_token)
+        rederived = await _next_refresh_or_503(body.refresh_token)
         if hash_refresh_token(rederived) != session.get("refresh_token_hash"):
-            # La cadena avanzó más allá (R_{n+1} ya fue consumido): generación vieja
             await bump("refresh_reuse_detected")
             await _revoke_family_for_reuse(session["sid"], session.get("user_id", ""), request)
             raise GENERIC_401
@@ -203,12 +194,11 @@ async def refresh(request: Request, body: RefreshRequest):
                 "refresh_token": rederived, "token_type": "bearer"}
 
     if action == BOOTSTRAP:
-        new_raw = generate_refresh_token()          # generación 1: CSPRNG puro
+        new_raw = generate_refresh_token()
         update = bootstrap_update(session, hash_refresh_token(new_raw))
-        # Guard atómico del bootstrap: solo UNA de dos carreras simultáneas gana
         guard = {"sid": session["sid"], "revoked_at": None, "refresh_token_hash": None}
-    else:  # ROTATE
-        new_raw = _next_refresh_or_503(body.refresh_token)  # cadena determinista D1
+    else:
+        new_raw = await _next_refresh_or_503(body.refresh_token)
         update = rotation_update(session, hash_refresh_token(new_raw))
         guard = {"sid": session["sid"], "revoked_at": None,
                  "refresh_token_hash": session.get("refresh_token_hash")}
@@ -216,10 +206,10 @@ async def refresh(request: Request, body: RefreshRequest):
     res = await db.auth_sessions.update_one(guard, {"$set": update})
     if res.modified_count != 1:
         await bump("refresh_denied")
-        raise GENERIC_401  # carrera perdida / revocada en el interín
+        raise GENERIC_401
 
     if action == ROTATE:
-        await _mark_consumed(presented_hash, session)  # D2: registro permanente hasta expiry
+        await _mark_consumed(presented_hash, session)
         await bump("refresh_rotate_ok")
     else:
         await bump("refresh_bootstrap_ok")
