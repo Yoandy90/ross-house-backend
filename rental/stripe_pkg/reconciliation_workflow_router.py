@@ -59,7 +59,7 @@ def _claim_age_seconds(claim: dict | None, now: datetime | None = None) -> int |
 
 def _workflow_state(confirmation: dict | None, claim: dict | None, result: dict | None, *, now: datetime | None = None) -> str:
     if result:
-        return "requires_review" if str(result.get("execution_status") or "") == "requires_review" else "executed"
+        return "executed" if str(result.get("execution_status") or "") == "completed" else "requires_review"
     if claim:
         age = _claim_age_seconds(claim, now)
         return "requires_review" if age is not None and age >= EXECUTION_STALE_SECONDS else "execution_started"
@@ -137,9 +137,6 @@ async def admin_reconciliation_workflows(request: Request, limit: int = 100, sta
     if requested_state and requested_state not in WORKFLOW_STATES:
         raise HTTPException(status_code=400, detail="Invalid workflow state")
 
-    # State is derived from multiple append-only records, so it cannot be pushed
-    # into the proposal query. For filtered views scan a larger but hard-bounded
-    # window and disclose the bound; never run an unbounded DB scan.
     scan_limit = min(MAX_WORKFLOW_SCAN, max(safe_limit, safe_limit * 5)) if requested_state else safe_limit
     cursor = db[ACTIONS_COLLECTION].find({"action": "proposal"}).sort("created_at", -1).limit(scan_limit)
     proposals = await _collect(cursor, scan_limit)
