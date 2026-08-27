@@ -753,6 +753,21 @@ def _receipt_prefix(processor: str) -> str:
             "helcim": "HLC"}.get(processor, "PAY")
 
 
+def _square_order_is_paid(order: dict) -> bool:
+    """Return True only when Square reports an actually completed/captured payment."""
+    if (order.get("state") or "").upper() == "COMPLETED":
+        return True
+    return any(
+        ((tender.get("card_details") or {}).get("status") or "").upper() == "CAPTURED"
+        for tender in (order.get("tenders") or [])
+    )
+
+
+def _square_webhook_can_complete(payment: dict, verified: bool) -> bool:
+    """Only a verified Square COMPLETED payment webhook may complete rent."""
+    return verified and (payment.get("status") or "").upper() == "COMPLETED"
+
+
 async def _mark_checkout_completed(payment: dict) -> dict:
     """Marca un rental_payment de checkout como completado y genera recibo."""
     now = datetime.now(timezone.utc)
@@ -908,10 +923,7 @@ async def tenant_checkout_payment_status(payment_id: str, request: Request):
                                               "Square-Version": SQUARE_VERSION})
             if r.status_code < 400:
                 order = r.json().get("order", {})
-                tenders = order.get("tenders", [])
-                paid = order.get("state") == "COMPLETED" or any(
-                    t.get("card_details", {}).get("status") == "CAPTURED" or t.get("type")
-                    for t in tenders)
+                paid = _square_order_is_paid(order)
         elif processor == "clover" and payment.get("checkout_external_id"):
             base = CLOVER_BASE.get(env, CLOVER_BASE["sandbox"])
             async with httpx.AsyncClient(timeout=15.0) as client:
@@ -944,16 +956,16 @@ async def tenant_checkout_payment_status(payment_id: str, request: Request):
     except Exception as e:
         logger.warning("Checkout status check failed (%s): %s", processor, e)
 
-    # Respaldo: webhook ya registró el evento de pago
+    # A webhook is only authoritative after its success handler matched this exact
+    # rental payment. Payload-ID coincidence alone is insufficient: pending/failed
+    # events can carry the same order/payment IDs.
     if not paid:
-        ext_ids = [v for v in (payment.get("checkout_order_id"), payment.get("checkout_external_id")) if v]
-        if ext_ids:
-            evt = await get_db().processor_webhook_events.find_one({
-                "processor": processor,
-                "$or": [{"matched_payment_id": str(payment["_id"])},
-                        {"payload_ids": {"$in": ext_ids}}]})
-            if evt:
-                paid = True
+        evt = await get_db().processor_webhook_events.find_one({
+            "processor": processor,
+            "matched_payment_id": str(payment["_id"]),
+        })
+        if evt:
+            paid = True
 
     if paid:
         info = await _mark_checkout_completed(payment)
@@ -996,6 +1008,7 @@ async def square_webhook(request: Request):
             sig_key.encode(), notif_url.encode() + raw, hashlib.sha256).digest()).decode()
         if not signature or not hmac.compare_digest(expected, signature):
             raise HTTPException(status_code=403, detail="Firma de Square inválida")
+    verified = bool(sig_key)
 
     try:
         event = json.loads(raw)
@@ -1017,13 +1030,13 @@ async def square_webhook(request: Request):
             (event.get("data", {}).get("object", {}).get("payment", {}) or {}).get("id"),
             event.get("data", {}).get("id"),
         ] if v],
-        "verified": bool(sig_key),
+        "verified": verified,
         "received_at": datetime.now(timezone.utc),
     })
     logger.info("Square webhook: %s", event.get("type", "?"))
-    # Completar pago de renta si el evento es de un pago exitoso
+    # Only a signed, completed Square payment may settle rent.
     pay_obj = (event.get("data", {}).get("object", {}) or {}).get("payment", {}) or {}
-    if pay_obj.get("status") in ("COMPLETED", "APPROVED"):
+    if _square_webhook_can_complete(pay_obj, verified):
         inserted = await db.processor_webhook_events.find_one({"event_id": event_id})
         await _try_complete_from_webhook("square", [pay_obj.get("order_id"), pay_obj.get("id")],
                                          inserted["_id"] if inserted else None)
