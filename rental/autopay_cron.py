@@ -33,9 +33,31 @@ def _stripe_autopay_idempotency_key(invoice_id, now: datetime) -> str:
     return f"autopay:{invoice_id}:{now.year}-{now.month:02d}"
 
 
-async def _claim_monthly_attempt(db, autopay_id, now: datetime) -> bool:
-    """Atomically reserve this config's one automatic charge attempt this month."""
+async def _claim_monthly_attempt(
+    db,
+    autopay_id,
+    now: datetime,
+    *,
+    invoice_id: str = "",
+    amount: float = 0,
+) -> bool:
+    """Atomically reserve this config's one automatic charge attempt this month.
+
+    Persist the canonical invoice id and exact server-side amount in the same
+    claim write. That gives later reconciliation a trusted local linkage even
+    when the process crashes immediately after claiming and before the provider
+    response is available.
+    """
     month_start, _next_month = _month_bounds(now)
+    claim_set = {
+        "last_attempt_date": now,
+        "last_attempt_status": "processing",
+    }
+    if invoice_id:
+        claim_set["last_attempt_invoice_id"] = str(invoice_id)
+    if float(amount or 0) > 0:
+        claim_set["last_attempt_amount"] = round(float(amount), 2)
+
     result = await db.autopay_config.update_one(
         {
             "_id": autopay_id,
@@ -46,10 +68,7 @@ async def _claim_monthly_attempt(db, autopay_id, now: datetime) -> bool:
                 {"last_attempt_date": {"$lt": month_start}},
             ],
         },
-        {"$set": {
-            "last_attempt_date": now,
-            "last_attempt_status": "processing",
-        }},
+        {"$set": claim_set},
     )
     return result.modified_count == 1
 
@@ -122,7 +141,9 @@ async def _process_autopay_for_config(db, autopay):
             if not api_token:
                 return {"skipped": True, "reason": "helcim_not_configured"}
 
-            if not await _claim_monthly_attempt(db, autopay_id, now):
+            if not await _claim_monthly_attempt(
+                db, autopay_id, now, invoice_id=invoice_id, amount=total
+            ):
                 return {"skipped": True, "reason": "already_attempted_this_month"}
 
             tx = await helcim_purchase_with_token(
@@ -138,6 +159,7 @@ async def _process_autopay_for_config(db, autopay):
                     "last_attempt_status": status_tx or "DECLINED",
                     "last_result": status_tx or "DECLINED",
                     "last_attempt_amount": total,
+                    "last_attempt_invoice_id": str(invoice_id),
                 }},
             )
             if status_tx in ("APPROVED", "APPROVAL"):
@@ -162,6 +184,7 @@ async def _process_autopay_for_config(db, autopay):
                             "last_attempt_status": "reconciliation_required",
                             "last_result": "invoice_reconciliation_required",
                             "last_attempt_amount": total,
+                            "last_attempt_invoice_id": str(invoice_id),
                         }},
                     )
                     logger.error("Helcim autopay charged but invoice transition was not applied: %s", invoice_id)
@@ -181,6 +204,8 @@ async def _process_autopay_for_config(db, autopay):
                 {"$set": {
                     "last_attempt_status": "failed_unknown",
                     "last_result": f"error: {str(e)[:120]}",
+                    "last_attempt_invoice_id": str(invoice_id),
+                    "last_attempt_amount": total,
                 }},
             )
             return {"charged": False, "success": False,
@@ -201,7 +226,9 @@ async def _process_autopay_for_config(db, autopay):
     if not customer_id:
         return {"skipped": True, "reason": "no_stripe_customer"}
 
-    if not await _claim_monthly_attempt(db, autopay_id, now):
+    if not await _claim_monthly_attempt(
+        db, autopay_id, now, invoice_id=invoice_id, amount=total
+    ):
         return {"skipped": True, "reason": "already_attempted_this_month"}
 
     try:
@@ -242,6 +269,7 @@ async def _process_autopay_for_config(db, autopay):
                 "last_attempt_status": intent.status,
                 "last_attempt_intent_id": intent.id,
                 "last_attempt_amount": total,
+                "last_attempt_invoice_id": str(invoice_id),
             }, "$inc": {"successful_charges": 1}},
         )
         logger.info("Autopay Stripe charged invoice %s $%.2f (PI=%s, status=%s)",
@@ -257,6 +285,8 @@ async def _process_autopay_for_config(db, autopay):
             {"$set": {
                 "last_attempt_status": "failed_unknown",
                 "last_attempt_error": err_str[:500],
+                "last_attempt_invoice_id": str(invoice_id),
+                "last_attempt_amount": total,
             }, "$inc": {"failed_charges": 1}},
         )
         logger.error("Autopay Stripe failed for %s: %s", autopay.get("user_email"), err_str)
