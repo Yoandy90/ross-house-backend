@@ -6,7 +6,7 @@ closed and a human should investigate before changing any balance.
 """
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import APIRouter, Request
@@ -30,6 +30,18 @@ HOSTED_RECONCILIATION_STATUSES = (
     "checkout_creation_unknown",
 )
 
+_BASE_SEVERITY = {
+    "reconciliation_required": 4,
+    "amount_mismatch": 3,
+    "invoice_not_found": 3,
+    "tenant_mismatch": 3,
+    "failed_unknown": 3,
+    "checkout_creation_unknown": 3,
+    "invalid_metadata": 2,
+    "creating_checkout": 1,
+}
+_SEVERITY_LABELS = {1: "low", 2: "medium", 3: "high", 4: "critical"}
+
 
 def _iso(value: Any) -> str | None:
     if isinstance(value, datetime):
@@ -37,6 +49,44 @@ def _iso(value: Any) -> str | None:
     if value is None:
         return None
     return str(value)
+
+
+def _as_utc_datetime(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+    if isinstance(value, str) and value:
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(timezone.utc)
+        except ValueError:
+            return None
+    return None
+
+
+def _priority(item: dict, now: datetime) -> dict:
+    """Attach triage-only age/severity without changing financial state."""
+    stamp = _as_utc_datetime(item.get("updated_at"))
+    age_seconds = max(0, int((now - stamp).total_seconds())) if stamp else None
+    score = _BASE_SEVERITY.get(str(item.get("status") or ""), 2)
+
+    if item.get("status") == "creating_checkout":
+        if age_seconds is not None and age_seconds >= 3600:
+            score = max(score, 3)
+        elif age_seconds is not None and age_seconds >= 300:
+            score = max(score, 2)
+    elif age_seconds is not None and age_seconds >= 86400:
+        score = min(4, score + 1)
+
+    return {
+        **item,
+        "age_seconds": age_seconds,
+        "severity": _SEVERITY_LABELS[score],
+        "severity_score": score,
+    }
 
 
 def _hosted_item(doc: dict) -> dict:
@@ -98,40 +148,53 @@ async def admin_payment_reconciliation(request: Request, limit: int = 100):
     await auth_admin(request)
     db = get_db()
     safe_limit = max(1, min(int(limit or 100), 200))
+    now = datetime.now(timezone.utc)
 
     hosted = await _collect(
         db.rental_payments.find({
             "status": {"$in": list(HOSTED_RECONCILIATION_STATUSES)},
-        }).sort("updated_at", -1),
+        }).sort("updated_at", -1).limit(safe_limit),
         _hosted_item,
         safe_limit,
     )
     stripe = await _collect(
         db.stripe_webhook_events.find({
             "reconciliation_status": {"$in": list(STRIPE_RECONCILIATION_STATUSES)},
-        }).sort("processed_at", -1),
+        }).sort("processed_at", -1).limit(safe_limit),
         _stripe_item,
         safe_limit,
     )
     autopay = await _collect(
         db.autopay_config.find({
             "last_attempt_status": {"$in": list(AUTOPAY_RECONCILIATION_STATUSES)},
-        }).sort("last_attempt_date", -1),
+        }).sort("last_attempt_date", -1).limit(safe_limit),
         _autopay_item,
         safe_limit,
     )
 
-    items = hosted + stripe + autopay
-    items.sort(key=lambda item: item.get("updated_at") or "", reverse=True)
+    items = [_priority(item, now) for item in hosted + stripe + autopay]
+    items.sort(
+        key=lambda item: (
+            item.get("severity_score") or 0,
+            item.get("age_seconds") or 0,
+            item.get("updated_at") or "",
+        ),
+        reverse=True,
+    )
     items = items[:safe_limit]
+
     counts: dict[str, int] = {}
+    by_severity: dict[str, int] = {}
     for item in items:
         source = item["source"]
+        severity = item["severity"]
         counts[source] = counts.get(source, 0) + 1
+        by_severity[severity] = by_severity.get(severity, 0) + 1
 
     return {
         "items": items,
         "count": len(items),
         "by_source": counts,
+        "by_severity": by_severity,
         "read_only": True,
     }
