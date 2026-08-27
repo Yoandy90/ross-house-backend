@@ -2,8 +2,14 @@
 
 No provider calls, refunds, new charges, retries, or claim releases live here.
 Only ``provider_confirmed_paid`` may change a canonical local rent invoice, and
-only when an exact system-proven invoice link exists and the third admin echoes
-the exact invoice id + current outstanding cents.
+only when BOTH conditions are proven from trusted local state:
+- an exact invoice linkage already exists; and
+- the original server-recorded charge amount equals the invoice's current
+  outstanding balance.
+
+The third admin must echo the exact invoice id and amount, but cannot choose
+those values: they are resolved from the canonical invoice and original source
+record first.
 
 Execution is deliberately fail-closed:
 - proposal + confirmation are revalidated;
@@ -87,7 +93,7 @@ def _invoice_financial_snapshot(invoice: dict | None) -> dict | None:
 
 
 def _invoice_update_guard(invoice: dict) -> dict:
-    """Guard every financial field used to approve the manual settlement."""
+    """Guard every financial/version field used to approve settlement."""
     guard = {
         "_id": invoice["_id"],
         "status": {"$in": list(CHARGEABLE_STATUSES)},
@@ -173,7 +179,12 @@ async def _proven_invoice_for_execution(db, proposal: dict) -> dict | None:
         if not source_doc or str(source_doc.get("last_attempt_status") or "") not in AUTOPAY_RECONCILIATION_STATUSES:
             return None
         invoice_id = str(source_doc.get("last_attempt_invoice_id") or "")
-        return await _find_by_id(db.rental_payments, invoice_id) if invoice_id else None
+        if invoice_id:
+            return await _find_by_id(db.rental_payments, invoice_id)
+        # Safe compatibility for Stripe autopay attempts that already persisted a
+        # PI identity; never infer by tenant/month/amount.
+        pi_id = str(source_doc.get("last_attempt_intent_id") or "")
+        return await db.rental_payments.find_one(stripe_payment_identity_query(pi_id)) if pi_id else None
 
     if source == "stripe_webhook":
         source_doc = await _find_by_id(db.stripe_webhook_events, item_id)
@@ -182,6 +193,31 @@ async def _proven_invoice_for_execution(db, proposal: dict) -> dict | None:
         pi_id = str(source_doc.get("account_id") or "")
         return await db.rental_payments.find_one(stripe_payment_identity_query(pi_id)) if pi_id else None
 
+    return None
+
+
+async def _trusted_source_amount_cents(db, proposal: dict) -> int | None:
+    """Return the original amount recorded by trusted server-side source state."""
+    source = str(proposal.get("source") or "")
+    item_id = str(proposal.get("item_id") or "")
+
+    if source == "hosted_checkout":
+        source_doc = await _find_by_id(db.rental_payments, item_id)
+        if not source_doc or str(source_doc.get("status") or "") not in HOSTED_RECONCILIATION_STATUSES:
+            return None
+        amount = float(source_doc.get("total_paid") or 0)
+        return _money_cents(amount) if amount > 0 else None
+
+    if source == "autopay":
+        source_doc = await _find_by_id(db.autopay_config, item_id)
+        if not source_doc or str(source_doc.get("last_attempt_status") or "") not in AUTOPAY_RECONCILIATION_STATUSES:
+            return None
+        amount = float(source_doc.get("last_attempt_amount") or 0)
+        return _money_cents(amount) if amount > 0 else None
+
+    # Hardened Stripe reconciliation logs intentionally do not persist raw event
+    # amounts/metadata. Without a trusted amount source, manual paid execution is
+    # not allowed; investigation remains available read-only.
     return None
 
 
@@ -216,14 +252,11 @@ def _workflow_record_snapshot(doc: dict | None) -> dict | None:
         item.update({
             "executor": doc.get("executor") or {},
             "invoice_id": str(doc.get("invoice_id") or ""),
+            "trusted_source_amount_cents": int(doc.get("trusted_source_amount_cents") or 0),
             "confirmed_amount_cents": int(doc.get("confirmed_amount_cents") or 0),
         })
         if action == "execution_result":
-            item.update({
-                "result": str(doc.get("result") or ""),
-                "before": doc.get("before"),
-                "after": doc.get("after"),
-            })
+            item.update({"result": str(doc.get("result") or ""), "before": doc.get("before"), "after": doc.get("after")})
     return item
 
 
@@ -237,6 +270,7 @@ async def _readiness(db, proposal: dict, confirmation: dict, confirmation_oid: O
         "financial_write": outcome == "provider_confirmed_paid",
         "invoice": None,
         "outstanding_cents": 0,
+        "trusted_source_amount_cents": 0,
         "reason": "ready",
     }
     if outcome not in EXECUTABLE_OUTCOMES:
@@ -261,7 +295,31 @@ async def _readiness(db, proposal: dict, confirmation: dict, confirmation_oid: O
     if snapshot["outstanding_cents"] <= 0:
         result.update({"can_execute": False, "reason": "invoice_has_no_outstanding", "invoice": snapshot["invoice"]})
         return result
-    result.update({"invoice": snapshot["invoice"], "outstanding_cents": snapshot["outstanding_cents"]})
+
+    trusted_amount = await _trusted_source_amount_cents(db, proposal)
+    if trusted_amount is None:
+        result.update({
+            "can_execute": False,
+            "reason": "trusted_source_amount_unavailable",
+            "invoice": snapshot["invoice"],
+            "outstanding_cents": snapshot["outstanding_cents"],
+        })
+        return result
+    if trusted_amount != snapshot["outstanding_cents"]:
+        result.update({
+            "can_execute": False,
+            "reason": "trusted_source_amount_mismatch",
+            "invoice": snapshot["invoice"],
+            "outstanding_cents": snapshot["outstanding_cents"],
+            "trusted_source_amount_cents": trusted_amount,
+        })
+        return result
+
+    result.update({
+        "invoice": snapshot["invoice"],
+        "outstanding_cents": snapshot["outstanding_cents"],
+        "trusted_source_amount_cents": trusted_amount,
+    })
     return result
 
 
@@ -336,19 +394,26 @@ async def execute_confirmed_reconciliation(confirmation_id: str, request: Reques
     invoice = None
     snapshot = None
     invoice_id = ""
+    trusted_source_amount_cents = 0
     confirmed_amount_cents = 0
     before = None
     if outcome == "provider_confirmed_paid":
         invoice = await _proven_invoice_for_execution(db, proposal)
         snapshot = _invoice_financial_snapshot(invoice)
-        if not invoice or not snapshot:
-            raise HTTPException(status_code=409, detail="Exact invoice linkage unavailable")
+        trusted_source_amount = await _trusted_source_amount_cents(db, proposal)
+        if not invoice or not snapshot or trusted_source_amount is None:
+            raise HTTPException(status_code=409, detail="Exact invoice or trusted source amount unavailable")
         invoice_id = str(invoice.get("_id") or "")
         if str(data.get("expected_invoice_id") or "").strip() != invoice_id:
             raise HTTPException(status_code=409, detail="Invoice confirmation mismatch")
+        trusted_source_amount_cents = int(trusted_source_amount)
         confirmed_amount_cents = int(data.get("confirmed_amount_cents") or 0)
-        if confirmed_amount_cents <= 0 or confirmed_amount_cents != snapshot["outstanding_cents"]:
-            raise HTTPException(status_code=409, detail="Confirmed amount does not match current outstanding balance")
+        if (
+            confirmed_amount_cents <= 0
+            or confirmed_amount_cents != snapshot["outstanding_cents"]
+            or confirmed_amount_cents != trusted_source_amount_cents
+        ):
+            raise HTTPException(status_code=409, detail="Confirmed amount does not match trusted source and current balance")
         before = snapshot["invoice"]
 
     now = datetime.now(timezone.utc)
@@ -365,6 +430,7 @@ async def execute_confirmed_reconciliation(confirmation_id: str, request: Reques
             "outcome": outcome,
             "executor": executor,
             "invoice_id": invoice_id,
+            "trusted_source_amount_cents": trusted_source_amount_cents,
             "confirmed_amount_cents": confirmed_amount_cents,
             "before": before,
             "financial_effect": "local_accounting_pending" if outcome == "provider_confirmed_paid" else "none",
@@ -429,6 +495,7 @@ async def execute_confirmed_reconciliation(confirmation_id: str, request: Reques
             "outcome": outcome,
             "executor": executor,
             "invoice_id": invoice_id,
+            "trusted_source_amount_cents": trusted_source_amount_cents,
             "confirmed_amount_cents": confirmed_amount_cents,
             "financial_effect": financial_effect,
             "execution_status": execution_status,
