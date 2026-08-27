@@ -32,11 +32,20 @@ def test_helcim_webhook_only_authorizes_provider_lookup():
         verified=True, event_type="cardTransaction", transaction_id="tx_1") is True
 
 
-def test_helcim_authoritative_transaction_requires_approved_exact_usd_amount():
-    good = dict(status="APPROVED", amount_cents=125000,
-                expected_amount_cents=125000, currency="USD")
+def test_helcim_authoritative_transaction_requires_approved_exact_usd_amount_and_id():
+    good = dict(
+        status="APPROVED",
+        amount_cents=125000,
+        expected_amount_cents=125000,
+        currency="USD",
+        transaction_id="25764674",
+        expected_transaction_id="25764674",
+    )
     assert helcim_transaction_can_settle(**good) is True
     assert helcim_transaction_can_settle(**{**good, "status": "DECLINED"}) is False
     assert helcim_transaction_can_settle(**{**good, "amount_cents": 124999}) is False
     assert helcim_transaction_can_settle(**{**good, "currency": "CAD"}) is False
     assert helcim_transaction_can_settle(**{**good, "amount_cents": None}) is False
+    assert helcim_transaction_can_settle(
+        **{**good, "transaction_id": "different"}
+    ) is False
