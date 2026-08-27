@@ -129,3 +129,7 @@ Identity comparison uses both admin id and normalized email. Session/auth tokens
 ## Operational rule
 
 When any evidence, amount, source version, invoice linkage, or concurrency state is ambiguous: **do not retry automatically and do not alter balances. Investigate first.**
+
+## Audit target
+
+Independent review must use the exact PR HEAD SHA recorded in the pull request at audit time. Do not approve against an older commit after any code or documentation change.
