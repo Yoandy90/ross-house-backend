@@ -1,4 +1,3 @@
-import asyncio
 from types import SimpleNamespace
 
 import pytest
@@ -28,12 +27,7 @@ class FakeActions:
                 return dict(doc)
             return None
         for doc in self.docs.values():
-            ok = True
-            for key, value in query.items():
-                if doc.get(key) != value:
-                    ok = False
-                    break
-            if ok:
+            if all(doc.get(k) == v for k, v in query.items()):
                 return dict(doc)
         return None
 
@@ -86,9 +80,8 @@ class FakeDB:
 
 
 def _proposal(outcome="dismiss_non_financial"):
-    oid = ObjectId()
     return {
-        "_id": oid,
+        "_id": ObjectId(),
         "action": "proposal",
         "proposal_digest": "a" * 64,
         "source": "hosted_checkout",
@@ -118,6 +111,20 @@ def _confirmation(proposal):
     }
 
 
+def _partial_invoice():
+    return {
+        "_id": ObjectId(),
+        "status": "partial",
+        "amount": 1000.0,
+        "late_fee": 50.0,
+        "total_due": 1050.0,
+        "total_paid": 400.0,
+        "updated_at": "v1",
+        "contract_id": "c1",
+        "tenant_id": "t1",
+    }
+
+
 def test_same_admin_matches_id_or_normalized_email():
     assert rer._same_admin({"id": "1", "email": "x@a.com"}, {"id": "1", "email": "z@a.com"})
     assert rer._same_admin({"id": "1", "email": "X@A.COM"}, {"id": "2", "email": "x@a.com"})
@@ -125,16 +132,7 @@ def test_same_admin_matches_id_or_normalized_email():
 
 
 def test_partial_invoice_snapshot_and_guard_bind_every_financial_field():
-    stamp = object()
-    invoice = {
-        "_id": ObjectId(),
-        "status": "partial",
-        "amount": 1000.0,
-        "late_fee": 50.0,
-        "total_due": 1050.0,
-        "total_paid": 400.0,
-        "updated_at": stamp,
-    }
+    invoice = _partial_invoice()
     snap = rer._invoice_financial_snapshot(invoice)
     assert snap["outstanding_cents"] == 65000
     guard = rer._invoice_update_guard(invoice)
@@ -142,7 +140,7 @@ def test_partial_invoice_snapshot_and_guard_bind_every_financial_field():
     assert guard["late_fee"] == 50.0
     assert guard["total_due"] == 1050.0
     assert guard["total_paid"] == 400.0
-    assert guard["updated_at"] is stamp
+    assert guard["updated_at"] == "v1"
     assert set(guard["status"]["$in"]) == {"pending", "late", "partial"}
 
 
@@ -156,6 +154,31 @@ def test_execution_receipt_and_ids_are_deterministic():
 
 
 @pytest.mark.asyncio
+async def test_readiness_blocks_paid_when_trusted_source_amount_differs(monkeypatch):
+    proposal = _proposal("provider_confirmed_paid")
+    confirmation = _confirmation(proposal)
+    invoice = _partial_invoice()
+    db = FakeDB(invoice)
+
+    async def active(_db, _proposal):
+        return {"status": proposal["exception_status"], "updated_at": proposal["exception_updated_at"]}
+    async def proven(_db, _proposal):
+        return dict(invoice)
+    async def wrong_amount(_db, _proposal):
+        return 64000
+
+    monkeypatch.setattr(rer, "_recheck_exception_version", active)
+    monkeypatch.setattr(rer, "_proven_invoice_for_execution", proven)
+    monkeypatch.setattr(rer, "_trusted_source_amount_cents", wrong_amount)
+
+    readiness = await rer._readiness(db, proposal, confirmation, confirmation["_id"])
+    assert readiness["can_execute"] is False
+    assert readiness["reason"] == "trusted_source_amount_mismatch"
+    assert readiness["outstanding_cents"] == 65000
+    assert readiness["trusted_source_amount_cents"] == 64000
+
+
+@pytest.mark.asyncio
 async def test_nonfinancial_execution_requires_third_admin_and_never_writes_invoice(monkeypatch):
     proposal = _proposal("dismiss_non_financial")
     confirmation = _confirmation(proposal)
@@ -163,10 +186,8 @@ async def test_nonfinancial_execution_requires_third_admin_and_never_writes_invo
 
     async def fake_auth(_request):
         return {"_id": "admin-c", "email": "c@example.com"}
-
     async def fake_load(_db, _confirmation_id):
         return proposal, confirmation, confirmation["_id"]
-
     async def fake_readiness(_db, _proposal, _confirmation, _oid):
         return {"can_execute": True}
 
@@ -177,18 +198,13 @@ async def test_nonfinancial_execution_requires_third_admin_and_never_writes_invo
 
     response = await rer.execute_confirmed_reconciliation(
         str(confirmation["_id"]),
-        FakeRequest({
-            "execute": True,
-            "proposal_digest": proposal["proposal_digest"],
-            "expected_outcome": proposal["outcome"],
-        }),
+        FakeRequest({"execute": True, "proposal_digest": proposal["proposal_digest"], "expected_outcome": proposal["outcome"]}),
     )
     assert response["executed"] is True
     assert response["financial_effect"] == "none"
     assert response["provider_calls"] is False
     assert db.rental_payments.update_calls == []
-    actions = list(db.payment_reconciliation_actions.docs.values())
-    assert [a["action"] for a in actions] == ["execution_claim", "execution_result"]
+    assert [a["action"] for a in db.payment_reconciliation_actions.docs.values()] == ["execution_claim", "execution_result"]
 
 
 @pytest.mark.asyncio
@@ -199,7 +215,6 @@ async def test_proposer_or_confirmer_cannot_execute(monkeypatch):
 
     async def fake_load(_db, _confirmation_id):
         return proposal, confirmation, confirmation["_id"]
-
     async def fake_readiness(_db, _proposal, _confirmation, _oid):
         return {"can_execute": True}
 
@@ -207,7 +222,8 @@ async def test_proposer_or_confirmer_cannot_execute(monkeypatch):
     monkeypatch.setattr(rer, "_load_confirmed_decision", fake_load)
     monkeypatch.setattr(rer, "_readiness", fake_readiness)
 
-    for identity in (proposal["proposer"], confirmation["confirmer"], {"id": "other", "email": "A@EXAMPLE.COM"}):
+    identities = (proposal["proposer"], confirmation["confirmer"], {"id": "other", "email": "A@EXAMPLE.COM"})
+    for identity in identities:
         async def fake_auth(_request, identity=identity):
             return {"_id": identity["id"], "email": identity["email"]}
         monkeypatch.setattr(rer, "auth_admin", fake_auth)
@@ -221,44 +237,31 @@ async def test_proposer_or_confirmer_cannot_execute(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_paid_execution_completes_exact_partial_invoice_once(monkeypatch):
-    invoice = {
-        "_id": ObjectId(),
-        "status": "partial",
-        "amount": 1000.0,
-        "late_fee": 50.0,
-        "total_due": 1050.0,
-        "total_paid": 400.0,
-        "updated_at": "v1",
-        "contract_id": "c1",
-        "tenant_id": "t1",
-    }
+async def test_paid_execution_requires_original_amount_and_completes_exact_partial_invoice_once(monkeypatch):
+    invoice = _partial_invoice()
     proposal = _proposal("provider_confirmed_paid")
     confirmation = _confirmation(proposal)
     db = FakeDB(invoice)
 
     async def fake_auth(_request):
         return {"_id": "admin-c", "email": "c@example.com"}
-
     async def fake_load(_db, _confirmation_id):
         return proposal, confirmation, confirmation["_id"]
-
     async def fake_readiness(_db, _proposal, _confirmation, _oid):
         return {"can_execute": True}
-
     async def fake_invoice(_db, _proposal):
         return dict(db.rental_payments.invoice)
-
+    async def trusted(_db, _proposal):
+        return 65000
     async def fake_find(_collection, value):
-        if str(value) == str(db.rental_payments.invoice["_id"]):
-            return dict(db.rental_payments.invoice)
-        return None
+        return dict(db.rental_payments.invoice) if str(value) == str(db.rental_payments.invoice["_id"]) else None
 
     monkeypatch.setattr(rer, "auth_admin", fake_auth)
     monkeypatch.setattr(rer, "get_db", lambda: db)
     monkeypatch.setattr(rer, "_load_confirmed_decision", fake_load)
     monkeypatch.setattr(rer, "_readiness", fake_readiness)
     monkeypatch.setattr(rer, "_proven_invoice_for_execution", fake_invoice)
+    monkeypatch.setattr(rer, "_trusted_source_amount_cents", trusted)
     monkeypatch.setattr(rer, "_find_by_id", fake_find)
 
     response = await rer.execute_confirmed_reconciliation(
@@ -283,6 +286,9 @@ async def test_paid_execution_completes_exact_partial_invoice_once(monkeypatch):
     assert guard["total_due"] == 1050.0
     assert guard["total_paid"] == 400.0
     assert guard["updated_at"] == "v1"
+    claim = next(a for a in db.payment_reconciliation_actions.docs.values() if a["action"] == "execution_claim")
+    assert claim["trusted_source_amount_cents"] == 65000
+    assert claim["confirmed_amount_cents"] == 65000
 
     with pytest.raises(HTTPException) as exc:
         await rer.execute_confirmed_reconciliation(
@@ -300,11 +306,8 @@ async def test_paid_execution_completes_exact_partial_invoice_once(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_amount_or_invoice_echo_mismatch_fails_before_execution_claim(monkeypatch):
-    invoice = {
-        "_id": ObjectId(), "status": "partial", "amount": 1000.0, "late_fee": 50.0,
-        "total_due": 1050.0, "total_paid": 400.0,
-    }
+async def test_amount_invoice_or_original_source_mismatch_fails_before_execution_claim(monkeypatch):
+    invoice = _partial_invoice()
     proposal = _proposal("provider_confirmed_paid")
     confirmation = _confirmation(proposal)
     db = FakeDB(invoice)
@@ -324,12 +327,16 @@ async def test_amount_or_invoice_echo_mismatch_fails_before_execution_claim(monk
     monkeypatch.setattr(rer, "_readiness", fake_readiness)
     monkeypatch.setattr(rer, "_proven_invoice_for_execution", fake_invoice)
 
-    bad_payloads = [
-        {"expected_invoice_id": str(ObjectId()), "confirmed_amount_cents": 65000},
-        {"expected_invoice_id": str(invoice["_id"]), "confirmed_amount_cents": 64999},
-        {"expected_invoice_id": str(invoice["_id"]), "confirmed_amount_cents": 65001},
+    cases = [
+        (65000, {"expected_invoice_id": str(ObjectId()), "confirmed_amount_cents": 65000}),
+        (65000, {"expected_invoice_id": str(invoice["_id"]), "confirmed_amount_cents": 64999}),
+        (65000, {"expected_invoice_id": str(invoice["_id"]), "confirmed_amount_cents": 65001}),
+        (64000, {"expected_invoice_id": str(invoice["_id"]), "confirmed_amount_cents": 65000}),
     ]
-    for extra in bad_payloads:
+    for source_amount, extra in cases:
+        async def trusted(_db, _proposal, source_amount=source_amount):
+            return source_amount
+        monkeypatch.setattr(rer, "_trusted_source_amount_cents", trusted)
         payload = {"execute": True, "proposal_digest": proposal["proposal_digest"], "expected_outcome": proposal["outcome"], **extra}
         with pytest.raises(HTTPException) as exc:
             await rer.execute_confirmed_reconciliation(str(confirmation["_id"]), FakeRequest(payload))
@@ -348,6 +355,7 @@ def test_execution_module_has_no_provider_or_refund_calls_and_one_financial_writ
         assert forbidden not in source
     assert source.count("db.rental_payments.update_one(") == 1
     assert source.count("db[ACTIONS_COLLECTION].insert_one(") == 2
+    assert "trusted_source_amount_cents" in source
 
 
 def test_public_router_includes_execution_workflow_once():
