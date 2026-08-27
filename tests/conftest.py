@@ -5,14 +5,18 @@ This conftest imports BEFORE any test module, so:
   1. ENVIRONMENT is forced to "test".
   2. MONGO_URL is forced to localhost (legacy tests that _load_env() with
      os.environ.setdefault can no longer override it with the Atlas URL).
-  3. assert_not_production_database() aborts the run if anything still looks
+  3. TENANT_JWT_SECRET is pinned to one suite-wide test value before rental.shared
+     can be imported, removing import-order signature drift between auth suites.
+  4. assert_not_production_database() aborts the run if anything still looks
      like a production/hosted database.
 """
 import os
 
 PROD_DB_MARKERS = ("mongodb.net", "mongodb+srv", "railway", "atlas")
+TEST_TENANT_JWT_SECRET = "phase1-test-secret-do-not-use-in-prod"
 
 os.environ["ENVIRONMENT"] = "test"
+os.environ["TENANT_JWT_SECRET"] = TEST_TENANT_JWT_SECRET
 _current = os.environ.get("MONGO_URL", "")
 if not _current or any(m in _current for m in PROD_DB_MARKERS):
     os.environ["MONGO_URL"] = "mongodb://localhost:27017"
