@@ -47,7 +47,7 @@ The reconciliation execution code does **not**:
 - automatically apply a manual credit review;
 - automatically execute a refund review.
 
-`needs_refund_review` and `needs_manual_credit_review` remain review-only decisions.
+`needs_refund_review` and `needs_manual_credit_review` remain review-only decisions and are recorded with `execution_status=requires_review`.
 
 ## Amount authority
 
@@ -57,7 +57,17 @@ For a paid reconciliation the backend requires:
 
 `trusted original attempt amount == canonical current outstanding == Admin C echoed amount`
 
-Hosted checkout uses the server-created checkout claim amount. Autopay uses the server-recorded `last_attempt_amount`. Hardened Stripe reconciliation logs intentionally do not retain raw amount metadata; if no trusted amount is available, paid execution remains blocked.
+Hosted checkout uses the server-created checkout claim amount. Autopay stores the canonical `last_attempt_invoice_id` and exact `last_attempt_amount` in the same atomic monthly claim that runs before the provider call. Hardened Stripe reconciliation logs intentionally do not retain a trusted raw amount, so paid execution from a Stripe-webhook exception remains blocked unless a trusted local amount source exists.
+
+## Autopay traceability
+
+The monthly autopay claim now stores, atomically with `last_attempt_status=processing`:
+
+- `last_attempt_invoice_id`
+- `last_attempt_amount`
+- `last_attempt_date`
+
+Both Stripe and Helcim acquire that claim before any provider charge. A losing concurrent worker still cannot charge. Ambiguous failure paths retain the same invoice/amount trace and do not release `last_attempt_date`.
 
 ## Concurrency and crash behavior
 
@@ -93,6 +103,8 @@ States:
 - `execution_started`
 - `executed`
 - `requires_review`
+
+Only `execution_status=completed` is rendered as `executed`; any non-completed or unknown result status fails closed to `requires_review`.
 
 An execution claim without a result is automatically triaged as `requires_review` after 5 minutes. This is read-only classification; it never releases the execution lock.
 
