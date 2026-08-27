@@ -60,25 +60,36 @@ def test_digest_is_deterministic_and_binds_exact_proposal_content():
     assert _proposal_digest(base) != _proposal_digest(changed)
 
 
-def test_proposal_identity_is_atomic_per_exception_version():
-    first = _deterministic_object_id(
-        "recon-proposal", "hosted_checkout", "p1", "checkout_creation_unknown", "v1"
+def test_exact_proposal_is_idempotent_but_revised_proposal_gets_new_identity():
+    exact = _deterministic_object_id(
+        "recon-proposal", "hosted_checkout", "p1", "checkout_creation_unknown", "v1", "digest-a"
     )
     same = _deterministic_object_id(
-        "recon-proposal", "hosted_checkout", "p1", "checkout_creation_unknown", "v1"
+        "recon-proposal", "hosted_checkout", "p1", "checkout_creation_unknown", "v1", "digest-a"
     )
-    newer = _deterministic_object_id(
-        "recon-proposal", "hosted_checkout", "p1", "checkout_creation_unknown", "v2"
+    revised = _deterministic_object_id(
+        "recon-proposal", "hosted_checkout", "p1", "checkout_creation_unknown", "v1", "digest-b"
     )
-    assert first == same
-    assert first != newer
+    newer_version = _deterministic_object_id(
+        "recon-proposal", "hosted_checkout", "p1", "checkout_creation_unknown", "v2", "digest-a"
+    )
+    assert exact == same
+    assert exact != revised
+    assert exact != newer_version
 
 
-def test_confirmation_identity_is_atomic_per_proposal():
-    proposal = _deterministic_object_id("recon-proposal", "stripe_webhook", "e1", "amount_mismatch", "v1")
-    assert _deterministic_object_id("recon-confirmation", proposal) == _deterministic_object_id(
-        "recon-confirmation", proposal
+def test_confirmation_identity_is_one_lock_per_exception_version():
+    first = _deterministic_object_id(
+        "recon-confirmation", "stripe_webhook", "e1", "amount_mismatch", "v1"
     )
+    competing_proposal_same_version = _deterministic_object_id(
+        "recon-confirmation", "stripe_webhook", "e1", "amount_mismatch", "v1"
+    )
+    newer_version = _deterministic_object_id(
+        "recon-confirmation", "stripe_webhook", "e1", "amount_mismatch", "v2"
+    )
+    assert first == competing_proposal_same_version
+    assert first != newer_version
 
 
 def test_router_has_dual_control_version_and_evidence_guards():
@@ -92,6 +103,7 @@ def test_router_has_dual_control_version_and_evidence_guards():
     assert 'exception_updated_at' in source
     assert 'Reconciliation item changed; create a new proposal' in source
     assert 'Evidence reference is required for financial decisions' in source
+    assert 'This exception version already has a confirmed decision' in source
     assert 'DuplicateKeyError' in source
 
 
