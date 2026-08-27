@@ -6,7 +6,10 @@ from rental.stripe_pkg.reconciliation_queue_router import (
     HOSTED_RECONCILIATION_STATUSES,
     STRIPE_RECONCILIATION_STATUSES,
     _autopay_item,
+    _autopay_snapshot,
     _hosted_item,
+    _investigation_hint,
+    _invoice_snapshot,
     _priority,
     _stripe_item,
 )
@@ -133,15 +136,80 @@ def test_priority_handles_naive_datetime_and_unknown_timestamp_fail_safely():
     assert unknown["severity"] == "medium"
 
 
+def test_invoice_detail_snapshot_is_allowlisted_and_financial_only():
+    snapshot = _invoice_snapshot({
+        "_id": "i1",
+        "status": "partial",
+        "contract_id": "c1",
+        "tenant_id": "t1",
+        "period": "2026-08",
+        "amount": 1000,
+        "late_fee": 50,
+        "total_due": 1050,
+        "total_paid": 400,
+        "payment_method": "stripe",
+        "receipt_number": "R1",
+        "reference_number": "pi_1",
+        "card_token": "secret",
+        "checkout_url": "https://secret.example",
+    })
+    assert snapshot["total_due"] == 1050
+    assert snapshot["total_paid"] == 400
+    assert "card_token" not in snapshot
+    assert "checkout_url" not in snapshot
+
+
+def test_autopay_detail_snapshot_excludes_credentials_and_last_result_text():
+    snapshot = _autopay_snapshot({
+        "_id": "a1",
+        "enabled": True,
+        "processor": "helcim",
+        "user_id": "t1",
+        "day_of_month": 1,
+        "last_attempt_status": "reconciliation_required",
+        "last_attempt_amount": 650,
+        "last_attempt_intent_id": "tx1",
+        "retry_count": 2,
+        "last_result": "provider internal details",
+        "payment_method_id": "pm_secret",
+        "helcim_card_token": "token_secret",
+        "helcim_customer_code": "customer_secret",
+    })
+    assert snapshot["reference_id"] == "tx1"
+    assert snapshot["retry_count"] == 2
+    assert "last_result" not in snapshot
+    assert "payment_method_id" not in snapshot
+    assert "helcim_card_token" not in snapshot
+    assert "helcim_customer_code" not in snapshot
+
+
+def test_investigation_hints_are_manual_and_fail_closed():
+    hint = _investigation_hint("stripe_webhook", "amount_mismatch").lower()
+    assert "do not auto-credit" in hint
+    hint = _investigation_hint("autopay", "failed_unknown").lower()
+    assert "confirm provider outcome" in hint
+    assert "retry" in hint
+
+
 def test_router_is_admin_only_and_read_only_by_contract():
     source = Path("rental/stripe_pkg/reconciliation_queue_router.py").read_text(encoding="utf-8")
     assert '@router.get("/admin/payment-reconciliation")' in source
-    assert "await auth_admin(request)" in source
+    assert '@router.get("/admin/payment-reconciliation/{source}/{item_id}")' in source
+    assert source.count("await auth_admin(request)") >= 2
     assert ".insert_one(" not in source
     assert ".update_one(" not in source
     assert ".delete_one(" not in source
     assert ".replace_one(" not in source
     assert '"read_only": True' in source
+
+
+def test_detail_reuses_audited_stripe_pi_identity_query_and_has_no_mutation_action():
+    source = Path("rental/stripe_pkg/reconciliation_queue_router.py").read_text(encoding="utf-8")
+    detail = source.split('@router.get("/admin/payment-reconciliation/{source}/{item_id}")', 1)[1]
+    assert "stripe_payment_identity_query(pi_id)" in detail
+    assert "HTTPException(status_code=404" in detail
+    for forbidden in ("retry_payment", "credit_invoice", "refund", "resolve_reconciliation"):
+        assert forbidden not in detail
 
 
 def test_queue_applies_db_limits_and_returns_severity_summary():
