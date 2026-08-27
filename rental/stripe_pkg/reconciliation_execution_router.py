@@ -181,8 +181,6 @@ async def _proven_invoice_for_execution(db, proposal: dict) -> dict | None:
         invoice_id = str(source_doc.get("last_attempt_invoice_id") or "")
         if invoice_id:
             return await _find_by_id(db.rental_payments, invoice_id)
-        # Safe compatibility for Stripe autopay attempts that already persisted a
-        # PI identity; never infer by tenant/month/amount.
         pi_id = str(source_doc.get("last_attempt_intent_id") or "")
         return await db.rental_payments.find_one(stripe_payment_identity_query(pi_id)) if pi_id else None
 
@@ -215,9 +213,6 @@ async def _trusted_source_amount_cents(db, proposal: dict) -> int | None:
         amount = float(source_doc.get("last_attempt_amount") or 0)
         return _money_cents(amount) if amount > 0 else None
 
-    # Hardened Stripe reconciliation logs intentionally do not persist raw event
-    # amounts/metadata. Without a trusted amount source, manual paid execution is
-    # not allowed; investigation remains available read-only.
     return None
 
 
@@ -476,8 +471,10 @@ async def execute_confirmed_reconciliation(confirmation_id: str, request: Reques
     elif outcome == "provider_confirmed_not_paid":
         result_name = "provider_not_paid_decision_recorded"
     elif outcome == "needs_refund_review":
+        execution_status = "requires_review"
         result_name = "refund_review_required"
     elif outcome == "needs_manual_credit_review":
+        execution_status = "requires_review"
         result_name = "manual_credit_review_required"
     elif outcome == "dismiss_non_financial":
         result_name = "non_financial_exception_dismissal_recorded"
@@ -507,11 +504,13 @@ async def execute_confirmed_reconciliation(confirmation_id: str, request: Reques
     except DuplicateKeyError:
         raise HTTPException(status_code=409, detail="Execution result already recorded")
 
-    if execution_status != "completed":
+    if result_name == "not_applied_concurrent_change":
         raise HTTPException(status_code=409, detail="Local accounting state changed; review the execution trail")
 
+    review_required = execution_status == "requires_review"
     return {
-        "executed": True,
+        "executed": not review_required,
+        "review_required": review_required,
         "proposal_id": str(proposal.get("_id") or ""),
         "confirmation_id": str(confirmation_oid),
         "execution_claim_id": str(claim_id),
