@@ -3,6 +3,7 @@ from pathlib import Path
 
 from rental.stripe_pkg.reconciliation_workflow_router import (
     EXECUTION_STALE_SECONDS,
+    MAX_WORKFLOW_SCAN,
     OUTCOME_CAPABILITIES,
     WORKFLOW_STATES,
     _execution_capability,
@@ -19,6 +20,7 @@ def test_workflow_states_are_exact_and_nonfinancial():
         "executed",
         "requires_review",
     )
+    assert MAX_WORKFLOW_SCAN == 1000
 
 
 def test_workflow_state_progression():
@@ -93,10 +95,7 @@ def test_summary_marks_second_and_third_admin_requirements():
 
 def test_summary_marks_stale_claim_as_recovery_required():
     now = datetime(2026, 8, 27, 20, 0, tzinfo=timezone.utc)
-    proposal = {
-        "_id": "p1", "source": "autopay", "item_id": "a1",
-        "outcome": "provider_confirmed_not_paid",
-    }
+    proposal = {"_id": "p1", "source": "autopay", "item_id": "a1", "outcome": "provider_confirmed_not_paid"}
     confirmation = {"_id": "c1"}
     claim = {"_id": "x1", "created_at": now - timedelta(minutes=10), "executor": {"id": "c"}}
     summary = _workflow_summary(proposal, confirmation, claim, None, now=now)
@@ -107,16 +106,12 @@ def test_summary_marks_stale_claim_as_recovery_required():
 
 def test_summary_does_not_spread_arbitrary_source_fields():
     proposal = {
-        "_id": "p1",
-        "proposal_digest": "d",
-        "source": "autopay",
-        "item_id": "a1",
+        "_id": "p1", "proposal_digest": "d", "source": "autopay", "item_id": "a1",
         "outcome": "provider_confirmed_not_paid",
         "reason": "Provider confirmed no transaction was completed.",
         "evidence_reference": "case-2",
         "proposer": {"id": "a", "email": "a@example.com"},
-        "secret_token": "DO-NOT-RETURN",
-        "payment_method_id": "pm_secret",
+        "secret_token": "DO-NOT-RETURN", "payment_method_id": "pm_secret",
     }
     summary = _workflow_summary(proposal, None, None, None)
     serialized = repr(summary)
@@ -126,7 +121,7 @@ def test_summary_does_not_spread_arbitrary_source_fields():
     assert "payment_method_id" not in summary
 
 
-def test_workflow_router_is_strictly_read_only():
+def test_workflow_router_is_strictly_read_only_and_scans_are_bounded():
     source = Path("rental/stripe_pkg/reconciliation_workflow_router.py").read_text(encoding="utf-8")
     for forbidden in (
         "insert_one(", "update_one(", "delete_one(", "replace_one(",
@@ -135,8 +130,10 @@ def test_workflow_router_is_strictly_read_only():
     ):
         assert forbidden not in source
     assert '"read_only": True' in source
-    assert '.limit(safe_limit)' in source
+    assert '.limit(scan_limit)' in source
+    assert 'MAX_WORKFLOW_SCAN = 1000' in source
     assert 'max(1, min(int(limit or 100), 200))' in source
+    assert 'min(MAX_WORKFLOW_SCAN' in source
 
 
 def test_public_router_includes_workflow_dashboard_once():
