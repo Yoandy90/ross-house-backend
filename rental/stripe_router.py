@@ -20,6 +20,7 @@ from rental.stripe_pkg.reconciliation_queue_router import router as _reconciliat
 from rental.stripe_pkg.reconciliation_resolution_router import router as _reconciliation_resolution_router
 from rental.stripe_pkg.reconciliation_execution_router import router as _reconciliation_execution_router
 from rental.stripe_pkg.reconciliation_workflow_router import router as _reconciliation_workflow_router
+from rental.stripe_pkg.reconciliation_recovery_router import router as _reconciliation_recovery_router
 
 from rental.stripe_pkg.helpers import (  # noqa: F401
     _get_stripe_config,
@@ -48,3 +49,4 @@ router.include_router(_reconciliation_queue_router)
 router.include_router(_reconciliation_resolution_router)
 router.include_router(_reconciliation_execution_router)
 router.include_router(_reconciliation_workflow_router)
+router.include_router(_reconciliation_recovery_router)
