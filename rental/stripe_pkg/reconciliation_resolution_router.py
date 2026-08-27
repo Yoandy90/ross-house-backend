@@ -7,12 +7,14 @@ A second *different* admin must confirm the exact immutable proposal digest.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 from datetime import datetime, timezone
 from typing import Any
 
 from bson import ObjectId
 from fastapi import APIRouter, HTTPException, Request
+from pymongo.errors import DuplicateKeyError
 
 from rental.shared import auth_admin, get_db
 from rental.stripe_pkg.reconciliation_queue_router import (
@@ -53,6 +55,11 @@ def _proposal_digest(payload: dict) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def _deterministic_object_id(prefix: str, *parts: Any) -> ObjectId:
+    raw = ":".join([prefix, *(str(part or "") for part in parts)])
+    return ObjectId(hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24])
+
+
 async def _active_exception(db, source: str, item_id: str) -> dict | None:
     if source == "hosted_checkout":
         doc = await _find_by_id(db.rental_payments, item_id)
@@ -89,6 +96,7 @@ def _immutable_proposal_payload(
         "source": source,
         "item_id": item_id,
         "exception_status": str(exception.get("status") or ""),
+        "exception_updated_at": str(exception.get("updated_at") or ""),
         "reference_id": str(exception.get("reference_id") or ""),
         "outcome": outcome,
         "reason": reason,
@@ -121,18 +129,7 @@ async def propose_reconciliation_resolution(source: str, item_id: str, request: 
     if not proposer["id"] and not proposer["email"]:
         raise HTTPException(status_code=403, detail="Admin identity unavailable")
 
-    # Only one open proposal per active exception. Financial source rows remain untouched.
-    existing = await db[ACTIONS_COLLECTION].find_one({
-        "action": "proposal",
-        "source": source,
-        "item_id": item_id,
-        "superseded": {"$ne": True},
-    })
-    if existing:
-        raise HTTPException(status_code=409, detail="An open reconciliation proposal already exists")
-
     now = datetime.now(timezone.utc)
-    proposal_id = ObjectId()
     immutable = _immutable_proposal_payload(
         source=source,
         item_id=item_id,
@@ -143,15 +140,26 @@ async def propose_reconciliation_resolution(source: str, item_id: str, request: 
         proposer=proposer,
     )
     digest = _proposal_digest(immutable)
+    # One immutable proposal per exact exception version. If the source row gets
+    # a new updated_at/status, a new version can be proposed safely.
+    proposal_id = _deterministic_object_id(
+        "recon-proposal",
+        source,
+        item_id,
+        immutable["exception_status"],
+        immutable["exception_updated_at"],
+    )
     record = {
         "_id": proposal_id,
         "action": "proposal",
         **immutable,
         "proposal_digest": digest,
         "created_at": now,
-        "superseded": False,
     }
-    await db[ACTIONS_COLLECTION].insert_one(record)
+    try:
+        await db[ACTIONS_COLLECTION].insert_one(record)
+    except DuplicateKeyError:
+        raise HTTPException(status_code=409, detail="A proposal already exists for this exception version")
 
     return {
         "proposal_id": str(proposal_id),
@@ -175,12 +183,13 @@ async def confirm_reconciliation_resolution(proposal_id: str, request: Request):
     proposal = await db[ACTIONS_COLLECTION].find_one({
         "_id": proposal_oid,
         "action": "proposal",
-        "superseded": {"$ne": True},
     })
     if proposal is None:
         raise HTTPException(status_code=404, detail="Reconciliation proposal not found")
 
     confirmer = _admin_identity(admin)
+    if not confirmer["id"] and not confirmer["email"]:
+        raise HTTPException(status_code=403, detail="Admin identity unavailable")
     proposer = proposal.get("proposer") or {}
     same_id = bool(confirmer["id"] and confirmer["id"] == str(proposer.get("id") or ""))
     same_email = bool(confirmer["email"] and confirmer["email"] == str(proposer.get("email") or "").lower())
@@ -191,38 +200,39 @@ async def confirm_reconciliation_resolution(proposal_id: str, request: Request):
     if data.get("confirm") is not True:
         raise HTTPException(status_code=400, detail="Explicit confirmation is required")
     supplied_digest = str(data.get("proposal_digest") or "").strip()
-    if not supplied_digest or supplied_digest != str(proposal.get("proposal_digest") or ""):
+    expected_digest = str(proposal.get("proposal_digest") or "")
+    if not supplied_digest or not hmac.compare_digest(supplied_digest, expected_digest):
         raise HTTPException(status_code=409, detail="Proposal digest mismatch")
     if str(data.get("expected_outcome") or "") != str(proposal.get("outcome") or ""):
         raise HTTPException(status_code=409, detail="Proposal outcome mismatch")
 
-    # Re-check the source exception immediately before dual-control confirmation.
+    # Re-check the same source exception version immediately before confirmation.
     exception = await _active_exception(db, str(proposal.get("source") or ""), str(proposal.get("item_id") or ""))
-    if exception is None or str(exception.get("status") or "") != str(proposal.get("exception_status") or ""):
+    if (
+        exception is None
+        or str(exception.get("status") or "") != str(proposal.get("exception_status") or "")
+        or str(exception.get("updated_at") or "") != str(proposal.get("exception_updated_at") or "")
+    ):
         raise HTTPException(status_code=409, detail="Reconciliation item changed; create a new proposal")
 
-    prior_confirmation = await db[ACTIONS_COLLECTION].find_one({
-        "action": "confirmation",
-        "proposal_id": str(proposal_oid),
-    })
-    if prior_confirmation:
+    confirmation_id = _deterministic_object_id("recon-confirmation", proposal_oid)
+    try:
+        await db[ACTIONS_COLLECTION].insert_one({
+            "_id": confirmation_id,
+            "action": "confirmation",
+            "proposal_id": str(proposal_oid),
+            "proposal_digest": supplied_digest,
+            "source": proposal.get("source"),
+            "item_id": proposal.get("item_id"),
+            "outcome": proposal.get("outcome"),
+            "proposer": proposer,
+            "confirmer": confirmer,
+            "financial_effect": "none",
+            "execution_status": "not_executed",
+            "confirmed_at": datetime.now(timezone.utc),
+        })
+    except DuplicateKeyError:
         raise HTTPException(status_code=409, detail="Proposal already confirmed")
-
-    confirmation_id = ObjectId()
-    await db[ACTIONS_COLLECTION].insert_one({
-        "_id": confirmation_id,
-        "action": "confirmation",
-        "proposal_id": str(proposal_oid),
-        "proposal_digest": supplied_digest,
-        "source": proposal.get("source"),
-        "item_id": proposal.get("item_id"),
-        "outcome": proposal.get("outcome"),
-        "proposer": proposer,
-        "confirmer": confirmer,
-        "financial_effect": "none",
-        "execution_status": "not_executed",
-        "confirmed_at": datetime.now(timezone.utc),
-    })
 
     return {
         "proposal_id": str(proposal_oid),
