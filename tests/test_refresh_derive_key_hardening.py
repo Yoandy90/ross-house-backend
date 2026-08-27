@@ -1,5 +1,9 @@
 """Security regression tests for refresh-token derivation key handling."""
 
+import base64
+import hashlib
+import hmac
+
 import pytest
 
 from rental.refresh_tokens import (
@@ -42,6 +46,20 @@ def test_jwt_secret_is_valid_compatibility_fallback(monkeypatch):
 
     assert first == second
     assert first != "token-1"
+
+
+def test_jwt_fallback_matches_legacy_formula_byte_for_byte(monkeypatch):
+    """Protect existing live chains when only TENANT_JWT_SECRET is configured."""
+    raw = "legacy-presented-token"
+    jwt_secret = "legacy-compatible-jwt-secret"
+    monkeypatch.delenv("REFRESH_DERIVE_KEY", raising=False)
+    monkeypatch.setenv("TENANT_JWT_SECRET", jwt_secret)
+
+    legacy_key = hashlib.sha256((jwt_secret + ":refresh-derive-v1").encode()).digest()
+    expected_digest = hmac.new(legacy_key, raw.encode(), hashlib.sha256).digest()
+    expected = base64.urlsafe_b64encode(expected_digest).rstrip(b"=").decode()
+
+    assert next_refresh_token(raw) == expected
 
 
 def test_different_keys_produce_different_next_tokens(monkeypatch):

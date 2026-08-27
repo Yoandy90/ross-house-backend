@@ -58,7 +58,9 @@ def test_h02_grace_response_idempotent_no_extra_rotation():
     grace_block = src.split("if action == GRACE_ROTATE:")[1].split("if action == BOOTSTRAP:")[0]
     assert "update_one" not in grace_block          # cero writes de rotación en grace
     assert "rotation_update" not in grace_block
-    assert "next_refresh_token" in grace_block      # re-deriva el mismo R2
+    assert "_next_refresh_or_503" in grace_block    # re-deriva mediante wrapper fail-closed
+    wrapper_src = inspect.getsource(rr._next_refresh_or_503)
+    assert "next_refresh_token" in wrapper_src      # wrapper conserva derivación D1
     # R2 sigue siendo el token vigente tras el replay de R1
     assert classify_refresh_attempt(s2, hash_refresh_token(r2), NOW + timedelta(seconds=10)) == ROTATE
     assert s2["refresh_generation"] == gen_after_a

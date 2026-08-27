@@ -28,12 +28,14 @@ from .auth_metrics import bump
 from .refresh_tokens import (refresh_enabled, generate_refresh_token, hash_refresh_token,
                              next_refresh_token, classify_refresh_attempt, rotation_update,
                              bootstrap_update, reuse_revocation_update, CONSUMED_COLLECTION,
-                             ROTATE, GRACE_ROTATE, REUSE_DETECTED, BOOTSTRAP, DENY)
+                             ROTATE, GRACE_ROTATE, REUSE_DETECTED, BOOTSTRAP, DENY,
+                             RefreshConfigurationError)
 
 logger = logging.getLogger("refresh")
 router = APIRouter(tags=["auth"])
 
 GENERIC_401 = HTTPException(status_code=401, detail="No autorizado")
+GENERIC_503 = HTTPException(status_code=503, detail="Servicio temporalmente no disponible")
 
 
 class RefreshRequest(BaseModel):
@@ -41,6 +43,19 @@ class RefreshRequest(BaseModel):
 
 
 _indexes_ready = False
+
+
+def _next_refresh_or_503(presented_raw: str) -> str:
+    """Deriva R_(n+1) o falla de forma segura ante configuración incompleta.
+
+    Solo captura RefreshConfigurationError. Errores inesperados siguen propagándose
+    para no ocultar bugs. Nunca incluye secretos ni tokens en logs/respuestas.
+    """
+    try:
+        return next_refresh_token(presented_raw)
+    except RefreshConfigurationError:
+        logger.error("refresh token derivation unavailable due to server configuration")
+        raise GENERIC_503
 
 
 async def _ensure_indexes():
@@ -177,7 +192,7 @@ async def refresh(request: Request, body: RefreshRequest):
     # Replay repetido de R_n durante la grace siempre produce la MISMA respuesta
     # (cero acuñación de tokens nuevos). Pasada la grace, R_n ⇒ REUSE ⇒ revocación.
     if action == GRACE_ROTATE:
-        rederived = next_refresh_token(body.refresh_token)
+        rederived = _next_refresh_or_503(body.refresh_token)
         if hash_refresh_token(rederived) != session.get("refresh_token_hash"):
             # La cadena avanzó más allá (R_{n+1} ya fue consumido): generación vieja
             await bump("refresh_reuse_detected")
@@ -193,7 +208,7 @@ async def refresh(request: Request, body: RefreshRequest):
         # Guard atómico del bootstrap: solo UNA de dos carreras simultáneas gana
         guard = {"sid": session["sid"], "revoked_at": None, "refresh_token_hash": None}
     else:  # ROTATE
-        new_raw = next_refresh_token(body.refresh_token)  # cadena determinista D1
+        new_raw = _next_refresh_or_503(body.refresh_token)  # cadena determinista D1
         update = rotation_update(session, hash_refresh_token(new_raw))
         guard = {"sid": session["sid"], "revoked_at": None,
                  "refresh_token_hash": session.get("refresh_token_hash")}
