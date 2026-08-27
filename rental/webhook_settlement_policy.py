@@ -37,7 +37,9 @@ def helcim_webhook_may_lookup(*, verified: bool, event_type: str | None,
 def helcim_transaction_can_settle(*, status: str | None,
                                   amount_cents: int | None,
                                   expected_amount_cents: int | None,
-                                  currency: str | None) -> bool:
+                                  currency: str | None,
+                                  transaction_id: str | None = None,
+                                  expected_transaction_id: str | None = None) -> bool:
     """Authoritative Helcim transaction requirements for rent settlement."""
     if (status or "").upper() != "APPROVED":
         return False
@@ -45,4 +47,9 @@ def helcim_transaction_can_settle(*, status: str | None,
         return False
     if int(amount_cents) != int(expected_amount_cents):
         return False
-    return (currency or "").upper() == "USD"
+    if (currency or "").upper() != "USD":
+        return False
+    if expected_transaction_id is not None:
+        if not transaction_id or str(transaction_id) != str(expected_transaction_id):
+            return False
+    return True
