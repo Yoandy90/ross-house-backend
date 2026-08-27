@@ -1,6 +1,9 @@
 """Admin-only, read-only overview of reconciliation decision workflows."""
 from __future__ import annotations
 
+from datetime import datetime, timezone
+from typing import Any
+
 from fastapi import APIRouter, HTTPException, Request
 
 from rental.shared import auth_admin, get_db
@@ -20,20 +23,107 @@ WORKFLOW_STATES = (
     "executed",
     "requires_review",
 )
+EXECUTION_STALE_SECONDS = 300
+
+OUTCOME_CAPABILITIES = {
+    "provider_confirmed_paid": {
+        "mode": "local_invoice_completion",
+        "financial_write": True,
+        "requires_exact_invoice": True,
+        "provider_call": False,
+    },
+    "provider_confirmed_not_paid": {
+        "mode": "record_only",
+        "financial_write": False,
+        "requires_exact_invoice": False,
+        "provider_call": False,
+    },
+    "needs_refund_review": {
+        "mode": "review_only",
+        "financial_write": False,
+        "requires_exact_invoice": False,
+        "provider_call": False,
+    },
+    "needs_manual_credit_review": {
+        "mode": "review_only",
+        "financial_write": False,
+        "requires_exact_invoice": False,
+        "provider_call": False,
+    },
+    "dismiss_non_financial": {
+        "mode": "record_only",
+        "financial_write": False,
+        "requires_exact_invoice": False,
+        "provider_call": False,
+    },
+}
 
 
-def _workflow_state(confirmation: dict | None, claim: dict | None, result: dict | None) -> str:
+def _as_utc(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+    if isinstance(value, str) and value:
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(timezone.utc)
+        except ValueError:
+            return None
+    return None
+
+
+def _claim_age_seconds(claim: dict | None, now: datetime | None = None) -> int | None:
+    if not claim:
+        return None
+    stamp = _as_utc(claim.get("created_at"))
+    if not stamp:
+        return None
+    now = now or datetime.now(timezone.utc)
+    return max(0, int((now - stamp).total_seconds()))
+
+
+def _workflow_state(
+    confirmation: dict | None,
+    claim: dict | None,
+    result: dict | None,
+    *,
+    now: datetime | None = None,
+) -> str:
     if result:
         return "requires_review" if str(result.get("execution_status") or "") == "requires_review" else "executed"
     if claim:
+        age = _claim_age_seconds(claim, now)
+        if age is not None and age >= EXECUTION_STALE_SECONDS:
+            return "requires_review"
         return "execution_started"
     if confirmation:
         return "confirmed"
     return "proposed"
 
 
-def _workflow_summary(proposal: dict, confirmation: dict | None, claim: dict | None, result: dict | None) -> dict:
-    state = _workflow_state(confirmation, claim, result)
+def _execution_capability(outcome: str) -> dict:
+    return dict(OUTCOME_CAPABILITIES.get(str(outcome or ""), {
+        "mode": "unsupported",
+        "financial_write": False,
+        "requires_exact_invoice": False,
+        "provider_call": False,
+    }))
+
+
+def _workflow_summary(
+    proposal: dict,
+    confirmation: dict | None,
+    claim: dict | None,
+    result: dict | None,
+    *,
+    now: datetime | None = None,
+) -> dict:
+    state = _workflow_state(confirmation, claim, result, now=now)
+    outcome = str(proposal.get("outcome") or "")
+    claim_age = _claim_age_seconds(claim, now)
     return {
         "proposal_id": str(proposal.get("_id") or ""),
         "proposal_digest": str(proposal.get("proposal_digest") or ""),
@@ -41,7 +131,8 @@ def _workflow_summary(proposal: dict, confirmation: dict | None, claim: dict | N
         "item_id": str(proposal.get("item_id") or ""),
         "exception_status": str(proposal.get("exception_status") or ""),
         "exception_updated_at": str(proposal.get("exception_updated_at") or ""),
-        "outcome": str(proposal.get("outcome") or ""),
+        "outcome": outcome,
+        "capability": _execution_capability(outcome),
         "reason": str(proposal.get("reason") or ""),
         "evidence_reference": str(proposal.get("evidence_reference") or ""),
         "proposer": proposal.get("proposer") or {},
@@ -49,6 +140,8 @@ def _workflow_summary(proposal: dict, confirmation: dict | None, claim: dict | N
         "confirmer": (confirmation or {}).get("confirmer") or None,
         "executor": (claim or result or {}).get("executor") or None,
         "state": state,
+        "recovery_required": state == "requires_review" and result is None and claim is not None,
+        "execution_claim_age_seconds": claim_age,
         "requires_second_admin": confirmation is None,
         "requires_third_admin": confirmation is not None and claim is None,
         "financial_effect": str((result or claim or proposal).get("financial_effect") or "none"),
@@ -79,6 +172,7 @@ async def admin_reconciliation_workflows(request: Request, limit: int = 100, sta
     if requested_state and requested_state not in WORKFLOW_STATES:
         raise HTTPException(status_code=400, detail="Invalid workflow state")
 
+    now = datetime.now(timezone.utc)
     cursor = db[ACTIONS_COLLECTION].find({"action": "proposal"}).sort("created_at", -1).limit(safe_limit)
     proposals = await _collect_proposals(cursor, safe_limit)
     items = []
@@ -96,7 +190,7 @@ async def admin_reconciliation_workflows(request: Request, limit: int = 100, sta
                 "_id": _execution_result_id(confirmation_oid),
                 "action": "execution_result",
             })
-        summary = _workflow_summary(proposal, confirmation, claim, result)
+        summary = _workflow_summary(proposal, confirmation, claim, result, now=now)
         if requested_state and summary["state"] != requested_state:
             continue
         items.append(summary)
@@ -122,12 +216,10 @@ async def admin_reconciliation_workflows(request: Request, limit: int = 100, sta
 
 @router.get("/admin/payment-reconciliation/workflows/{proposal_id}")
 async def admin_reconciliation_workflow_detail(proposal_id: str, request: Request):
-    """Sanitized workflow detail; delegates no mutations or provider operations."""
     await auth_admin(request)
     db = get_db()
     proposal = await db[ACTIONS_COLLECTION].find_one({"action": "proposal", "_id": _object_id_or_string(proposal_id)})
     if not proposal:
-        # exact legacy string fallback only
         proposal = await db[ACTIONS_COLLECTION].find_one({"action": "proposal", "_id": str(proposal_id)})
     if not proposal:
         raise HTTPException(status_code=404, detail="Reconciliation workflow not found")
