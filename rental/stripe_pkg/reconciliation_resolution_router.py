@@ -142,12 +142,15 @@ async def propose_reconciliation_resolution(source: str, item_id: str, request: 
         proposer=proposer,
     )
     digest = _proposal_digest(immutable)
+    # The same exact proposal is idempotent, but a revised proposal may coexist.
+    # Only one proposal can ultimately be confirmed for an exception version.
     proposal_id = _deterministic_object_id(
         "recon-proposal",
         source,
         item_id,
         immutable["exception_status"],
         immutable["exception_updated_at"],
+        digest,
     )
     record = {
         "_id": proposal_id,
@@ -159,7 +162,7 @@ async def propose_reconciliation_resolution(source: str, item_id: str, request: 
     try:
         await db[ACTIONS_COLLECTION].insert_one(record)
     except DuplicateKeyError:
-        raise HTTPException(status_code=409, detail="A proposal already exists for this exception version")
+        raise HTTPException(status_code=409, detail="This exact proposal already exists")
 
     return {
         "proposal_id": str(proposal_id),
@@ -214,7 +217,15 @@ async def confirm_reconciliation_resolution(proposal_id: str, request: Request):
     ):
         raise HTTPException(status_code=409, detail="Reconciliation item changed; create a new proposal")
 
-    confirmation_id = _deterministic_object_id("recon-confirmation", proposal_oid)
+    # One atomic confirmation lock per exception version, regardless of which
+    # competing proposal won the second-admin approval.
+    confirmation_id = _deterministic_object_id(
+        "recon-confirmation",
+        proposal.get("source"),
+        proposal.get("item_id"),
+        proposal.get("exception_status"),
+        proposal.get("exception_updated_at"),
+    )
     try:
         await db[ACTIONS_COLLECTION].insert_one({
             "_id": confirmation_id,
@@ -223,6 +234,8 @@ async def confirm_reconciliation_resolution(proposal_id: str, request: Request):
             "proposal_digest": supplied_digest,
             "source": proposal.get("source"),
             "item_id": proposal.get("item_id"),
+            "exception_status": proposal.get("exception_status"),
+            "exception_updated_at": proposal.get("exception_updated_at"),
             "outcome": proposal.get("outcome"),
             "proposer": proposer,
             "confirmer": confirmer,
@@ -231,7 +244,7 @@ async def confirm_reconciliation_resolution(proposal_id: str, request: Request):
             "confirmed_at": datetime.now(timezone.utc),
         })
     except DuplicateKeyError:
-        raise HTTPException(status_code=409, detail="Proposal already confirmed")
+        raise HTTPException(status_code=409, detail="This exception version already has a confirmed decision")
 
     return {
         "proposal_id": str(proposal_oid),
