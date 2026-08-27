@@ -26,13 +26,22 @@ def _intent_belongs_to_tenant(metadata, tenant_id) -> bool:
     return bool(metadata.get("tenant_id")) and str(metadata.get("tenant_id")) == str(tenant_id)
 
 
+def _stripe_rent_intent_idempotency_key(contract_id, year: int, month: int) -> str:
+    """Stable provider key for one contract's rent PaymentIntent per month.
+
+    The key deliberately excludes amount/late-fee values. If financial params
+    change after an intent was created, Stripe will reject reuse of the same key
+    with different parameters instead of silently creating a second payable PI.
+    """
+    return f"rent:{contract_id}:{int(year):04d}-{int(month):02d}"
+
+
 @router.post('/tenant/create-stripe-payment')
 async def tenant_create_stripe_payment(request: Request):
-    """Tenant: Create a Stripe PaymentIntent for rent payment (with optional Connect split)"""
+    """Tenant: Create a Stripe PaymentIntent for rent payment (with optional Connect split)."""
     tenant = await auth_tenant_flex(request)
     data = await request.json()
 
-    # Get Stripe config from rental_config
     config = await get_db().rental_config.find_one({"type": "company"}) or {}
     stripe_secret = config.get("stripe_secret_key", "")
     stripe_enabled = config.get("stripe_enabled", False)
@@ -42,7 +51,6 @@ async def tenant_create_stripe_payment(request: Request):
     if not stripe_enabled or not stripe_secret:
         raise HTTPException(status_code=400, detail="Stripe no está configurado. Contacte al administrador.")
 
-    # Get active contract
     contract = await get_db().rental_contracts.find_one({
         "tenant_id": tenant["_id"],
         "status": "active"
@@ -50,7 +58,6 @@ async def tenant_create_stripe_payment(request: Request):
     if not contract:
         raise HTTPException(status_code=404, detail="No se encontró contrato activo")
 
-    # Check if already paid this month
     now = datetime.utcnow()
     current_month = now.strftime('%B').lower()
     existing = await get_db().rental_payments.find_one({
@@ -62,16 +69,12 @@ async def tenant_create_stripe_payment(request: Request):
     if existing:
         raise HTTPException(status_code=400, detail="Ya existe un pago registrado para este mes")
 
-    # ─── Amount resolution (avoid double-counting late fee) ──────────────
-    # SECURITY: the base rent is ALWAYS taken from the contract server-side —
-    # never trusted from the client — so a tenant cannot underpay by sending a
-    # smaller rent_amount. Only the late_fee is read from the request.
+    # SECURITY: base rent comes from the contract, never from the client.
     contract_rent = float(contract.get("rent_amount") or 0)
     late_fee = float(data.get("late_fee") or 0)
     if contract_rent > 0:
         amount = contract_rent
     else:
-        # Contract has no rent on file → fall back to client value (legacy data)
         amount = float(data.get("rent_amount") or data.get("amount") or 0)
     total = amount + late_fee
 
@@ -82,11 +85,6 @@ async def tenant_create_stripe_payment(request: Request):
         import stripe
         stripe.api_key = stripe_secret
 
-        # ─── Resolve Stripe Customer so saved cards appear in PaymentSheet ────
-        # Saved payment methods are stored against `app_users.stripe_customer_id`
-        # (the "Métodos de Pago" screen uses `auth_marketplace`).
-        # The `auth_tenant_flex` returns a `tenants` doc, so we have to find the
-        # linked app_user to reuse the same Stripe customer.
         stripe_customer_id = None
         ephemeral_key_secret = None
         try:
@@ -107,27 +105,23 @@ async def tenant_create_stripe_payment(request: Request):
             if app_user:
                 stripe_customer_id = await _get_or_create_stripe_customer(app_user)
             elif tenant.get("stripe_customer_id"):
-                # Last resort: tenant doc itself has one stored
                 stripe_customer_id = tenant["stripe_customer_id"]
         except Exception as e:
             logging.warning(f"Stripe customer resolution failed for tenant {tenant.get('_id')}: {e}")
             stripe_customer_id = None
 
-        # Check if property has a connected owner (Stripe Connect split payment)
         property_id = str(contract.get("property_id", ""))
         owner_stripe_account = None
 
         if connect_enabled and property_id:
-            # Look for marketplace listing with an owner who has Stripe Connect
             listing = await get_db().marketplace_listings.find_one({"_id": ObjectId(property_id)}) if property_id else None
             if listing and listing.get("owner_id"):
                 owner = await get_db().app_users.find_one({"_id": ObjectId(listing["owner_id"])})
                 if owner and owner.get("stripe_account_id") and owner.get("stripe_onboarding_status") == "active":
                     owner_stripe_account = owner["stripe_account_id"]
 
-        # Build PaymentIntent params
         intent_params = {
-            "amount": int(total * 100),
+            "amount": int(round(total * 100)),
             "currency": "usd",
             "metadata": {
                 "tenant_id": str(tenant["_id"]),
@@ -136,6 +130,7 @@ async def tenant_create_stripe_payment(request: Request):
                 "property_id": property_id,
                 "period_month": current_month,
                 "period_year": str(now.year),
+                "period_month_num": str(now.month),
                 "rent_amount": str(amount),
                 "late_fee": str(late_fee),
             },
@@ -143,29 +138,30 @@ async def tenant_create_stripe_payment(request: Request):
             "receipt_email": tenant.get("email"),
         }
 
-        # Attach customer (enables saved cards in PaymentSheet) and persist
-        # future-use so any new card entered also gets saved automatically.
         if stripe_customer_id:
             intent_params["customer"] = stripe_customer_id
             intent_params["setup_future_usage"] = "off_session"
 
-        # If owner has Stripe Connect, add automatic split
         if owner_stripe_account:
-            application_fee = int(total * 100 * (commission_rate / 100))
+            application_fee = int(round(total * 100 * (commission_rate / 100)))
             intent_params["application_fee_amount"] = application_fee
             intent_params["transfer_data"] = {"destination": owner_stripe_account}
             intent_params["metadata"]["split_payment"] = "true"
             intent_params["metadata"]["commission_rate"] = str(commission_rate)
             intent_params["metadata"]["owner_stripe_account"] = owner_stripe_account
 
-        # 3D Secure enforcement (admin toggle in Seguridad)
         if config.get("stripe_3ds_enabled"):
             intent_params["payment_method_options"] = {"card": {"request_three_d_secure": "any"}}
 
-        intent = stripe.PaymentIntent.create(**intent_params)
+        # P0: provider-side idempotency prevents double taps, transport retries,
+        # and concurrent requests from creating multiple payable intents for the
+        # same contract/month.
+        intent = stripe.PaymentIntent.create(
+            **intent_params,
+            idempotency_key=_stripe_rent_intent_idempotency_key(
+                contract["_id"], now.year, now.month),
+        )
 
-        # Create an Ephemeral Key so the mobile PaymentSheet can list/manage
-        # the customer's saved payment methods.
         if stripe_customer_id:
             try:
                 ek = stripe.EphemeralKey.create(
@@ -234,7 +230,6 @@ async def tenant_confirm_stripe_payment(request: Request):
         if not contract_id:
             raise HTTPException(status_code=400, detail="PaymentIntent sin contrato asociado")
 
-        # Defense in depth: metadata contract must also belong to this tenant.
         try:
             contract_oid = ObjectId(contract_id)
         except Exception:
@@ -246,8 +241,6 @@ async def tenant_confirm_stripe_payment(request: Request):
         if not contract:
             raise HTTPException(status_code=403, detail="El contrato del pago no pertenece a este inquilino")
 
-        # The webhook may already have written the payment. Match both historical
-        # field names plus reference_number so legacy records are recognized.
         existing = await get_db().rental_payments.find_one(
             _stripe_payment_identity_query(payment_intent_id))
         if existing:
@@ -262,8 +255,6 @@ async def tenant_confirm_stripe_payment(request: Request):
                 "processing": False,
             }
 
-        # No DB write here. Stripe retries signed webhooks until acknowledged;
-        # this avoids a second financial writer and the webhook/app insert race.
         logging.info("Stripe PI %s verified for tenant %s; awaiting webhook record",
                      payment_intent_id, tenant.get("_id"))
         return {
