@@ -27,7 +27,7 @@ from .webhook_settlement_policy import (
     helcim_webhook_may_lookup,
 )
 
-# Preserve the old module surface for all existing imports.  ``router`` is
+# Preserve the old module surface for all existing imports. ``router`` is
 # intentionally excluded because this module publishes the hardened composition.
 for _name in dir(core):
     if _name != "router" and not _name.startswith("__"):
@@ -85,7 +85,7 @@ async def clover_webhook(request: Request):
     except json.JSONDecodeError:
         payload = {}
 
-    # Clover sends this challenge while registering the endpoint.  It is not a
+    # Clover sends this challenge while registering the endpoint. It is not a
     # payment event and therefore cannot enter the settlement path.
     if isinstance(payload, dict) and payload.get("verificationCode"):
         await core.get_db().processor_webhook_events.insert_one({
@@ -144,6 +144,20 @@ async def clover_webhook(request: Request):
     return {"received": True}
 
 
+def _bofa_signed_fields_cover_settlement(form: dict) -> bool:
+    """Require decision and local checkout identifiers to be authenticated."""
+    signed = {
+        name.strip()
+        for name in str(form.get("signed_field_names") or "").split(",")
+        if name.strip()
+    }
+    return {
+        "decision",
+        "req_transaction_uuid",
+        "req_reference_number",
+    }.issubset(signed)
+
+
 @router.post("/webhooks/bofa")
 async def bofa_webhook(request: Request):
     """BofA Secure Acceptance: valid signed ACCEPT before rent settlement."""
@@ -154,7 +168,11 @@ async def bofa_webhook(request: Request):
 
     verified = False
     if secret:
-        if not form.get("signed_field_names") or not form.get("signature"):
+        if (
+            not form.get("signed_field_names")
+            or not form.get("signature")
+            or not _bofa_signed_fields_cover_settlement(form)
+        ):
             raise HTTPException(
                 status_code=403, detail="Firma de Bank of America inválida"
             )
@@ -181,6 +199,11 @@ async def bofa_webhook(request: Request):
         form.get("req_reference_number"),
         form.get("transaction_id"),
     ] if v]
+    # Only signed request identifiers are allowed to select a local rent payment.
+    settlement_ids = [v for v in [
+        form.get("req_transaction_uuid"),
+        form.get("req_reference_number"),
+    ] if v]
     await db.processor_webhook_events.insert_one({
         "processor": "bofa",
         "event_id": event_id,
@@ -198,7 +221,7 @@ async def bofa_webhook(request: Request):
             "event_id": event_id, "processor": "bofa"
         })
         await core._try_complete_from_webhook(
-            "bofa", payload_ids, inserted["_id"] if inserted else None
+            "bofa", settlement_ids, inserted["_id"] if inserted else None
         )
     return {"ok": True}
 
@@ -293,7 +316,7 @@ async def helcim_webhook(request: Request):
         "received_at": datetime.now(timezone.utc),
     })
 
-    # A verified webhook only authorizes lookup.  Settlement requires the
+    # A verified webhook only authorizes lookup. Settlement requires the
     # authoritative Helcim transaction to match the local session exactly.
     if helcim_webhook_may_lookup(
         verified=verified,
