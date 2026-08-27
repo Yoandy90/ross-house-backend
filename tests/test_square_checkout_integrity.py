@@ -45,7 +45,9 @@ def test_square_verified_completed_webhook_can_settle_rent():
 
 
 def test_source_does_not_restore_false_positive_paths():
-    source = Path("rental/payment_processors_router.py").read_text(encoding="utf-8")
+    # The large implementation is preserved byte-for-byte in the core module;
+    # the public router is now a thin hardened adapter around it.
+    source = Path("rental/payment_processors_core.py").read_text(encoding="utf-8")
     assert 'or t.get("type")' not in source
     assert 'if pay_obj.get("status") in ("COMPLETED", "APPROVED")' not in source
 
