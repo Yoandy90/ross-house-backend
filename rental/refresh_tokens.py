@@ -21,6 +21,12 @@ Feature flags (defaults preservan producción actual):
 - ALLOW_LEGACY_USER_SESSIONS (default true → fallback user_sessions sigue vivo;
   Fase B lo apagará)
 - REQUIRE_SESSION_SID      (ya existía; Fase B lo activará)
+
+Key material:
+- REFRESH_DERIVE_KEY: recomendado y separado del JWT signing secret.
+- TENANT_JWT_SECRET: fallback permitido únicamente cuando es real y no vacío.
+- Si faltan ambos secretos, la derivación falla cerrada. Nunca se usa una clave
+  constante o predecible por configuración incompleta.
 """
 import os
 import hashlib
@@ -39,6 +45,10 @@ BOOTSTRAP = "BOOTSTRAP"           # sesión sin refresh aún → emitir primer r
 DENY = "DENY"                     # revocada/expirada/mismatch → 401 genérico
 
 
+class RefreshConfigurationError(RuntimeError):
+    """Configuración insegura o incompleta para derivar refresh tokens."""
+
+
 def refresh_enabled() -> bool:
     return os.environ.get("REFRESH_TOKENS_ENABLED", "").lower() == "true"
 
@@ -55,11 +65,29 @@ def generate_refresh_token() -> str:
 
 
 def _derive_key() -> bytes:
-    """Clave HMAC para la cadena determinista. Dedicada (REFRESH_DERIVE_KEY) o
-    derivada del secreto JWT — nunca se expone."""
-    dedicated = os.environ.get("REFRESH_DERIVE_KEY")
-    base = dedicated or (os.environ.get("TENANT_JWT_SECRET", "") + ":refresh-derive-v1")
-    return hashlib.sha256(base.encode()).digest()
+    """Obtiene la clave HMAC de derivación de forma fail-closed.
+
+    Prioridad:
+    1. REFRESH_DERIVE_KEY (recomendado; secreto dedicado).
+    2. TENANT_JWT_SECRET + separación de dominio, solo como fallback compatible.
+
+    Nunca derivamos desde una cadena vacía. Si refresh se habilita con secretos
+    ausentes, es preferible fallar explícitamente a producir una cadena de tokens
+    predecible entre instalaciones.
+    """
+    dedicated = (os.environ.get("REFRESH_DERIVE_KEY") or "").strip()
+    if dedicated:
+        material = "refresh-key-v1:" + dedicated
+        return hashlib.sha256(material.encode()).digest()
+
+    jwt_secret = (os.environ.get("TENANT_JWT_SECRET") or "").strip()
+    if jwt_secret:
+        material = jwt_secret + ":refresh-derive-v1"
+        return hashlib.sha256(material.encode()).digest()
+
+    raise RefreshConfigurationError(
+        "REFRESH_DERIVE_KEY or TENANT_JWT_SECRET must be configured before refresh token derivation"
+    )
 
 
 def next_refresh_token(presented_raw: str) -> str:
@@ -72,7 +100,9 @@ def next_refresh_token(presented_raw: str) -> str:
     - Derivar hacia adelante exige la clave K del servidor (256 bits): un atacante
       con R_n NO puede computar R_{n+1}.
     - La entropía de la cadena hereda los 256 bits CSPRNG del bootstrap R1.
-    - Compromiso de K equivale al compromiso del secreto JWT (mismo perímetro)."""
+    - Compromiso de K equivale al compromiso del secreto configurado para derivación.
+    - Configuración sin secretos falla cerrada antes de producir ningún token.
+    """
     import hmac as _hmac
     import base64 as _b64
     digest = _hmac.new(_derive_key(), presented_raw.encode(), hashlib.sha256).digest()
