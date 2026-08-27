@@ -24,52 +24,24 @@ WORKFLOW_STATES = (
     "requires_review",
 )
 EXECUTION_STALE_SECONDS = 300
+MAX_WORKFLOW_SCAN = 1000
 
 OUTCOME_CAPABILITIES = {
-    "provider_confirmed_paid": {
-        "mode": "local_invoice_completion",
-        "financial_write": True,
-        "requires_exact_invoice": True,
-        "provider_call": False,
-    },
-    "provider_confirmed_not_paid": {
-        "mode": "record_only",
-        "financial_write": False,
-        "requires_exact_invoice": False,
-        "provider_call": False,
-    },
-    "needs_refund_review": {
-        "mode": "review_only",
-        "financial_write": False,
-        "requires_exact_invoice": False,
-        "provider_call": False,
-    },
-    "needs_manual_credit_review": {
-        "mode": "review_only",
-        "financial_write": False,
-        "requires_exact_invoice": False,
-        "provider_call": False,
-    },
-    "dismiss_non_financial": {
-        "mode": "record_only",
-        "financial_write": False,
-        "requires_exact_invoice": False,
-        "provider_call": False,
-    },
+    "provider_confirmed_paid": {"mode": "local_invoice_completion", "financial_write": True, "requires_exact_invoice": True, "provider_call": False},
+    "provider_confirmed_not_paid": {"mode": "record_only", "financial_write": False, "requires_exact_invoice": False, "provider_call": False},
+    "needs_refund_review": {"mode": "review_only", "financial_write": False, "requires_exact_invoice": False, "provider_call": False},
+    "needs_manual_credit_review": {"mode": "review_only", "financial_write": False, "requires_exact_invoice": False, "provider_call": False},
+    "dismiss_non_financial": {"mode": "record_only", "financial_write": False, "requires_exact_invoice": False, "provider_call": False},
 }
 
 
 def _as_utc(value: Any) -> datetime | None:
     if isinstance(value, datetime):
-        if value.tzinfo is None:
-            return value.replace(tzinfo=timezone.utc)
-        return value.astimezone(timezone.utc)
+        return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
     if isinstance(value, str) and value:
         try:
             parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-            if parsed.tzinfo is None:
-                parsed = parsed.replace(tzinfo=timezone.utc)
-            return parsed.astimezone(timezone.utc)
+            return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed.astimezone(timezone.utc)
         except ValueError:
             return None
     return None
@@ -85,23 +57,13 @@ def _claim_age_seconds(claim: dict | None, now: datetime | None = None) -> int |
     return max(0, int((now - stamp).total_seconds()))
 
 
-def _workflow_state(
-    confirmation: dict | None,
-    claim: dict | None,
-    result: dict | None,
-    *,
-    now: datetime | None = None,
-) -> str:
+def _workflow_state(confirmation: dict | None, claim: dict | None, result: dict | None, *, now: datetime | None = None) -> str:
     if result:
         return "requires_review" if str(result.get("execution_status") or "") == "requires_review" else "executed"
     if claim:
         age = _claim_age_seconds(claim, now)
-        if age is not None and age >= EXECUTION_STALE_SECONDS:
-            return "requires_review"
-        return "execution_started"
-    if confirmation:
-        return "confirmed"
-    return "proposed"
+        return "requires_review" if age is not None and age >= EXECUTION_STALE_SECONDS else "execution_started"
+    return "confirmed" if confirmation else "proposed"
 
 
 def _execution_capability(outcome: str) -> dict:
@@ -113,17 +75,9 @@ def _execution_capability(outcome: str) -> dict:
     }))
 
 
-def _workflow_summary(
-    proposal: dict,
-    confirmation: dict | None,
-    claim: dict | None,
-    result: dict | None,
-    *,
-    now: datetime | None = None,
-) -> dict:
+def _workflow_summary(proposal: dict, confirmation: dict | None, claim: dict | None, result: dict | None, *, now: datetime | None = None) -> dict:
     state = _workflow_state(confirmation, claim, result, now=now)
     outcome = str(proposal.get("outcome") or "")
-    claim_age = _claim_age_seconds(claim, now)
     return {
         "proposal_id": str(proposal.get("_id") or ""),
         "proposal_digest": str(proposal.get("proposal_digest") or ""),
@@ -141,7 +95,7 @@ def _workflow_summary(
         "executor": (claim or result or {}).get("executor") or None,
         "state": state,
         "recovery_required": state == "requires_review" and result is None and claim is not None,
-        "execution_claim_age_seconds": claim_age,
+        "execution_claim_age_seconds": _claim_age_seconds(claim, now),
         "requires_second_admin": confirmation is None,
         "requires_third_admin": confirmation is not None and claim is None,
         "financial_effect": str((result or claim or proposal).get("financial_effect") or "none"),
@@ -154,13 +108,24 @@ def _workflow_summary(
     }
 
 
-async def _collect_proposals(cursor, limit: int) -> list[dict]:
-    proposals = []
+async def _collect(cursor, limit: int) -> list[dict]:
+    items = []
     async for doc in cursor:
-        proposals.append(doc)
-        if len(proposals) >= limit:
+        items.append(doc)
+        if len(items) >= limit:
             break
-    return proposals
+    return items
+
+
+async def _load_parts(db, proposal: dict):
+    proposal_id = str(proposal.get("_id") or "")
+    confirmation = await db[ACTIONS_COLLECTION].find_one({"action": "confirmation", "proposal_id": proposal_id})
+    claim = result = None
+    if confirmation:
+        confirmation_oid = confirmation.get("_id")
+        claim = await db[ACTIONS_COLLECTION].find_one({"_id": _execution_claim_id(confirmation_oid), "action": "execution_claim"})
+        result = await db[ACTIONS_COLLECTION].find_one({"_id": _execution_result_id(confirmation_oid), "action": "execution_result"})
+    return confirmation, claim, result
 
 
 @router.get("/admin/payment-reconciliation/workflows")
@@ -172,24 +137,16 @@ async def admin_reconciliation_workflows(request: Request, limit: int = 100, sta
     if requested_state and requested_state not in WORKFLOW_STATES:
         raise HTTPException(status_code=400, detail="Invalid workflow state")
 
+    # State is derived from multiple append-only records, so it cannot be pushed
+    # into the proposal query. For filtered views scan a larger but hard-bounded
+    # window and disclose the bound; never run an unbounded DB scan.
+    scan_limit = min(MAX_WORKFLOW_SCAN, max(safe_limit, safe_limit * 5)) if requested_state else safe_limit
+    cursor = db[ACTIONS_COLLECTION].find({"action": "proposal"}).sort("created_at", -1).limit(scan_limit)
+    proposals = await _collect(cursor, scan_limit)
     now = datetime.now(timezone.utc)
-    cursor = db[ACTIONS_COLLECTION].find({"action": "proposal"}).sort("created_at", -1).limit(safe_limit)
-    proposals = await _collect_proposals(cursor, safe_limit)
     items = []
     for proposal in proposals:
-        proposal_id = str(proposal.get("_id") or "")
-        confirmation = await db[ACTIONS_COLLECTION].find_one({"action": "confirmation", "proposal_id": proposal_id})
-        claim = result = None
-        if confirmation:
-            confirmation_oid = confirmation.get("_id")
-            claim = await db[ACTIONS_COLLECTION].find_one({
-                "_id": _execution_claim_id(confirmation_oid),
-                "action": "execution_claim",
-            })
-            result = await db[ACTIONS_COLLECTION].find_one({
-                "_id": _execution_result_id(confirmation_oid),
-                "action": "execution_result",
-            })
+        confirmation, claim, result = await _load_parts(db, proposal)
         summary = _workflow_summary(proposal, confirmation, claim, result, now=now)
         if requested_state and summary["state"] != requested_state:
             continue
@@ -197,19 +154,22 @@ async def admin_reconciliation_workflows(request: Request, limit: int = 100, sta
         if len(items) >= safe_limit:
             break
 
-    by_state = {name: 0 for name in WORKFLOW_STATES}
+    by_state: dict[str, int] = {}
     by_outcome: dict[str, int] = {}
+    recovery_required = 0
     for item in items:
-        by_state[item["state"]] += 1
-        outcome = item["outcome"]
-        by_outcome[outcome] = by_outcome.get(outcome, 0) + 1
+        by_state[item["state"]] = by_state.get(item["state"], 0) + 1
+        by_outcome[item["outcome"]] = by_outcome.get(item["outcome"], 0) + 1
+        recovery_required += int(bool(item.get("recovery_required")))
 
     return {
         "items": items,
         "count": len(items),
-        "by_state": {k: v for k, v in by_state.items() if v},
+        "by_state": by_state,
         "by_outcome": by_outcome,
+        "recovery_required": recovery_required,
         "filter": {"state": requested_state or None, "limit": safe_limit},
+        "scan": {"limit": scan_limit, "max": MAX_WORKFLOW_SCAN, "bounded": True},
         "read_only": True,
     }
 
@@ -223,14 +183,7 @@ async def admin_reconciliation_workflow_detail(proposal_id: str, request: Reques
         proposal = await db[ACTIONS_COLLECTION].find_one({"action": "proposal", "_id": str(proposal_id)})
     if not proposal:
         raise HTTPException(status_code=404, detail="Reconciliation workflow not found")
-
-    confirmation = await db[ACTIONS_COLLECTION].find_one({"action": "confirmation", "proposal_id": str(proposal.get("_id"))})
-    claim = result = None
-    if confirmation:
-        confirmation_oid = confirmation.get("_id")
-        claim = await db[ACTIONS_COLLECTION].find_one({"_id": _execution_claim_id(confirmation_oid), "action": "execution_claim"})
-        result = await db[ACTIONS_COLLECTION].find_one({"_id": _execution_result_id(confirmation_oid), "action": "execution_result"})
-
+    confirmation, claim, result = await _load_parts(db, proposal)
     return {
         "summary": _workflow_summary(proposal, confirmation, claim, result),
         "proposal": _workflow_record_snapshot(proposal),
