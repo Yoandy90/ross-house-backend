@@ -55,8 +55,11 @@ async def test_1_bump_increments_daily_counter():
     await bump("refresh_denied")
     await bump("refresh_denied")
     await bump("legacy_fallback_used")
+    await bump("refresh_config_error")
     d = await DB.auth_metrics_daily.find_one({})
-    assert d["refresh_denied"] == 2 and d["legacy_fallback_used"] == 1
+    assert d["refresh_denied"] == 2
+    assert d["legacy_fallback_used"] == 1
+    assert d["refresh_config_error"] == 1
 
 
 @pytest.mark.asyncio
@@ -68,13 +71,14 @@ async def test_2_bump_invalid_metric_is_noop():
 @pytest.mark.asyncio
 async def test_3_bump_never_raises_on_db_error(monkeypatch):
     monkeypatch.setattr(am, "get_db", lambda: (_ for _ in ()).throw(RuntimeError("db down")))
-    await bump("refresh_denied")  # no exception = pass
+    await bump("refresh_config_error")  # no exception = pass
 
 
 @pytest.mark.asyncio
 async def test_4_endpoint_rbac_and_totals():
     await bump("refresh_bootstrap_ok")
     await bump("refresh_rotate_ok")
+    await bump("refresh_config_error")
     async with client() as c:
         assert (await c.get("/api/admin/auth-metrics")).status_code == 401
         r = await c.get("/api/admin/auth-metrics", headers={"x-test-admin": "1"})
@@ -82,20 +86,18 @@ async def test_4_endpoint_rbac_and_totals():
         d = r.json()
         assert d["totals"]["refresh_bootstrap_ok"] == 1
         assert d["totals"]["refresh_rotate_ok"] == 1
+        assert d["totals"]["refresh_config_error"] == 1
         assert set(d["totals"].keys()) == VALID_METRICS
-        # sin PII: solo day + contadores
         for row in d["daily"]:
             assert set(row.keys()) <= ({"day"} | VALID_METRICS)
 
 
 @pytest.mark.asyncio
 async def test_5_sidless_accepted_and_rejected_metrics(monkeypatch):
-    # aceptado (ventana de gracia)
     monkeypatch.delenv("REQUIRE_SESSION_SID", raising=False)
-    await shared._validate_session_claims({"user_id": "u1"})  # sin sid → return
+    await shared._validate_session_claims({"user_id": "u1"})
     d = await DB.auth_metrics_daily.find_one({})
     assert d["sidless_token_accepted"] == 1
-    # rechazado (Phase C flag)
     monkeypatch.setenv("REQUIRE_SESSION_SID", "true")
     with pytest.raises(HTTPException) as e:
         await shared._validate_session_claims({"user_id": "u1"})
