@@ -15,6 +15,7 @@ Métricas:
   refresh_grace_served      respuesta idempotente dentro del grace window
   refresh_denied            401 genérico (hash desconocido/sesión inválida/DENY)
   refresh_reuse_detected    reuse fuera de grace ⇒ familia revocada
+  refresh_config_error      derivación refresh no disponible por config inválida
   unexpected_401            401 en sesión con sid válido no clasificado (candidato a bug)
 """
 import logging
@@ -30,7 +31,8 @@ router = APIRouter(tags=["observability"])
 VALID_METRICS = {
     "legacy_fallback_used", "sidless_token_accepted", "sidless_token_rejected",
     "refresh_bootstrap_ok", "refresh_rotate_ok", "refresh_grace_served",
-    "refresh_denied", "refresh_reuse_detected", "unexpected_401",
+    "refresh_denied", "refresh_reuse_detected", "refresh_config_error",
+    "unexpected_401",
 }
 
 
