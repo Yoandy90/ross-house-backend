@@ -135,7 +135,8 @@ def test_secure_legacy_route_is_registered_before_historical_handler():
     ]
     assert len(matches) >= 2, "guard and historical route should both be visible during migration"
     assert matches[0].endpoint is legacy_guard.secure_legacy_lease_sign
-    assert matches[0].endpoint is not historical_contracts_router.routes[3].endpoint
+    assert matches[1].endpoint is not legacy_guard.secure_legacy_lease_sign
+    assert matches[1].endpoint.__module__ == "rental.contracts_router"
 
 
 def test_server_source_keeps_pre_contract_router_order():
