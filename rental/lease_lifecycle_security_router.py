@@ -14,7 +14,8 @@ from rental.shared import auth_admin, get_db
 from rental.units_router import mark_unit_rented, sync_property_from_units
 
 router = APIRouter()
-_ALLOWED = {"active", "terminated", "expired", "draft", "pending_signature", "pending"}
+_ALLOWED = {"active", "terminated", "expired", "draft", "pending_signature", "pending",
+            "pending_tenant", "pending_landlord", "pending_signatures", "pending_activation"}
 _RELEASE = {"terminated", "expired", "draft", "pending_signature", "pending"}
 
 
@@ -106,7 +107,6 @@ async def _release_tenant(contract: dict, contract_id: str, now: datetime) -> No
 
 
 async def _claim_lifecycle(contract_oid: ObjectId, old_status: str, new_status: str) -> str:
-    """Serialize lifecycle projection writes before any occupancy mutation."""
     db = get_db()
     claim_id = secrets.token_hex(16)
     now = datetime.utcnow()
@@ -170,7 +170,6 @@ async def secure_update_contract_status(contract_id: str, request: Request):
             current_property = str(tenant.get("current_property_id") or "")
             if current_property and current_property != expected_property:
                 raise HTTPException(status_code=409, detail="lease_tenant_property_changed")
-
             if contract.get("unit_id"):
                 await mark_unit_rented(str(contract["unit_id"]), tenant_id, contract_id)
             else:
@@ -185,7 +184,6 @@ async def secure_update_contract_status(contract_id: str, request: Request):
                 )
                 if claim.matched_count != 1:
                     raise HTTPException(status_code=409, detail="lease_property_occupancy_changed")
-
             tenant_write = await db.tenants.update_one(
                 {"_id": tenant_oid, "$or": [
                     {"current_property_id": expected_property}, {"current_property_id": None},
@@ -211,9 +209,6 @@ async def secure_update_contract_status(contract_id: str, request: Request):
         if result.matched_count != 1:
             raise HTTPException(status_code=409, detail="lease_status_changed")
     except Exception:
-        # Request-time failures release only our own claim. A process crash can
-        # leave a claim visible for explicit recovery rather than unsafe retry.
         await _clear_claim(contract_oid, claim_id)
         raise
-
     return {"success": True, "message": f"Contrato actualizado a: {new_status}"}
