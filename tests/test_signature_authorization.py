@@ -129,14 +129,22 @@ def test_secure_legacy_route_is_registered_before_historical_handler():
 
     secure_key = ("rental.lease_signature_security_router", "secure_legacy_lease_sign")
     historical_key = ("rental.contracts_router", "sign_lease")
-    assert [_endpoint_key(r) for r in pre_contract_router.routes].count(secure_key) == 1
-    assert [_endpoint_key(r) for r in historical_contracts_router.routes].count(historical_key) == 1
+    secure_routes = [r for r in pre_contract_router.routes if _endpoint_key(r) == secure_key]
+    historical_routes = [r for r in historical_contracts_router.routes if _endpoint_key(r) == historical_key]
+    assert len(secure_routes) == 1
+    assert len(historical_routes) == 1
+    assert getattr(secure_routes[0], "path", None) == "/lease/{lease_id}/sign"
+    assert getattr(historical_routes[0], "path", None) == "/lease/{lease_id}/sign"
+    assert "POST" in getattr(secure_routes[0], "methods", set())
+    assert "POST" in getattr(historical_routes[0], "methods", set())
 
     app = FastAPI()
     app.include_router(pre_contract_router, prefix="/api")
     app.include_router(historical_contracts_router, prefix="/api")
-    keys = [_endpoint_key(route) for route in app.routes]
-    assert keys.index(secure_key) < keys.index(historical_key)
+    names = [getattr(route, "name", "") for route in app.routes]
+    assert names.count("secure_legacy_lease_sign") == 1
+    assert names.count("sign_lease") == 1
+    assert names.index("secure_legacy_lease_sign") < names.index("sign_lease")
 
 
 def test_server_source_keeps_pre_contract_router_order():
