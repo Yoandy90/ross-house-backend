@@ -23,4 +23,6 @@ jobs:
       - name: Compile signature security modules
         run: python -m py_compile rental/lease_signature_security_router.py rental/signatures_router.py rental/dnc_registry_router.py
       - name: Run signature authorization regression tests
-        run: pytest -q tests/test_signature_authorization.py
+        env:
+          PYTHONPATH: .
+        run: python -m pytest -q tests/test_signature_authorization.py
