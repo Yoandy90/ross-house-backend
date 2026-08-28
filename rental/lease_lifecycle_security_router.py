@@ -1,10 +1,11 @@
-"""Fail-closed lease lifecycle transitions for occupancy release.
+"""Fail-closed lease lifecycle transitions for occupancy mutation.
 
-Mounted ahead of the historical contracts router.  The route keeps the public
-API stable while ensuring a stale termination/expiration can never release a
-property, unit, or tenant relationship now owned by another active contract.
+A per-contract lifecycle claim serializes the multi-document projection writes.
+The contract is the authority; unit/property/tenant occupancy fields are guarded
+projections and must never be overwritten by a stale lease transition.
 """
 from datetime import datetime
+import secrets
 
 from bson import ObjectId
 from fastapi import APIRouter, HTTPException, Request
@@ -80,9 +81,6 @@ async def _release_tenant(contract: dict, contract_id: str, now: datetime) -> No
     tenant = await db.tenants.find_one({"_id": tenant_oid})
     if not tenant:
         raise HTTPException(status_code=409, detail="lease_tenant_missing")
-
-    # Tenant pointers are legacy projections and do not carry contract_id.  The
-    # active-contract collection is therefore the authority before clearing.
     other = await db.rental_contracts.find_one({
         "tenant_id": tenant_id, "status": "active", "_id": {"$ne": ObjectId(contract_id)}
     })
@@ -99,14 +97,35 @@ async def _release_tenant(contract: dict, contract_id: str, now: datetime) -> No
         ]},
         {"$set": {"current_property_id": None, "current_unit_id": None, "updated_at": now},
          "$push": {"rental_history": {"contract_id": contract_id,
-             "property_id": expected_property,
-             "property_address": contract.get("property_address", ""),
-             "start_date": contract.get("start_date"),
-             "end_date": now.strftime("%Y-%m-%d"),
+             "property_id": expected_property, "property_address": contract.get("property_address", ""),
+             "start_date": contract.get("start_date"), "end_date": now.strftime("%Y-%m-%d"),
              "rent_amount": contract.get("rent_amount", 0)}}},
     )
     if result.matched_count != 1:
         raise HTTPException(status_code=409, detail="lease_tenant_release_changed")
+
+
+async def _claim_lifecycle(contract_oid: ObjectId, old_status: str, new_status: str) -> str:
+    """Serialize lifecycle projection writes before any occupancy mutation."""
+    db = get_db()
+    claim_id = secrets.token_hex(16)
+    now = datetime.utcnow()
+    result = await db.rental_contracts.update_one(
+        {"_id": contract_oid, "status": old_status,
+         "$or": [{"lifecycle_claim_id": {"$exists": False}}, {"lifecycle_claim_id": None}]},
+        {"$set": {"lifecycle_claim_id": claim_id, "lifecycle_claim_target": new_status,
+                  "lifecycle_claimed_at": now}},
+    )
+    if result.matched_count != 1:
+        raise HTTPException(status_code=409, detail="lease_lifecycle_busy_or_changed")
+    return claim_id
+
+
+async def _clear_claim(contract_oid: ObjectId, claim_id: str) -> None:
+    await get_db().rental_contracts.update_one(
+        {"_id": contract_oid, "lifecycle_claim_id": claim_id},
+        {"$unset": {"lifecycle_claim_id": "", "lifecycle_claim_target": "", "lifecycle_claimed_at": ""}},
+    )
 
 
 @router.patch('/admin/rental-contracts/{contract_id}/status')
@@ -125,48 +144,76 @@ async def secure_update_contract_status(contract_id: str, request: Request):
     if new_status == old_status:
         return {"success": True, "message": f"Contrato ya está: {new_status}"}
 
-    now = datetime.utcnow()
     if new_status == "active":
-        missing = []
-        if not contract.get("tenant_signature"):
-            missing.append("tenant")
-        if not (contract.get("landlord_signature") or contract.get("admin_signature")):
-            missing.append("office")
-        if missing and not bool(data.get("force_activate", False)):
-            raise HTTPException(status_code=400, detail="lease_signatures_required")
-        if contract.get("unit_id"):
-            await mark_unit_rented(str(contract["unit_id"]), str(contract["tenant_id"]), contract_id)
-        else:
-            property_id = str(contract.get("property_id") or "")
-            prop_oid = _oid(property_id, "lease_property_invalid")
-            claim = await db.properties.update_one(
-                {"_id": prop_oid, "$or": [
-                    {"current_contract_id": contract_id}, {"current_contract_id": None},
-                    {"current_contract_id": ""}, {"current_contract_id": {"$exists": False}},
-                ]},
-                {"$set": {"status": "rented", "current_contract_id": contract_id,
-                          "current_tenant_id": str(contract["tenant_id"]), "updated_at": now}},
-            )
-            if claim.matched_count != 1:
-                raise HTTPException(status_code=409, detail="lease_property_occupancy_changed")
-        await db.tenants.update_one(
-            {"_id": _oid(str(contract.get("tenant_id") or ""), "lease_tenant_invalid")},
-            {"$set": {"current_property_id": str(contract["property_id"]),
-                      "current_unit_id": contract.get("unit_id"), "updated_at": now}},
-        )
-    elif new_status in _RELEASE:
-        if contract.get("unit_id"):
-            await _release_unit(contract, contract_id, now)
-        else:
-            await _release_property(contract, contract_id, now)
-        await _release_tenant(contract, contract_id, now)
+        if not contract.get("tenant_signature") or not (
+            contract.get("landlord_signature") or contract.get("admin_signature")
+        ):
+            if not bool(data.get("force_activate", False)):
+                raise HTTPException(status_code=400, detail="lease_signatures_required")
+        tenant_id = str(contract.get("tenant_id") or "")
+        other_tenant_lease = await db.rental_contracts.find_one({
+            "tenant_id": tenant_id, "status": "active", "_id": {"$ne": contract_oid}
+        })
+        if other_tenant_lease:
+            raise HTTPException(status_code=409, detail="lease_tenant_already_active_elsewhere")
 
-    # CAS status last: if another actor changed the lease while occupancy work
-    # ran, fail closed rather than silently overwrite the newer lifecycle state.
-    result = await db.rental_contracts.update_one(
-        {"_id": contract_oid, "status": old_status},
-        {"$set": {"status": new_status, "updated_at": now}},
-    )
-    if result.matched_count != 1:
-        raise HTTPException(status_code=409, detail="lease_status_changed")
+    claim_id = await _claim_lifecycle(contract_oid, old_status, new_status)
+    now = datetime.utcnow()
+    try:
+        if new_status == "active":
+            tenant_id = str(contract.get("tenant_id") or "")
+            tenant_oid = _oid(tenant_id, "lease_tenant_invalid")
+            tenant = await db.tenants.find_one({"_id": tenant_oid})
+            if not tenant:
+                raise HTTPException(status_code=409, detail="lease_tenant_missing")
+            expected_property = str(contract.get("property_id") or "")
+            current_property = str(tenant.get("current_property_id") or "")
+            if current_property and current_property != expected_property:
+                raise HTTPException(status_code=409, detail="lease_tenant_property_changed")
+
+            if contract.get("unit_id"):
+                await mark_unit_rented(str(contract["unit_id"]), tenant_id, contract_id)
+            else:
+                prop_oid = _oid(expected_property, "lease_property_invalid")
+                claim = await db.properties.update_one(
+                    {"_id": prop_oid, "$or": [
+                        {"current_contract_id": contract_id}, {"current_contract_id": None},
+                        {"current_contract_id": ""}, {"current_contract_id": {"$exists": False}},
+                    ]},
+                    {"$set": {"status": "rented", "current_contract_id": contract_id,
+                              "current_tenant_id": tenant_id, "updated_at": now}},
+                )
+                if claim.matched_count != 1:
+                    raise HTTPException(status_code=409, detail="lease_property_occupancy_changed")
+
+            tenant_write = await db.tenants.update_one(
+                {"_id": tenant_oid, "$or": [
+                    {"current_property_id": expected_property}, {"current_property_id": None},
+                    {"current_property_id": ""}, {"current_property_id": {"$exists": False}},
+                ]},
+                {"$set": {"current_property_id": expected_property,
+                          "current_unit_id": contract.get("unit_id"), "updated_at": now}},
+            )
+            if tenant_write.matched_count != 1:
+                raise HTTPException(status_code=409, detail="lease_tenant_occupancy_changed")
+        elif new_status in _RELEASE:
+            if contract.get("unit_id"):
+                await _release_unit(contract, contract_id, now)
+            else:
+                await _release_property(contract, contract_id, now)
+            await _release_tenant(contract, contract_id, now)
+
+        result = await db.rental_contracts.update_one(
+            {"_id": contract_oid, "status": old_status, "lifecycle_claim_id": claim_id},
+            {"$set": {"status": new_status, "updated_at": now},
+             "$unset": {"lifecycle_claim_id": "", "lifecycle_claim_target": "", "lifecycle_claimed_at": ""}},
+        )
+        if result.matched_count != 1:
+            raise HTTPException(status_code=409, detail="lease_status_changed")
+    except Exception:
+        # Request-time failures release only our own claim. A process crash can
+        # leave a claim visible for explicit recovery rather than unsafe retry.
+        await _clear_claim(contract_oid, claim_id)
+        raise
+
     return {"success": True, "message": f"Contrato actualizado a: {new_status}"}
