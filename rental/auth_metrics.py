@@ -15,6 +15,7 @@ from .shared import get_db, auth_admin
 from .tenant_dashboard_security_router import router as tenant_dashboard_security_router
 from .maintenance_security_router import router as maintenance_security_router
 from .lease_lifecycle_security_router import router as lease_lifecycle_security_router
+from .lease_creation_security_router import router as lease_creation_security_router
 
 logger = logging.getLogger("auth_metrics")
 router = APIRouter(tags=["observability"])
@@ -24,6 +25,7 @@ router = APIRouter(tags=["observability"])
 # FastAPI first-match resolution without changing public URLs.
 router.routes.extend(tenant_dashboard_security_router.routes)
 router.routes.extend(maintenance_security_router.routes)
+router.routes.extend(lease_creation_security_router.routes)
 router.routes.extend(lease_lifecycle_security_router.routes)
 
 VALID_METRICS = {
