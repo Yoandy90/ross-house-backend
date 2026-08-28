@@ -6,8 +6,10 @@ from bson import ObjectId
 from fastapi import FastAPI, HTTPException
 
 import rental.maintenance_security_router as secure
+import rental.maintenance_ownership_security_router as ownership
 from rental.auth_metrics import router as pre_tenant_router
 from rental.tenant_router import router as historical_tenant_router
+from rental.service_providers_router import router as historical_provider_router
 
 
 def run(coro):
@@ -49,6 +51,20 @@ def test_secure_maintenance_routes_are_first_runtime_match():
     assert get_matches[1].name == "list_tenant_maintenance_requests"
 
 
+def test_secure_provider_help_route_is_first_runtime_match():
+    app = FastAPI()
+    app.include_router(pre_tenant_router, prefix="/api")
+    app.include_router(historical_provider_router, prefix="/api")
+
+    matches = [r for r in app.routes
+               if getattr(r, "path", None) == "/api/tenant/service-providers/request-help"
+               and "POST" in getattr(r, "methods", set())]
+
+    assert len(matches) == 2
+    assert matches[0].name == "secure_tenant_request_help"
+    assert matches[1].name == "tenant_request_help"
+
+
 def test_client_relationship_fields_are_not_payload_authority():
     source = open("rental/maintenance_security_router.py", encoding="utf-8").read()
     assert '"property_id": location["property_id"]' in source
@@ -57,6 +73,43 @@ def test_client_relationship_fields_are_not_payload_authority():
     assert 'data.get("property_id")' not in source
     assert 'data.get("contract_id")' not in source
     assert 'data.get("tenant_id")' not in source
+
+
+def test_provider_help_relationship_fields_are_lease_derived():
+    source = open("rental/maintenance_ownership_security_router.py", encoding="utf-8").read()
+    assert '"tenant_id": str(tenant["_id"])' in source
+    assert '"contract_id": str(contract["_id"])' in source
+    assert '"property_id": location["property_id"]' in source
+    assert '"unit_id": location["unit_id"]' in source
+    assert '"relationship_source": "active_contract"' in source
+    assert 'data.get("tenant_id")' not in source
+    assert 'data.get("contract_id")' not in source
+    assert 'data.get("property_id")' not in source
+    assert 'data.get("unit_id")' not in source
+
+
+def test_provider_help_rejects_cross_tenant_contract(monkeypatch):
+    tenant_oid = ObjectId()
+    other_tenant_oid = ObjectId()
+    contract_oid = ObjectId()
+
+    async def fake_auth(_request):
+        return {"sub": "user"}
+
+    async def fake_tenant(_user):
+        return {"_id": tenant_oid}
+
+    async def fake_contract(_tenant):
+        return {"_id": contract_oid, "tenant_id": str(other_tenant_oid)}
+
+    monkeypatch.setattr(ownership, "auth_marketplace", fake_auth)
+    monkeypatch.setattr(ownership, "resolve_authenticated_tenant", fake_tenant)
+    monkeypatch.setattr(ownership, "find_active_contract_for_tenant", fake_contract)
+
+    with pytest.raises(HTTPException) as exc:
+        run(ownership._active_maintenance_context(SimpleNamespace()))
+    assert exc.value.status_code == 409
+    assert exc.value.detail == "maintenance_contract_tenant_mismatch"
 
 
 def test_photo_policy_rejects_non_image_and_unbounded_lists():
