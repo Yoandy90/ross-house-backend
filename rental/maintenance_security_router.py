@@ -35,7 +35,7 @@ _MAX_PHOTO_CHARS = 1_500_000
 
 
 async def _canonical_lease_location(contract: dict) -> dict:
-    """Resolve and validate the exact property/unit represented by a lease."""
+    """Resolve and validate the exact property/unit represented by an active lease."""
     db = get_db()
     property_id = str(contract.get("property_id") or "")
     if not ObjectId.is_valid(property_id):
@@ -55,7 +55,10 @@ async def _canonical_lease_location(contract: dict) -> dict:
             raise HTTPException(status_code=409, detail="maintenance_contract_unit_missing")
         if str(unit.get("property_id") or "") != property_id:
             raise HTTPException(status_code=409, detail="maintenance_unit_property_mismatch")
-        if str(unit.get("current_contract_id") or "") not in ("", str(contract["_id"])):
+        # An active lease must already own its unit projection.  Allowing an
+        # empty claim here would let maintenance proceed from an internally
+        # inconsistent active contract after a partial lifecycle failure.
+        if str(unit.get("current_contract_id") or "") != str(contract["_id"]):
             raise HTTPException(status_code=409, detail="maintenance_unit_contract_mismatch")
 
     address = prop.get("address", "")
