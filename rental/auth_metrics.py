@@ -25,16 +25,17 @@ from fastapi import APIRouter, Request
 
 from .shared import get_db, auth_admin
 from .tenant_dashboard_security_router import router as tenant_dashboard_security_router
+from .maintenance_security_router import router as maintenance_security_router
 
 logger = logging.getLogger("auth_metrics")
 router = APIRouter(tags=["observability"])
 
 # Temporary compatibility shim: server.py mounts auth_metrics_router before
-# properties_router and tenant_router. Flattening the secure dashboard route
-# here makes GET /tenant/dashboard resolve to the canonical actor-bound handler
-# first without changing the public URL. Remove this shim when tenant_router is
-# decomposed and the historical dashboard handler is deleted.
+# properties_router and tenant_router. Flattening actor-bound routes here makes
+# them the first FastAPI match without changing public URLs. Remove this shim
+# when tenant_router is decomposed and the historical handlers are deleted.
 router.routes.extend(tenant_dashboard_security_router.routes)
+router.routes.extend(maintenance_security_router.routes)
 
 VALID_METRICS = {
     "legacy_fallback_used", "sidless_token_accepted", "sidless_token_rejected",
