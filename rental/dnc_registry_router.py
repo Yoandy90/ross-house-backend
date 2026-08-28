@@ -19,12 +19,12 @@ from rental.lease_signature_security_router import router as lease_signature_sec
 router = APIRouter(tags=["dnc-registry"])
 
 # SECURITY REGISTRATION SHIM:
-# server.py mounts this router immediately before contracts_router. Including
-# the actor-bound lease-signing route here makes it the first FastAPI match for
-# POST /lease/{id}/sign, closing the legacy client-role-trust path without
-# changing the public URL. Keep this ordering guard covered by tests until the
-# oversized legacy contracts router can be decomposed and the old route removed.
-router.include_router(lease_signature_security_router)
+# server.py mounts this router immediately before contracts_router. Flattening
+# the actor-bound APIRoutes here makes POST /lease/{id}/sign the first FastAPI
+# match without changing the public URL. Keep this ordering guard covered by
+# tests until the oversized legacy contracts router can be decomposed and the
+# old route removed.
+router.routes.extend(lease_signature_security_router.routes)
 
 STATUSES = ["pendiente_email", "inscrito", "verificado", "rechazado"]
 
