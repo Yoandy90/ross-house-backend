@@ -18,6 +18,11 @@ class _DB:
         self.tenants = _Tenants(tenant_doc)
 
 
+def _endpoint_key(route):
+    endpoint = getattr(route, "endpoint", None)
+    return (getattr(endpoint, "__module__", ""), getattr(endpoint, "__name__", ""))
+
+
 @pytest.mark.asyncio
 async def test_legacy_tenant_must_match_lease_party(monkeypatch):
     actor = {"_id": "actor-1", "email": "tenant@example.com", "role": "tenant"}
@@ -119,33 +124,19 @@ async def test_modern_landlord_is_bound_to_contract_id():
 
 
 def test_secure_legacy_route_is_registered_before_historical_handler():
-    # Mirrors server.py's intentional order: dnc router immediately precedes
-    # contracts_router. FastAPI resolves the first matching endpoint in order.
     from rental.dnc_registry_router import router as pre_contract_router
     from rental.contracts_router import router as historical_contracts_router
 
-    secure_routes = [
-        route for route in pre_contract_router.routes
-        if getattr(route, "endpoint", None) is legacy_guard.secure_legacy_lease_sign
-    ]
-    historical_routes = [
-        route for route in historical_contracts_router.routes
-        if getattr(getattr(route, "endpoint", None), "__name__", "") == "sign_lease"
-    ]
-    assert len(secure_routes) == 1
-    assert len(historical_routes) == 1
+    secure_key = ("rental.lease_signature_security_router", "secure_legacy_lease_sign")
+    historical_key = ("rental.contracts_router", "sign_lease")
+    assert [_endpoint_key(r) for r in pre_contract_router.routes].count(secure_key) == 1
+    assert [_endpoint_key(r) for r in historical_contracts_router.routes].count(historical_key) == 1
 
     app = FastAPI()
     app.include_router(pre_contract_router, prefix="/api")
     app.include_router(historical_contracts_router, prefix="/api")
-    endpoints = [getattr(route, "endpoint", None) for route in app.routes]
-    secure_index = next(i for i, endpoint in enumerate(endpoints) if endpoint is legacy_guard.secure_legacy_lease_sign)
-    historical_index = next(
-        i for i, endpoint in enumerate(endpoints)
-        if getattr(endpoint, "__module__", "") == "rental.contracts_router"
-        and getattr(endpoint, "__name__", "") == "sign_lease"
-    )
-    assert secure_index < historical_index
+    keys = [_endpoint_key(route) for route in app.routes]
+    assert keys.index(secure_key) < keys.index(historical_key)
 
 
 def test_server_source_keeps_pre_contract_router_order():
