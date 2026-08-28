@@ -95,6 +95,7 @@ def _workflow_summary(proposal: dict, confirmation: dict | None, claim: dict | N
         "executor": (claim or result or {}).get("executor") or None,
         "state": state,
         "recovery_required": state == "requires_review" and result is None and claim is not None,
+        "execution_claim_id": str((claim or {}).get("_id") or ""),
         "execution_claim_age_seconds": _claim_age_seconds(claim, now),
         "requires_second_admin": confirmation is None,
         "requires_third_admin": confirmation is not None and claim is None,
