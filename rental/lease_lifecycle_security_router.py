@@ -3,6 +3,11 @@
 A per-contract lifecycle claim serializes the multi-document projection writes.
 The contract is the authority; unit/property/tenant occupancy fields are guarded
 projections and must never be overwritten by a stale lease transition.
+
+Once a lifecycle claim is acquired it is deliberately retained on any failed
+multi-document transition.  A failure may have happened after one projection
+was already written, so clearing the claim would permit an unsafe blind retry.
+Recovery is explicit and separately inspected.
 """
 from datetime import datetime
 import secrets
@@ -121,13 +126,6 @@ async def _claim_lifecycle(contract_oid: ObjectId, old_status: str, new_status: 
     return claim_id
 
 
-async def _clear_claim(contract_oid: ObjectId, claim_id: str) -> None:
-    await get_db().rental_contracts.update_one(
-        {"_id": contract_oid, "lifecycle_claim_id": claim_id},
-        {"$unset": {"lifecycle_claim_id": "", "lifecycle_claim_target": "", "lifecycle_claimed_at": ""}},
-    )
-
-
 @router.patch('/admin/rental-contracts/{contract_id}/status')
 async def secure_update_contract_status(contract_id: str, request: Request):
     await auth_admin(request)
@@ -209,6 +207,8 @@ async def secure_update_contract_status(contract_id: str, request: Request):
         if result.matched_count != 1:
             raise HTTPException(status_code=409, detail="lease_status_changed")
     except Exception:
-        await _clear_claim(contract_oid, claim_id)
+        # Fail closed.  We cannot know whether a prior projection write committed.
+        # Retain the exact claim so another transition cannot retry or release by
+        # inference.  The read-only recovery inspector classifies observed state.
         raise
     return {"success": True, "message": f"Contrato actualizado a: {new_status}"}
