@@ -67,3 +67,42 @@ def test_activation_property_claim_uses_compare_and_set():
     assert 'detail="lease_property_occupancy_changed"' in source
     assert '{"current_contract_id": contract_id}' in source
     assert '{"current_contract_id": {"$exists": False}}' in source
+
+
+def test_failed_transition_retains_claim_instead_of_blind_retry():
+    source = Path("rental/lease_lifecycle_security_router.py").read_text()
+    assert "async def _clear_claim" not in source
+    except_block = source[source.index("    except Exception:"):]
+    assert "_clear_claim" not in except_block
+    assert "Fail closed" in except_block
+
+
+def test_recovery_inspector_is_read_only_and_exact_claim_bound():
+    source = Path("rental/lease_lifecycle_recovery_router.py").read_text()
+    assert "@router.get('/admin/rental-contracts/{contract_id}/lifecycle-recovery/{claim_id}')" in source
+    assert 'detail="lease_lifecycle_claim_mismatch"' in source
+    assert '"read_only": True' in source
+    assert '"automatic_retry_allowed": False' in source
+    assert "update_one(" not in source
+    assert "insert_one(" not in source
+    assert "delete_one(" not in source
+
+
+def test_recovery_has_explicit_partial_failure_classifications():
+    source = Path("rental/lease_lifecycle_recovery_router.py").read_text()
+    for state in (
+        "result_recorded",
+        "projection_applied_status_missing",
+        "no_projection_detected",
+        "partial_projection",
+        "ambiguous_state",
+    ):
+        assert state in source
+    assert '"other_contract"' in source
+    assert '"different_projection"' in source
+
+
+def test_recovery_router_is_mounted_in_security_shim():
+    source = Path("rental/auth_metrics.py").read_text()
+    assert "lease_lifecycle_recovery_router" in source
+    assert "router.routes.extend(lease_lifecycle_recovery_router.routes)" in source
