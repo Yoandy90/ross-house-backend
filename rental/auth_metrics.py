@@ -14,6 +14,7 @@ from fastapi import APIRouter, Request
 from .shared import get_db, auth_admin
 from .tenant_dashboard_security_router import router as tenant_dashboard_security_router
 from .tenant_receipt_security_router import router as tenant_receipt_security_router
+from .section8_security_router import router as section8_security_router
 from .maintenance_security_router import router as maintenance_security_router
 from .maintenance_ownership_security_router import router as maintenance_ownership_security_router
 from .lease_lifecycle_security_router import router as lease_lifecycle_security_router
@@ -29,6 +30,7 @@ router = APIRouter(tags=["observability"])
 # URLs while the historical endpoints remain available for compatibility.
 router.routes.extend(tenant_dashboard_security_router.routes)
 router.routes.extend(tenant_receipt_security_router.routes)
+router.routes.extend(section8_security_router.routes)
 router.routes.extend(maintenance_security_router.routes)
 router.routes.extend(maintenance_ownership_security_router.routes)
 router.routes.extend(lease_creation_security_router.routes)
