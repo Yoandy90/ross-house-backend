@@ -2,6 +2,7 @@
 Signature Management Router
 Handles digital signatures (touch + Topaz pad) for contracts and documents.
 """
+import re
 from fastapi import APIRouter, HTTPException, Request
 from datetime import datetime, timezone
 from bson import ObjectId
@@ -9,21 +10,75 @@ from .shared import get_db, auth_admin, auth_marketplace, serialize
 
 router = APIRouter()
 
+_ALLOWED_CONTRACT_SIGNER_ROLES = {"tenant", "landlord", "admin"}
+_ALLOWED_DOCUMENT_TYPES = {"contract", "document"}
+
 
 async def _my_ids(user, db) -> list:
-    """IDs que identifican al usuario en contratos: user_id + tenant doc id (por email)."""
+    """IDs that identify the current user in contracts/documents."""
     ids = [str(user['_id'])]
     email = (user.get('email') or '').strip().lower()
     if email:
-        tenant_doc = await db.tenants.find_one({"email": {"$regex": f"^{email}$", "$options": "i"}})
+        tenant_doc = await db.tenants.find_one({
+            "email": {"$regex": f"^{re.escape(email)}$", "$options": "i"}
+        })
         if tenant_doc:
             ids.append(str(tenant_doc['_id']))
-    return ids
+    return list(dict.fromkeys(ids))
 
 
 def _effective_role(user) -> str:
-    role = user.get('role', 'tenant')
+    role = str(user.get('role', 'tenant') or 'tenant').strip().lower()
     return 'tenant' if role in ('tenant', 'client') else role
+
+
+def _actor_name(user: dict, role: str) -> str:
+    name = str(user.get('name') or user.get('full_name') or '').strip()
+    if name:
+        return name
+    first = str(user.get('first_name') or '').strip()
+    last = str(user.get('last_name') or '').strip()
+    joined = f"{first} {last}".strip()
+    return joined or str(user.get('email') or '').strip().lower() or role
+
+
+def _norm_id(value) -> str:
+    return str(value or '').strip()
+
+
+async def _authorize_contract_signer(user: dict, contract: dict, db) -> tuple[str, list[str]]:
+    role = _effective_role(user)
+    if role not in _ALLOWED_CONTRACT_SIGNER_ROLES:
+        raise HTTPException(403, "Rol no autorizado para firmar contratos")
+
+    user_id = _norm_id(user.get('_id'))
+    my_ids = await _my_ids(user, db)
+    if role == 'tenant':
+        if _norm_id(contract.get('tenant_id')) not in my_ids:
+            raise HTTPException(403, "No autorizado para firmar este contrato")
+    elif role == 'landlord':
+        landlord_id = _norm_id(contract.get('landlord_id'))
+        if not landlord_id or landlord_id != user_id:
+            raise HTTPException(403, "No autorizado para firmar este contrato")
+    # Admin authority is established by the authenticated DB-backed role.
+    return role, my_ids
+
+
+async def _authorize_standalone_document(user: dict, document: dict, db) -> None:
+    role = _effective_role(user)
+    if role == 'admin':
+        return
+    user_id = _norm_id(user.get('_id'))
+    my_ids = await _my_ids(user, db)
+    recipient_id = document.get('recipient_id')
+    if isinstance(recipient_id, list):
+        recipients = {_norm_id(x) for x in recipient_id}
+        is_recipient = bool(recipients.intersection(my_ids))
+    else:
+        is_recipient = _norm_id(recipient_id) in my_ids
+    is_creator = _norm_id(document.get('created_by')) == user_id
+    if not is_recipient and not is_creator:
+        raise HTTPException(403, "No autorizado para firmar este documento")
 
 
 # ─── List pending documents that need signatures ──────
@@ -37,8 +92,6 @@ async def get_pending_signatures(request: Request):
     my_ids = await _my_ids(user, db)
 
     pending = []
-
-    # Check contracts/leases that need signatures
     contracts = await db.rental_contracts.find({
         '$or': [
             {'tenant_id': {'$in': my_ids}},
@@ -52,7 +105,6 @@ async def get_pending_signatures(request: Request):
         c = serialize(contract)
         needs_sig = False
         signed_by_me = False
-
         if role == 'tenant' and c.get('tenant_id') in my_ids:
             signed_by_me = bool(c.get('tenant_signature'))
             needs_sig = not signed_by_me and c.get('status') in ['pending_signatures', 'pending_tenant']
@@ -84,7 +136,6 @@ async def get_pending_signatures(request: Request):
             }
         })
 
-    # Check standalone documents (legal docs, addendums, etc.)
     docs = await db.signature_documents.find({
         '$or': [
             {'recipient_id': {'$in': my_ids}},
@@ -96,7 +147,6 @@ async def get_pending_signatures(request: Request):
         d = serialize(doc)
         sigs = d.get('signatures', [])
         my_sig = next((s for s in sigs if s.get('signer_id') == user_id), None)
-
         pending.append({
             'id': d['id'],
             'type': 'document',
@@ -110,9 +160,7 @@ async def get_pending_signatures(request: Request):
             'signatures': {},
         })
 
-    # Sort: pending first, then by date
     pending.sort(key=lambda x: (0 if x['needs_my_signature'] else 1, str(x.get('created_at', ''))), reverse=False)
-
     return {
         'success': True,
         'documents': pending,
@@ -124,59 +172,63 @@ async def get_pending_signatures(request: Request):
 # ─── Submit a signature ──────────────────────────────
 @router.post('/signatures/sign')
 async def submit_signature(request: Request):
-    """Submit a signature for a document or contract."""
+    """Submit a signature only after binding the authenticated actor to the source."""
     user = await auth_marketplace(request)
     db = get_db()
     body = await request.json()
 
-    document_id = body.get('document_id')
-    document_type = body.get('document_type', 'contract')
-    signature_data = body.get('signature_data')  # base64 image
-    signature_method = body.get('method', 'touch')  # 'touch' or 'topaz'
-    signer_name = body.get('signer_name', user.get('name', ''))
+    document_id = str(body.get('document_id') or '').strip()
+    document_type = str(body.get('document_type', 'contract') or '').strip().lower()
+    signature_data = body.get('signature_data')
+    signature_method = body.get('method', 'touch')
 
     if not document_id or not signature_data:
         raise HTTPException(400, "document_id y signature_data son requeridos")
+    if document_type not in _ALLOWED_DOCUMENT_TYPES:
+        raise HTTPException(400, "document_type inválido")
+
+    try:
+        object_id = ObjectId(document_id)
+    except Exception:
+        raise HTTPException(400, "document_id inválido")
 
     user_id = str(user['_id'])
     role = _effective_role(user)
     now = datetime.now(timezone.utc)
-
     contract = None
+    source_document = None
+
     if document_type == 'contract':
-        try:
-            contract = await db.rental_contracts.find_one({'_id': ObjectId(document_id)})
-        except Exception:
-            raise HTTPException(400, "document_id inválido")
+        contract = await db.rental_contracts.find_one({'_id': object_id})
         if not contract:
             raise HTTPException(404, "Contrato no encontrado")
-        # Security: tenants can only sign their own contract
-        if role == 'tenant':
-            my_ids = await _my_ids(user, db)
-            if contract.get('tenant_id') not in my_ids:
-                raise HTTPException(403, "No autorizado para firmar este contrato")
+        role, _ = await _authorize_contract_signer(user, contract, db)
+    else:
+        source_document = await db.signature_documents.find_one({'_id': object_id})
+        if not source_document:
+            raise HTTPException(404, "Documento no encontrado")
+        await _authorize_standalone_document(user, source_document, db)
 
-    # Create signature record
+    # Client text cannot redefine the signer identity. Name/email/role come
+    # from the authenticated actor; only the signature image/method are input.
     sig_record = {
         'document_id': document_id,
         'document_type': document_type,
         'signer_id': user_id,
-        'signer_name': signer_name,
+        'signer_name': _actor_name(user, role),
         'signer_role': role,
         'signer_email': user.get('email', ''),
         'signature_data': signature_data,
-        'method': signature_method,  # 'touch' | 'topaz'
+        'method': signature_method,
         'device_info': body.get('device_info', ''),
         'ip_address': request.client.host if request.client else '',
         'signed_at': now,
         'created_at': now,
     }
 
-    # Save the signature record
     result = await db.signatures.insert_one(sig_record)
     sig_id = str(result.inserted_id)
 
-    # Update the source document
     if document_type == 'contract':
         update_field = f"{role}_signature"
         update_data = {
@@ -185,8 +237,6 @@ async def submit_signature(request: Request):
             f"{update_field}_method": signature_method,
             'updated_at': now,
         }
-
-        # Determine new status. Landlord only counts if the contract has one.
         sigs_after = {
             'admin': contract.get('admin_signature') or (signature_data if role == 'admin' else None),
             'tenant': contract.get('tenant_signature') or (signature_data if role == 'tenant' else None),
@@ -201,12 +251,21 @@ async def submit_signature(request: Request):
         elif role == 'tenant':
             update_data['status'] = 'pending_signatures'
 
-        await db.rental_contracts.update_one(
-            {'_id': ObjectId(document_id)},
-            {'$set': update_data}
-        )
+        write_filter = {'_id': object_id, 'updated_at': contract.get('updated_at')}
+        # Older records may lack updated_at; match that exact absence instead of
+        # silently widening the write to an arbitrary current document.
+        if contract.get('updated_at') is None:
+            write_filter = {'_id': object_id, 'updated_at': {'$exists': False}}
+        write_result = await db.rental_contracts.update_one(write_filter, {'$set': update_data})
+        if getattr(write_result, 'matched_count', 0) != 1:
+            # The audit record is retained, but it must not be represented as a
+            # successful source mutation when the contract changed concurrently.
+            await db.signatures.update_one(
+                {'_id': result.inserted_id},
+                {'$set': {'source_write_status': 'conflict', 'source_write_conflict_at': now}}
+            )
+            raise HTTPException(409, "signature_source_state_changed")
 
-        # Mark property as rented once the contract is fully signed
         if all_signed and contract.get('property_id'):
             try:
                 await db.properties.update_one(
@@ -216,14 +275,20 @@ async def submit_signature(request: Request):
             except Exception:
                 pass
 
-    elif document_type == 'document':
-        await db.signature_documents.update_one(
-            {'_id': ObjectId(document_id)},
+    else:
+        write_result = await db.signature_documents.update_one(
+            {'_id': object_id},
             {
                 '$push': {'signatures': {**sig_record, '_id': ObjectId(sig_id)}},
                 '$set': {'updated_at': now}
             }
         )
+        if getattr(write_result, 'matched_count', 0) != 1:
+            await db.signatures.update_one(
+                {'_id': result.inserted_id},
+                {'$set': {'source_write_status': 'missing', 'source_write_conflict_at': now}}
+            )
+            raise HTTPException(409, "signature_source_state_changed")
 
     return {
         'success': True,
@@ -236,15 +301,10 @@ async def submit_signature(request: Request):
 # ─── Get signature history ──────────────────────────
 @router.get('/signatures/history')
 async def get_signature_history(request: Request):
-    """Get the user's signature history."""
     user = await auth_marketplace(request)
     db = get_db()
     user_id = str(user['_id'])
-
-    sigs = await db.signatures.find(
-        {'signer_id': user_id}
-    ).sort('signed_at', -1).to_list(50)
-
+    sigs = await db.signatures.find({'signer_id': user_id}).sort('signed_at', -1).to_list(50)
     history = []
     for sig in sigs:
         s = serialize(sig)
@@ -256,38 +316,22 @@ async def get_signature_history(request: Request):
             'signed_at': s.get('signed_at'),
             'signer_name': s.get('signer_name'),
         })
-
-    return {
-        'success': True,
-        'signatures': history,
-        'total': len(history),
-    }
+    return {'success': True, 'signatures': history, 'total': len(history)}
 
 
 # ─── Admin: Get all pending signatures across all users ──
 @router.get('/admin/signatures/overview')
 async def admin_signatures_overview(request: Request):
-    """Admin view: overview of all signature activity."""
     await auth_admin(request)
     db = get_db()
-
-    # Count pending contracts
     pending_contracts = await db.rental_contracts.count_documents({
         'status': {'$in': ['pending_signatures', 'pending_tenant', 'pending_landlord']}
     })
-
-    # Count total signatures this month
     now = datetime.now(timezone.utc)
     month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    monthly_sigs = await db.signatures.count_documents({
-        'signed_at': {'$gte': month_start}
-    })
-
-    # Count by method
+    monthly_sigs = await db.signatures.count_documents({'signed_at': {'$gte': month_start}})
     touch_count = await db.signatures.count_documents({'method': 'touch'})
     topaz_count = await db.signatures.count_documents({'method': 'topaz'})
-
-    # Recent signatures
     recent = await db.signatures.find().sort('signed_at', -1).to_list(10)
     recent_list = []
     for sig in recent:
@@ -300,7 +344,6 @@ async def admin_signatures_overview(request: Request):
             'document_type': s.get('document_type', ''),
             'signed_at': s.get('signed_at', ''),
         })
-
     return {
         'success': True,
         'pending_contracts': pending_contracts,

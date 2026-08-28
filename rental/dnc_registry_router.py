@@ -14,8 +14,17 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
 from rental.shared import get_db, auth_admin, serialize
+from rental.lease_signature_security_router import router as lease_signature_security_router
 
 router = APIRouter(tags=["dnc-registry"])
+
+# SECURITY REGISTRATION SHIM:
+# server.py mounts this router immediately before contracts_router. Flattening
+# the actor-bound APIRoutes here makes POST /lease/{id}/sign the first FastAPI
+# match without changing the public URL. Keep this ordering guard covered by
+# tests until the oversized legacy contracts router can be decomposed and the
+# old route removed.
+router.routes.extend(lease_signature_security_router.routes)
 
 STATUSES = ["pendiente_email", "inscrito", "verificado", "rechazado"]
 
@@ -62,7 +71,7 @@ async def create_dnc_registration(request: Request, body: DncRegistrationBody):
         "source": body.source,
         "notes": body.notes.strip(),
         "status": "pendiente_email",
-        "phone_status": {},           # {phone: {national_dnc, checked_at}}
+        "phone_status": {},
         "registered_by": admin.get("email", ""),
         "created_at": datetime.now(timezone.utc),
         "updated_at": datetime.now(timezone.utc),
