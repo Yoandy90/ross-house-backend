@@ -14,6 +14,7 @@ from fastapi import APIRouter, Request
 from .shared import get_db, auth_admin
 from .tenant_dashboard_security_router import router as tenant_dashboard_security_router
 from .maintenance_security_router import router as maintenance_security_router
+from .maintenance_ownership_security_router import router as maintenance_ownership_security_router
 from .lease_lifecycle_security_router import router as lease_lifecycle_security_router
 from .lease_lifecycle_recovery_router import router as lease_lifecycle_recovery_router
 from .lease_creation_security_router import router as lease_creation_security_router
@@ -22,10 +23,12 @@ logger = logging.getLogger("auth_metrics")
 router = APIRouter(tags=["observability"])
 
 # Temporary compatibility shim: server.py mounts auth_metrics_router before
-# properties/contracts/tenant routers. Canonical security routes therefore win
-# FastAPI first-match resolution without changing public URLs.
+# properties/contracts/tenant/service-provider routers. Canonical security
+# routes therefore win FastAPI first-match resolution without changing public
+# URLs while the historical endpoints remain available for compatibility.
 router.routes.extend(tenant_dashboard_security_router.routes)
 router.routes.extend(maintenance_security_router.routes)
+router.routes.extend(maintenance_ownership_security_router.routes)
 router.routes.extend(lease_creation_security_router.routes)
 router.routes.extend(lease_lifecycle_security_router.routes)
 router.routes.extend(lease_lifecycle_recovery_router.routes)
