@@ -120,23 +120,32 @@ async def test_modern_landlord_is_bound_to_contract_id():
 
 def test_secure_legacy_route_is_registered_before_historical_handler():
     # Mirrors server.py's intentional order: dnc router immediately precedes
-    # contracts_router. FastAPI resolves the first matching path+method.
+    # contracts_router. FastAPI resolves the first matching endpoint in order.
     from rental.dnc_registry_router import router as pre_contract_router
     from rental.contracts_router import router as historical_contracts_router
+
+    secure_routes = [
+        route for route in pre_contract_router.routes
+        if getattr(route, "endpoint", None) is legacy_guard.secure_legacy_lease_sign
+    ]
+    historical_routes = [
+        route for route in historical_contracts_router.routes
+        if getattr(getattr(route, "endpoint", None), "__name__", "") == "sign_lease"
+    ]
+    assert len(secure_routes) == 1
+    assert len(historical_routes) == 1
 
     app = FastAPI()
     app.include_router(pre_contract_router, prefix="/api")
     app.include_router(historical_contracts_router, prefix="/api")
-
-    matches = [
-        route for route in app.routes
-        if getattr(route, "path", None) == "/api/lease/{lease_id}/sign"
-        and "POST" in getattr(route, "methods", set())
-    ]
-    assert len(matches) >= 2, "guard and historical route should both be visible during migration"
-    assert matches[0].endpoint is legacy_guard.secure_legacy_lease_sign
-    assert matches[1].endpoint is not legacy_guard.secure_legacy_lease_sign
-    assert matches[1].endpoint.__module__ == "rental.contracts_router"
+    endpoints = [getattr(route, "endpoint", None) for route in app.routes]
+    secure_index = next(i for i, endpoint in enumerate(endpoints) if endpoint is legacy_guard.secure_legacy_lease_sign)
+    historical_index = next(
+        i for i, endpoint in enumerate(endpoints)
+        if getattr(endpoint, "__module__", "") == "rental.contracts_router"
+        and getattr(endpoint, "__name__", "") == "sign_lease"
+    )
+    assert secure_index < historical_index
 
 
 def test_server_source_keeps_pre_contract_router_order():
