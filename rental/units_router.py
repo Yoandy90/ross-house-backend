@@ -55,12 +55,13 @@ async def sync_property_from_units(property_id: str):
 
 
 async def mark_unit_rented(unit_id: str, tenant_id: str, contract_id: str):
-    """Claim a unit for one exact active contract, fail-closed on conflicts.
+    """Claim a unit for one exact contract, fail-closed on conflicts.
 
-    This helper is called by contract activation paths.  It intentionally
-    re-validates the contract->unit->tenant->property relationship instead of
-    trusting caller-supplied IDs, then uses a CAS-style filter so a stale
-    activation cannot overwrite a unit claimed by another contract.
+    Contract creation may insert an already-active contract, while the status
+    transition endpoint claims the unit immediately before persisting the new
+    active status.  Therefore this helper validates relationship identity and
+    occupancy atomically, but deliberately does not treat the contract's
+    current status field as authority.
     """
     if not all(ObjectId.is_valid(value) for value in (unit_id, tenant_id, contract_id)):
         raise HTTPException(status_code=400, detail="unit_occupancy_invalid_id")
@@ -84,8 +85,6 @@ async def mark_unit_rented(unit_id: str, tenant_id: str, contract_id: str):
         raise HTTPException(status_code=409, detail="unit_tenant_mismatch")
     if str(contract.get("property_id") or "") != str(unit.get("property_id") or ""):
         raise HTTPException(status_code=409, detail="unit_property_mismatch")
-    if contract.get("status") != "active":
-        raise HTTPException(status_code=409, detail="unit_contract_not_active")
 
     tenant = await db.tenants.find_one({"_id": tenant_oid})
     if not tenant:
@@ -267,7 +266,7 @@ async def update_unit(unit_id: str, request: Request):
                                 detail=f"status debe ser: {', '.join(UNIT_STATUSES)}")
         if requested_status == "rented" and unit.get("status") != "rented":
             raise HTTPException(status_code=409, detail="unit_rented_requires_active_contract")
-        if (unit.get("current_contract_id") and requested_status != "rented"):
+        if unit.get("current_contract_id") and requested_status != "rented":
             raise HTTPException(status_code=409, detail="unit_status_requires_contract_release")
         sets["status"] = requested_status
         if requested_status != "rented":
