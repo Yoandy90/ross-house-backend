@@ -85,12 +85,14 @@ def test_summary_marks_second_and_third_admin_requirements():
     assert proposed["requires_third_admin"] is False
     assert proposed["state"] == "proposed"
     assert proposed["capability"]["requires_exact_invoice"] is True
+    assert proposed["execution_claim_id"] == ""
 
     confirmation = {"_id": "c1", "confirmer": {"id": "b", "email": "b@example.com"}}
     confirmed = _workflow_summary(proposal, confirmation, None, None)
     assert confirmed["requires_second_admin"] is False
     assert confirmed["requires_third_admin"] is True
     assert confirmed["state"] == "confirmed"
+    assert confirmed["execution_claim_id"] == ""
 
 
 def test_summary_marks_stale_claim_as_recovery_required():
@@ -101,7 +103,27 @@ def test_summary_marks_stale_claim_as_recovery_required():
     summary = _workflow_summary(proposal, confirmation, claim, None, now=now)
     assert summary["state"] == "requires_review"
     assert summary["recovery_required"] is True
+    assert summary["execution_claim_id"] == "x1"
     assert summary["execution_claim_age_seconds"] == 600
+
+
+def test_summary_exposes_only_claim_identifier_not_claim_payload():
+    proposal = {"_id": "p1", "source": "autopay", "item_id": "a1", "outcome": "provider_confirmed_not_paid"}
+    confirmation = {"_id": "c1"}
+    claim = {
+        "_id": "x-safe-id",
+        "created_at": datetime.now(timezone.utc),
+        "executor": {"id": "c"},
+        "payment_method_id": "pm_secret",
+        "helcim_card_token": "secret-card-token",
+        "raw_payload": {"secret": "do-not-return"},
+    }
+    summary = _workflow_summary(proposal, confirmation, claim, None)
+    assert summary["execution_claim_id"] == "x-safe-id"
+    serialized = repr(summary)
+    assert "pm_secret" not in serialized
+    assert "secret-card-token" not in serialized
+    assert "do-not-return" not in serialized
 
 
 def test_summary_does_not_spread_arbitrary_source_fields():
@@ -130,6 +152,7 @@ def test_workflow_router_is_strictly_read_only_and_scans_are_bounded():
     ):
         assert forbidden not in source
     assert '"read_only": True' in source
+    assert '"execution_claim_id": str((claim or {}).get("_id") or "")' in source
     assert '.limit(scan_limit)' in source
     assert 'MAX_WORKFLOW_SCAN = 1000' in source
     assert 'max(1, min(int(limit or 100), 200))' in source
