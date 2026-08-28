@@ -65,6 +65,20 @@ def test_secure_provider_help_route_is_first_runtime_match():
     assert matches[1].name == "tenant_request_help"
 
 
+def test_secure_admin_maintenance_update_is_first_runtime_match():
+    app = FastAPI()
+    app.include_router(pre_tenant_router, prefix="/api")
+    app.include_router(historical_tenant_router, prefix="/api")
+
+    matches = [r for r in app.routes
+               if getattr(r, "path", None) == "/api/admin/maintenance-requests/{request_id}"
+               and "PUT" in getattr(r, "methods", set())]
+
+    assert len(matches) == 2
+    assert matches[0].name == "secure_update_maintenance_request"
+    assert matches[1].name == "update_maintenance_request"
+
+
 def test_client_relationship_fields_are_not_payload_authority():
     source = open("rental/maintenance_security_router.py", encoding="utf-8").read()
     assert '"property_id": location["property_id"]' in source
@@ -112,6 +126,16 @@ def test_provider_help_rejects_cross_tenant_contract(monkeypatch):
     assert exc.value.detail == "maintenance_contract_tenant_mismatch"
 
 
+def test_admin_maintenance_update_keeps_ownership_immutable_and_uses_cas():
+    source = open("rental/maintenance_ownership_security_router.py", encoding="utf-8").read()
+    assert 'maintenance_ownership_immutable' in source
+    for field in ("tenant_id", "contract_id", "property_id", "unit_id"):
+        assert f'"{field}"' in source
+    assert '{"_id": ticket["_id"], "status": ticket.get("status")}' in source
+    assert 'maintenance_concurrent_update' in source
+    assert 'maintenance_status_transition_invalid' in source
+
+
 def test_photo_policy_rejects_non_image_and_unbounded_lists():
     with pytest.raises(HTTPException) as exc:
         secure._validated_photos(["http://example.com/a.jpg"])
@@ -153,4 +177,21 @@ def test_contract_unit_must_not_point_to_another_contract(monkeypatch):
     contract = {"_id": contract_oid, "property_id": str(property_oid), "unit_id": str(unit_oid)}
     with pytest.raises(HTTPException) as exc:
         run(secure._canonical_lease_location(contract))
+    assert exc.value.detail == "maintenance_unit_contract_mismatch"
+
+
+def test_active_contract_unit_must_have_exact_claim(monkeypatch):
+    property_oid = ObjectId()
+    unit_oid = ObjectId()
+    contract_oid = ObjectId()
+    db = DB(
+        properties=[{"_id": property_oid, "address": "121 Oak"}],
+        units=[{"_id": unit_oid, "property_id": str(property_oid),
+                "current_contract_id": ""}],
+    )
+    monkeypatch.setattr(secure, "get_db", lambda: db)
+    contract = {"_id": contract_oid, "property_id": str(property_oid), "unit_id": str(unit_oid)}
+    with pytest.raises(HTTPException) as exc:
+        run(secure._canonical_lease_location(contract))
+    assert exc.value.status_code == 409
     assert exc.value.detail == "maintenance_unit_contract_mismatch"
