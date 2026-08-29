@@ -1,10 +1,10 @@
 """Security shadows for legacy admin contract mutation surfaces.
 
-The historical generic PUT accepted ``status`` directly, while legacy admin
-signature endpoints could activate a lease and write occupancy projections.
-These first-match routes preserve compatible admin editing/signing behavior but
-keep lifecycle state and occupancy authority exclusively behind the guarded
-PATCH lifecycle endpoint.
+The historical generic PUT accepted ``status`` directly, legacy admin signature
+endpoints could activate/write occupancy, forced DELETE could release active
+leases outside lifecycle, and manual property sync could overwrite projections.
+These first-match routes preserve safe compatibility while keeping lifecycle and
+occupancy authority behind canonical guarded paths.
 """
 from datetime import datetime
 import hashlib
@@ -14,6 +14,7 @@ from fastapi import APIRouter, HTTPException, Request
 
 from rental.shared import auth_admin, get_db
 from rental.contracts_router import update_contract as historical_update_contract
+from rental.property_sync_cron import reconcile_property_statuses
 
 router = APIRouter()
 
@@ -76,6 +77,38 @@ def _next_signature_status(contract: dict, *, tenant_signed: bool, admin_signed:
     return "pending_tenant"
 
 
+async def _validate_draft_relationship_edit(contract: dict, data: dict) -> None:
+    """Validate relationship edits without letting generic PUT become occupancy authority."""
+    db = get_db()
+    if "unit_id" in data or "landlord_id" in data:
+        # Historical PUT does not safely maintain these relationships.
+        raise HTTPException(status_code=409, detail="lease_relationship_requires_recreation")
+
+    target_property = str(data.get("property_id") or contract.get("property_id") or "")
+    target_tenant = str(data.get("tenant_id") or contract.get("tenant_id") or "")
+    if not ObjectId.is_valid(target_property):
+        raise HTTPException(status_code=400, detail="lease_property_invalid")
+    if not ObjectId.is_valid(target_tenant):
+        raise HTTPException(status_code=400, detail="lease_tenant_invalid")
+
+    prop = await db.properties.find_one({"_id": ObjectId(target_property)})
+    tenant = await db.tenants.find_one({"_id": ObjectId(target_tenant)})
+    if not prop:
+        raise HTTPException(status_code=404, detail="lease_property_not_found")
+    if not tenant:
+        raise HTTPException(status_code=404, detail="lease_tenant_not_found")
+
+    unit_id = str(contract.get("unit_id") or "")
+    if unit_id:
+        if not ObjectId.is_valid(unit_id):
+            raise HTTPException(status_code=409, detail="lease_unit_invalid")
+        unit = await db.property_units.find_one({"_id": ObjectId(unit_id)})
+        if not unit:
+            raise HTTPException(status_code=409, detail="lease_unit_not_found")
+        if str(unit.get("property_id") or "") != target_property:
+            raise HTTPException(status_code=409, detail="lease_unit_property_mismatch")
+
+
 @router.put('/admin/rental-contracts/{contract_id}')
 async def secure_update_contract(contract_id: str, request: Request):
     """Keep generic editing separate from lifecycle and occupancy authority."""
@@ -93,15 +126,66 @@ async def secure_update_contract(contract_id: str, request: Request):
     if not contract:
         raise HTTPException(status_code=404, detail="lease_contract_not_found")
 
-    if str(contract.get("status") or "").strip().lower() != "draft":
-        attempted_relationship = sorted(_RELATIONSHIP_FIELDS.intersection(data))
-        if attempted_relationship:
-            raise HTTPException(status_code=409, detail="lease_relationship_locked_after_draft")
+    status = str(contract.get("status") or "").strip().lower()
+    attempted_relationship = sorted(_RELATIONSHIP_FIELDS.intersection(data))
+    if status != "draft" and attempted_relationship:
+        raise HTTPException(status_code=409, detail="lease_relationship_locked_after_draft")
+    if status == "draft" and attempted_relationship:
+        await _validate_draft_relationship_edit(contract, data)
 
-    # Delegate the remaining legacy-compatible editable fields. The body is
-    # unchanged except that lifecycle/forbidden relationship writes have already
-    # been rejected by this first-match boundary.
     return await historical_update_contract(contract_id, request)
+
+
+@router.delete('/admin/rental-contracts/{contract_id}')
+async def secure_delete_contract(contract_id: str, request: Request):
+    """Delete only an unclaimed draft; active/terminal cleanup requires lifecycle."""
+    await auth_admin(request)
+    contract_oid = _contract_oid(contract_id)
+    db = get_db()
+    contract = await db.rental_contracts.find_one({"_id": contract_oid})
+    if not contract:
+        raise HTTPException(status_code=404, detail="lease_contract_not_found")
+    if str(contract.get("status") or "").strip().lower() != "draft":
+        raise HTTPException(status_code=409, detail="lease_delete_requires_lifecycle")
+    if contract.get("lifecycle_claim_id"):
+        raise HTTPException(status_code=409, detail="lease_delete_lifecycle_busy")
+
+    contract_id_str = str(contract["_id"])
+    property_id = str(contract.get("property_id") or "")
+    tenant_id = str(contract.get("tenant_id") or "")
+    unit_id = str(contract.get("unit_id") or "")
+
+    if ObjectId.is_valid(property_id):
+        prop = await db.properties.find_one({"_id": ObjectId(property_id)})
+        if prop and str(prop.get("current_contract_id") or "") == contract_id_str:
+            raise HTTPException(status_code=409, detail="lease_delete_projection_exists")
+    if ObjectId.is_valid(tenant_id):
+        tenant = await db.tenants.find_one({"_id": ObjectId(tenant_id)})
+        if tenant and str(tenant.get("current_contract_id") or "") == contract_id_str:
+            raise HTTPException(status_code=409, detail="lease_delete_projection_exists")
+    if unit_id:
+        if not ObjectId.is_valid(unit_id):
+            raise HTTPException(status_code=409, detail="lease_unit_invalid")
+        unit = await db.property_units.find_one({"_id": ObjectId(unit_id)})
+        if unit and str(unit.get("current_contract_id") or "") == contract_id_str:
+            raise HTTPException(status_code=409, detail="lease_delete_projection_exists")
+
+    result = await db.rental_contracts.delete_one({
+        "_id": contract_oid,
+        "status": "draft",
+        "$or": [{"lifecycle_claim_id": {"$exists": False}}, {"lifecycle_claim_id": None}],
+    })
+    if result.deleted_count != 1:
+        raise HTTPException(status_code=409, detail="lease_delete_concurrent_change")
+    return {"success": True, "message": "Contrato borrador eliminado"}
+
+
+@router.post('/admin/properties/sync-status')
+async def secure_sync_property_status(request: Request):
+    """Use the same conservative CAS reconciliation as the background sync."""
+    await auth_admin(request)
+    report = await reconcile_property_statuses(get_db())
+    return {"success": True, **report}
 
 
 @router.post('/admin/rental-contracts/{contract_id}/sign')
