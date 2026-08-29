@@ -20,6 +20,7 @@ from .tenant_receipt_security_router import router as tenant_receipt_security_ro
 from .section8_security_router import router as section8_security_router
 from .maintenance_security_router import router as maintenance_security_router
 from .maintenance_ownership_security_router import router as maintenance_ownership_security_router
+from .lease_lifecycle_state_guard_router import router as lease_lifecycle_state_guard_router
 from .lease_lifecycle_security_router import router as lease_lifecycle_security_router
 from .lease_lifecycle_recovery_router import router as lease_lifecycle_recovery_router
 from .lease_creation_security_router import router as lease_creation_security_router
@@ -39,6 +40,7 @@ router.routes.extend(section8_security_router.routes)
 router.routes.extend(maintenance_security_router.routes)
 router.routes.extend(maintenance_ownership_security_router.routes)
 router.routes.extend(lease_creation_security_router.routes)
+router.routes.extend(lease_lifecycle_state_guard_router.routes)
 router.routes.extend(lease_lifecycle_security_router.routes)
 router.routes.extend(lease_lifecycle_recovery_router.routes)
 
