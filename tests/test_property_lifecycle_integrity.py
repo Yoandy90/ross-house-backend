@@ -6,6 +6,7 @@ from bson import ObjectId
 from fastapi import BackgroundTasks, FastAPI, HTTPException
 
 import rental.property_lifecycle_security_router as secure
+import rental.lease_lifecycle_security_router as lifecycle
 from rental.auth_metrics import router as security_router
 from rental.properties_router import router as historical_properties_router
 
@@ -24,29 +25,30 @@ class Request:
 
 
 class Result:
-    def __init__(self, deleted_count=1):
-        self.deleted_count = deleted_count
+    def __init__(self, matched_count=1):
+        self.matched_count = matched_count
 
 
 class Collection:
-    def __init__(self, doc=None, deleted_count=1):
+    def __init__(self, doc=None, matched_count=1):
         self.doc = doc
-        self.deleted_count = deleted_count
-        self.deletes = []
+        self.matched_count = matched_count
+        self.updates = []
 
     async def find_one(self, query):
         return self.doc
 
-    async def delete_one(self, query):
-        self.deletes.append(query)
-        return Result(self.deleted_count)
+    async def update_one(self, query, update):
+        self.updates.append((query, update))
+        return Result(self.matched_count)
 
 
 class DB:
-    def __init__(self, prop, contract=None, unit=None, deleted_count=1):
-        self.properties = Collection(prop, deleted_count)
-        self.rental_contracts = Collection(contract)
-        self.property_units = Collection(unit)
+    def __init__(self, prop, contract=None, unit=None, tenant=None, matched_count=1):
+        self.properties = Collection(prop, matched_count)
+        self.rental_contracts = Collection(contract, matched_count)
+        self.property_units = Collection(unit, matched_count)
+        self.tenants = Collection(tenant, matched_count)
 
 
 async def allow_admin(_request):
@@ -110,79 +112,99 @@ def test_update_cannot_release_claimed_property(monkeypatch):
 
 
 def test_update_cannot_hide_active_contract_when_projection_missing(monkeypatch):
-    prop = _property(status="rented")
+    prop = _property(status="maintenance")
     contract = {"_id": ObjectId(), "property_id": str(prop["_id"]), "status": "active"}
     monkeypatch.setattr(secure, "auth_admin", allow_admin)
     monkeypatch.setattr(secure, "get_db", lambda: DB(prop, contract=contract))
     with pytest.raises(HTTPException) as exc:
-        run(secure.secure_update_property(str(prop["_id"]), Request({"status": "maintenance"}), BackgroundTasks()))
+        run(secure.secure_update_property(str(prop["_id"]), Request({"status": "available"}), BackgroundTasks()))
     assert exc.value.status_code == 409
     assert exc.value.detail == "property_active_lease_conflict"
 
 
-def test_safe_profile_update_delegates_after_guard(monkeypatch):
+def test_profile_only_update_never_touches_status(monkeypatch):
     prop = _property()
     db = DB(prop)
-    called = {}
-
-    async def historical(property_id, request, background_tasks):
-        called["property_id"] = property_id
-        called["payload"] = await request.json()
-        return {"success": True}
-
     monkeypatch.setattr(secure, "auth_admin", allow_admin)
     monkeypatch.setattr(secure, "get_db", lambda: db)
-    monkeypatch.setattr(secure, "historical_update_property", historical)
+
     result = run(secure.secure_update_property(str(prop["_id"]), Request({"notes": "safe"}), BackgroundTasks()))
     assert result["success"] is True
-    assert called["property_id"] == str(prop["_id"])
-    assert called["payload"] == {"notes": "safe"}
+    query, update = db.properties.updates[0]
+    assert query == {"_id": prop["_id"]}
+    assert update["$set"]["notes"] == "safe"
+    assert "status" not in update["$set"]
+    assert "$unset" not in update
 
 
-def test_delete_blocks_nonterminal_contract_even_without_projection(monkeypatch):
-    prop = _property()
-    contract = {"_id": ObjectId(), "property_id": str(prop["_id"]), "status": "pending_activation"}
-    db = DB(prop, contract=contract)
-    monkeypatch.setattr(secure, "auth_admin", allow_admin)
-    monkeypatch.setattr(secure, "get_db", lambda: db)
-    with pytest.raises(HTTPException) as exc:
-        run(secure.secure_delete_property(str(prop["_id"]), Request()))
-    assert exc.value.status_code == 409
-    assert exc.value.detail == "property_delete_contract_exists"
-    assert db.properties.deletes == []
-
-
-def test_delete_blocks_units_to_avoid_orphans(monkeypatch):
-    prop = _property()
-    unit = {"_id": ObjectId(), "property_id": str(prop["_id"])}
-    db = DB(prop, unit=unit)
-    monkeypatch.setattr(secure, "auth_admin", allow_admin)
-    monkeypatch.setattr(secure, "get_db", lambda: db)
-    with pytest.raises(HTTPException) as exc:
-        run(secure.secure_delete_property(str(prop["_id"]), Request()))
-    assert exc.value.detail == "property_delete_units_exist"
-    assert db.properties.deletes == []
-
-
-def test_delete_uses_no_claim_cas_and_ignores_legacy_force_query(monkeypatch):
-    prop = _property(status="rented")
+def test_safe_status_change_uses_no_claim_cas_and_clears_manual_lock(monkeypatch):
+    prop = _property(status="available", status_manually_set=True)
     db = DB(prop)
     monkeypatch.setattr(secure, "auth_admin", allow_admin)
     monkeypatch.setattr(secure, "get_db", lambda: db)
-    result = run(secure.secure_delete_property(str(prop["_id"]), Request()))
+
+    result = run(secure.secure_update_property(str(prop["_id"]), Request({"status": "maintenance"}), BackgroundTasks()))
     assert result["success"] is True
-    query = db.properties.deletes[0]
+    query, update = db.properties.updates[0]
     assert query["_id"] == prop["_id"]
-    assert "$and" in query
+    assert query["status"] == "available"
     rendered = repr(query)
     assert "current_contract_id" in rendered
     assert "current_tenant_id" in rendered
-    assert "force" not in rendered
+    assert update["$set"]["status"] == "maintenance"
+    assert update["$set"]["status_manually_set"] is False
+    assert "status_manually_set_at" in update["$unset"]
+    assert "status_manually_set_by" in update["$unset"]
 
 
-def test_source_has_no_direct_property_projection_write():
+def test_status_cas_loss_fails_closed(monkeypatch):
+    prop = _property(status="available")
+    db = DB(prop, matched_count=0)
+    monkeypatch.setattr(secure, "auth_admin", allow_admin)
+    monkeypatch.setattr(secure, "get_db", lambda: db)
+    with pytest.raises(HTTPException) as exc:
+        run(secure.secure_update_property(str(prop["_id"]), Request({"status": "maintenance"}), BackgroundTasks()))
+    assert exc.value.status_code == 409
+    assert exc.value.detail == "property_state_changed"
+
+
+def test_hard_delete_is_disabled_even_for_unclaimed_property(monkeypatch):
+    prop = _property()
+    monkeypatch.setattr(secure, "auth_admin", allow_admin)
+    monkeypatch.setattr(secure, "get_db", lambda: DB(prop))
+    with pytest.raises(HTTPException) as exc:
+        run(secure.secure_delete_property(str(prop["_id"]), Request()))
+    assert exc.value.status_code == 409
+    assert exc.value.detail == "property_delete_requires_archival"
+
+
+def test_whole_property_activation_rejects_maintenance_before_claim(monkeypatch):
+    prop = _property(status="maintenance")
+    contract = {"_id": ObjectId(), "property_id": str(prop["_id"]), "unit_id": None}
+    monkeypatch.setattr(lifecycle, "get_db", lambda: DB(prop))
+    with pytest.raises(HTTPException) as exc:
+        run(lifecycle._preflight_whole_property_activation(contract, str(contract["_id"])))
+    assert exc.value.status_code == 409
+    assert exc.value.detail == "lease_property_not_available"
+
+
+def test_whole_property_activation_rejects_legacy_manual_lock(monkeypatch):
+    prop = _property(status="available", status_manually_set=True)
+    contract = {"_id": ObjectId(), "property_id": str(prop["_id"]), "unit_id": None}
+    monkeypatch.setattr(lifecycle, "get_db", lambda: DB(prop))
+    with pytest.raises(HTTPException) as exc:
+        run(lifecycle._preflight_whole_property_activation(contract, str(contract["_id"])))
+    assert exc.value.detail == "lease_property_manual_status_conflict"
+
+
+def test_lifecycle_whole_property_claim_requires_available_status():
+    source = open(lifecycle.__file__, encoding="utf-8").read()
+    assert '"_id": prop_oid, "status": "available", "status_manually_set": {"$ne": True}' in source
+    assert '"$set": {"status": "rented", "current_contract_id": contract_id' in source
+
+
+def test_property_security_has_no_historical_update_or_hard_delete():
     source = open(secure.__file__, encoding="utf-8").read()
-    assert "properties.update_one" not in source
-    assert "historical_delete_property" not in source
-    assert "'$set': {'status': 'rented'" not in source
-    assert '"$set": {"status": "rented"' not in source
+    assert "historical_update_property" not in source
+    assert "properties.delete_one" not in source
+    assert "property_delete_requires_archival" in source
