@@ -30,13 +30,20 @@ def _owner_state(current_contract_id, contract_id: str) -> str:
 
 
 def _tenant_state(tenant: dict, contract: dict) -> str:
+    contract_id = str(contract.get("_id") or "")
     expected_property = str(contract.get("property_id") or "")
     expected_unit = str(contract.get("unit_id") or "")
+    current_contract = str(tenant.get("current_contract_id") or "")
     current_property = str(tenant.get("current_property_id") or "")
     current_unit = str(tenant.get("current_unit_id") or "")
+
+    if current_contract and current_contract != contract_id:
+        return "different_projection"
     if current_property == expected_property and current_unit == expected_unit:
+        # Missing current_contract_id is accepted only as a legacy projection
+        # shape. New lifecycle activations always set the exact contract claim.
         return "exact_contract_projection"
-    if not current_property and not current_unit:
+    if not current_contract and not current_property and not current_unit:
         return "cleared"
     return "different_projection"
 
@@ -63,7 +70,11 @@ async def _observe(contract: dict) -> dict:
             "ownership": _owner_state(prop.get("current_contract_id"), contract_id),
             "status": str(prop.get("status") or ""),
         },
-        "tenant": {"exists": True, "projection": _tenant_state(tenant, contract)},
+        "tenant": {
+            "exists": True,
+            "ownership": _owner_state(tenant.get("current_contract_id"), contract_id),
+            "projection": _tenant_state(tenant, contract),
+        },
         "unit": None,
     }
     if unit_id:
@@ -88,11 +99,12 @@ def _classify(contract: dict, target: str, observed: dict) -> str:
         return "ambiguous_state"
 
     prop_owner = observed["property"]["ownership"]
+    tenant_owner = observed["tenant"]["ownership"]
     tenant_state = observed["tenant"]["projection"]
     unit = observed.get("unit")
     unit_owner = unit["ownership"] if unit else None
 
-    if prop_owner == "other_contract" or tenant_state == "different_projection":
+    if prop_owner == "other_contract" or tenant_owner == "other_contract" or tenant_state == "different_projection":
         return "ambiguous_state"
     if unit and (unit_owner == "other_contract" or not unit["tenant_matches"]):
         return "ambiguous_state"
@@ -103,22 +115,22 @@ def _classify(contract: dict, target: str, observed: dict) -> str:
 
     if target == "active":
         occupancy_applied = unit_owner == "exact_contract" if unit else prop_owner == "exact_contract"
-        tenant_applied = tenant_state == "exact_contract_projection"
+        tenant_applied = tenant_state == "exact_contract_projection" and tenant_owner in ("exact_contract", "unclaimed")
         if occupancy_applied and tenant_applied:
             return "projection_applied_status_missing"
         occupancy_absent = unit_owner == "unclaimed" if unit else prop_owner == "unclaimed"
-        tenant_absent = tenant_state == "cleared"
+        tenant_absent = tenant_state == "cleared" and tenant_owner == "unclaimed"
         if occupancy_absent and tenant_absent:
             return "no_projection_detected"
         return "partial_projection"
 
     if target in _RELEASE_TARGETS:
         occupancy_cleared = unit_owner == "unclaimed" if unit else prop_owner == "unclaimed"
-        tenant_cleared = tenant_state == "cleared"
+        tenant_cleared = tenant_state == "cleared" and tenant_owner == "unclaimed"
         if occupancy_cleared and tenant_cleared:
             return "projection_applied_status_missing"
         occupancy_still_exact = unit_owner == "exact_contract" if unit else prop_owner == "exact_contract"
-        tenant_still_exact = tenant_state == "exact_contract_projection"
+        tenant_still_exact = tenant_state == "exact_contract_projection" and tenant_owner in ("exact_contract", "unclaimed")
         if occupancy_still_exact and tenant_still_exact:
             return "no_projection_detected"
         return "partial_projection"
