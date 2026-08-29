@@ -11,6 +11,11 @@ from datetime import datetime
 from bson import ObjectId
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 
+from rental.property_mutation_lock import (
+    acquire_property_mutation_lock,
+    assert_property_lifecycle_recovery_clear,
+    release_property_mutation_lock,
+)
 from rental.properties_router import create_property as historical_create_property
 from rental.shared import auth_admin, get_db
 
@@ -77,10 +82,6 @@ async def secure_create_property(request: Request, background_tasks: BackgroundT
         raise HTTPException(status_code=409, detail="property_rented_status_lifecycle_managed")
     if requested_status not in _SAFE_MANUAL_PROPERTY_STATES:
         raise HTTPException(status_code=400, detail="property_status_invalid")
-    # The historical creator persists the original request payload. Accepting a
-    # case/whitespace variant here would therefore validate one value but store
-    # another, breaking exact-status CAS during lease activation. Fail closed
-    # unless an explicitly supplied status is already the canonical value.
     if status_supplied and str(raw_status) != requested_status:
         raise HTTPException(status_code=400, detail="property_status_not_canonical")
     return await historical_create_property(request, background_tasks)
@@ -88,8 +89,22 @@ async def secure_create_property(request: Request, background_tasks: BackgroundT
 
 @router.put('/admin/properties/{property_id}')
 async def secure_update_property(property_id: str, request: Request, background_tasks: BackgroundTasks):
-    """Profile edits are allowed; status changes use a no-claim CAS."""
+    """Serialize profile/status writes with lease creation and topology changes."""
     admin = await auth_admin(request)
+    _oid(property_id)
+    token = await acquire_property_mutation_lock(
+        property_id,
+        "property_update",
+        str(admin.get("email") or admin.get("_id") or "admin"),
+    )
+    try:
+        await assert_property_lifecycle_recovery_clear(property_id)
+        return await _secure_update_property_under_lock(property_id, request, background_tasks)
+    finally:
+        await release_property_mutation_lock(property_id, token)
+
+
+async def _secure_update_property_under_lock(property_id: str, request: Request, background_tasks: BackgroundTasks):
     object_id = _oid(property_id)
     db = get_db()
     prop = await db.properties.find_one({"_id": object_id})
@@ -125,9 +140,6 @@ async def secure_update_property(property_id: str, request: Request, background_
             if active_contract:
                 raise HTTPException(status_code=409, detail="property_active_lease_conflict")
         update_fields["status"] = requested_status
-        # Historical manual locks can make lifecycle release skip a projection.
-        # Safe operational status edits therefore clear that legacy lock instead
-        # of creating a second source of occupancy authority.
         update_fields["status_manually_set"] = False
 
     write_filter = {"_id": object_id}
@@ -164,6 +176,4 @@ async def secure_delete_property(property_id: str, request: Request):
     prop = await get_db().properties.find_one({"_id": object_id})
     if not prop:
         raise HTTPException(status_code=404, detail="Propiedad no encontrada")
-    # A legacy ?force=true query is intentionally ignored. Archival must be a
-    # separate state machine so contracts/units can never be orphaned by TOCTOU.
     raise HTTPException(status_code=409, detail="property_delete_requires_archival")

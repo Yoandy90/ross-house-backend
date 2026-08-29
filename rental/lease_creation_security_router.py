@@ -10,6 +10,11 @@ from datetime import datetime
 from bson import ObjectId
 from fastapi import APIRouter, HTTPException, Request
 
+from rental.property_mutation_lock import (
+    acquire_property_mutation_lock,
+    assert_property_lifecycle_recovery_clear,
+    release_property_mutation_lock,
+)
 from rental.shared import auth_admin, get_db
 
 router = APIRouter()
@@ -27,6 +32,21 @@ def _oid(value, detail: str) -> ObjectId:
 async def _create_canonical_contract(data: dict, admin: dict, *, default_status: str) -> dict:
     if not isinstance(data, dict):
         raise HTTPException(status_code=400, detail="lease_payload_invalid")
+    property_id = str(data.get("property_id") or "").strip()
+    _oid(property_id, "lease_property_invalid")
+    lock_token = await acquire_property_mutation_lock(
+        property_id,
+        "lease_creation",
+        str(admin.get("email") or admin.get("_id") or "admin"),
+    )
+    try:
+        await assert_property_lifecycle_recovery_clear(property_id)
+        return await _create_canonical_contract_under_lock(data, admin, default_status=default_status)
+    finally:
+        await release_property_mutation_lock(property_id, lock_token)
+
+
+async def _create_canonical_contract_under_lock(data: dict, admin: dict, *, default_status: str) -> dict:
     db = get_db()
 
     property_id = str(data.get("property_id") or "").strip()
@@ -57,10 +77,6 @@ async def _create_canonical_contract(data: dict, admin: dict, *, default_status:
         if unit.get("current_contract_id"):
             raise HTTPException(status_code=409, detail="lease_unit_already_claimed")
     else:
-        # A multi-unit property can never silently fall back to whole-property
-        # lease authority. Require one exact unit relationship, using both the
-        # property summary and the actual child collection to fail closed if
-        # legacy summary data is stale.
         existing_unit = await db.property_units.find_one({"property_id": property_id})
         if prop.get("is_multi_unit") or existing_unit:
             raise HTTPException(status_code=409, detail="lease_unit_required_for_multi_unit_property")
@@ -150,7 +166,6 @@ async def secure_create_rental_contract(request: Request):
 
 @router.post('/admin/leases')
 async def secure_admin_create_lease(request: Request):
-    """Secure compatibility replacement for the older /admin/leases creator."""
     admin = await auth_admin(request)
     created = await _create_canonical_contract(await request.json(), admin, default_status="pending_tenant")
     return {

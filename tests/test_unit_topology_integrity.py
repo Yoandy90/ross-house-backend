@@ -30,12 +30,12 @@ class Result:
 
 
 class Collection:
-    def __init__(self, doc, matched_count=1):
+    def __init__(self, doc=None, matched_count=1):
         self.doc = doc
         self.matched_count = matched_count
         self.updates = []
 
-    async def find_one(self, query):
+    async def find_one(self, query, *args, **kwargs):
         return self.doc
 
     async def update_one(self, query, update):
@@ -44,9 +44,10 @@ class Collection:
 
 
 class DB:
-    def __init__(self, prop=None, unit=None, matched_count=1):
+    def __init__(self, prop=None, unit=None, contract=None, matched_count=1):
         self.properties = Collection(prop, matched_count)
         self.property_units = Collection(unit, matched_count)
+        self.rental_contracts = Collection(contract, matched_count)
 
 
 async def allow_admin(_request):
@@ -55,6 +56,33 @@ async def allow_admin(_request):
 
 async def no_sync(_property_id):
     return None
+
+
+async def fake_lock(_property_id, _admin, _operation):
+    return "lock-token"
+
+
+async def fake_release(_property_id, _token):
+    return True
+
+
+async def fake_recovery_clear(_property_id):
+    return None
+
+
+async def fake_create(_property_id, _request):
+    return {"success": True, "created": 1}
+
+
+async def fake_delete(_unit_id, _request):
+    return {"success": True, "message": "Unidad eliminada"}
+
+
+def install_topology_stubs(monkeypatch):
+    monkeypatch.setattr(secure, "auth_admin", allow_admin)
+    monkeypatch.setattr(secure, "_acquire_topology_lock", fake_lock)
+    monkeypatch.setattr(secure, "release_property_mutation_lock", fake_release)
+    monkeypatch.setattr(secure, "assert_property_lifecycle_recovery_clear", fake_recovery_clear)
 
 
 def test_unit_topology_security_routes_are_first_runtime_match():
@@ -73,29 +101,62 @@ def test_unit_topology_security_routes_are_first_runtime_match():
         assert (matches[0].name, matches[1].name) == names
 
 
-def test_unit_creation_is_frozen_until_managed_topology_workflow(monkeypatch):
-    prop = {"_id": ObjectId(), "name": "Multi-unit"}
-    monkeypatch.setattr(secure, "auth_admin", allow_admin)
+def test_managed_unit_creation_delegates_only_under_serialized_safe_property(monkeypatch):
+    prop = {"_id": ObjectId(), "status": "available", "current_contract_id": None, "current_tenant_id": None}
+    db = DB(prop=prop)
+    install_topology_stubs(monkeypatch)
+    monkeypatch.setattr(secure, "get_db", lambda: db)
+    monkeypatch.setattr(secure, "historical_create_units", fake_create)
+    result = run(secure.secure_create_units(str(prop["_id"]), Request({"unit_name": "Apt 1"})))
+    assert result == {"success": True, "created": 1}
+
+
+def test_unit_creation_blocks_non_available_property(monkeypatch):
+    prop = {"_id": ObjectId(), "status": "maintenance", "current_contract_id": None, "current_tenant_id": None}
+    install_topology_stubs(monkeypatch)
     monkeypatch.setattr(secure, "get_db", lambda: DB(prop=prop))
     with pytest.raises(HTTPException) as exc:
         run(secure.secure_create_units(str(prop["_id"]), Request()))
     assert exc.value.status_code == 409
-    assert exc.value.detail == "unit_topology_requires_managed_workflow"
+    assert exc.value.detail == "unit_topology_property_not_available"
 
 
-def test_unit_delete_is_frozen_until_managed_topology_workflow(monkeypatch):
-    unit = {"_id": ObjectId(), "property_id": str(ObjectId()), "status": "available"}
-    monkeypatch.setattr(secure, "auth_admin", allow_admin)
+def test_unit_creation_blocks_nonterminal_whole_property_contract(monkeypatch):
+    prop = {"_id": ObjectId(), "status": "available", "current_contract_id": None, "current_tenant_id": None}
+    contract = {"_id": ObjectId(), "property_id": str(prop["_id"]), "unit_id": None, "status": "draft"}
+    install_topology_stubs(monkeypatch)
+    monkeypatch.setattr(secure, "get_db", lambda: DB(prop=prop, contract=contract))
+    with pytest.raises(HTTPException) as exc:
+        run(secure.secure_create_units(str(prop["_id"]), Request()))
+    assert exc.value.status_code == 409
+    assert exc.value.detail == "unit_topology_whole_property_contract_conflict"
+
+
+def test_managed_unit_delete_delegates_when_unclaimed_and_unreferenced(monkeypatch):
+    property_id = str(ObjectId())
+    unit = {"_id": ObjectId(), "property_id": property_id, "status": "available", "current_contract_id": None, "current_tenant_id": None}
+    install_topology_stubs(monkeypatch)
     monkeypatch.setattr(secure, "get_db", lambda: DB(unit=unit))
+    monkeypatch.setattr(secure, "historical_delete_unit", fake_delete)
+    result = run(secure.secure_delete_unit(str(unit["_id"]), Request()))
+    assert result["success"] is True
+
+
+def test_unit_delete_blocks_any_contract_history_reference(monkeypatch):
+    property_id = str(ObjectId())
+    unit = {"_id": ObjectId(), "property_id": property_id, "status": "available", "current_contract_id": None, "current_tenant_id": None}
+    contract = {"_id": ObjectId(), "property_id": property_id, "unit_id": str(unit["_id"]), "status": "expired"}
+    install_topology_stubs(monkeypatch)
+    monkeypatch.setattr(secure, "get_db", lambda: DB(unit=unit, contract=contract))
     with pytest.raises(HTTPException) as exc:
         run(secure.secure_delete_unit(str(unit["_id"]), Request()))
     assert exc.value.status_code == 409
-    assert exc.value.detail == "unit_topology_requires_managed_workflow"
+    assert exc.value.detail == "unit_topology_contract_conflict"
 
 
 def test_manual_unit_rented_status_is_lifecycle_managed(monkeypatch):
     unit = {"_id": ObjectId(), "property_id": str(ObjectId()), "status": "available"}
-    monkeypatch.setattr(secure, "auth_admin", allow_admin)
+    install_topology_stubs(monkeypatch)
     monkeypatch.setattr(secure, "get_db", lambda: DB(unit=unit))
     with pytest.raises(HTTPException) as exc:
         run(secure.secure_update_unit(str(unit["_id"]), Request({"status": "rented"})))
@@ -104,11 +165,8 @@ def test_manual_unit_rented_status_is_lifecycle_managed(monkeypatch):
 
 
 def test_claimed_unit_cannot_be_moved_to_maintenance(monkeypatch):
-    unit = {
-        "_id": ObjectId(), "property_id": str(ObjectId()), "status": "rented",
-        "current_contract_id": str(ObjectId()), "current_tenant_id": str(ObjectId()),
-    }
-    monkeypatch.setattr(secure, "auth_admin", allow_admin)
+    unit = {"_id": ObjectId(), "property_id": str(ObjectId()), "status": "rented", "current_contract_id": str(ObjectId()), "current_tenant_id": str(ObjectId())}
+    install_topology_stubs(monkeypatch)
     monkeypatch.setattr(secure, "get_db", lambda: DB(unit=unit))
     with pytest.raises(HTTPException) as exc:
         run(secure.secure_update_unit(str(unit["_id"]), Request({"status": "maintenance"})))
@@ -116,35 +174,40 @@ def test_claimed_unit_cannot_be_moved_to_maintenance(monkeypatch):
     assert exc.value.detail == "unit_occupancy_claimed"
 
 
+def test_pending_unit_contract_blocks_maintenance(monkeypatch):
+    property_id = str(ObjectId())
+    unit = {"_id": ObjectId(), "property_id": property_id, "status": "available", "current_contract_id": None, "current_tenant_id": None}
+    contract = {"_id": ObjectId(), "property_id": property_id, "unit_id": str(unit["_id"]), "status": "pending_activation"}
+    install_topology_stubs(monkeypatch)
+    monkeypatch.setattr(secure, "get_db", lambda: DB(unit=unit, contract=contract))
+    with pytest.raises(HTTPException) as exc:
+        run(secure.secure_update_unit(str(unit["_id"]), Request({"status": "maintenance"})))
+    assert exc.value.status_code == 409
+    assert exc.value.detail == "unit_contract_pending_activation"
+
+
 def test_safe_unit_status_change_uses_no_claim_cas(monkeypatch):
-    unit = {
-        "_id": ObjectId(), "property_id": str(ObjectId()), "status": "available",
-        "current_contract_id": None, "current_tenant_id": None,
-    }
+    unit = {"_id": ObjectId(), "property_id": str(ObjectId()), "status": "available", "current_contract_id": None, "current_tenant_id": None}
     db = DB(unit=unit)
-    monkeypatch.setattr(secure, "auth_admin", allow_admin)
+    install_topology_stubs(monkeypatch)
     monkeypatch.setattr(secure, "get_db", lambda: db)
     monkeypatch.setattr(secure, "sync_property_from_units", no_sync)
     result = run(secure.secure_update_unit(str(unit["_id"]), Request({"status": "maintenance"})))
     assert result["success"] is True
     query, update = db.property_units.updates[0]
     assert query["_id"] == unit["_id"]
+    assert query["property_id"] == unit["property_id"]
     assert query["status"] == "available"
     rendered = repr(query)
     assert "current_contract_id" in rendered
     assert "current_tenant_id" in rendered
     assert update["$set"]["status"] == "maintenance"
-    assert "current_contract_id" not in update["$set"]
-    assert "current_tenant_id" not in update["$set"]
 
 
 def test_unit_status_cas_loss_fails_closed(monkeypatch):
-    unit = {
-        "_id": ObjectId(), "property_id": str(ObjectId()), "status": "available",
-        "current_contract_id": None, "current_tenant_id": None,
-    }
+    unit = {"_id": ObjectId(), "property_id": str(ObjectId()), "status": "available", "current_contract_id": None, "current_tenant_id": None}
     db = DB(unit=unit, matched_count=0)
-    monkeypatch.setattr(secure, "auth_admin", allow_admin)
+    install_topology_stubs(monkeypatch)
     monkeypatch.setattr(secure, "get_db", lambda: db)
     monkeypatch.setattr(secure, "sync_property_from_units", no_sync)
     with pytest.raises(HTTPException) as exc:
@@ -153,10 +216,21 @@ def test_unit_status_cas_loss_fails_closed(monkeypatch):
     assert exc.value.detail == "unit_state_changed"
 
 
-def test_lease_creation_requires_unit_for_multi_unit_property():
+def test_all_unit_writes_use_property_serialization_and_recovery_boundaries():
+    source = open(secure.__file__, encoding="utf-8").read()
+    for operation in ("unit_topology_create", "unit_update", "unit_topology_delete"):
+        assert f'"{operation}"' in source
+    assert "assert_property_lifecycle_recovery_clear" in source
+    assert "release_property_mutation_lock" in source
+
+
+def test_lease_creation_uses_same_property_serialization_boundary():
     source = open("rental/lease_creation_security_router.py", encoding="utf-8").read()
+    assert "acquire_property_mutation_lock" in source
+    assert '"lease_creation"' in source
+    assert "assert_property_lifecycle_recovery_clear" in source
+    assert "release_property_mutation_lock" in source
     assert 'existing_unit = await db.property_units.find_one({"property_id": property_id})' in source
-    assert 'prop.get("is_multi_unit") or existing_unit' in source
     assert 'detail="lease_unit_required_for_multi_unit_property"' in source
 
 

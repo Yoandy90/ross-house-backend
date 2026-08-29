@@ -1,4 +1,5 @@
 import asyncio
+from datetime import datetime, timedelta
 
 from bson import ObjectId
 
@@ -43,6 +44,20 @@ class Properties:
 class Contracts:
     def __init__(self, docs):
         self.docs = list(docs)
+
+    async def find_one(self, query, *args, **kwargs):
+        property_id = str(query.get("property_id") or "")
+        if "lifecycle_claim_id" in query:
+            for doc in self.docs:
+                claim = doc.get("lifecycle_claim_id")
+                if str(doc.get("property_id")) == property_id and claim not in (None, ""):
+                    return doc
+            return None
+        for doc in self.docs:
+            if str(doc.get("property_id")) == property_id:
+                return doc
+        return None
+
     def find(self, query):
         matches = [d for d in self.docs
                    if str(d.get("property_id")) == str(query.get("property_id"))
@@ -109,4 +124,50 @@ def test_sync_does_not_clear_claim_when_no_active_contract_but_projection_exists
     )
     report = run(sync.reconcile_property_statuses(db))
     assert report["conflicts"] == 1
+    assert db.properties.updates == []
+
+
+def test_sync_skips_property_with_live_mutation_claim():
+    pid = ObjectId()
+    db = DB(
+        [{
+            "_id": pid,
+            "status": "maintenance",
+            "mutation_lock": {
+                "token": "owned",
+                "operation": "unit_topology_create",
+                "expires_at": datetime.utcnow() + timedelta(minutes=1),
+            },
+        }],
+        [],
+    )
+    report = run(sync.reconcile_property_statuses(db))
+    assert report["skipped_mutation"] == 1
+    assert db.properties.updates == []
+
+
+def test_sync_fails_closed_on_malformed_mutation_claim():
+    pid = ObjectId()
+    db = DB(
+        [{"_id": pid, "status": "maintenance", "mutation_lock": {"token": "owned"}}],
+        [],
+    )
+    report = run(sync.reconcile_property_statuses(db))
+    assert report["skipped_mutation"] == 1
+    assert db.properties.updates == []
+
+
+def test_sync_skips_property_with_lifecycle_recovery_claim():
+    pid = ObjectId()
+    db = DB(
+        [{"_id": pid, "status": "maintenance"}],
+        [{
+            "_id": ObjectId(),
+            "property_id": str(pid),
+            "status": "pending_activation",
+            "lifecycle_claim_id": "retained-claim",
+        }],
+    )
+    report = run(sync.reconcile_property_statuses(db))
+    assert report["skipped_recovery"] == 1
     assert db.properties.updates == []

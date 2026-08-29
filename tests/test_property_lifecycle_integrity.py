@@ -35,7 +35,7 @@ class Collection:
         self.matched_count = matched_count
         self.updates = []
 
-    async def find_one(self, query):
+    async def find_one(self, query, *args, **kwargs):
         return self.doc
 
     async def update_one(self, query, update):
@@ -53,6 +53,25 @@ class DB:
 
 async def allow_admin(_request):
     return {"_id": str(ObjectId()), "role": "admin", "email": "admin@example.com"}
+
+
+async def fake_acquire(_property_id, _operation, _actor=""):
+    return "lock-token"
+
+
+async def fake_release(_property_id, _token):
+    return True
+
+
+async def fake_recovery_clear(_property_id):
+    return None
+
+
+def install_update_lock_stubs(monkeypatch):
+    monkeypatch.setattr(secure, "auth_admin", allow_admin)
+    monkeypatch.setattr(secure, "acquire_property_mutation_lock", fake_acquire)
+    monkeypatch.setattr(secure, "release_property_mutation_lock", fake_release)
+    monkeypatch.setattr(secure, "assert_property_lifecycle_recovery_clear", fake_recovery_clear)
 
 
 def _property(**extra):
@@ -93,7 +112,7 @@ def test_create_cannot_start_rented(monkeypatch):
 
 def test_update_cannot_set_rented(monkeypatch):
     prop = _property()
-    monkeypatch.setattr(secure, "auth_admin", allow_admin)
+    install_update_lock_stubs(monkeypatch)
     monkeypatch.setattr(secure, "get_db", lambda: DB(prop))
     with pytest.raises(HTTPException) as exc:
         run(secure.secure_update_property(str(prop["_id"]), Request({"status": "rented"}), BackgroundTasks()))
@@ -103,7 +122,7 @@ def test_update_cannot_set_rented(monkeypatch):
 
 def test_update_cannot_release_claimed_property(monkeypatch):
     prop = _property(status="rented", current_contract_id=str(ObjectId()), current_tenant_id=str(ObjectId()))
-    monkeypatch.setattr(secure, "auth_admin", allow_admin)
+    install_update_lock_stubs(monkeypatch)
     monkeypatch.setattr(secure, "get_db", lambda: DB(prop))
     with pytest.raises(HTTPException) as exc:
         run(secure.secure_update_property(str(prop["_id"]), Request({"status": "available"}), BackgroundTasks()))
@@ -114,7 +133,7 @@ def test_update_cannot_release_claimed_property(monkeypatch):
 def test_update_cannot_hide_active_contract_when_projection_missing(monkeypatch):
     prop = _property(status="maintenance")
     contract = {"_id": ObjectId(), "property_id": str(prop["_id"]), "status": "active"}
-    monkeypatch.setattr(secure, "auth_admin", allow_admin)
+    install_update_lock_stubs(monkeypatch)
     monkeypatch.setattr(secure, "get_db", lambda: DB(prop, contract=contract))
     with pytest.raises(HTTPException) as exc:
         run(secure.secure_update_property(str(prop["_id"]), Request({"status": "available"}), BackgroundTasks()))
@@ -125,7 +144,7 @@ def test_update_cannot_hide_active_contract_when_projection_missing(monkeypatch)
 def test_profile_only_update_never_touches_status(monkeypatch):
     prop = _property()
     db = DB(prop)
-    monkeypatch.setattr(secure, "auth_admin", allow_admin)
+    install_update_lock_stubs(monkeypatch)
     monkeypatch.setattr(secure, "get_db", lambda: db)
 
     result = run(secure.secure_update_property(str(prop["_id"]), Request({"notes": "safe"}), BackgroundTasks()))
@@ -140,7 +159,7 @@ def test_profile_only_update_never_touches_status(monkeypatch):
 def test_safe_status_change_uses_no_claim_cas_and_clears_manual_lock(monkeypatch):
     prop = _property(status="available", status_manually_set=True)
     db = DB(prop)
-    monkeypatch.setattr(secure, "auth_admin", allow_admin)
+    install_update_lock_stubs(monkeypatch)
     monkeypatch.setattr(secure, "get_db", lambda: db)
 
     result = run(secure.secure_update_property(str(prop["_id"]), Request({"status": "maintenance"}), BackgroundTasks()))
@@ -160,12 +179,20 @@ def test_safe_status_change_uses_no_claim_cas_and_clears_manual_lock(monkeypatch
 def test_status_cas_loss_fails_closed(monkeypatch):
     prop = _property(status="available")
     db = DB(prop, matched_count=0)
-    monkeypatch.setattr(secure, "auth_admin", allow_admin)
+    install_update_lock_stubs(monkeypatch)
     monkeypatch.setattr(secure, "get_db", lambda: db)
     with pytest.raises(HTTPException) as exc:
         run(secure.secure_update_property(str(prop["_id"]), Request({"status": "maintenance"}), BackgroundTasks()))
     assert exc.value.status_code == 409
     assert exc.value.detail == "property_state_changed"
+
+
+def test_property_update_uses_shared_mutation_and_recovery_boundaries():
+    source = open(secure.__file__, encoding="utf-8").read()
+    assert "acquire_property_mutation_lock" in source
+    assert '"property_update"' in source
+    assert "assert_property_lifecycle_recovery_clear" in source
+    assert "release_property_mutation_lock" in source
 
 
 def test_hard_delete_is_disabled_even_for_unclaimed_property(monkeypatch):
