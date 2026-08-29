@@ -1,11 +1,11 @@
-"""Guard tenant projection fields from becoming occupancy authority.
+"""Guard tenant projections and identity writes from becoming authority leaks.
 
 ``current_property_id``, ``current_contract_id`` and ``current_unit_id`` are
 projections maintained by the lease lifecycle. They must never be freely
 writable from generic admin tenant create/update operations.
 
-Tenant email/phone identity is normalized on every guarded write. Existing
-legacy rows remain readable through bounded compatibility fallbacks in
+Tenant email/phone identity is normalized on guarded writes. Existing legacy
+rows remain readable through bounded compatibility fallbacks in
 ``tenant_integrity`` while new and edited rows use indexed lookup fields.
 """
 from datetime import datetime
@@ -14,7 +14,10 @@ from bson import ObjectId
 from fastapi import APIRouter, HTTPException, Request
 
 from rental.shared import auth_admin, get_db
-from rental.tenant_router import create_tenant as historical_create_tenant
+from rental.tenant_router import (
+    create_tenant as historical_create_tenant,
+    convert_app_user_to_tenant as historical_convert_app_user_to_tenant,
+)
 from rental.tenant_integrity import (
     _norm_email,
     _norm_phone,
@@ -60,14 +63,55 @@ async def _assert_identity_available(data: dict, *, current_tenant_id: str | Non
             raise HTTPException(status_code=409, detail="tenant_phone_already_linked")
 
 
+async def _persist_normalized_identity(tenant_id: str, data: dict) -> None:
+    if not ObjectId.is_valid(tenant_id):
+        raise HTTPException(status_code=409, detail="tenant_identity_normalization_id_invalid")
+    normalized = {}
+    email = _norm_email(data.get("email"))
+    phone = _norm_phone(data.get("phone"))
+    if email:
+        normalized["email_normalized"] = email
+    if phone:
+        normalized["phone_normalized"] = phone
+    if not normalized:
+        return
+    normalized["identity_normalized_at"] = datetime.utcnow()
+    write = await get_db().tenants.update_one(
+        {"_id": ObjectId(tenant_id)},
+        {"$set": normalized},
+    )
+    if write.matched_count != 1:
+        raise HTTPException(status_code=409, detail="tenant_identity_normalization_missing")
+
+
+@router.post('/admin/all-users/{user_id}/convert-to-tenant')
+async def secure_convert_app_user_to_tenant(user_id: str, request: Request):
+    """Prevent conversion from creating a second tenant identity by fallback data."""
+    await auth_admin(request)
+    if not ObjectId.is_valid(user_id):
+        raise HTTPException(status_code=400, detail="tenant_conversion_user_id_invalid")
+    db = get_db()
+    app_user = await db.app_users.find_one({"_id": ObjectId(user_id)})
+    if not app_user:
+        raise HTTPException(status_code=404, detail="Usuario no encontrado")
+
+    linked_id = str(app_user.get("tenant_id") or "")
+    if linked_id and ObjectId.is_valid(linked_id):
+        linked = await db.tenants.find_one({"_id": ObjectId(linked_id)})
+        if linked:
+            return await historical_convert_app_user_to_tenant(user_id, request)
+
+    identity_data = {"email": app_user.get("email"), "phone": app_user.get("phone")}
+    await _assert_identity_available(identity_data)
+    result = await historical_convert_app_user_to_tenant(user_id, request)
+    tenant_id = str((result or {}).get("tenant_id") or "")
+    await _persist_normalized_identity(tenant_id, identity_data)
+    return result
+
+
 @router.post('/admin/tenants')
 async def secure_create_tenant(request: Request):
-    """Compatibility guard around the historical tenant creation workflow.
-
-    The historical handler still owns account creation and welcome-message
-    compatibility. This first-match route removes occupancy authority and adds
-    normalized identity fields around that established workflow.
-    """
+    """Compatibility guard around the historical tenant creation workflow."""
     data = await request.json()
     if not isinstance(data, dict):
         raise HTTPException(status_code=400, detail="tenant_create_payload_invalid")
@@ -76,22 +120,8 @@ async def secure_create_tenant(request: Request):
 
     result = await historical_create_tenant(request)
     tenant_id = str((result or {}).get("tenant_id") or "")
-    if tenant_id and ObjectId.is_valid(tenant_id):
-        normalized = {}
-        email = _norm_email(data.get("email"))
-        phone = _norm_phone(data.get("phone"))
-        if email:
-            normalized["email_normalized"] = email
-        if phone:
-            normalized["phone_normalized"] = phone
-        if normalized:
-            normalized["identity_normalized_at"] = datetime.utcnow()
-            write = await get_db().tenants.update_one(
-                {"_id": ObjectId(tenant_id)},
-                {"$set": normalized},
-            )
-            if write.matched_count != 1:
-                raise HTTPException(status_code=409, detail="tenant_identity_normalization_missing")
+    if tenant_id:
+        await _persist_normalized_identity(tenant_id, data)
     return result
 
 
