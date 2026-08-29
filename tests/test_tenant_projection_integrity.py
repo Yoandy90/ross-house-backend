@@ -43,16 +43,50 @@ class Request:
         return self.payload
 
 
-def test_secure_admin_tenant_update_is_first_runtime_match():
+def test_secure_admin_tenant_routes_are_first_runtime_match():
     app = FastAPI()
     app.include_router(pre_tenant_router, prefix="/api")
     app.include_router(historical_tenant_router, prefix="/api")
-    matches = [r for r in app.routes
-               if getattr(r, "path", None) == "/api/admin/tenants/{tenant_id}"
-               and "PUT" in getattr(r, "methods", set())]
-    assert len(matches) == 2
-    assert matches[0].name == "secure_update_tenant"
-    assert matches[1].name == "update_tenant"
+
+    post_matches = [r for r in app.routes
+                    if getattr(r, "path", None) == "/api/admin/tenants"
+                    and "POST" in getattr(r, "methods", set())]
+    put_matches = [r for r in app.routes
+                   if getattr(r, "path", None) == "/api/admin/tenants/{tenant_id}"
+                   and "PUT" in getattr(r, "methods", set())]
+
+    assert len(post_matches) == 2
+    assert post_matches[0].name == "secure_create_tenant"
+    assert post_matches[1].name == "create_tenant"
+    assert len(put_matches) == 2
+    assert put_matches[0].name == "secure_update_tenant"
+    assert put_matches[1].name == "update_tenant"
+
+
+def test_admin_cannot_seed_occupancy_projection_on_create():
+    with pytest.raises(HTTPException) as exc:
+        run(secure.secure_create_tenant(Request({
+            "first_name": "A",
+            "last_name": "B",
+            "phone": "8065550101",
+            "current_property_id": str(ObjectId()),
+        })))
+    assert exc.value.status_code == 409
+    assert exc.value.detail == "tenant_occupancy_projection_lifecycle_managed"
+
+
+def test_safe_create_delegates_to_historical_workflow(monkeypatch):
+    called = {}
+
+    async def fake_historical(request):
+        called["request"] = request
+        return {"success": True, "tenant_id": "new"}
+
+    monkeypatch.setattr(secure, "historical_create_tenant", fake_historical)
+    request = Request({"first_name": "A", "last_name": "B", "phone": "8065550101"})
+    result = run(secure.secure_create_tenant(request))
+    assert result["success"] is True
+    assert called["request"] is request
 
 
 def test_admin_cannot_write_occupancy_projection(monkeypatch):
