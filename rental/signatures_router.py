@@ -1,28 +1,46 @@
 """Signature Management Router — authenticated, contract-bound signatures."""
-import re
 from fastapi import APIRouter, HTTPException, Request
 from datetime import datetime, timezone
 from bson import ObjectId
 from .shared import get_db, auth_admin, auth_marketplace, serialize
+from .tenant_integrity import resolve_authenticated_tenant
 
 router = APIRouter()
 _ALLOWED_CONTRACT_SIGNER_ROLES = {"tenant", "landlord", "admin"}
 _ALLOWED_DOCUMENT_TYPES = {"contract", "document"}
-
-
-async def _my_ids(user, db) -> list:
-    ids = [str(user['_id'])]
-    email = (user.get('email') or '').strip().lower()
-    if email:
-        tenant_doc = await db.tenants.find_one({"email": {"$regex": f"^{re.escape(email)}$", "$options": "i"}})
-        if tenant_doc:
-            ids.append(str(tenant_doc['_id']))
-    return list(dict.fromkeys(ids))
+_ALLOWED_SIGNING_STATES = {
+    "tenant": {"pending", "pending_signature", "pending_signatures", "pending_tenant"},
+    "landlord": {"pending", "pending_signature", "pending_signatures", "pending_landlord"},
+    "admin": {"draft", "pending", "pending_signature", "pending_signatures", "pending_tenant", "pending_landlord"},
+}
 
 
 def _effective_role(user) -> str:
     role = str(user.get('role', 'tenant') or 'tenant').strip().lower()
     return 'tenant' if role in ('tenant', 'client') else role
+
+
+def _norm_id(value) -> str:
+    return str(value or '').strip()
+
+
+async def _my_ids(user, db=None) -> list[str]:
+    """Return actor-owned identifiers without trusting first-match email lookups.
+
+    Marketplace/app-user ids remain valid compatibility identifiers. Tenant/client
+    actors additionally receive the one canonical tenant id resolved by the shared
+    fail-closed identity boundary; ambiguous legacy email/phone mappings therefore
+    cannot authorize a signature or expose another tenant's pending documents.
+    """
+    user_id = _norm_id(user.get('_id') or user.get('id'))
+    ids = [user_id] if user_id else []
+    if _effective_role(user) == 'tenant':
+        tenant = await resolve_authenticated_tenant(user)
+        if tenant:
+            tenant_id = _norm_id(tenant.get('_id'))
+            if tenant_id:
+                ids.append(tenant_id)
+    return list(dict.fromkeys(ids))
 
 
 def _actor_name(user: dict, role: str) -> str:
@@ -33,8 +51,10 @@ def _actor_name(user: dict, role: str) -> str:
     return joined or str(user.get('email') or '').strip().lower() or role
 
 
-def _norm_id(value) -> str:
-    return str(value or '').strip()
+def _assert_contract_signing_state(contract: dict, role: str) -> None:
+    status = str(contract.get('status') or '').strip().lower()
+    if status not in _ALLOWED_SIGNING_STATES.get(role, set()):
+        raise HTTPException(409, "contract_not_in_signable_state")
 
 
 async def _authorize_contract_signer(user: dict, contract: dict, db) -> tuple[str, list[str]]:
@@ -50,6 +70,7 @@ async def _authorize_contract_signer(user: dict, contract: dict, db) -> tuple[st
         landlord_id = _norm_id(contract.get('landlord_id'))
         if not landlord_id or landlord_id != user_id:
             raise HTTPException(403, "No autorizado para firmar este contrato")
+    _assert_contract_signing_state(contract, role)
     return role, my_ids
 
 
@@ -78,8 +99,8 @@ async def get_pending_signatures(request: Request):
     pending = []
     contracts = await db.rental_contracts.find({
         '$or': [{'tenant_id': {'$in': my_ids}}, {'landlord_id': user_id}, {'admin_id': user_id}],
-        'status': {'$in': ['pending_signatures', 'pending_tenant', 'pending_landlord',
-                           'pending_activation', 'active', 'draft']}
+        'status': {'$in': ['pending', 'pending_signature', 'pending_signatures', 'pending_tenant',
+                           'pending_landlord', 'pending_activation', 'active', 'draft']}
     }).sort('created_at', -1).to_list(20)
     for contract in contracts:
         c = serialize(contract)
@@ -87,13 +108,13 @@ async def get_pending_signatures(request: Request):
         signed_by_me = False
         if role == 'tenant' and c.get('tenant_id') in my_ids:
             signed_by_me = bool(c.get('tenant_signature'))
-            needs_sig = not signed_by_me and c.get('status') in ['pending_signatures', 'pending_tenant']
+            needs_sig = not signed_by_me and c.get('status') in _ALLOWED_SIGNING_STATES['tenant']
         elif role == 'landlord' and c.get('landlord_id') == user_id:
             signed_by_me = bool(c.get('landlord_signature'))
-            needs_sig = not signed_by_me and c.get('status') in ['pending_signatures', 'pending_landlord']
+            needs_sig = not signed_by_me and c.get('status') in _ALLOWED_SIGNING_STATES['landlord']
         elif role == 'admin':
             signed_by_me = bool(c.get('admin_signature'))
-            needs_sig = not signed_by_me and c.get('status') != 'active'
+            needs_sig = not signed_by_me and c.get('status') in _ALLOWED_SIGNING_STATES['admin']
         pending.append({
             'id': c['id'], 'type': 'contract',
             'title': f"Contrato - {c.get('property_address', 'Propiedad')}",
@@ -183,9 +204,10 @@ async def submit_signature(request: Request):
             update_data['signed_at'] = now
         elif role == 'tenant':
             update_data['status'] = 'pending_signatures'
-        write_filter = {'_id': object_id, 'updated_at': contract.get('updated_at')}
+        expected_status = contract.get('status')
+        write_filter = {'_id': object_id, 'status': expected_status, 'updated_at': contract.get('updated_at')}
         if contract.get('updated_at') is None:
-            write_filter = {'_id': object_id, 'updated_at': {'$exists': False}}
+            write_filter = {'_id': object_id, 'status': expected_status, 'updated_at': {'$exists': False}}
         write_result = await db.rental_contracts.update_one(write_filter, {'$set': update_data})
         if getattr(write_result, 'matched_count', 0) != 1:
             await db.signatures.update_one({'_id': result.inserted_id},
