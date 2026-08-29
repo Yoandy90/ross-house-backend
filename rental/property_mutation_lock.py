@@ -30,10 +30,14 @@ def _property_oid(property_id: str) -> ObjectId:
     return ObjectId(str(property_id))
 
 
-async def acquire_property_mutation_lock(property_id: str, operation: str, actor: str = "") -> str:
-    """Acquire the per-property serialization claim or fail closed with 409."""
+async def acquire_property_mutation_lock(property_id: str, operation: str, actor: str = "", db=None) -> str:
+    """Acquire the per-property serialization claim or fail closed with 409.
+
+    ``db`` is injectable for background jobs/tests that already own a database
+    handle. Request routers continue using the canonical shared database.
+    """
     oid = _property_oid(property_id)
-    db = get_db()
+    db = db or get_db()
     now = datetime.utcnow()
     token = uuid4().hex
     expires_at = now + timedelta(seconds=_LOCK_TTL_SECONDS)
@@ -66,10 +70,11 @@ async def acquire_property_mutation_lock(property_id: str, operation: str, actor
     return token
 
 
-async def assert_property_lifecycle_recovery_clear(property_id: str) -> None:
+async def assert_property_lifecycle_recovery_clear(property_id: str, db=None) -> None:
     """Fail closed while any contract on this property retains a lifecycle claim."""
     _property_oid(property_id)
-    pending = await get_db().rental_contracts.find_one(
+    db = db or get_db()
+    pending = await db.rental_contracts.find_one(
         {
             "property_id": str(property_id),
             "lifecycle_claim_id": {"$exists": True, "$nin": [None, ""]},
@@ -80,7 +85,7 @@ async def assert_property_lifecycle_recovery_clear(property_id: str) -> None:
         raise HTTPException(status_code=409, detail="property_lifecycle_recovery_pending")
 
 
-async def release_property_mutation_lock(property_id: str, token: str) -> bool:
+async def release_property_mutation_lock(property_id: str, token: str, db=None) -> bool:
     """Release only the exact owned claim without making a committed write ambiguous.
 
     If MongoDB is temporarily unavailable after the protected operation already
@@ -91,7 +96,8 @@ async def release_property_mutation_lock(property_id: str, token: str) -> bool:
     if not token or not ObjectId.is_valid(str(property_id or "")):
         return False
     try:
-        result = await get_db().properties.update_one(
+        db = db or get_db()
+        result = await db.properties.update_one(
             {"_id": ObjectId(str(property_id)), f"{_LOCK_FIELD}.token": token},
             {"$unset": {_LOCK_FIELD: ""}},
         )
