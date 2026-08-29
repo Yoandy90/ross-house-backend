@@ -28,6 +28,9 @@ UNIT_STATUSES = ("available", "rented", "maintenance")
 async def sync_property_from_units(property_id: str):
     """Recalcula resumen y status de la propiedad a partir de sus unidades."""
     db = get_db()
+    if not ObjectId.is_valid(property_id):
+        logger.warning("Skipping unit/property sync for invalid property_id=%r", property_id)
+        return
     units = await db.property_units.find({"property_id": property_id}).to_list(500)
     now = datetime.utcnow()
     if not units:
@@ -52,20 +55,83 @@ async def sync_property_from_units(property_id: str):
 
 
 async def mark_unit_rented(unit_id: str, tenant_id: str, contract_id: str):
-    """Marca una unidad como rentada (usado al activar un contrato con unit_id)."""
+    """Claim a unit for one exact contract, fail-closed on conflicts.
+
+    Contract creation may insert an already-active contract, while the status
+    transition endpoint claims the unit immediately before persisting the new
+    active status.  Therefore this helper validates relationship identity and
+    occupancy atomically, but deliberately does not treat the contract's
+    current status field as authority.
+    """
+    if not all(ObjectId.is_valid(value) for value in (unit_id, tenant_id, contract_id)):
+        raise HTTPException(status_code=400, detail="unit_occupancy_invalid_id")
+
     db = get_db()
-    unit = await db.property_units.find_one({"_id": ObjectId(unit_id)})
+    unit_oid = ObjectId(unit_id)
+    contract_oid = ObjectId(contract_id)
+    tenant_oid = ObjectId(tenant_id)
+
+    unit = await db.property_units.find_one({"_id": unit_oid})
     if not unit:
-        return
-    await db.property_units.update_one(
-        {"_id": unit["_id"]},
+        raise HTTPException(status_code=404, detail="unit_not_found")
+
+    contract = await db.rental_contracts.find_one({"_id": contract_oid})
+    if not contract:
+        raise HTTPException(status_code=404, detail="unit_contract_not_found")
+
+    if str(contract.get("unit_id") or "") != unit_id:
+        raise HTTPException(status_code=409, detail="unit_contract_mismatch")
+    if str(contract.get("tenant_id") or "") != tenant_id:
+        raise HTTPException(status_code=409, detail="unit_tenant_mismatch")
+    if str(contract.get("property_id") or "") != str(unit.get("property_id") or ""):
+        raise HTTPException(status_code=409, detail="unit_property_mismatch")
+
+    tenant = await db.tenants.find_one({"_id": tenant_oid})
+    if not tenant:
+        raise HTTPException(status_code=404, detail="unit_tenant_not_found")
+
+    current_contract = str(unit.get("current_contract_id") or "")
+    current_tenant = str(unit.get("current_tenant_id") or "")
+    if current_contract and current_contract != contract_id:
+        raise HTTPException(status_code=409, detail="unit_already_claimed")
+    if current_tenant and current_tenant != tenant_id:
+        raise HTTPException(status_code=409, detail="unit_tenant_already_claimed")
+    if unit.get("status") == "maintenance" and current_contract != contract_id:
+        raise HTTPException(status_code=409, detail="unit_in_maintenance")
+
+    claim_filter = {
+        "_id": unit_oid,
+        "$and": [
+            {"$or": [
+                {"current_contract_id": {"$exists": False}},
+                {"current_contract_id": None},
+                {"current_contract_id": ""},
+                {"current_contract_id": contract_id},
+            ]},
+            {"$or": [
+                {"current_tenant_id": {"$exists": False}},
+                {"current_tenant_id": None},
+                {"current_tenant_id": ""},
+                {"current_tenant_id": tenant_id},
+            ]},
+            {"status": {"$in": ["available", "rented"]}},
+        ],
+    }
+    result = await db.property_units.update_one(
+        claim_filter,
         {"$set": {"status": "rented", "current_tenant_id": tenant_id,
-                  "current_contract_id": contract_id, "updated_at": datetime.utcnow()}})
-    await sync_property_from_units(unit["property_id"])
+                  "current_contract_id": contract_id, "updated_at": datetime.utcnow()}},
+    )
+    if result.matched_count != 1:
+        raise HTTPException(status_code=409, detail="unit_occupancy_changed")
+
+    await sync_property_from_units(str(unit["property_id"]))
 
 
 async def free_unit(unit_id: str):
     """Libera una unidad (contrato terminado/expirado/revertido a borrador)."""
+    if not ObjectId.is_valid(unit_id):
+        raise HTTPException(status_code=400, detail="unit_occupancy_invalid_id")
     db = get_db()
     unit = await db.property_units.find_one({"_id": ObjectId(unit_id)})
     if not unit:
@@ -97,7 +163,6 @@ async def list_units(property_id: str, request: Request):
         raise HTTPException(status_code=400, detail="ID inválido")
     units = await (db.property_units.find({"property_id": property_id})
                    .sort("unit_name", 1).to_list(500))
-    # nombre del inquilino por unidad ocupada
     tenant_ids = [u["current_tenant_id"] for u in units if u.get("current_tenant_id")]
     names = {}
     if tenant_ids:
@@ -175,7 +240,7 @@ async def create_units(property_id: str, request: Request):
 
 @router.put('/admin/units/{unit_id}')
 async def update_unit(unit_id: str, request: Request):
-    """Edita una unidad. Body: campos de unidad y/o status (available|rented|maintenance)."""
+    """Edita una unidad sin permitir bypass manual del ciclo contractual."""
     await auth_admin(request)
     db = get_db()
     if not ObjectId.is_valid(unit_id):
@@ -195,11 +260,16 @@ async def update_unit(unit_id: str, request: Request):
         if f in data:
             sets[f] = float(data[f] or 0)
     if "status" in data:
-        if data["status"] not in UNIT_STATUSES:
+        requested_status = data["status"]
+        if requested_status not in UNIT_STATUSES:
             raise HTTPException(status_code=400,
                                 detail=f"status debe ser: {', '.join(UNIT_STATUSES)}")
-        sets["status"] = data["status"]
-        if data["status"] != "rented":
+        if requested_status == "rented" and unit.get("status") != "rented":
+            raise HTTPException(status_code=409, detail="unit_rented_requires_active_contract")
+        if unit.get("current_contract_id") and requested_status != "rented":
+            raise HTTPException(status_code=409, detail="unit_status_requires_contract_release")
+        sets["status"] = requested_status
+        if requested_status != "rented":
             sets["current_tenant_id"] = None
             sets["current_contract_id"] = None
     if sets.get("unit_name"):
