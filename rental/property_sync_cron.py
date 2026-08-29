@@ -8,6 +8,7 @@ contract's claim, clear a claim merely because no active contract is visible,
 or mutate a property while another serialized operation or lifecycle recovery
 owns it. Repairs participate in the same per-property mutation lock as request
 workflows so contract lifecycle and projection writes cannot cross in flight.
+Archived properties are excluded from operational projection repair.
 """
 import asyncio
 import logging
@@ -31,6 +32,7 @@ async def reconcile_property_statuses(db) -> dict:
     skipped_manual = 0
     skipped_mutation = 0
     skipped_recovery = 0
+    skipped_archived = 0
     unchanged = 0
     ambiguous = 0
     conflicts = 0
@@ -40,9 +42,6 @@ async def reconcile_property_statuses(db) -> dict:
         pid_obj = observed_prop["_id"]
         pid = str(pid_obj)
 
-        # Preserve fail-closed handling for malformed/live claims without trying
-        # to take them over. Expired well-formed claims are handled atomically by
-        # acquire_property_mutation_lock below.
         observed_lock = observed_prop.get("mutation_lock")
         if observed_lock:
             expires_at = observed_lock.get("expires_at") if isinstance(observed_lock, dict) else None
@@ -65,11 +64,12 @@ async def reconcile_property_statuses(db) -> dict:
                     continue
                 raise
 
-            # Re-read all property authority after acquisition. The cursor copy
-            # may predate a just-completed lifecycle/property mutation.
             prop = await db.properties.find_one({"_id": pid_obj})
             if not prop:
                 conflicts += 1
+                continue
+            if prop.get("archived_at"):
+                skipped_archived += 1
                 continue
 
             try:
@@ -85,9 +85,6 @@ async def reconcile_property_statuses(db) -> dict:
                 continue
 
             if prop.get("is_multi_unit"):
-                # Multi-unit projection authority remains unit-derived. Holding
-                # the shared property lock prevents topology/lifecycle mutation
-                # from crossing this delegated reconciliation.
                 from rental.units_router import sync_property_from_units
                 await sync_property_from_units(pid)
                 continue
@@ -154,9 +151,6 @@ async def reconcile_property_statuses(db) -> dict:
                 unchanged += 1
                 continue
 
-            # Cross-collection recheck under the shared lock closes the prior
-            # read->lifecycle-release->property-CAS window. A lifecycle request
-            # cannot terminate this contract while this token is owned.
             still_active = await db.rental_contracts.find_one(
                 {"_id": active_contract.get("_id"), "property_id": pid, "status": "active"},
                 {"_id": 1, "tenant_id": 1},
@@ -200,6 +194,7 @@ async def reconcile_property_statuses(db) -> dict:
         "skipped_manual": skipped_manual,
         "skipped_mutation": skipped_mutation,
         "skipped_recovery": skipped_recovery,
+        "skipped_archived": skipped_archived,
         "unchanged": unchanged,
         "ambiguous": ambiguous,
         "conflicts": conflicts,
@@ -225,8 +220,8 @@ async def property_sync_loop():
             report = await reconcile_property_statuses(db)
             if report["fixed"] or report["ambiguous"] or report["conflicts"]:
                 logger.info(
-                    "[property-sync] run: %s fixed, %s manual, %s mutation-locked, %s recovery-locked, %s unchanged, %s ambiguous, %s conflicts",
-                    report["fixed"], report["skipped_manual"], report["skipped_mutation"], report["skipped_recovery"],
+                    "[property-sync] run: %s fixed, %s manual, %s mutation-locked, %s recovery-locked, %s archived, %s unchanged, %s ambiguous, %s conflicts",
+                    report["fixed"], report["skipped_manual"], report["skipped_mutation"], report["skipped_recovery"], report["skipped_archived"],
                     report["unchanged"], report["ambiguous"], report["conflicts"],
                 )
         except asyncio.CancelledError:
