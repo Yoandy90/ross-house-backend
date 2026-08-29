@@ -40,6 +40,15 @@ def test_lifecycle_transition_graph_forbids_skip_activation_reopen_and_preactiva
     assert 'detail="lease_signatures_required"' in source
 
 
+def test_guarded_lifecycle_uses_property_serialization_and_recovery_fence():
+    source = Path("rental/lease_lifecycle_state_guard_router.py").read_text()
+    assert "acquire_property_mutation_lock" in source
+    assert '"lease_lifecycle"' in source
+    assert "assert_property_lifecycle_recovery_clear" in source
+    assert "release_property_mutation_lock" in source
+    assert "str(contract.get(\"property_id\")" in source
+
+
 def test_lifecycle_release_is_contract_bound_and_fail_closed():
     source = Path("rental/lease_lifecycle_security_router.py").read_text()
     assert 'detail="lease_unit_owned_by_other_contract"' in source
