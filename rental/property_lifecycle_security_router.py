@@ -64,14 +64,25 @@ def _profile_update(data: dict) -> dict:
 
 @router.post('/admin/properties')
 async def secure_create_property(request: Request, background_tasks: BackgroundTasks):
-    """Forbid creating an already-rented property outside lease activation."""
+    """Forbid creating non-canonical or already-rented property state."""
     await auth_admin(request)
     data = await request.json()
-    requested_status = str(data.get("status") or "available").strip().lower()
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=400, detail="property_payload_invalid")
+
+    status_supplied = "status" in data
+    raw_status = data.get("status") if status_supplied else "available"
+    requested_status = str(raw_status or "available").strip().lower()
     if requested_status == "rented":
         raise HTTPException(status_code=409, detail="property_rented_status_lifecycle_managed")
     if requested_status not in _SAFE_MANUAL_PROPERTY_STATES:
         raise HTTPException(status_code=400, detail="property_status_invalid")
+    # The historical creator persists the original request payload. Accepting a
+    # case/whitespace variant here would therefore validate one value but store
+    # another, breaking exact-status CAS during lease activation. Fail closed
+    # unless an explicitly supplied status is already the canonical value.
+    if status_supplied and str(raw_status) != requested_status:
+        raise HTTPException(status_code=400, detail="property_status_not_canonical")
     return await historical_create_property(request, background_tasks)
 
 
