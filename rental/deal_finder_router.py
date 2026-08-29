@@ -787,6 +787,23 @@ async def campaign_stats(request: Request):
             "note": "Entregadas = estimado por fecha de entrega esperada de Lob/USPS"}
 
 
+@router.get("/admin/deal-finder/responses")
+async def list_offer_responses(request: Request, action: Optional[str] = None, limit: int = 50):
+    """Respuestas recibidas en la página de oferta personalizada (QR/PURL),
+    ordenadas por fecha (más reciente primero). Cada fila es el lead completo
+    para poder abrirlo directo en el panel."""
+    await auth_admin(request)
+    db = get_db()
+    filt: dict = {"offer.response.action": {"$exists": True}}
+    if action:
+        if action not in ("accept", "counter", "call", "reject"):
+            raise HTTPException(422, "action inválida")
+        filt["offer.response.action"] = action
+    docs = await db.deal_finder_leads.find(filt).sort(
+        [("offer.response.at", -1)]).to_list(min(max(limit, 1), 100))
+    return {"success": True, "responses": [_lead_out(d) for d in docs]}
+
+
 @router.get("/admin/deal-finder/stats")
 async def get_stats(request: Request):
     await auth_admin(request)
@@ -1748,7 +1765,38 @@ async def public_offer_respond(slug: str, body: OfferResponseBody, request: Requ
         except Exception as e:
             logger.warning(f"[deal_finder] notificación de respuesta falló: {e}")
 
+    # 📱 SMS inmediato al admin (solo aceptó / contraoferta — lo accionable)
+    async def _notify_admin_sms():
+        if body.action not in ("accept", "counter"):
+            return
+        try:
+            to_admin = (os.environ.get("ADMIN_NOTIFY_PHONE") or "").strip()
+            if not to_admin:
+                admin = await db.app_users.find_one(
+                    {"email": {"$regex": "^yoandyross@gmail\\.com$", "$options": "i"}},
+                    {"phone": 1})
+                to_admin = ((admin or {}).get("phone") or "").strip()
+            if not to_admin:
+                logger.info("[deal_finder] SMS de respuesta omitido: sin ADMIN_NOTIFY_PHONE ni teléfono del admin")
+                return
+            addr = (doc.get("address") or "la propiedad")[:60]
+            owner = (doc.get("owner_name") or "").strip()[:40]
+            if body.action == "accept":
+                sms = f"✅ ACEPTO tu oferta: {addr}" + (f" — {owner}" if owner else "")
+            else:
+                sms = f"💬 CONTRAOFERTA ${body.price:,.0f}: {addr}" + (f" — {owner}" if owner else "")
+            if body.phone.strip():
+                sms += f". Su tel: {body.phone.strip()[:25]}"
+            sms += ". Detalles en tu email y en el panel de Oportunidades."
+            from rental.service_providers_router import _send_sms
+            ok = await _send_sms(to_admin, sms)
+            if not ok:
+                logger.warning("[deal_finder] SMS de respuesta al admin falló (Twilio no configurado o error)")
+        except Exception as e:
+            logger.warning(f"[deal_finder] SMS de respuesta al admin falló: {e}")
+
     asyncio.create_task(_notify_admin())
+    asyncio.create_task(_notify_admin_sms())
     return {"success": True}
 
 
