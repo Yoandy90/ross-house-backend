@@ -15,8 +15,8 @@ def run(coro):
 
 
 class Request:
-    def __init__(self, payload):
-        self.payload = payload
+    def __init__(self, payload=None):
+        self.payload = payload or {}
         self.client = SimpleNamespace(host="127.0.0.1")
 
     async def json(self):
@@ -24,28 +24,39 @@ class Request:
 
 
 class Result:
-    def __init__(self, matched_count=1):
+    def __init__(self, matched_count=1, deleted_count=1):
         self.matched_count = matched_count
+        self.deleted_count = deleted_count
 
 
 class Collection:
-    def __init__(self, doc=None, matched_count=1):
+    def __init__(self, doc=None, matched_count=1, deleted_count=1):
         self.doc = doc
         self.matched_count = matched_count
+        self.deleted_count = deleted_count
         self.updates = []
+        self.deletes = []
 
     async def find_one(self, query):
         return self.doc
 
     async def update_one(self, query, update):
         self.updates.append((query, update))
-        return Result(self.matched_count)
+        return Result(matched_count=self.matched_count)
+
+    async def delete_one(self, query):
+        self.deletes.append(query)
+        return Result(deleted_count=self.deleted_count)
 
 
 class DB:
-    def __init__(self, contract, matched_count=1, saved_signature=None):
-        self.rental_contracts = Collection(contract, matched_count)
+    def __init__(self, contract, matched_count=1, saved_signature=None,
+                 prop=None, tenant=None, unit=None, deleted_count=1):
+        self.rental_contracts = Collection(contract, matched_count, deleted_count)
         self.admin_signatures = Collection(saved_signature)
+        self.properties = Collection(prop)
+        self.tenants = Collection(tenant)
+        self.property_units = Collection(unit)
 
 
 async def allow_admin(_request):
@@ -74,6 +85,8 @@ def test_admin_mutation_security_routes_are_first_runtime_match():
 
     expected = {
         ("/api/admin/rental-contracts/{contract_id}", "PUT"): ("secure_update_contract", "update_contract"),
+        ("/api/admin/rental-contracts/{contract_id}", "DELETE"): ("secure_delete_contract", "delete_contract"),
+        ("/api/admin/properties/sync-status", "POST"): ("secure_sync_property_status", "sync_property_status"),
         ("/api/admin/rental-contracts/{contract_id}/sign", "POST"): ("secure_admin_contract_sign", "sign_contract"),
         ("/api/admin/rental-contracts/{contract_id}/office-sign", "POST"): ("secure_office_sign_contract", "office_sign_contract"),
     }
@@ -103,6 +116,90 @@ def test_generic_put_locks_relationships_after_draft(monkeypatch):
         run(secure.secure_update_contract(str(contract["_id"]), Request({"tenant_id": str(ObjectId())})))
     assert exc.value.status_code == 409
     assert exc.value.detail == "lease_relationship_locked_after_draft"
+
+
+def test_draft_property_change_cannot_break_existing_unit_relationship(monkeypatch):
+    old_property = str(ObjectId())
+    new_property = str(ObjectId())
+    unit_id = str(ObjectId())
+    contract = _contract("draft", property_id=old_property, unit_id=unit_id)
+    db = DB(
+        contract,
+        prop={"_id": ObjectId(new_property)},
+        tenant={"_id": ObjectId(contract["tenant_id"])},
+        unit={"_id": ObjectId(unit_id), "property_id": old_property},
+    )
+    monkeypatch.setattr(secure, "auth_admin", allow_admin)
+    monkeypatch.setattr(secure, "get_db", lambda: db)
+
+    with pytest.raises(HTTPException) as exc:
+        run(secure.secure_update_contract(str(contract["_id"]), Request({"property_id": new_property})))
+    assert exc.value.status_code == 409
+    assert exc.value.detail == "lease_unit_property_mismatch"
+
+
+def test_active_contract_delete_is_blocked_even_if_legacy_force_would_allow(monkeypatch):
+    contract = _contract("active")
+    monkeypatch.setattr(secure, "auth_admin", allow_admin)
+    monkeypatch.setattr(secure, "get_db", lambda: DB(contract))
+
+    with pytest.raises(HTTPException) as exc:
+        run(secure.secure_delete_contract(str(contract["_id"]), Request()))
+    assert exc.value.status_code == 409
+    assert exc.value.detail == "lease_delete_requires_lifecycle"
+
+
+def test_draft_delete_fails_closed_when_projection_exists(monkeypatch):
+    contract = _contract("draft")
+    db = DB(
+        contract,
+        prop={"_id": ObjectId(contract["property_id"]), "current_contract_id": str(contract["_id"])},
+        tenant={"_id": ObjectId(contract["tenant_id"]), "current_contract_id": ""},
+    )
+    monkeypatch.setattr(secure, "auth_admin", allow_admin)
+    monkeypatch.setattr(secure, "get_db", lambda: db)
+
+    with pytest.raises(HTTPException) as exc:
+        run(secure.secure_delete_contract(str(contract["_id"]), Request()))
+    assert exc.value.detail == "lease_delete_projection_exists"
+    assert db.rental_contracts.deletes == []
+
+
+def test_draft_delete_uses_exact_status_and_no_claim_cas(monkeypatch):
+    contract = _contract("draft")
+    db = DB(
+        contract,
+        prop={"_id": ObjectId(contract["property_id"]), "current_contract_id": ""},
+        tenant={"_id": ObjectId(contract["tenant_id"]), "current_contract_id": ""},
+    )
+    monkeypatch.setattr(secure, "auth_admin", allow_admin)
+    monkeypatch.setattr(secure, "get_db", lambda: db)
+
+    result = run(secure.secure_delete_contract(str(contract["_id"]), Request()))
+    assert result["success"] is True
+    query = db.rental_contracts.deletes[0]
+    assert query["_id"] == contract["_id"]
+    assert query["status"] == "draft"
+    assert "$or" in query
+
+
+def test_manual_sync_delegates_only_to_conservative_reconciler(monkeypatch):
+    contract = _contract("draft")
+    db = DB(contract)
+    called = {}
+
+    async def fake_reconcile(actual_db):
+        called["db"] = actual_db
+        return {"fixed": 1, "skipped_manual": 0, "unchanged": 2, "ambiguous": 0, "conflicts": 0}
+
+    monkeypatch.setattr(secure, "auth_admin", allow_admin)
+    monkeypatch.setattr(secure, "get_db", lambda: db)
+    monkeypatch.setattr(secure, "reconcile_property_statuses", fake_reconcile)
+
+    result = run(secure.secure_sync_property_status(Request()))
+    assert called["db"] is db
+    assert result["success"] is True
+    assert result["fixed"] == 1
 
 
 def test_legacy_admin_sign_records_evidence_without_activation(monkeypatch):
