@@ -1,4 +1,5 @@
 import asyncio
+from datetime import datetime, timedelta
 
 from bson import ObjectId
 
@@ -109,4 +110,34 @@ def test_sync_does_not_clear_claim_when_no_active_contract_but_projection_exists
     )
     report = run(sync.reconcile_property_statuses(db))
     assert report["conflicts"] == 1
+    assert db.properties.updates == []
+
+
+def test_sync_skips_property_with_live_mutation_claim():
+    pid = ObjectId()
+    db = DB(
+        [{
+            "_id": pid,
+            "status": "maintenance",
+            "mutation_lock": {
+                "token": "owned",
+                "operation": "unit_topology_create",
+                "expires_at": datetime.utcnow() + timedelta(minutes=1),
+            },
+        }],
+        [],
+    )
+    report = run(sync.reconcile_property_statuses(db))
+    assert report["skipped_mutation"] == 1
+    assert db.properties.updates == []
+
+
+def test_sync_fails_closed_on_malformed_mutation_claim():
+    pid = ObjectId()
+    db = DB(
+        [{"_id": pid, "status": "maintenance", "mutation_lock": {"token": "owned"}}],
+        [],
+    )
+    report = run(sync.reconcile_property_statuses(db))
+    assert report["skipped_mutation"] == 1
     assert db.properties.updates == []
