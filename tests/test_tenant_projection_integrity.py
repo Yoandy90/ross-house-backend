@@ -97,17 +97,21 @@ def test_admin_cannot_seed_occupancy_projection_on_create():
 
 def test_safe_create_delegates_to_historical_workflow(monkeypatch):
     called = {}
+    tenant_oid = ObjectId()
+    db = DB(tenant={"_id": tenant_oid})
 
     async def fake_historical(request):
         called["request"] = request
-        return {"success": True, "tenant_id": "new"}
+        return {"success": True, "tenant_id": str(tenant_oid)}
 
     monkeypatch.setattr(secure, "_assert_identity_available", allow_identity)
     monkeypatch.setattr(secure, "historical_create_tenant", fake_historical)
+    monkeypatch.setattr(secure, "get_db", lambda: db)
     request = Request({"first_name": "A", "last_name": "B", "phone": "8065550101"})
     result = run(secure.secure_create_tenant(request))
     assert result["success"] is True
     assert called["request"] is request
+    assert db.tenants.last_update[1]["$set"]["phone_normalized"] == "8065550101"
 
 
 def test_conversion_checks_identity_before_creating_second_tenant(monkeypatch):
