@@ -1,5 +1,4 @@
 import asyncio
-from types import SimpleNamespace
 
 import pytest
 from bson import ObjectId
@@ -12,27 +11,6 @@ from rental.tenant_router import router as historical_tenant_router
 
 def run(coro):
     return asyncio.run(coro)
-
-
-class Cursor:
-    def __init__(self, docs):
-        self.docs = list(docs)
-
-    async def to_list(self, _limit):
-        return list(self.docs)
-
-
-class Tenants:
-    def __init__(self, docs):
-        self.docs = list(docs)
-
-    def find(self, _query):
-        return Cursor(self.docs)
-
-
-class DB:
-    def __init__(self, docs):
-        self.tenants = Tenants(docs)
 
 
 class Request:
@@ -56,10 +34,7 @@ def test_secure_tenant_login_is_first_runtime_match():
     assert matches[1].name == "tenant_login"
 
 
-def test_last_four_phone_is_rejected(monkeypatch):
-    tenant = {"_id": ObjectId(), "email": "tenant@example.com", "phone": "8065551212"}
-    monkeypatch.setattr(secure, "get_db", lambda: DB([tenant]))
-
+def test_last_four_phone_is_rejected():
     with pytest.raises(HTTPException) as exc:
         run(secure.secure_tenant_login(Request({"email": "tenant@example.com", "phone": "1212"})))
     assert exc.value.status_code == 401
@@ -71,7 +46,13 @@ def test_full_normalized_phone_match_succeeds(monkeypatch):
         "_id": ObjectId(), "email": "Tenant@Example.com", "phone": "(806) 555-1212",
         "name": "Test Tenant", "tenant_number": "INQ-1",
     }
-    monkeypatch.setattr(secure, "get_db", lambda: DB([tenant]))
+
+    async def find_tenant(email, *, ambiguity_detail):
+        assert email == "tenant@example.com"
+        assert ambiguity_detail == "tenant_login_identity_ambiguous"
+        return tenant
+
+    monkeypatch.setattr(secure, "find_unique_tenant_by_email", find_tenant)
     monkeypatch.setattr(secure, "create_tenant_token", lambda tenant_id, email: f"token:{tenant_id}:{email}")
 
     result = run(secure.secure_tenant_login(Request({"email": " tenant@example.com ", "phone": "806-555-1212"})))
@@ -80,11 +61,33 @@ def test_full_normalized_phone_match_succeeds(monkeypatch):
     assert result["token"].startswith("token:")
 
 
+def test_indexed_phone_value_can_authenticate(monkeypatch):
+    tenant = {
+        "_id": ObjectId(),
+        "email": "tenant@example.com",
+        "phone": "legacy-display-value",
+        "phone_normalized": "18065551212",
+    }
+
+    async def find_tenant(_email, *, ambiguity_detail):
+        assert ambiguity_detail == "tenant_login_identity_ambiguous"
+        return tenant
+
+    monkeypatch.setattr(secure, "find_unique_tenant_by_email", find_tenant)
+    monkeypatch.setattr(secure, "create_tenant_token", lambda *_args: "token")
+
+    result = run(secure.secure_tenant_login(Request({
+        "email": "tenant@example.com",
+        "phone": "+1 (806) 555-1212",
+    })))
+    assert result["success"] is True
+
+
 def test_duplicate_normalized_email_fails_closed(monkeypatch):
-    monkeypatch.setattr(secure, "get_db", lambda: DB([
-        {"_id": ObjectId(), "email": "Tenant@Example.com", "phone": "8065551212"},
-        {"_id": ObjectId(), "email": "tenant@example.com", "phone": "8065551212"},
-    ]))
+    async def ambiguous(_email, *, ambiguity_detail):
+        raise HTTPException(status_code=409, detail=ambiguity_detail)
+
+    monkeypatch.setattr(secure, "find_unique_tenant_by_email", ambiguous)
 
     with pytest.raises(HTTPException) as exc:
         run(secure.secure_tenant_login(Request({"email": "tenant@example.com", "phone": "8065551212"})))
