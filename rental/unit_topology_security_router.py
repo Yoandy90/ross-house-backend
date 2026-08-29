@@ -11,13 +11,13 @@ from datetime import datetime
 from bson import ObjectId
 from fastapi import APIRouter, HTTPException, Request
 
-from rental.property_mutation_lock import acquire_property_mutation_lock, release_property_mutation_lock
-from rental.shared import auth_admin, get_db
-from rental.units_router import (
-    create_units as historical_create_units,
-    delete_unit as historical_delete_unit,
-    sync_property_from_units,
+from rental.property_mutation_lock import (
+    acquire_property_mutation_lock,
+    assert_property_lifecycle_recovery_clear,
+    release_property_mutation_lock,
 )
+from rental.shared import auth_admin, get_db
+from rental.units_router import create_units as historical_create_units, delete_unit as historical_delete_unit, sync_property_from_units
 
 router = APIRouter(tags=["unit-topology-security"])
 _SAFE_UNIT_STATUSES = {"available", "maintenance"}
@@ -50,11 +50,7 @@ def _profile_update(data: dict) -> dict:
 
 
 async def _acquire_topology_lock(property_id: str, admin: dict, operation: str) -> str:
-    return await acquire_property_mutation_lock(
-        property_id,
-        operation,
-        str(admin.get("email") or admin.get("_id") or "admin"),
-    )
+    return await acquire_property_mutation_lock(property_id, operation, str(admin.get("email") or admin.get("_id") or "admin"))
 
 
 @router.post('/admin/properties/{property_id}/units')
@@ -63,6 +59,7 @@ async def secure_create_units(property_id: str, request: Request):
     object_id = _oid(property_id, "property_id_invalid")
     token = await _acquire_topology_lock(property_id, admin, "unit_topology_create")
     try:
+        await assert_property_lifecycle_recovery_clear(property_id)
         db = get_db()
         prop = await db.properties.find_one({"_id": object_id})
         if not prop:
@@ -71,24 +68,9 @@ async def secure_create_units(property_id: str, request: Request):
             raise HTTPException(status_code=409, detail="unit_topology_property_not_available")
         if prop.get("current_contract_id") or prop.get("current_tenant_id"):
             raise HTTPException(status_code=409, detail="unit_topology_property_claimed")
-
-        # Adding the first child unit changes lease authority from whole-property
-        # to exact-unit. Any non-terminal whole-property contract therefore
-        # blocks the topology change, including drafts that could activate later.
-        whole_property_contract = await db.rental_contracts.find_one({
-            "property_id": property_id,
-            "$and": [
-                {"$or": [
-                    {"unit_id": {"$exists": False}},
-                    {"unit_id": None},
-                    {"unit_id": ""},
-                ]},
-                {"status": {"$nin": _TERMINAL_CONTRACT_STATUSES}},
-            ],
-        })
+        whole_property_contract = await db.rental_contracts.find_one({"property_id": property_id, "$and": [{"$or": [{"unit_id": {"$exists": False}}, {"unit_id": None}, {"unit_id": ""}]}, {"status": {"$nin": _TERMINAL_CONTRACT_STATUSES}}]})
         if whole_property_contract:
             raise HTTPException(status_code=409, detail="unit_topology_whole_property_contract_conflict")
-
         return await historical_create_units(property_id, request)
     finally:
         await release_property_mutation_lock(property_id, token)
@@ -106,6 +88,7 @@ async def secure_update_unit(unit_id: str, request: Request):
     _oid(property_id, "property_id_invalid")
     token = await _acquire_topology_lock(property_id, admin, "unit_update")
     try:
+        await assert_property_lifecycle_recovery_clear(property_id)
         return await _secure_update_unit_under_lock(object_id, property_id, request)
     finally:
         await release_property_mutation_lock(property_id, token)
@@ -116,21 +99,14 @@ async def _secure_update_unit_under_lock(object_id: ObjectId, property_id: str, 
     unit = await db.property_units.find_one({"_id": object_id, "property_id": property_id})
     if not unit:
         raise HTTPException(status_code=409, detail="unit_topology_state_changed")
-
     data = await request.json()
     if not isinstance(data, dict):
         raise HTTPException(status_code=400, detail="unit_payload_invalid")
     update = _profile_update(data)
-
     if update.get("unit_name"):
-        duplicate = await db.property_units.find_one({
-            "property_id": property_id,
-            "unit_name": update["unit_name"],
-            "_id": {"$ne": object_id},
-        })
+        duplicate = await db.property_units.find_one({"property_id": property_id, "unit_name": update["unit_name"], "_id": {"$ne": object_id}})
         if duplicate:
             raise HTTPException(status_code=400, detail="Nombre de unidad duplicado")
-
     status_requested = "status" in data
     if status_requested:
         requested_status = str(data.get("status") or "").strip().lower()
@@ -140,23 +116,18 @@ async def _secure_update_unit_under_lock(object_id: ObjectId, property_id: str, 
             raise HTTPException(status_code=400, detail="unit_status_invalid")
         if unit.get("current_contract_id") or unit.get("current_tenant_id"):
             raise HTTPException(status_code=409, detail="unit_occupancy_claimed")
+        if requested_status == "maintenance":
+            pending_contract = await db.rental_contracts.find_one({"property_id": property_id, "unit_id": str(object_id), "status": {"$nin": _TERMINAL_CONTRACT_STATUSES}})
+            if pending_contract:
+                raise HTTPException(status_code=409, detail="unit_contract_pending_activation")
         update["status"] = requested_status
-
     if not update:
         raise HTTPException(status_code=400, detail="unit_no_changes")
     update["updated_at"] = datetime.utcnow()
-
     write_filter = {"_id": object_id, "property_id": property_id}
     if status_requested:
-        # The status and both occupancy pointers are checked in the same write.
-        # If lifecycle activation claims the unit after our read, this CAS loses
-        # instead of clearing or overwriting that authoritative claim.
         write_filter["status"] = unit.get("status", "available")
-        write_filter["$and"] = [
-            {"$or": [{"current_contract_id": {"$exists": False}}, {"current_contract_id": None}, {"current_contract_id": ""}]},
-            {"$or": [{"current_tenant_id": {"$exists": False}}, {"current_tenant_id": None}, {"current_tenant_id": ""}]},
-        ]
-
+        write_filter["$and"] = [{"$or": [{"current_contract_id": {"$exists": False}}, {"current_contract_id": None}, {"current_contract_id": ""}]}, {"$or": [{"current_tenant_id": {"$exists": False}}, {"current_tenant_id": None}, {"current_tenant_id": ""}]}]
     result = await db.property_units.update_one(write_filter, {"$set": update})
     if getattr(result, "matched_count", 0) != 1:
         raise HTTPException(status_code=409, detail="unit_state_changed")
@@ -176,22 +147,15 @@ async def secure_delete_unit(unit_id: str, request: Request):
     _oid(property_id, "property_id_invalid")
     token = await _acquire_topology_lock(property_id, admin, "unit_topology_delete")
     try:
+        await assert_property_lifecycle_recovery_clear(property_id)
         unit = await db.property_units.find_one({"_id": object_id, "property_id": property_id})
         if not unit:
             raise HTTPException(status_code=409, detail="unit_topology_state_changed")
         if unit.get("status") == "rented" or unit.get("current_contract_id") or unit.get("current_tenant_id"):
             raise HTTPException(status_code=409, detail="unit_topology_unit_claimed")
-
-        # Never hard-delete a unit that is part of contract history. Even a
-        # terminal lease remains an auditable relationship and keeps its exact
-        # unit reference; archival can later replace destructive deletion.
-        contract = await db.rental_contracts.find_one({
-            "property_id": property_id,
-            "unit_id": unit_id,
-        })
+        contract = await db.rental_contracts.find_one({"property_id": property_id, "unit_id": unit_id})
         if contract:
             raise HTTPException(status_code=409, detail="unit_topology_contract_conflict")
-
         return await historical_delete_unit(unit_id, request)
     finally:
         await release_property_mutation_lock(property_id, token)
