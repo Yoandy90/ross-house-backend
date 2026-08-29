@@ -31,7 +31,9 @@ def test_lifecycle_release_is_contract_bound_and_fail_closed():
     assert 'detail="lease_unit_owned_by_other_contract"' in source
     assert '"current_contract_id": contract_id' in source
     assert 'detail="lease_property_owned_by_other_contract"' in source
+    assert 'detail="lease_tenant_contract_changed"' in source
     assert 'detail="lease_tenant_property_changed"' in source
+    assert 'detail="lease_tenant_unit_changed"' in source
     assert '"status": old_status, "lifecycle_claim_id": claim_id' in source
     assert 'detail="lease_status_changed"' in source
 
@@ -39,13 +41,38 @@ def test_lifecycle_release_is_contract_bound_and_fail_closed():
 def test_lifecycle_serializes_before_projection_mutation():
     source = Path("rental/lease_lifecycle_security_router.py").read_text()
     claim_call = 'claim_id = await _claim_lifecycle(contract_oid, old_status, new_status)'
+    tenant_call = 'await _claim_tenant_occupancy(contract, contract_id, now)'
     unit_call = 'await mark_unit_rented('
     property_call = 'claim = await db.properties.update_one('
     assert claim_call in source
-    assert source.index(claim_call) < source.rindex(unit_call)
-    assert source.index(claim_call) < source.rindex(property_call)
+    assert tenant_call in source
+    assert source.index(claim_call) < source.rindex(tenant_call)
+    assert source.rindex(tenant_call) < source.rindex(unit_call)
+    assert source.rindex(tenant_call) < source.rindex(property_call)
     assert 'detail="lease_lifecycle_busy_or_changed"' in source
     assert '"lifecycle_claim_id": claim_id' in source
+
+
+def test_tenant_contract_claim_closes_double_activation_race():
+    source = Path("rental/lease_lifecycle_security_router.py").read_text()
+    start = source.index("async def _claim_tenant_occupancy")
+    end = source.index("@router.patch('/admin/rental-contracts/{contract_id}/status')")
+    claim = source[start:end]
+    assert '"current_contract_id": contract_id' in claim
+    assert '{"current_contract_id": None}' in claim
+    assert '{"current_contract_id": {"$exists": False}}' in claim
+    assert 'detail="lease_tenant_already_claimed"' in claim
+    assert 'detail="lease_tenant_occupancy_changed"' in claim
+
+
+def test_release_clears_tenant_contract_projection_only_when_owned():
+    source = Path("rental/lease_lifecycle_security_router.py").read_text()
+    start = source.index("async def _release_tenant")
+    end = source.index("async def _claim_lifecycle")
+    release = source[start:end]
+    assert '"current_contract_id": contract_id' in release
+    assert '"current_contract_id": None' in release
+    assert 'detail="lease_tenant_contract_changed"' in release
 
 
 def test_release_checks_other_active_tenant_contract_before_clearing():
@@ -100,6 +127,7 @@ def test_recovery_has_explicit_partial_failure_classifications():
         assert state in source
     assert '"other_contract"' in source
     assert '"different_projection"' in source
+    assert 'tenant.get("current_contract_id")' in source
 
 
 def test_recovery_router_is_mounted_in_security_shim():
