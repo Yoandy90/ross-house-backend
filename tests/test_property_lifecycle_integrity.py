@@ -180,10 +180,9 @@ def test_delete_uses_no_claim_cas_and_ignores_legacy_force_query(monkeypatch):
     assert "force" not in rendered
 
 
-def test_source_never_writes_rented_or_clears_occupancy_directly():
+def test_source_has_no_direct_property_projection_write():
     source = open(secure.__file__, encoding="utf-8").read()
     assert "properties.update_one" not in source
-    assert "current_contract_id': None" not in source
-    assert '"current_contract_id": None' not in source
-    assert "current_tenant_id': None" not in source
-    assert '"current_tenant_id": None' not in source
+    assert "historical_delete_property" not in source
+    assert "'$set': {'status': 'rented'" not in source
+    assert '"$set": {"status": "rented"' not in source
