@@ -11,6 +11,7 @@ from datetime import datetime
 from bson import ObjectId
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 
+from rental.property_mutation_lock import acquire_property_mutation_lock, release_property_mutation_lock
 from rental.properties_router import create_property as historical_create_property
 from rental.shared import auth_admin, get_db
 
@@ -88,8 +89,21 @@ async def secure_create_property(request: Request, background_tasks: BackgroundT
 
 @router.put('/admin/properties/{property_id}')
 async def secure_update_property(property_id: str, request: Request, background_tasks: BackgroundTasks):
-    """Profile edits are allowed; status changes use a no-claim CAS."""
+    """Serialize profile/status writes with lease creation and topology changes."""
     admin = await auth_admin(request)
+    _oid(property_id)
+    token = await acquire_property_mutation_lock(
+        property_id,
+        "property_update",
+        str(admin.get("email") or admin.get("_id") or "admin"),
+    )
+    try:
+        return await _secure_update_property_under_lock(property_id, request, background_tasks)
+    finally:
+        await release_property_mutation_lock(property_id, token)
+
+
+async def _secure_update_property_under_lock(property_id: str, request: Request, background_tasks: BackgroundTasks):
     object_id = _oid(property_id)
     db = get_db()
     prop = await db.properties.find_one({"_id": object_id})
