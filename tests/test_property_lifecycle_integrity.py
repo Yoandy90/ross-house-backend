@@ -94,12 +94,12 @@ def test_property_security_routes_are_first_runtime_match():
     expected = {
         ("/api/admin/properties", "POST"): ("secure_create_property", "create_property"),
         ("/api/admin/properties/{property_id}", "PUT"): ("secure_update_property", "update_property"),
-        ("/api/admin/properties/{property_id}", "DELETE"): ("secure_delete_property", "delete_property"),
+        ("/api/admin/properties/{property_id}", "DELETE"): ("archive_property", "secure_delete_property", "delete_property"),
     }
     for (path, method), names in expected.items():
         matches = [r for r in app.routes if getattr(r, "path", None) == path and method in getattr(r, "methods", set())]
-        assert len(matches) == 2
-        assert (matches[0].name, matches[1].name) == names
+        assert len(matches) == len(names)
+        assert tuple(r.name for r in matches) == names
 
 
 def test_create_cannot_start_rented(monkeypatch):
@@ -150,7 +150,8 @@ def test_profile_only_update_never_touches_status(monkeypatch):
     result = run(secure.secure_update_property(str(prop["_id"]), Request({"notes": "safe"}), BackgroundTasks()))
     assert result["success"] is True
     query, update = db.properties.updates[0]
-    assert query == {"_id": prop["_id"]}
+    assert query["_id"] == prop["_id"]
+    assert query["$or"] == [{"archived_at": {"$exists": False}}, {"archived_at": None}]
     assert update["$set"]["notes"] == "safe"
     assert "status" not in update["$set"]
     assert "$unset" not in update

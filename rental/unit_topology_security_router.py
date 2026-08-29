@@ -4,7 +4,7 @@ Lease authority binds a contract to either one exact ``unit_id`` or to the
 whole property. Unit create/update/delete operations share the property
 mutation lock with canonical lease creation and property updates, so a new
 lease cannot race a topology or operational unit write across collections.
-Destructive unit deletion also preserves historical lease references.
+Archived properties freeze topology until explicitly restored.
 """
 from datetime import datetime
 
@@ -53,17 +53,24 @@ async def _acquire_topology_lock(property_id: str, admin: dict, operation: str) 
     return await acquire_property_mutation_lock(property_id, operation, str(admin.get("email") or admin.get("_id") or "admin"))
 
 
+async def _assert_property_not_archived(property_id: str) -> dict:
+    prop = await get_db().properties.find_one({"_id": _oid(property_id, "property_id_invalid")})
+    if not prop:
+        raise HTTPException(status_code=404, detail="Propiedad no encontrada")
+    if prop.get("archived_at"):
+        raise HTTPException(status_code=409, detail="property_archived")
+    return prop
+
+
 @router.post('/admin/properties/{property_id}/units')
 async def secure_create_units(property_id: str, request: Request):
     admin = await auth_admin(request)
-    object_id = _oid(property_id, "property_id_invalid")
+    _oid(property_id, "property_id_invalid")
     token = await _acquire_topology_lock(property_id, admin, "unit_topology_create")
     try:
         await assert_property_lifecycle_recovery_clear(property_id)
         db = get_db()
-        prop = await db.properties.find_one({"_id": object_id})
-        if not prop:
-            raise HTTPException(status_code=404, detail="Propiedad no encontrada")
+        prop = await _assert_property_not_archived(property_id)
         if str(prop.get("status") or "available").strip().lower() != "available":
             raise HTTPException(status_code=409, detail="unit_topology_property_not_available")
         if prop.get("current_contract_id") or prop.get("current_tenant_id"):
@@ -89,6 +96,7 @@ async def secure_update_unit(unit_id: str, request: Request):
     token = await _acquire_topology_lock(property_id, admin, "unit_update")
     try:
         await assert_property_lifecycle_recovery_clear(property_id)
+        await _assert_property_not_archived(property_id)
         return await _secure_update_unit_under_lock(object_id, property_id, request)
     finally:
         await release_property_mutation_lock(property_id, token)
@@ -148,6 +156,7 @@ async def secure_delete_unit(unit_id: str, request: Request):
     token = await _acquire_topology_lock(property_id, admin, "unit_topology_delete")
     try:
         await assert_property_lifecycle_recovery_clear(property_id)
+        await _assert_property_not_archived(property_id)
         unit = await db.property_units.find_one({"_id": object_id, "property_id": property_id})
         if not unit:
             raise HTTPException(status_code=409, detail="unit_topology_state_changed")

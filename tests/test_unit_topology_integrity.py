@@ -45,6 +45,13 @@ class Collection:
 
 class DB:
     def __init__(self, prop=None, unit=None, contract=None, matched_count=1):
+        if prop is None and unit and ObjectId.is_valid(str(unit.get("property_id") or "")):
+            prop = {
+                "_id": ObjectId(str(unit["property_id"])),
+                "status": "available",
+                "current_contract_id": None,
+                "current_tenant_id": None,
+            }
         self.properties = Collection(prop, matched_count)
         self.property_units = Collection(unit, matched_count)
         self.rental_contracts = Collection(contract, matched_count)

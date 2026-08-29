@@ -54,6 +54,8 @@ async def _create_canonical_contract_under_lock(data: dict, admin: dict, *, defa
     prop = await db.properties.find_one({"_id": _oid(property_id, "lease_property_invalid")})
     if not prop:
         raise HTTPException(status_code=404, detail="lease_property_not_found")
+    if prop.get("archived_at"):
+        raise HTTPException(status_code=409, detail="lease_property_archived")
     tenant = await db.tenants.find_one({"_id": _oid(tenant_id, "lease_tenant_invalid")})
     if not tenant:
         raise HTTPException(status_code=404, detail="lease_tenant_not_found")

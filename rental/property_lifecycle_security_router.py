@@ -3,8 +3,8 @@
 Property ``rented`` state is a projection of the canonical lease lifecycle, not
 an administrator-editable flag. These first-match routes preserve normal
 property profile editing while preventing manual occupancy creation/release.
-Hard deletion is deliberately disabled until an archival workflow can serialize
-against concurrent lease creation without cross-collection races.
+Archived properties are immutable until an explicit restore workflow reopens
+operational mutation authority.
 """
 from datetime import datetime
 
@@ -110,6 +110,8 @@ async def _secure_update_property_under_lock(property_id: str, request: Request,
     prop = await db.properties.find_one({"_id": object_id})
     if not prop:
         raise HTTPException(status_code=404, detail="Propiedad no encontrada")
+    if prop.get("archived_at"):
+        raise HTTPException(status_code=409, detail="property_archived")
 
     data = await request.json()
     if not isinstance(data, dict):
@@ -142,7 +144,7 @@ async def _secure_update_property_under_lock(property_id: str, request: Request,
         update_fields["status"] = requested_status
         update_fields["status_manually_set"] = False
 
-    write_filter = {"_id": object_id}
+    write_filter = {"_id": object_id, "$or": [{"archived_at": {"$exists": False}}, {"archived_at": None}]}
     update_doc = {"$set": update_fields}
     if status_requested:
         write_filter["status"] = prop.get("status", "available")
@@ -170,7 +172,7 @@ async def _secure_update_property_under_lock(property_id: str, request: Request,
 
 @router.delete('/admin/properties/{property_id}')
 async def secure_delete_property(property_id: str, request: Request):
-    """Fail closed: hard-delete cannot be serialized against lease creation."""
+    """Compatibility fallback; archival security route wins first-match."""
     await auth_admin(request)
     object_id = _oid(property_id)
     prop = await get_db().properties.find_one({"_id": object_id})
