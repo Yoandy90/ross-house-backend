@@ -1,4 +1,5 @@
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 from bson import ObjectId
@@ -23,16 +24,25 @@ class Tenants:
         self.last_update = None
 
     async def find_one(self, query):
-        return self.tenant if query.get("_id") == self.tenant.get("_id") else None
+        return self.tenant if self.tenant and query.get("_id") == self.tenant.get("_id") else None
 
     async def update_one(self, query, update):
         self.last_update = (query, update)
         return Result()
 
 
+class AppUsers:
+    def __init__(self, user):
+        self.user = user
+
+    async def find_one(self, query):
+        return self.user if self.user and query.get("_id") == self.user.get("_id") else None
+
+
 class DB:
-    def __init__(self, tenant):
+    def __init__(self, tenant=None, app_user=None):
         self.tenants = Tenants(tenant)
+        self.app_users = AppUsers(app_user)
 
 
 class Request:
@@ -52,16 +62,22 @@ def test_secure_admin_tenant_routes_are_first_runtime_match():
     app.include_router(pre_tenant_router, prefix="/api")
     app.include_router(historical_tenant_router, prefix="/api")
 
-    post_matches = [r for r in app.routes
-                    if getattr(r, "path", None) == "/api/admin/tenants"
-                    and "POST" in getattr(r, "methods", set())]
+    create_matches = [r for r in app.routes
+                      if getattr(r, "path", None) == "/api/admin/tenants"
+                      and "POST" in getattr(r, "methods", set())]
+    convert_matches = [r for r in app.routes
+                       if getattr(r, "path", None) == "/api/admin/all-users/{user_id}/convert-to-tenant"
+                       and "POST" in getattr(r, "methods", set())]
     put_matches = [r for r in app.routes
                    if getattr(r, "path", None) == "/api/admin/tenants/{tenant_id}"
                    and "PUT" in getattr(r, "methods", set())]
 
-    assert len(post_matches) == 2
-    assert post_matches[0].name == "secure_create_tenant"
-    assert post_matches[1].name == "create_tenant"
+    assert len(create_matches) == 2
+    assert create_matches[0].name == "secure_create_tenant"
+    assert create_matches[1].name == "create_tenant"
+    assert len(convert_matches) == 2
+    assert convert_matches[0].name == "secure_convert_app_user_to_tenant"
+    assert convert_matches[1].name == "convert_app_user_to_tenant"
     assert len(put_matches) == 2
     assert put_matches[0].name == "secure_update_tenant"
     assert put_matches[1].name == "update_tenant"
@@ -94,6 +110,26 @@ def test_safe_create_delegates_to_historical_workflow(monkeypatch):
     assert called["request"] is request
 
 
+def test_conversion_checks_identity_before_creating_second_tenant(monkeypatch):
+    user_id = ObjectId()
+    app_user = {"_id": user_id, "email": "same@example.com", "phone": "8065550101"}
+
+    async def fake_admin(_request):
+        return {"role": "admin"}
+
+    async def reject_identity(_data, **_kwargs):
+        raise HTTPException(status_code=409, detail="tenant_email_already_linked")
+
+    monkeypatch.setattr(secure, "auth_admin", fake_admin)
+    monkeypatch.setattr(secure, "_assert_identity_available", reject_identity)
+    monkeypatch.setattr(secure, "get_db", lambda: DB(app_user=app_user))
+
+    with pytest.raises(HTTPException) as exc:
+        run(secure.secure_convert_app_user_to_tenant(str(user_id), Request({})))
+    assert exc.value.status_code == 409
+    assert exc.value.detail == "tenant_email_already_linked"
+
+
 def test_admin_cannot_write_occupancy_projection(monkeypatch):
     tenant_id = ObjectId()
 
@@ -101,7 +137,7 @@ def test_admin_cannot_write_occupancy_projection(monkeypatch):
         return {"role": "admin"}
 
     monkeypatch.setattr(secure, "auth_admin", fake_admin)
-    monkeypatch.setattr(secure, "get_db", lambda: DB({"_id": tenant_id}))
+    monkeypatch.setattr(secure, "get_db", lambda: DB(tenant={"_id": tenant_id}))
 
     with pytest.raises(HTTPException) as exc:
         run(secure.secure_update_tenant(str(tenant_id), Request({"current_property_id": str(ObjectId())})))
@@ -111,7 +147,7 @@ def test_admin_cannot_write_occupancy_projection(monkeypatch):
 
 def test_profile_update_does_not_mutate_projection(monkeypatch):
     tenant_id = ObjectId()
-    db = DB({"_id": tenant_id, "first_name": "Old", "last_name": "Name"})
+    db = DB(tenant={"_id": tenant_id, "first_name": "Old", "last_name": "Name"})
 
     async def fake_admin(_request):
         return {"role": "admin"}
@@ -132,7 +168,7 @@ def test_profile_update_does_not_mutate_projection(monkeypatch):
 
 def test_identity_update_persists_normalized_lookup_fields(monkeypatch):
     tenant_id = ObjectId()
-    db = DB({"_id": tenant_id, "first_name": "A", "last_name": "B"})
+    db = DB(tenant={"_id": tenant_id, "first_name": "A", "last_name": "B"})
 
     async def fake_admin(_request):
         return {"role": "admin"}
