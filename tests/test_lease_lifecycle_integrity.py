@@ -6,16 +6,17 @@ from rental.auth_metrics import router as pre_contract_router
 from rental.contracts_router import router as historical_contracts_router
 
 
-def test_secure_status_transition_is_first_runtime_match():
+def test_secure_status_transition_guard_is_first_runtime_match():
     app = FastAPI()
     app.include_router(pre_contract_router, prefix="/api")
     app.include_router(historical_contracts_router, prefix="/api")
     matches = [r for r in app.routes
                if getattr(r, "path", None) == "/api/admin/rental-contracts/{contract_id}/status"
                and "PATCH" in getattr(r, "methods", set())]
-    assert len(matches) == 2
-    assert matches[0].name == "secure_update_contract_status"
-    assert matches[1].name == "update_contract_status"
+    assert len(matches) == 3
+    assert matches[0].name == "guarded_update_contract_status"
+    assert matches[1].name == "secure_update_contract_status"
+    assert matches[2].name == "update_contract_status"
 
 
 def test_server_mounts_security_shim_before_contracts_router():
@@ -24,6 +25,17 @@ def test_server_mounts_security_shim_before_contracts_router():
     legacy = 'app.include_router(contracts_router, prefix="/api")'
     assert source.count(pre) == 1 and source.count(legacy) == 1
     assert source.index(pre) < source.index(legacy)
+
+
+def test_lifecycle_transition_graph_forbids_skip_activation_and_reopen():
+    source = Path("rental/lease_lifecycle_state_guard_router.py").read_text()
+    assert '"pending_activation": {"draft", "active"}' in source
+    assert '"active": {"terminated", "expired"}' in source
+    assert '"terminated": set()' in source
+    assert '"expired": set()' in source
+    assert 'detail="lease_status_transition_invalid"' in source
+    assert 'detail="lease_force_activation_forbidden"' in source
+    assert 'detail="lease_signatures_required"' in source
 
 
 def test_lifecycle_release_is_contract_bound_and_fail_closed():
@@ -130,7 +142,11 @@ def test_recovery_has_explicit_partial_failure_classifications():
     assert 'tenant.get("current_contract_id")' in source
 
 
-def test_recovery_router_is_mounted_in_security_shim():
+def test_recovery_router_and_transition_guard_are_mounted_in_security_shim():
     source = Path("rental/auth_metrics.py").read_text()
+    guard = "router.routes.extend(lease_lifecycle_state_guard_router.routes)"
+    lifecycle = "router.routes.extend(lease_lifecycle_security_router.routes)"
     assert "lease_lifecycle_recovery_router" in source
     assert "router.routes.extend(lease_lifecycle_recovery_router.routes)" in source
+    assert guard in source and lifecycle in source
+    assert source.index(guard) < source.index(lifecycle)
