@@ -6,8 +6,12 @@ normalized phone match and refuses ambiguous tenant identities.
 """
 from fastapi import APIRouter, HTTPException, Request
 
-from rental.shared import create_tenant_token, get_db
-from rental.tenant_integrity import _norm_email, _norm_phone
+from rental.shared import create_tenant_token
+from rental.tenant_integrity import (
+    _norm_email,
+    _norm_phone,
+    find_unique_tenant_by_email,
+)
 
 router = APIRouter()
 
@@ -27,17 +31,14 @@ async def secure_tenant_login(request: Request):
     if len(phone) < 10 or len(phone) > 15:
         raise HTTPException(status_code=401, detail="Credenciales inválidas")
 
-    candidates = await get_db().tenants.find(
-        {"email": {"$exists": True, "$ne": ""}}
-    ).to_list(1000)
-    matches = [t for t in candidates if _norm_email(t.get("email")) == email]
-    if len(matches) > 1:
-        raise HTTPException(status_code=409, detail="tenant_login_identity_ambiguous")
-    if not matches:
+    tenant = await find_unique_tenant_by_email(
+        email,
+        ambiguity_detail="tenant_login_identity_ambiguous",
+    )
+    if not tenant:
         raise HTTPException(status_code=401, detail="Credenciales inválidas")
 
-    tenant = matches[0]
-    if _norm_phone(tenant.get("phone")) != phone:
+    if _norm_phone(tenant.get("phone_normalized") or tenant.get("phone")) != phone:
         raise HTTPException(status_code=401, detail="Credenciales inválidas")
 
     tenant_id = str(tenant.get("_id") or "")
