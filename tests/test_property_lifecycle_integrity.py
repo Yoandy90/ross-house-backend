@@ -63,10 +63,15 @@ async def fake_release(_property_id, _token):
     return True
 
 
+async def fake_recovery_clear(_property_id):
+    return None
+
+
 def install_update_lock_stubs(monkeypatch):
     monkeypatch.setattr(secure, "auth_admin", allow_admin)
     monkeypatch.setattr(secure, "acquire_property_mutation_lock", fake_acquire)
     monkeypatch.setattr(secure, "release_property_mutation_lock", fake_release)
+    monkeypatch.setattr(secure, "assert_property_lifecycle_recovery_clear", fake_recovery_clear)
 
 
 def _property(**extra):
@@ -182,10 +187,11 @@ def test_status_cas_loss_fails_closed(monkeypatch):
     assert exc.value.detail == "property_state_changed"
 
 
-def test_property_update_uses_shared_mutation_lock():
+def test_property_update_uses_shared_mutation_and_recovery_boundaries():
     source = open(secure.__file__, encoding="utf-8").read()
     assert "acquire_property_mutation_lock" in source
     assert '"property_update"' in source
+    assert "assert_property_lifecycle_recovery_clear" in source
     assert "release_property_mutation_lock" in source
 
 
