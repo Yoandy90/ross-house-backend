@@ -25,6 +25,12 @@ logger = logging.getLogger(__name__)
 SITE = "https://www.rosshouserentals.com"
 CONTACT = {"name": "Ross House Rentals", "email": "info@rosshouserentals.com",
            "phone": "8069342018"}
+_ACTIVE_PROPERTY_FILTER = {
+    "$or": [
+        {"archived_at": {"$exists": False}},
+        {"archived_at": None},
+    ]
+}
 
 
 async def _photo_urls(property_id: str) -> list:
@@ -43,10 +49,10 @@ async def _photo_urls(property_id: str) -> list:
 
 
 async def _available_listings() -> list:
-    """Propiedades disponibles + unidades libres de multi-unidad."""
+    """Propiedades operativas disponibles + unidades libres de multi-unidad."""
     db = get_db()
     out = []
-    async for prop in db.properties.find({}):
+    async for prop in db.properties.find(_ACTIVE_PROPERTY_FILTER):
         pid = str(prop["_id"])
         photos = await _photo_urls(pid)
         base = {
@@ -159,6 +165,8 @@ async def generate_ad_copy(property_id: str, request: Request):
     prop = await db.properties.find_one({"_id": ObjectId(property_id)})
     if not prop:
         raise HTTPException(status_code=404, detail="Propiedad no encontrada")
+    if prop.get("archived_at"):
+        raise HTTPException(status_code=409, detail="property_archived")
 
     import os
     api_key = os.environ.get("EMERGENT_LLM_KEY")
@@ -171,8 +179,15 @@ async def generate_ad_copy(property_id: str, request: Request):
     except Exception:
         pass
     unit = None
-    if data.get("unit_id") and ObjectId.is_valid(data["unit_id"]):
-        unit = await db.property_units.find_one({"_id": ObjectId(data["unit_id"])})
+    unit_id = data.get("unit_id")
+    if unit_id:
+        if not ObjectId.is_valid(str(unit_id)):
+            raise HTTPException(status_code=400, detail="unit_id_invalid")
+        unit = await db.property_units.find_one({"_id": ObjectId(str(unit_id))})
+        if not unit:
+            raise HTTPException(status_code=404, detail="unit_not_found")
+        if str(unit.get("property_id") or "") != property_id:
+            raise HTTPException(status_code=409, detail="unit_property_mismatch")
 
     src = {
         "direccion": prop.get("address"), "ciudad": prop.get("city", "Dumas") + ", TX",
@@ -204,5 +219,10 @@ async def generate_ad_copy(property_id: str, request: Request):
 
     ad["generated_at"] = datetime.utcnow().isoformat()
     ad["unit_id"] = str(unit["_id"]) if unit else None
-    await db.properties.update_one({"_id": prop["_id"]}, {"$set": {"ad_copy": ad}})
+    result = await db.properties.update_one(
+        {"_id": prop["_id"], "$or": [{"archived_at": {"$exists": False}}, {"archived_at": None}]},
+        {"$set": {"ad_copy": ad}},
+    )
+    if getattr(result, "matched_count", 0) != 1:
+        raise HTTPException(status_code=409, detail="property_archived")
     return {"success": True, "ad_copy": ad}
