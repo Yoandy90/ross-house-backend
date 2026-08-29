@@ -1,24 +1,28 @@
-"""Fail-closed boundary for property-unit topology and status mutations.
+"""Serialized boundary for property-unit topology and status mutations.
 
 Lease authority binds a contract to either one exact ``unit_id`` or to the
-whole property. Adding/removing units concurrently with lease creation can
-change that topology across collections without a transactional serialization
-point. Unit operational status also races lease activation if an admin edit can
-clear a freshly-written occupancy pointer. Until dedicated topology/archive
-workflows exist, topology-changing create/delete is disabled and unit status
-changes use a no-claim CAS without ever clearing occupancy fields.
+whole property. Topology-changing create/delete operations share the property
+mutation lock with canonical lease creation, so a new lease cannot race a unit
+insert/delete across collections. Existing non-terminal contracts that would be
+invalidated by the topology change fail closed.
 """
 from datetime import datetime
 
 from bson import ObjectId
 from fastapi import APIRouter, HTTPException, Request
 
+from rental.property_mutation_lock import acquire_property_mutation_lock, release_property_mutation_lock
 from rental.shared import auth_admin, get_db
-from rental.units_router import sync_property_from_units
+from rental.units_router import (
+    create_units as historical_create_units,
+    delete_unit as historical_delete_unit,
+    sync_property_from_units,
+)
 
 router = APIRouter(tags=["unit-topology-security"])
 _SAFE_UNIT_STATUSES = {"available", "maintenance"}
 _PROFILE_FIELDS = {"unit_name", "notes", "bedrooms", "square_feet", "bathrooms", "rent_amount", "deposit_amount"}
+_TERMINAL_CONTRACT_STATUSES = ["terminated", "expired"]
 
 
 def _oid(value: str, detail: str) -> ObjectId:
@@ -45,14 +49,49 @@ def _profile_update(data: dict) -> dict:
     return update
 
 
+async def _acquire_topology_lock(property_id: str, admin: dict, operation: str) -> str:
+    return await acquire_property_mutation_lock(
+        property_id,
+        operation,
+        str(admin.get("email") or admin.get("_id") or "admin"),
+    )
+
+
 @router.post('/admin/properties/{property_id}/units')
 async def secure_create_units(property_id: str, request: Request):
-    await auth_admin(request)
+    admin = await auth_admin(request)
     object_id = _oid(property_id, "property_id_invalid")
-    prop = await get_db().properties.find_one({"_id": object_id})
-    if not prop:
-        raise HTTPException(status_code=404, detail="Propiedad no encontrada")
-    raise HTTPException(status_code=409, detail="unit_topology_requires_managed_workflow")
+    token = await _acquire_topology_lock(property_id, admin, "unit_topology_create")
+    try:
+        db = get_db()
+        prop = await db.properties.find_one({"_id": object_id})
+        if not prop:
+            raise HTTPException(status_code=404, detail="Propiedad no encontrada")
+        if str(prop.get("status") or "available").strip().lower() != "available":
+            raise HTTPException(status_code=409, detail="unit_topology_property_not_available")
+        if prop.get("current_contract_id") or prop.get("current_tenant_id"):
+            raise HTTPException(status_code=409, detail="unit_topology_property_claimed")
+
+        # Adding the first child unit changes lease authority from whole-property
+        # to exact-unit. Any non-terminal whole-property contract therefore
+        # blocks the topology change, including drafts that could activate later.
+        whole_property_contract = await db.rental_contracts.find_one({
+            "property_id": property_id,
+            "$and": [
+                {"$or": [
+                    {"unit_id": {"$exists": False}},
+                    {"unit_id": None},
+                    {"unit_id": ""},
+                ]},
+                {"status": {"$nin": _TERMINAL_CONTRACT_STATUSES}},
+            ],
+        })
+        if whole_property_contract:
+            raise HTTPException(status_code=409, detail="unit_topology_whole_property_contract_conflict")
+
+        return await historical_create_units(property_id, request)
+    finally:
+        await release_property_mutation_lock(property_id, token)
 
 
 @router.put('/admin/units/{unit_id}')
@@ -113,9 +152,32 @@ async def secure_update_unit(unit_id: str, request: Request):
 
 @router.delete('/admin/units/{unit_id}')
 async def secure_delete_unit(unit_id: str, request: Request):
-    await auth_admin(request)
+    admin = await auth_admin(request)
     object_id = _oid(unit_id, "unit_id_invalid")
-    unit = await get_db().property_units.find_one({"_id": object_id})
-    if not unit:
+    db = get_db()
+    initial = await db.property_units.find_one({"_id": object_id})
+    if not initial:
         raise HTTPException(status_code=404, detail="Unidad no encontrada")
-    raise HTTPException(status_code=409, detail="unit_topology_requires_managed_workflow")
+    property_id = str(initial.get("property_id") or "")
+    _oid(property_id, "property_id_invalid")
+    token = await _acquire_topology_lock(property_id, admin, "unit_topology_delete")
+    try:
+        unit = await db.property_units.find_one({"_id": object_id, "property_id": property_id})
+        if not unit:
+            raise HTTPException(status_code=409, detail="unit_topology_state_changed")
+        if unit.get("status") == "rented" or unit.get("current_contract_id") or unit.get("current_tenant_id"):
+            raise HTTPException(status_code=409, detail="unit_topology_unit_claimed")
+
+        # A draft/pending contract can still become active; do not delete the
+        # exact unit relationship while any such contract references it.
+        contract = await db.rental_contracts.find_one({
+            "property_id": property_id,
+            "unit_id": unit_id,
+            "status": {"$nin": _TERMINAL_CONTRACT_STATUSES},
+        })
+        if contract:
+            raise HTTPException(status_code=409, detail="unit_topology_contract_conflict")
+
+        return await historical_delete_unit(unit_id, request)
+    finally:
+        await release_property_mutation_lock(property_id, token)
