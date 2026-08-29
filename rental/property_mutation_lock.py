@@ -6,6 +6,7 @@ with one MongoDB CAS and released by exact token. Expired claims can be taken
 over after a conservative timeout so a crashed request cannot permanently lock
 a property.
 """
+import logging
 from datetime import datetime, timedelta
 from uuid import uuid4
 
@@ -14,6 +15,7 @@ from fastapi import HTTPException
 
 from rental.shared import get_db
 
+logger = logging.getLogger(__name__)
 _LOCK_FIELD = "mutation_lock"
 _LOCK_TTL_SECONDS = 120
 
@@ -60,11 +62,22 @@ async def acquire_property_mutation_lock(property_id: str, operation: str, actor
     return token
 
 
-async def release_property_mutation_lock(property_id: str, token: str) -> None:
-    """Release only the exact claim owned by this request; never clear another."""
+async def release_property_mutation_lock(property_id: str, token: str) -> bool:
+    """Release only the exact owned claim without making a committed write ambiguous.
+
+    If MongoDB is temporarily unavailable after the protected operation already
+    committed, the claim naturally expires. Returning failure instead of raising
+    avoids turning a successful contract/unit write into a client-visible error
+    that could trigger a duplicate retry.
+    """
     if not token or not ObjectId.is_valid(str(property_id or "")):
-        return
-    await get_db().properties.update_one(
-        {"_id": ObjectId(str(property_id)), f"{_LOCK_FIELD}.token": token},
-        {"$unset": {_LOCK_FIELD: ""}},
-    )
+        return False
+    try:
+        result = await get_db().properties.update_one(
+            {"_id": ObjectId(str(property_id)), f"{_LOCK_FIELD}.token": token},
+            {"$unset": {_LOCK_FIELD: ""}},
+        )
+        return getattr(result, "matched_count", 0) == 1
+    except Exception:
+        logger.exception("Failed to release property mutation lock for property_id=%s", property_id)
+        return False
