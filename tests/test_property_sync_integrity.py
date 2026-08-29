@@ -44,6 +44,20 @@ class Properties:
 class Contracts:
     def __init__(self, docs):
         self.docs = list(docs)
+
+    async def find_one(self, query, *args, **kwargs):
+        property_id = str(query.get("property_id") or "")
+        if "lifecycle_claim_id" in query:
+            for doc in self.docs:
+                claim = doc.get("lifecycle_claim_id")
+                if str(doc.get("property_id")) == property_id and claim not in (None, ""):
+                    return doc
+            return None
+        for doc in self.docs:
+            if str(doc.get("property_id")) == property_id:
+                return doc
+        return None
+
     def find(self, query):
         matches = [d for d in self.docs
                    if str(d.get("property_id")) == str(query.get("property_id"))
@@ -140,4 +154,20 @@ def test_sync_fails_closed_on_malformed_mutation_claim():
     )
     report = run(sync.reconcile_property_statuses(db))
     assert report["skipped_mutation"] == 1
+    assert db.properties.updates == []
+
+
+def test_sync_skips_property_with_lifecycle_recovery_claim():
+    pid = ObjectId()
+    db = DB(
+        [{"_id": pid, "status": "maintenance"}],
+        [{
+            "_id": ObjectId(),
+            "property_id": str(pid),
+            "status": "pending_activation",
+            "lifecycle_claim_id": "retained-claim",
+        }],
+    )
+    report = run(sync.reconcile_property_statuses(db))
+    assert report["skipped_recovery"] == 1
     assert db.properties.updates == []
