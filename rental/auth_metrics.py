@@ -12,6 +12,7 @@ from datetime import datetime, timezone, timedelta
 from fastapi import APIRouter, Request
 
 from .shared import get_db, auth_admin
+from .tenant_integrity import ensure_tenant_identity_indexes
 from .tenant_login_security_router import router as tenant_login_security_router
 from .tenant_projection_security_router import router as tenant_projection_security_router
 from .tenant_dashboard_security_router import router as tenant_dashboard_security_router
@@ -47,6 +48,17 @@ VALID_METRICS = {
     "refresh_denied", "refresh_reuse_detected", "refresh_config_error",
     "unexpected_401",
 }
+
+
+@router.on_event("startup")
+async def _ensure_tenant_identity_indexes() -> None:
+    try:
+        await ensure_tenant_identity_indexes()
+        logger.info("tenant identity lookup indexes ready")
+    except Exception as exc:
+        # Index availability improves performance but must never prevent the API
+        # from starting. Runtime identity resolution still fails closed.
+        logger.warning("tenant identity indexes deferred: %s", exc)
 
 
 async def bump(metric: str) -> None:
