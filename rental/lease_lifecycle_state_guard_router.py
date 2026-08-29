@@ -1,23 +1,23 @@
 """Strict admin lease lifecycle state-machine guard.
 
 This precedence route constrains the historical/admin status mutation surface
-before the occupancy lifecycle implementation runs. Signatures advance their
-own evidence states; admin status mutation cannot skip directly into occupancy,
-reopen terminal leases, use the legacy ``force_activate`` escape hatch, or send
-a pre-activation contract through a projection-release target.
+before the occupancy lifecycle implementation runs. It also owns the shared
+per-property mutation claim for the full guarded lifecycle call, serializing
+activation/release with lease creation, property edits, and unit topology.
 """
 from bson import ObjectId
 from fastapi import APIRouter, HTTPException, Request
 
-from rental.shared import auth_admin, get_db
 from rental.lease_lifecycle_security_router import secure_update_contract_status
+from rental.property_mutation_lock import (
+    acquire_property_mutation_lock,
+    assert_property_lifecycle_recovery_clear,
+    release_property_mutation_lock,
+)
+from rental.shared import auth_admin, get_db
 
 router = APIRouter()
 
-# The underlying lifecycle implementation treats draft/pending/pending_signature
-# as release targets for historical compatibility.  Therefore a pre-activation
-# admin transition may only move forward into evidence states that do not touch
-# occupancy projections.  Actual release is exclusively active -> terminal.
 _TRANSITIONS = {
     "draft": {"pending_tenant", "pending_signatures"},
     "pending": {"pending_tenant", "pending_signatures"},
@@ -34,7 +34,7 @@ _TRANSITIONS = {
 
 @router.patch('/admin/rental-contracts/{contract_id}/status')
 async def guarded_update_contract_status(contract_id: str, request: Request):
-    await auth_admin(request)
+    admin = await auth_admin(request)
     if not ObjectId.is_valid(contract_id):
         raise HTTPException(status_code=400, detail="lease_contract_invalid")
 
@@ -43,26 +43,42 @@ async def guarded_update_contract_status(contract_id: str, request: Request):
         raise HTTPException(status_code=400, detail="lease_status_payload_invalid")
     new_status = str(data.get("status") or "").strip().lower()
 
-    contract = await get_db().rental_contracts.find_one({"_id": ObjectId(contract_id)})
-    if not contract:
+    db = get_db()
+    contract_oid = ObjectId(contract_id)
+    initial = await db.rental_contracts.find_one({"_id": contract_oid})
+    if not initial:
         raise HTTPException(status_code=404, detail="lease_contract_not_found")
-    old_status = str(contract.get("status") or "").strip().lower()
+    property_id = str(initial.get("property_id") or "").strip()
 
-    if new_status == old_status:
+    token = await acquire_property_mutation_lock(
+        property_id,
+        "lease_lifecycle",
+        str(admin.get("email") or admin.get("_id") or "admin"),
+    )
+    try:
+        await assert_property_lifecycle_recovery_clear(property_id)
+        contract = await db.rental_contracts.find_one({"_id": contract_oid})
+        if not contract:
+            raise HTTPException(status_code=409, detail="lease_contract_changed")
+        if str(contract.get("property_id") or "").strip() != property_id:
+            raise HTTPException(status_code=409, detail="lease_property_changed")
+        old_status = str(contract.get("status") or "").strip().lower()
+
+        if new_status == old_status:
+            return await secure_update_contract_status(contract_id, request)
+        if old_status not in _TRANSITIONS or new_status not in _TRANSITIONS[old_status]:
+            raise HTTPException(status_code=409, detail="lease_status_transition_invalid")
+
+        if new_status == "active":
+            if old_status != "pending_activation":
+                raise HTTPException(status_code=409, detail="lease_activation_state_invalid")
+            if not contract.get("tenant_signature") or not (
+                contract.get("landlord_signature") or contract.get("admin_signature")
+            ):
+                raise HTTPException(status_code=400, detail="lease_signatures_required")
+            if data.get("force_activate"):
+                raise HTTPException(status_code=400, detail="lease_force_activation_forbidden")
+
         return await secure_update_contract_status(contract_id, request)
-    if old_status not in _TRANSITIONS or new_status not in _TRANSITIONS[old_status]:
-        raise HTTPException(status_code=409, detail="lease_status_transition_invalid")
-
-    if new_status == "active":
-        # The approved lifecycle is create -> signatures -> pending_activation ->
-        # guarded activation -> occupancy. Admin input never bypasses evidence.
-        if old_status != "pending_activation":
-            raise HTTPException(status_code=409, detail="lease_activation_state_invalid")
-        if not contract.get("tenant_signature") or not (
-            contract.get("landlord_signature") or contract.get("admin_signature")
-        ):
-            raise HTTPException(status_code=400, detail="lease_signatures_required")
-        if data.get("force_activate"):
-            raise HTTPException(status_code=400, detail="lease_force_activation_forbidden")
-
-    return await secure_update_contract_status(contract_id, request)
+    finally:
+        await release_property_mutation_lock(property_id, token)
