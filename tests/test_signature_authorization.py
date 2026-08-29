@@ -102,7 +102,7 @@ async def test_modern_contract_signing_rejects_non_signer_roles():
     with pytest.raises(HTTPException) as exc:
         await signatures_router._authorize_contract_signer(
             {"_id": "buyer-1", "role": "buyer", "email": "buyer@example.com"},
-            {"tenant_id": "buyer-1"}, _DB())
+            {"tenant_id": "buyer-1", "status": "pending_tenant"}, _DB())
     assert exc.value.status_code == 403
 
 
@@ -111,8 +111,46 @@ async def test_modern_landlord_is_bound_to_contract_id():
     with pytest.raises(HTTPException) as exc:
         await signatures_router._authorize_contract_signer(
             {"_id": "landlord-1", "role": "landlord", "email": "owner@example.com"},
-            {"landlord_id": "landlord-2"}, _DB())
+            {"landlord_id": "landlord-2", "status": "pending_landlord"}, _DB())
     assert exc.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_modern_tenant_uses_canonical_identity_not_first_email_match(monkeypatch):
+    actor = {"_id": "app-user-1", "role": "tenant", "email": "same@example.com"}
+    async def canonical(_actor):
+        return {"_id": "tenant-1", "email": "same@example.com"}
+    monkeypatch.setattr(signatures_router, "resolve_authenticated_tenant", canonical)
+    role, ids = await signatures_router._authorize_contract_signer(
+        actor, {"tenant_id": "tenant-1", "status": "pending_tenant"}, _DB())
+    assert role == "tenant"
+    assert ids == ["app-user-1", "tenant-1"]
+
+
+@pytest.mark.asyncio
+async def test_modern_tenant_ambiguous_identity_fails_closed(monkeypatch):
+    actor = {"_id": "app-user-1", "role": "tenant", "email": "same@example.com"}
+    async def ambiguous(_actor):
+        raise HTTPException(409, "tenant_identity_ambiguous_email")
+    monkeypatch.setattr(signatures_router, "resolve_authenticated_tenant", ambiguous)
+    with pytest.raises(HTTPException) as exc:
+        await signatures_router._authorize_contract_signer(
+            actor, {"tenant_id": "tenant-1", "status": "pending_tenant"}, _DB())
+    assert exc.value.status_code == 409
+    assert exc.value.detail == "tenant_identity_ambiguous_email"
+
+
+@pytest.mark.asyncio
+async def test_modern_signature_rejects_terminal_or_activation_states(monkeypatch):
+    actor = {"_id": "app-user-1", "role": "tenant", "email": "tenant@example.com"}
+    async def canonical(_actor): return {"_id": "tenant-1"}
+    monkeypatch.setattr(signatures_router, "resolve_authenticated_tenant", canonical)
+    for status in ("active", "terminated", "cancelled", "pending_activation"):
+        with pytest.raises(HTTPException) as exc:
+            await signatures_router._authorize_contract_signer(
+                actor, {"tenant_id": "tenant-1", "status": status}, _DB())
+        assert exc.value.status_code == 409
+        assert exc.value.detail == "contract_not_in_signable_state"
 
 
 def test_signatures_never_directly_activate_occupancy():
@@ -127,6 +165,10 @@ def test_signatures_never_directly_activate_occupancy():
     assert 'write_filter = {"_id": object_id, "status": expected_status}' in legacy
     assert "resolve_authenticated_tenant" in legacy
     assert 'find_one({\n            "email"' not in legacy
+    assert "resolve_authenticated_tenant" in modern
+    assert '"email": {"$regex"' not in modern
+    assert "contract_not_in_signable_state" in modern
+    assert "'status': expected_status" in modern
 
 
 def test_secure_legacy_route_is_registered_before_historical_handler():
