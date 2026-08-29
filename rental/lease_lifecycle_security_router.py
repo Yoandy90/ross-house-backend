@@ -10,7 +10,7 @@ two different contracts for the same tenant could otherwise activate at nearly
 the same time after both passed a preflight active-lease lookup.
 
 Once a lifecycle claim is acquired it is deliberately retained on any failed
-multi-document transition.  A failure may have happened after one projection
+multi-document transition. A failure may have happened after one projection
 was already written, so clearing the claim would permit an unsafe blind retry.
 Recovery is explicit and separately inspected.
 """
@@ -153,12 +153,7 @@ async def _claim_lifecycle(contract_oid: ObjectId, old_status: str, new_status: 
 
 
 async def _claim_tenant_occupancy(contract: dict, contract_id: str, now: datetime) -> None:
-    """Atomically reserve the tenant for this contract before other projections.
-
-    The preliminary active-contract lookup remains useful diagnostics, but this
-    compare-and-set is the race-proof authority. Two concurrent activations for
-    the same tenant cannot both acquire ``current_contract_id``.
-    """
+    """Atomically reserve the tenant for this contract before other projections."""
     db = get_db()
     tenant_id = str(contract.get("tenant_id") or "")
     tenant_oid = _oid(tenant_id, "lease_tenant_invalid")
@@ -204,6 +199,26 @@ async def _claim_tenant_occupancy(contract: dict, contract_id: str, now: datetim
         raise HTTPException(status_code=409, detail="lease_tenant_occupancy_changed")
 
 
+async def _preflight_whole_property_activation(contract: dict, contract_id: str) -> None:
+    """Reject stale or multi-unit whole-property projections before claiming tenant."""
+    db = get_db()
+    property_id = str(contract.get("property_id") or "")
+    prop_oid = _oid(property_id, "lease_property_invalid")
+    prop = await db.properties.find_one({"_id": prop_oid})
+    if not prop:
+        raise HTTPException(status_code=409, detail="lease_property_missing")
+    current = str(prop.get("current_contract_id") or "")
+    if current and current != contract_id:
+        raise HTTPException(status_code=409, detail="lease_property_owned_by_other_contract")
+    if prop.get("status_manually_set"):
+        raise HTTPException(status_code=409, detail="lease_property_manual_status_conflict")
+    if str(prop.get("status") or "available").strip().lower() != "available":
+        raise HTTPException(status_code=409, detail="lease_property_not_available")
+    existing_unit = await db.property_units.find_one({"property_id": property_id})
+    if prop.get("is_multi_unit") or existing_unit:
+        raise HTTPException(status_code=409, detail="lease_unit_required_for_multi_unit_property")
+
+
 @router.patch('/admin/rental-contracts/{contract_id}/status')
 async def secure_update_contract_status(contract_id: str, request: Request):
     await auth_admin(request)
@@ -232,6 +247,8 @@ async def secure_update_contract_status(contract_id: str, request: Request):
         })
         if other_tenant_lease:
             raise HTTPException(status_code=409, detail="lease_tenant_already_active_elsewhere")
+        if not contract.get("unit_id"):
+            await _preflight_whole_property_activation(contract, contract_id)
 
     claim_id = await _claim_lifecycle(contract_oid, old_status, new_status)
     now = datetime.utcnow()
@@ -240,8 +257,6 @@ async def secure_update_contract_status(contract_id: str, request: Request):
             tenant_id = str(contract.get("tenant_id") or "")
             expected_property = str(contract.get("property_id") or "")
 
-            # Cross-contract serialization point: claim the tenant before unit or
-            # property occupancy. This is the authoritative race guard.
             await _claim_tenant_occupancy(contract, contract_id, now)
 
             if contract.get("unit_id"):
@@ -249,10 +264,11 @@ async def secure_update_contract_status(contract_id: str, request: Request):
             else:
                 prop_oid = _oid(expected_property, "lease_property_invalid")
                 claim = await db.properties.update_one(
-                    {"_id": prop_oid, "$or": [
-                        {"current_contract_id": contract_id}, {"current_contract_id": None},
-                        {"current_contract_id": ""}, {"current_contract_id": {"$exists": False}},
-                    ]},
+                    {"_id": prop_oid, "status": "available", "status_manually_set": {"$ne": True},
+                     "$or": [
+                        {"current_contract_id": None}, {"current_contract_id": ""},
+                        {"current_contract_id": {"$exists": False}},
+                     ]},
                     {"$set": {"status": "rented", "current_contract_id": contract_id,
                               "current_tenant_id": tenant_id, "updated_at": now}},
                 )
@@ -273,8 +289,8 @@ async def secure_update_contract_status(contract_id: str, request: Request):
         if result.matched_count != 1:
             raise HTTPException(status_code=409, detail="lease_status_changed")
     except Exception:
-        # Fail closed.  We cannot know whether a prior projection write committed.
+        # Fail closed. We cannot know whether a prior projection write committed.
         # Retain the exact claim so another transition cannot retry or release by
-        # inference.  The read-only recovery inspector classifies observed state.
+        # inference. The read-only recovery inspector classifies observed state.
         raise
     return {"success": True, "message": f"Contrato actualizado a: {new_status}"}

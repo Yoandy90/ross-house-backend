@@ -56,6 +56,14 @@ async def _create_canonical_contract(data: dict, admin: dict, *, default_status:
             raise HTTPException(status_code=409, detail="lease_unit_in_maintenance")
         if unit.get("current_contract_id"):
             raise HTTPException(status_code=409, detail="lease_unit_already_claimed")
+    else:
+        # A multi-unit property can never silently fall back to whole-property
+        # lease authority. Require one exact unit relationship, using both the
+        # property summary and the actual child collection to fail closed if
+        # legacy summary data is stale.
+        existing_unit = await db.property_units.find_one({"property_id": property_id})
+        if prop.get("is_multi_unit") or existing_unit:
+            raise HTTPException(status_code=409, detail="lease_unit_required_for_multi_unit_property")
 
     property_owner = str(prop.get("owner_id") or "").strip()
     supplied_landlord = str(data.get("landlord_id") or "").strip()
