@@ -5,6 +5,10 @@ change lease authority or unit topology across collections. Claims are acquired
 with one MongoDB CAS and released by exact token. Expired claims can be taken
 over after a conservative timeout so a crashed request cannot permanently lock
 a property.
+
+A retained lease lifecycle claim represents a potentially partial multi-document
+transition. New property-scoped mutations must not run while such recovery is
+pending, even after the short-lived mutation lock itself has expired.
 """
 import logging
 from datetime import datetime, timedelta
@@ -60,6 +64,20 @@ async def acquire_property_mutation_lock(property_id: str, operation: str, actor
             raise HTTPException(status_code=404, detail="lease_property_not_found")
         raise HTTPException(status_code=409, detail="property_mutation_in_progress")
     return token
+
+
+async def assert_property_lifecycle_recovery_clear(property_id: str) -> None:
+    """Fail closed while any contract on this property retains a lifecycle claim."""
+    _property_oid(property_id)
+    pending = await get_db().rental_contracts.find_one(
+        {
+            "property_id": str(property_id),
+            "lifecycle_claim_id": {"$exists": True, "$nin": [None, ""]},
+        },
+        {"_id": 1, "lifecycle_claim_id": 1},
+    )
+    if pending:
+        raise HTTPException(status_code=409, detail="property_lifecycle_recovery_pending")
 
 
 async def release_property_mutation_lock(property_id: str, token: str) -> bool:
