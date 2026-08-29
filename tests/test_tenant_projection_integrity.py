@@ -43,6 +43,10 @@ class Request:
         return self.payload
 
 
+async def allow_identity(*_args, **_kwargs):
+    return None
+
+
 def test_secure_admin_tenant_routes_are_first_runtime_match():
     app = FastAPI()
     app.include_router(pre_tenant_router, prefix="/api")
@@ -82,6 +86,7 @@ def test_safe_create_delegates_to_historical_workflow(monkeypatch):
         called["request"] = request
         return {"success": True, "tenant_id": "new"}
 
+    monkeypatch.setattr(secure, "_assert_identity_available", allow_identity)
     monkeypatch.setattr(secure, "historical_create_tenant", fake_historical)
     request = Request({"first_name": "A", "last_name": "B", "phone": "8065550101"})
     result = run(secure.secure_create_tenant(request))
@@ -112,6 +117,7 @@ def test_profile_update_does_not_mutate_projection(monkeypatch):
         return {"role": "admin"}
 
     monkeypatch.setattr(secure, "auth_admin", fake_admin)
+    monkeypatch.setattr(secure, "_assert_identity_available", allow_identity)
     monkeypatch.setattr(secure, "get_db", lambda: db)
 
     result = run(secure.secure_update_tenant(str(tenant_id), Request({"first_name": "New", "notes": "ok"})))
@@ -122,3 +128,26 @@ def test_profile_update_does_not_mutate_projection(monkeypatch):
     assert "current_property_id" not in update
     assert "current_contract_id" not in update
     assert "current_unit_id" not in update
+
+
+def test_identity_update_persists_normalized_lookup_fields(monkeypatch):
+    tenant_id = ObjectId()
+    db = DB({"_id": tenant_id, "first_name": "A", "last_name": "B"})
+
+    async def fake_admin(_request):
+        return {"role": "admin"}
+
+    monkeypatch.setattr(secure, "auth_admin", fake_admin)
+    monkeypatch.setattr(secure, "_assert_identity_available", allow_identity)
+    monkeypatch.setattr(secure, "get_db", lambda: db)
+
+    result = run(secure.secure_update_tenant(str(tenant_id), Request({
+        "email": " User@Example.COM ",
+        "phone": "+1 (806) 555-0100",
+    })))
+    assert result["success"] is True
+    update = db.tenants.last_update[1]["$set"]
+    assert update["email"] == "user@example.com"
+    assert update["email_normalized"] == "user@example.com"
+    assert update["phone_normalized"] == "18065550100"
+    assert "identity_normalized_at" in update
