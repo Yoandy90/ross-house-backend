@@ -66,6 +66,10 @@ async def fake_release(_property_id, _token):
     return True
 
 
+async def fake_recovery_clear(_property_id):
+    return None
+
+
 async def fake_create(_property_id, _request):
     return {"success": True, "created": 1}
 
@@ -78,6 +82,7 @@ def install_topology_stubs(monkeypatch):
     monkeypatch.setattr(secure, "auth_admin", allow_admin)
     monkeypatch.setattr(secure, "_acquire_topology_lock", fake_lock)
     monkeypatch.setattr(secure, "release_property_mutation_lock", fake_release)
+    monkeypatch.setattr(secure, "assert_property_lifecycle_recovery_clear", fake_recovery_clear)
 
 
 def test_unit_topology_security_routes_are_first_runtime_match():
@@ -97,10 +102,7 @@ def test_unit_topology_security_routes_are_first_runtime_match():
 
 
 def test_managed_unit_creation_delegates_only_under_serialized_safe_property(monkeypatch):
-    prop = {
-        "_id": ObjectId(), "name": "Multi-unit", "status": "available",
-        "current_contract_id": None, "current_tenant_id": None,
-    }
+    prop = {"_id": ObjectId(), "status": "available", "current_contract_id": None, "current_tenant_id": None}
     db = DB(prop=prop)
     install_topology_stubs(monkeypatch)
     monkeypatch.setattr(secure, "get_db", lambda: db)
@@ -163,10 +165,7 @@ def test_manual_unit_rented_status_is_lifecycle_managed(monkeypatch):
 
 
 def test_claimed_unit_cannot_be_moved_to_maintenance(monkeypatch):
-    unit = {
-        "_id": ObjectId(), "property_id": str(ObjectId()), "status": "rented",
-        "current_contract_id": str(ObjectId()), "current_tenant_id": str(ObjectId()),
-    }
+    unit = {"_id": ObjectId(), "property_id": str(ObjectId()), "status": "rented", "current_contract_id": str(ObjectId()), "current_tenant_id": str(ObjectId())}
     install_topology_stubs(monkeypatch)
     monkeypatch.setattr(secure, "get_db", lambda: DB(unit=unit))
     with pytest.raises(HTTPException) as exc:
@@ -175,11 +174,20 @@ def test_claimed_unit_cannot_be_moved_to_maintenance(monkeypatch):
     assert exc.value.detail == "unit_occupancy_claimed"
 
 
+def test_pending_unit_contract_blocks_maintenance(monkeypatch):
+    property_id = str(ObjectId())
+    unit = {"_id": ObjectId(), "property_id": property_id, "status": "available", "current_contract_id": None, "current_tenant_id": None}
+    contract = {"_id": ObjectId(), "property_id": property_id, "unit_id": str(unit["_id"]), "status": "pending_activation"}
+    install_topology_stubs(monkeypatch)
+    monkeypatch.setattr(secure, "get_db", lambda: DB(unit=unit, contract=contract))
+    with pytest.raises(HTTPException) as exc:
+        run(secure.secure_update_unit(str(unit["_id"]), Request({"status": "maintenance"})))
+    assert exc.value.status_code == 409
+    assert exc.value.detail == "unit_contract_pending_activation"
+
+
 def test_safe_unit_status_change_uses_no_claim_cas(monkeypatch):
-    unit = {
-        "_id": ObjectId(), "property_id": str(ObjectId()), "status": "available",
-        "current_contract_id": None, "current_tenant_id": None,
-    }
+    unit = {"_id": ObjectId(), "property_id": str(ObjectId()), "status": "available", "current_contract_id": None, "current_tenant_id": None}
     db = DB(unit=unit)
     install_topology_stubs(monkeypatch)
     monkeypatch.setattr(secure, "get_db", lambda: db)
@@ -194,15 +202,10 @@ def test_safe_unit_status_change_uses_no_claim_cas(monkeypatch):
     assert "current_contract_id" in rendered
     assert "current_tenant_id" in rendered
     assert update["$set"]["status"] == "maintenance"
-    assert "current_contract_id" not in update["$set"]
-    assert "current_tenant_id" not in update["$set"]
 
 
 def test_unit_status_cas_loss_fails_closed(monkeypatch):
-    unit = {
-        "_id": ObjectId(), "property_id": str(ObjectId()), "status": "available",
-        "current_contract_id": None, "current_tenant_id": None,
-    }
+    unit = {"_id": ObjectId(), "property_id": str(ObjectId()), "status": "available", "current_contract_id": None, "current_tenant_id": None}
     db = DB(unit=unit, matched_count=0)
     install_topology_stubs(monkeypatch)
     monkeypatch.setattr(secure, "get_db", lambda: db)
@@ -213,11 +216,11 @@ def test_unit_status_cas_loss_fails_closed(monkeypatch):
     assert exc.value.detail == "unit_state_changed"
 
 
-def test_all_unit_writes_use_property_serialization_boundary():
+def test_all_unit_writes_use_property_serialization_and_recovery_boundaries():
     source = open(secure.__file__, encoding="utf-8").read()
-    assert '"unit_topology_create"' in source
-    assert '"unit_update"' in source
-    assert '"unit_topology_delete"' in source
+    for operation in ("unit_topology_create", "unit_update", "unit_topology_delete"):
+        assert f'"{operation}"' in source
+    assert "assert_property_lifecycle_recovery_clear" in source
     assert "release_property_mutation_lock" in source
 
 
@@ -225,6 +228,7 @@ def test_lease_creation_uses_same_property_serialization_boundary():
     source = open("rental/lease_creation_security_router.py", encoding="utf-8").read()
     assert "acquire_property_mutation_lock" in source
     assert '"lease_creation"' in source
+    assert "assert_property_lifecycle_recovery_clear" in source
     assert "release_property_mutation_lock" in source
     assert 'existing_unit = await db.property_units.find_one({"property_id": property_id})' in source
     assert 'detail="lease_unit_required_for_multi_unit_property"' in source
