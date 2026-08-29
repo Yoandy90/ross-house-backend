@@ -10,6 +10,7 @@ from datetime import datetime
 from bson import ObjectId
 from fastapi import APIRouter, HTTPException, Request
 
+from rental.property_mutation_lock import acquire_property_mutation_lock, release_property_mutation_lock
 from rental.shared import auth_admin, get_db
 
 router = APIRouter()
@@ -27,6 +28,20 @@ def _oid(value, detail: str) -> ObjectId:
 async def _create_canonical_contract(data: dict, admin: dict, *, default_status: str) -> dict:
     if not isinstance(data, dict):
         raise HTTPException(status_code=400, detail="lease_payload_invalid")
+    property_id = str(data.get("property_id") or "").strip()
+    _oid(property_id, "lease_property_invalid")
+    lock_token = await acquire_property_mutation_lock(
+        property_id,
+        "lease_creation",
+        str(admin.get("email") or admin.get("_id") or "admin"),
+    )
+    try:
+        return await _create_canonical_contract_under_lock(data, admin, default_status=default_status)
+    finally:
+        await release_property_mutation_lock(property_id, lock_token)
+
+
+async def _create_canonical_contract_under_lock(data: dict, admin: dict, *, default_status: str) -> dict:
     db = get_db()
 
     property_id = str(data.get("property_id") or "").strip()
