@@ -13,6 +13,7 @@ from fastapi import APIRouter, Request
 
 from .shared import get_db, auth_admin
 from .tenant_login_security_router import router as tenant_login_security_router
+from .tenant_projection_security_router import router as tenant_projection_security_router
 from .tenant_dashboard_security_router import router as tenant_dashboard_security_router
 from .tenant_receipt_security_router import router as tenant_receipt_security_router
 from .section8_security_router import router as section8_security_router
@@ -30,6 +31,7 @@ router = APIRouter(tags=["observability"])
 # routes therefore win FastAPI first-match resolution without changing public
 # URLs while the historical endpoints remain available for compatibility.
 router.routes.extend(tenant_login_security_router.routes)
+router.routes.extend(tenant_projection_security_router.routes)
 router.routes.extend(tenant_dashboard_security_router.routes)
 router.routes.extend(tenant_receipt_security_router.routes)
 router.routes.extend(section8_security_router.routes)
