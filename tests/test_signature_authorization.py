@@ -26,8 +26,9 @@ def _endpoint_key(route):
 async def test_legacy_tenant_must_match_lease_party(monkeypatch):
     actor = {"_id": "actor-1", "email": "tenant@example.com", "role": "tenant"}
     async def fake_auth(_request): return actor
+    async def fake_tenant(_actor): return {"_id": "tenant-1", "email": "tenant@example.com"}
     monkeypatch.setattr(legacy_guard, "auth_marketplace", fake_auth)
-    monkeypatch.setattr(legacy_guard, "get_db", lambda: _DB())
+    monkeypatch.setattr(legacy_guard, "resolve_authenticated_tenant", fake_tenant)
     with pytest.raises(HTTPException) as exc:
         await legacy_guard._authorize_actor(object(), {"tenant_id": "other-tenant"}, "tenant")
     assert exc.value.status_code == 403
@@ -35,16 +36,37 @@ async def test_legacy_tenant_must_match_lease_party(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_legacy_tenant_email_fallback_only_when_lease_id_missing(monkeypatch):
+async def test_legacy_tenant_email_fallback_requires_unique_canonical_tenant(monkeypatch):
     actor = {"_id": "actor-1", "email": "Tenant@Example.com", "role": "tenant"}
+    tenant = {"_id": "tenant-1", "email": "tenant@example.com"}
     async def fake_auth(_request): return actor
+    async def fake_tenant(_actor): return tenant
     monkeypatch.setattr(legacy_guard, "auth_marketplace", fake_auth)
-    monkeypatch.setattr(legacy_guard, "get_db", lambda: _DB())
-    allowed = await legacy_guard._authorize_actor(object(), {"tenant_id": "", "tenant_email": "tenant@example.com"}, "tenant")
+    monkeypatch.setattr(legacy_guard, "resolve_authenticated_tenant", fake_tenant)
+    allowed = await legacy_guard._authorize_actor(
+        object(), {"tenant_id": "", "tenant_email": "tenant@example.com"}, "tenant"
+    )
     assert allowed is actor
+
+    async def no_tenant(_actor): return None
+    monkeypatch.setattr(legacy_guard, "resolve_authenticated_tenant", no_tenant)
     with pytest.raises(HTTPException) as exc:
-        await legacy_guard._authorize_actor(object(), {"tenant_id": "bound-id", "tenant_email": "tenant@example.com"}, "tenant")
+        await legacy_guard._authorize_actor(
+            object(), {"tenant_id": "", "tenant_email": "tenant@example.com"}, "tenant"
+        )
     assert exc.value.status_code == 403
+    assert exc.value.detail == "lease_tenant_mismatch"
+
+
+@pytest.mark.asyncio
+async def test_legacy_tenant_bound_id_uses_canonical_resolution(monkeypatch):
+    actor = {"_id": "app-user-1", "email": "tenant@example.com", "role": "tenant"}
+    async def fake_auth(_request): return actor
+    async def fake_tenant(_actor): return {"_id": "tenant-1", "email": "tenant@example.com"}
+    monkeypatch.setattr(legacy_guard, "auth_marketplace", fake_auth)
+    monkeypatch.setattr(legacy_guard, "resolve_authenticated_tenant", fake_tenant)
+    allowed = await legacy_guard._authorize_actor(object(), {"tenant_id": "tenant-1"}, "tenant")
+    assert allowed is actor
 
 
 @pytest.mark.asyncio
@@ -103,6 +125,8 @@ def test_signatures_never_directly_activate_occupancy():
     assert "{'status': 'rented'" not in modern
     assert "startswith('data:image/')" in modern
     assert 'write_filter = {"_id": object_id, "status": expected_status}' in legacy
+    assert "resolve_authenticated_tenant" in legacy
+    assert 'find_one({\n            "email"' not in legacy
 
 
 def test_secure_legacy_route_is_registered_before_historical_handler():
