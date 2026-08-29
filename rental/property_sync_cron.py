@@ -5,8 +5,7 @@ The lease lifecycle is the authority for occupancy. This task may repair a
 missing single-property projection when there is exactly one active contract,
 but it must never choose between multiple contracts, overwrite another
 contract's claim, clear a claim merely because no active contract is visible,
-or mutate a property while a serialized lease/topology operation owns it.
-Those states require explicit lifecycle recovery or a later sync iteration.
+or mutate a property while a serialized operation or lifecycle recovery owns it.
 """
 import asyncio
 import logging
@@ -21,6 +20,7 @@ async def reconcile_property_statuses(db) -> dict:
     fixed = 0
     skipped_manual = 0
     skipped_mutation = 0
+    skipped_recovery = 0
     unchanged = 0
     ambiguous = 0
     conflicts = 0
@@ -33,11 +33,17 @@ async def reconcile_property_statuses(db) -> dict:
         mutation_lock = prop.get("mutation_lock")
         if mutation_lock:
             expires_at = mutation_lock.get("expires_at") if isinstance(mutation_lock, dict) else None
-            # Malformed/non-expiring claims fail closed instead of allowing a
-            # background projection write into an in-flight serialized mutation.
             if not isinstance(expires_at, datetime) or expires_at > now:
                 skipped_mutation += 1
                 continue
+
+        recovery_claim = await db.rental_contracts.find_one(
+            {"property_id": pid, "lifecycle_claim_id": {"$exists": True, "$nin": [None, ""]}},
+            {"_id": 1},
+        )
+        if recovery_claim:
+            skipped_recovery += 1
+            continue
 
         if prop.get("status_manually_set"):
             skipped_manual += 1
@@ -63,9 +69,6 @@ async def reconcile_property_statuses(db) -> dict:
         current_tenant = str(prop.get("current_tenant_id") or "")
 
         if not active_contracts:
-            # Never infer that a non-empty projection is stale. It may be an
-            # interrupted termination whose lifecycle claim is awaiting explicit
-            # recovery inspection.
             if current_contract or current_tenant:
                 conflicts += 1
                 logger.warning("[property-sync] occupied projection without active contract for %s; no mutation", pid)
@@ -107,8 +110,6 @@ async def reconcile_property_statuses(db) -> dict:
             unchanged += 1
             continue
 
-        # Repair only an empty or same-contract projection, using CAS so a
-        # concurrent lifecycle transition wins instead of being overwritten.
         result = await db.properties.update_one(
             {"_id": pid_obj,
              "$or": [
@@ -136,6 +137,7 @@ async def reconcile_property_statuses(db) -> dict:
         "fixed": fixed,
         "skipped_manual": skipped_manual,
         "skipped_mutation": skipped_mutation,
+        "skipped_recovery": skipped_recovery,
         "unchanged": unchanged,
         "ambiguous": ambiguous,
         "conflicts": conflicts,
@@ -161,9 +163,9 @@ async def property_sync_loop():
             report = await reconcile_property_statuses(db)
             if report["fixed"] or report["ambiguous"] or report["conflicts"]:
                 logger.info(
-                    "[property-sync] run: %s fixed, %s manual, %s mutation-locked, %s unchanged, %s ambiguous, %s conflicts",
-                    report["fixed"], report["skipped_manual"], report["skipped_mutation"], report["unchanged"],
-                    report["ambiguous"], report["conflicts"],
+                    "[property-sync] run: %s fixed, %s manual, %s mutation-locked, %s recovery-locked, %s unchanged, %s ambiguous, %s conflicts",
+                    report["fixed"], report["skipped_manual"], report["skipped_mutation"], report["skipped_recovery"],
+                    report["unchanged"], report["ambiguous"], report["conflicts"],
                 )
         except asyncio.CancelledError:
             logger.info("Property-sync cron cancelled")
