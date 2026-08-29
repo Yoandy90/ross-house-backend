@@ -27,12 +27,14 @@ def test_server_mounts_security_shim_before_contracts_router():
     assert source.index(pre) < source.index(legacy)
 
 
-def test_lifecycle_transition_graph_forbids_skip_activation_and_reopen():
+def test_lifecycle_transition_graph_forbids_skip_activation_reopen_and_preactivation_release():
     source = Path("rental/lease_lifecycle_state_guard_router.py").read_text()
-    assert '"pending_activation": {"draft", "active"}' in source
+    assert '"pending_activation": {"active"}' in source
     assert '"active": {"terminated", "expired"}' in source
     assert '"terminated": set()' in source
     assert '"expired": set()' in source
+    assert '"draft": {"pending_tenant", "pending_signatures"}' in source
+    assert '"pending": {"pending_tenant", "pending_signatures"}' in source
     assert 'detail="lease_status_transition_invalid"' in source
     assert 'detail="lease_force_activation_forbidden"' in source
     assert 'detail="lease_signatures_required"' in source
