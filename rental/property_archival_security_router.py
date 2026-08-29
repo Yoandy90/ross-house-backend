@@ -33,6 +33,24 @@ async def _actor_and_lock(property_id: str, request: Request, operation: str):
     return actor, token
 
 
+def _unclaimed_parent_filter() -> list[dict]:
+    return [
+        {"$or": [{"current_contract_id": {"$exists": False}}, {"current_contract_id": None}, {"current_contract_id": ""}]},
+        {"$or": [{"current_tenant_id": {"$exists": False}}, {"current_tenant_id": None}, {"current_tenant_id": ""}]},
+    ]
+
+
+def _claimed_unit_filter(property_id: str) -> dict:
+    return {
+        "property_id": property_id,
+        "$or": [
+            {"current_contract_id": {"$nin": [None, ""]}},
+            {"current_tenant_id": {"$nin": [None, ""]}},
+            {"status": "rented"},
+        ],
+    }
+
+
 @router.delete('/admin/properties/{property_id}')
 async def archive_property(property_id: str, request: Request):
     object_id = _oid(property_id)
@@ -53,14 +71,7 @@ async def archive_property(property_id: str, request: Request):
         })
         if contract:
             raise HTTPException(status_code=409, detail="property_archive_contract_conflict")
-        claimed_unit = await db.property_units.find_one({
-            "property_id": property_id,
-            "$or": [
-                {"current_contract_id": {"$nin": [None, ""]}},
-                {"current_tenant_id": {"$nin": [None, ""]}},
-                {"status": "rented"},
-            ],
-        })
+        claimed_unit = await db.property_units.find_one(_claimed_unit_filter(property_id))
         if claimed_unit:
             raise HTTPException(status_code=409, detail="property_archive_unit_occupancy_conflict")
         now = datetime.utcnow()
@@ -68,10 +79,10 @@ async def archive_property(property_id: str, request: Request):
             {
                 "_id": object_id,
                 "mutation_lock.token": token,
+                "status": {"$ne": "rented"},
                 "$and": [
                     {"$or": [{"archived_at": {"$exists": False}}, {"archived_at": None}]},
-                    {"$or": [{"current_contract_id": {"$exists": False}}, {"current_contract_id": None}, {"current_contract_id": ""}]},
-                    {"$or": [{"current_tenant_id": {"$exists": False}}, {"current_tenant_id": None}, {"current_tenant_id": ""}]},
+                    *_unclaimed_parent_filter(),
                 ],
             },
             {"$set": {"archived_at": now, "archived_by": actor, "updated_at": now}},
@@ -103,9 +114,18 @@ async def restore_property(property_id: str, request: Request):
         })
         if contract:
             raise HTTPException(status_code=409, detail="property_restore_contract_conflict")
+        claimed_unit = await db.property_units.find_one(_claimed_unit_filter(property_id))
+        if claimed_unit:
+            raise HTTPException(status_code=409, detail="property_restore_unit_occupancy_conflict")
         now = datetime.utcnow()
         result = await db.properties.update_one(
-            {"_id": object_id, "mutation_lock.token": token, "archived_at": prop.get("archived_at")},
+            {
+                "_id": object_id,
+                "mutation_lock.token": token,
+                "archived_at": prop.get("archived_at"),
+                "status": {"$ne": "rented"},
+                "$and": _unclaimed_parent_filter(),
+            },
             {
                 "$unset": {"archived_at": "", "archived_by": ""},
                 "$set": {"restored_at": now, "restored_by": actor, "updated_at": now},
