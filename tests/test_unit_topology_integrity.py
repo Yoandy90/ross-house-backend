@@ -63,7 +63,7 @@ async def fake_lock(_property_id, _admin, _operation):
 
 
 async def fake_release(_property_id, _token):
-    return None
+    return True
 
 
 async def fake_create(_property_id, _request):
@@ -140,10 +140,10 @@ def test_managed_unit_delete_delegates_when_unclaimed_and_unreferenced(monkeypat
     assert result["success"] is True
 
 
-def test_unit_delete_blocks_nonterminal_contract_reference(monkeypatch):
+def test_unit_delete_blocks_any_contract_history_reference(monkeypatch):
     property_id = str(ObjectId())
     unit = {"_id": ObjectId(), "property_id": property_id, "status": "available", "current_contract_id": None, "current_tenant_id": None}
-    contract = {"_id": ObjectId(), "property_id": property_id, "unit_id": str(unit["_id"]), "status": "pending_tenant"}
+    contract = {"_id": ObjectId(), "property_id": property_id, "unit_id": str(unit["_id"]), "status": "expired"}
     install_topology_stubs(monkeypatch)
     monkeypatch.setattr(secure, "get_db", lambda: DB(unit=unit, contract=contract))
     with pytest.raises(HTTPException) as exc:
@@ -154,7 +154,7 @@ def test_unit_delete_blocks_nonterminal_contract_reference(monkeypatch):
 
 def test_manual_unit_rented_status_is_lifecycle_managed(monkeypatch):
     unit = {"_id": ObjectId(), "property_id": str(ObjectId()), "status": "available"}
-    monkeypatch.setattr(secure, "auth_admin", allow_admin)
+    install_topology_stubs(monkeypatch)
     monkeypatch.setattr(secure, "get_db", lambda: DB(unit=unit))
     with pytest.raises(HTTPException) as exc:
         run(secure.secure_update_unit(str(unit["_id"]), Request({"status": "rented"})))
@@ -167,7 +167,7 @@ def test_claimed_unit_cannot_be_moved_to_maintenance(monkeypatch):
         "_id": ObjectId(), "property_id": str(ObjectId()), "status": "rented",
         "current_contract_id": str(ObjectId()), "current_tenant_id": str(ObjectId()),
     }
-    monkeypatch.setattr(secure, "auth_admin", allow_admin)
+    install_topology_stubs(monkeypatch)
     monkeypatch.setattr(secure, "get_db", lambda: DB(unit=unit))
     with pytest.raises(HTTPException) as exc:
         run(secure.secure_update_unit(str(unit["_id"]), Request({"status": "maintenance"})))
@@ -181,13 +181,14 @@ def test_safe_unit_status_change_uses_no_claim_cas(monkeypatch):
         "current_contract_id": None, "current_tenant_id": None,
     }
     db = DB(unit=unit)
-    monkeypatch.setattr(secure, "auth_admin", allow_admin)
+    install_topology_stubs(monkeypatch)
     monkeypatch.setattr(secure, "get_db", lambda: db)
     monkeypatch.setattr(secure, "sync_property_from_units", no_sync)
     result = run(secure.secure_update_unit(str(unit["_id"]), Request({"status": "maintenance"})))
     assert result["success"] is True
     query, update = db.property_units.updates[0]
     assert query["_id"] == unit["_id"]
+    assert query["property_id"] == unit["property_id"]
     assert query["status"] == "available"
     rendered = repr(query)
     assert "current_contract_id" in rendered
@@ -203,13 +204,21 @@ def test_unit_status_cas_loss_fails_closed(monkeypatch):
         "current_contract_id": None, "current_tenant_id": None,
     }
     db = DB(unit=unit, matched_count=0)
-    monkeypatch.setattr(secure, "auth_admin", allow_admin)
+    install_topology_stubs(monkeypatch)
     monkeypatch.setattr(secure, "get_db", lambda: db)
     monkeypatch.setattr(secure, "sync_property_from_units", no_sync)
     with pytest.raises(HTTPException) as exc:
         run(secure.secure_update_unit(str(unit["_id"]), Request({"status": "maintenance"})))
     assert exc.value.status_code == 409
     assert exc.value.detail == "unit_state_changed"
+
+
+def test_all_unit_writes_use_property_serialization_boundary():
+    source = open(secure.__file__, encoding="utf-8").read()
+    assert '"unit_topology_create"' in source
+    assert '"unit_update"' in source
+    assert '"unit_topology_delete"' in source
+    assert "release_property_mutation_lock" in source
 
 
 def test_lease_creation_uses_same_property_serialization_boundary():
