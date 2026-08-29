@@ -225,6 +225,8 @@ async def secure_update_contract_status(contract_id: str, request: Request):
     contract_oid = _oid(contract_id, "lease_contract_invalid")
     db = get_db()
     data = await request.json()
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=400, detail="lease_status_payload_invalid")
     new_status = str(data.get("status") or "").strip()
     if new_status not in _ALLOWED:
         raise HTTPException(status_code=400, detail="lease_status_invalid")
@@ -236,11 +238,12 @@ async def secure_update_contract_status(contract_id: str, request: Request):
         return {"success": True, "message": f"Contrato ya está: {new_status}"}
 
     if new_status == "active":
+        if bool(data.get("force_activate", False)):
+            raise HTTPException(status_code=400, detail="lease_force_activation_forbidden")
         if not contract.get("tenant_signature") or not (
             contract.get("landlord_signature") or contract.get("admin_signature")
         ):
-            if not bool(data.get("force_activate", False)):
-                raise HTTPException(status_code=400, detail="lease_signatures_required")
+            raise HTTPException(status_code=400, detail="lease_signatures_required")
         tenant_id = str(contract.get("tenant_id") or "")
         other_tenant_lease = await db.rental_contracts.find_one({
             "tenant_id": tenant_id, "status": "active", "_id": {"$ne": contract_oid}
