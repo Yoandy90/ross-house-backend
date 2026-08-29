@@ -200,9 +200,10 @@ async def _claim_tenant_occupancy(contract: dict, contract_id: str, now: datetim
 
 
 async def _preflight_whole_property_activation(contract: dict, contract_id: str) -> None:
-    """Reject maintenance/manual/stale whole-property projections before claiming tenant."""
+    """Reject stale or multi-unit whole-property projections before claiming tenant."""
     db = get_db()
-    prop_oid = _oid(str(contract.get("property_id") or ""), "lease_property_invalid")
+    property_id = str(contract.get("property_id") or "")
+    prop_oid = _oid(property_id, "lease_property_invalid")
     prop = await db.properties.find_one({"_id": prop_oid})
     if not prop:
         raise HTTPException(status_code=409, detail="lease_property_missing")
@@ -213,6 +214,9 @@ async def _preflight_whole_property_activation(contract: dict, contract_id: str)
         raise HTTPException(status_code=409, detail="lease_property_manual_status_conflict")
     if str(prop.get("status") or "available").strip().lower() != "available":
         raise HTTPException(status_code=409, detail="lease_property_not_available")
+    existing_unit = await db.property_units.find_one({"property_id": property_id})
+    if prop.get("is_multi_unit") or existing_unit:
+        raise HTTPException(status_code=409, detail="lease_unit_required_for_multi_unit_property")
 
 
 @router.patch('/admin/rental-contracts/{contract_id}/status')
