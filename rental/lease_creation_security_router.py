@@ -1,8 +1,8 @@
 """Canonical admin lease creation boundary.
 
-The historical create endpoint accepted client-supplied relationship metadata.
-This first-match compatibility route derives property/tenant/unit identity from
-server records and forbids creating an already-active lease. Activation remains
+Both historical admin creation URLs write ``rental_contracts``. These
+first-match compatibility routes derive property/tenant/unit identity from
+server records and forbid creating an already-active lease. Activation remains
 a separate guarded lifecycle transition.
 """
 from datetime import datetime
@@ -24,10 +24,9 @@ def _oid(value, detail: str) -> ObjectId:
     return ObjectId(str(value))
 
 
-@router.post('/admin/rental-contracts')
-async def secure_create_rental_contract(request: Request):
-    admin = await auth_admin(request)
-    data = await request.json()
+async def _create_canonical_contract(data: dict, admin: dict, *, default_status: str) -> dict:
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=400, detail="lease_payload_invalid")
     db = get_db()
 
     property_id = str(data.get("property_id") or "").strip()
@@ -39,7 +38,7 @@ async def secure_create_rental_contract(request: Request):
     if not tenant:
         raise HTTPException(status_code=404, detail="lease_tenant_not_found")
 
-    requested_status = str(data.get("status") or "draft").strip().lower()
+    requested_status = str(data.get("status") or default_status).strip().lower()
     if requested_status == "active":
         raise HTTPException(status_code=409, detail="lease_creation_cannot_bypass_activation")
     if requested_status not in _ALLOWED_INITIAL_STATUSES:
@@ -96,6 +95,7 @@ async def secure_create_rental_contract(request: Request):
         "tenant_phone": tenant.get("phone", ""),
         "tenant_email": tenant.get("email", ""),
         "landlord_id": landlord_id,
+        "lease_type": data.get("lease_type", "residential"),
         "start_date": data.get("start_date", now.strftime("%Y-%m-%d")),
         "end_date": data.get("end_date", ""),
         "rent_amount": rent_amount,
@@ -104,6 +104,7 @@ async def secure_create_rental_contract(request: Request):
         "late_fee_amount": late_fee,
         "late_fee_grace_days": grace_days,
         "terms": data.get("terms", ""),
+        "clauses": data.get("clauses", []),
         "special_conditions": data.get("special_conditions", ""),
         "payment_method_type": data.get("payment_method_type", "cash"),
         "addendums": data.get("addendums", {}),
@@ -114,6 +115,8 @@ async def secure_create_rental_contract(request: Request):
         "tenant_signed_at": None,
         "landlord_signature": None,
         "landlord_signed_at": None,
+        "admin_signature": None,
+        "admin_signed_at": None,
         "created_at": now,
         "updated_at": now,
         "created_by": admin.get("email", "admin"),
@@ -121,8 +124,31 @@ async def secure_create_rental_contract(request: Request):
     }
     result = await db.rental_contracts.insert_one(contract_doc)
     return {
-        "success": True,
-        "message": f"Contrato {contract_number} creado",
         "contract_id": str(result.inserted_id),
         "contract_number": contract_number,
+    }
+
+
+@router.post('/admin/rental-contracts')
+async def secure_create_rental_contract(request: Request):
+    admin = await auth_admin(request)
+    created = await _create_canonical_contract(await request.json(), admin, default_status="draft")
+    return {
+        "success": True,
+        "message": f"Contrato {created['contract_number']} creado",
+        **created,
+    }
+
+
+@router.post('/admin/leases')
+async def secure_admin_create_lease(request: Request):
+    """Secure compatibility replacement for the older /admin/leases creator."""
+    admin = await auth_admin(request)
+    created = await _create_canonical_contract(await request.json(), admin, default_status="pending_tenant")
+    return {
+        "success": True,
+        "lease_id": created["contract_id"],
+        "contract_id": created["contract_id"],
+        "contract_number": created["contract_number"],
+        "message": "Contrato creado. Pendiente firma del inquilino.",
     }
