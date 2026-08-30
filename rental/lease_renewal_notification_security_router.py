@@ -139,7 +139,7 @@ async def list_notification_outbox(
     admin=Depends(auth_admin),
 ):
     del admin
-    allowed = {"pending", "sending", "sent", "failed"}
+    allowed = {"pending", "claimed", "sent", "retryable_failure", "ambiguous_provider_result", "failed"}
     if status is not None and status not in allowed:
         raise HTTPException(status_code=400, detail="renewal_notification_status_invalid")
     limit = max(1, min(int(limit), 200))
@@ -152,4 +152,5 @@ async def list_notification_outbox(
 
 async def ensure_indexes(db) -> None:
     await db.lease_renewal_notification_outbox.create_index("proposal_id", unique=True)
-    await db.lease_renewal_notification_outbox.create_index([("status", 1), ("created_at", 1)])
+    await db.lease_renewal_notification_outbox.create_index([("status", 1), ("next_attempt_at", 1), ("created_at", 1)])
+    await db.lease_renewal_notification_outbox.create_index("claim_id", sparse=True)
