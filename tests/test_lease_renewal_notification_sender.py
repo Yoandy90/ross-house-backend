@@ -66,7 +66,7 @@ def test_definite_retryable_rejection_is_bounded():
     db, intent = fixture()
     async def reject(_delivery): raise sender.ProviderRetryableFailure('provider_http_503')
     assert run(sender.process_claimed(db, intent, reject)) == 'retryable_failure'
-    intent['status'] = 'claimed'; intent['claim_id'] = 'claim'; intent.pop('provider_started_at', None); intent['attempts'] = sender.MAX_ATTEMPTS
+    intent['status'] = 'claimed'; intent['claim_id'] = 'second-claim'; intent['attempts'] = sender.MAX_ATTEMPTS
     assert run(sender.process_claimed(db, intent, reject)) == 'failed'
     assert intent['automatic_retry_allowed'] is False
 
@@ -87,4 +87,3 @@ def test_source_has_atomic_claim_and_no_recipient_logging():
     assert 'ambiguous_provider_result' in source
     assert 'automatic_retry_allowed=False' in source
     assert 'logger.info' not in source
-
