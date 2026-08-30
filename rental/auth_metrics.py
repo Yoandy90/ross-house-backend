@@ -60,10 +60,15 @@ router.routes.extend(lease_creation_security_router.routes)
 router.routes.extend(lease_lifecycle_state_guard_router.routes)
 router.routes.extend(lease_lifecycle_security_router.routes)
 router.routes.extend(lease_lifecycle_recovery_router.routes)
-# Notification approve must precede the generic renewal approve route so the
-# durable outbox intent is guaranteed without changing the public endpoint.
+# Notification-aware approve replaces the prior secure approve route while all
+# other canonical renewal routes remain unchanged.
 router.routes.extend(lease_renewal_notification_security_router.routes)
-router.routes.extend(lease_renewal_security_router.routes)
+for _route in lease_renewal_security_router.routes:
+    _path = getattr(_route, "path", None)
+    _methods = getattr(_route, "methods", set())
+    if _path == "/admin/lease-renewals/{proposal_id}/approve" and "POST" in _methods:
+        continue
+    router.routes.append(_route)
 
 VALID_METRICS = {
     "legacy_fallback_used", "sidless_token_accepted", "sidless_token_rejected",
