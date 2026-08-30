@@ -172,7 +172,7 @@ async def process_claimed(
 
     started = _now()
     marked = await db.lease_renewal_notification_outbox.update_one(
-        {"_id": intent["_id"], "status": "claimed", "claim_id": intent["claim_id"], "provider_started_at": {"$exists": False}},
+        {"_id": intent["_id"], "status": "claimed", "claim_id": intent["claim_id"]},
         {"$set": {"provider_started_at": started, "updated_at": started}},
     )
     if getattr(marked, "matched_count", 0) != 1:
@@ -218,4 +218,3 @@ async def process_next(db=Depends(get_db), admin=Depends(auth_admin)):
     actor = admin.get("_id") or admin.get("email") if isinstance(admin, dict) else admin
     outcome = await run_once(db, f"admin:{actor}")
     return {"ok": True, "outcome": outcome}
-
