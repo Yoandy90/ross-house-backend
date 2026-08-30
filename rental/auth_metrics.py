@@ -31,6 +31,7 @@ from .lease_lifecycle_security_router import router as lease_lifecycle_security_
 from .lease_lifecycle_recovery_router import router as lease_lifecycle_recovery_router
 from .lease_creation_security_router import router as lease_creation_security_router
 from .lease_renewal_security_router import router as lease_renewal_security_router
+from .lease_renewal_notification_security_router import router as lease_renewal_notification_security_router
 
 logger = logging.getLogger("auth_metrics")
 router = APIRouter(tags=["observability"])
@@ -56,6 +57,9 @@ router.routes.extend(lease_creation_security_router.routes)
 router.routes.extend(lease_lifecycle_state_guard_router.routes)
 router.routes.extend(lease_lifecycle_security_router.routes)
 router.routes.extend(lease_lifecycle_recovery_router.routes)
+# Notification approve must precede the generic renewal approve route so the
+# durable outbox intent is guaranteed without changing the public endpoint.
+router.routes.extend(lease_renewal_notification_security_router.routes)
 router.routes.extend(lease_renewal_security_router.routes)
 
 VALID_METRICS = {
