@@ -1,5 +1,5 @@
 import asyncio
-from types import SimpleNamespace
+from datetime import datetime, timezone, timedelta
 
 import pytest
 from bson import ObjectId
@@ -88,6 +88,7 @@ def contract_and_proposal(status="draft"):
         "tenant_id": str(tenant_id),
         "tenant_name": "Tenant One",
         "tenant_email": "tenant@example.com",
+        "tenant_phone": "8065551212",
         "rent_amount": 1200.0,
         "end_date": "2026-09-30T00:00:00+00:00",
     }
@@ -189,6 +190,51 @@ def test_edit_validates_recommendation_and_rent(monkeypatch):
     with pytest.raises(HTTPException) as exc2:
         run(secure.secure_edit_proposal(str(proposal["_id"]), {"proposed_rent": -1}, db, {"email": "admin@example.com"}))
     assert exc2.value.detail == "renewal_rent_invalid"
+
+
+def test_analysis_view_strips_direct_tenant_pii():
+    contract, _, _ = contract_and_proposal()
+    view = secure._analysis_view(contract, 1200.0)
+    assert view["tenant_name"] is None
+    assert view["tenant_email"] is None
+    assert view["tenant_phone"] is None
+    assert view["tenant_id"] == contract["tenant_id"]
+    assert view["monthly_rent"] == 1200.0
+
+
+def test_existing_proposal_skips_analysis_and_upsert(monkeypatch):
+    contract, proposal, prop = contract_and_proposal()
+    contract["end_date"] = (datetime.now(timezone.utc) + timedelta(days=20)).isoformat()
+    db = DB(proposal, contract, prop)
+    called = {"analysis": 0}
+
+    async def should_not_run(*_args, **_kwargs):
+        called["analysis"] += 1
+        raise AssertionError("existing proposal must skip analysis")
+
+    monkeypatch.setattr(secure, "_safe_recommendation", should_not_run)
+    result = run(secure.secure_list_proposals(None, db, {"email": "admin@example.com"}))
+    assert result["total"] == 1
+    assert called["analysis"] == 0
+    assert db.lease_renewal_proposals.updates == []
+
+
+def test_highlights_string_is_not_expanded_into_characters():
+    contract, _, prop = contract_and_proposal()
+    now = datetime.now(timezone.utc)
+    canonical = {
+        **contract,
+        "_canonical_end": now + timedelta(days=20),
+        "_canonical_rent": 1200.0,
+        "_property": prop,
+    }
+    doc = secure._proposal_doc(
+        canonical,
+        {},
+        {"recommendation": "renew", "proposed_rent": 1200, "highlights": "bad-shape"},
+        now,
+    )
+    assert doc["highlights"] == []
 
 
 def test_secure_boundary_never_mutates_lease_occupancy_or_payments():
