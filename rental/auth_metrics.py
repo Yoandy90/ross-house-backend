@@ -31,7 +31,10 @@ from .lease_lifecycle_security_router import router as lease_lifecycle_security_
 from .lease_lifecycle_recovery_router import router as lease_lifecycle_recovery_router
 from .lease_creation_security_router import router as lease_creation_security_router
 from .lease_renewal_security_router import router as lease_renewal_security_router
-from .lease_renewal_notification_security_router import router as lease_renewal_notification_security_router
+from .lease_renewal_notification_security_router import (
+    router as lease_renewal_notification_security_router,
+    ensure_indexes as ensure_lease_renewal_notification_indexes,
+)
 
 logger = logging.getLogger("auth_metrics")
 router = APIRouter(tags=["observability"])
@@ -79,6 +82,11 @@ async def _ensure_tenant_identity_indexes() -> None:
         # Index availability improves performance but must never prevent the API
         # from starting. Runtime identity resolution still fails closed.
         logger.warning("tenant identity indexes deferred: %s", exc)
+    try:
+        await ensure_lease_renewal_notification_indexes(get_db())
+        logger.info("lease renewal notification outbox indexes ready")
+    except Exception as exc:
+        logger.warning("lease renewal notification indexes deferred: %s", exc)
 
 
 async def bump(metric: str) -> None:
