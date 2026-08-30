@@ -109,8 +109,8 @@ def test_notification_approve_wins_route_precedence():
         if getattr(r, "path", None) == "/api/admin/lease-renewals/{proposal_id}/approve"
         and "POST" in getattr(r, "methods", set())
     ]
-    assert len(matches) >= 2
-    assert matches[0].name == "secure_approve_and_queue"
+    assert len(matches) == 2
+    assert matches[0].name == "secure_approve_proposal"
 
 
 def test_draft_approval_creates_single_outbox_intent_without_direct_pii():
