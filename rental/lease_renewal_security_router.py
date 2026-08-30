@@ -14,7 +14,13 @@ from typing import Any, Dict, Optional
 from bson import ObjectId
 from fastapi import APIRouter, Body, Depends, HTTPException
 
-from .lease_renewals_router import WINDOW_DAYS, _lease_market_context, _llm_analyze, _serialize
+from .lease_renewals_router import (
+    WINDOW_DAYS,
+    _lease_market_context,
+    _llm_analyze,
+    _rule_based_recommendation,
+    _serialize,
+)
 from .shared import auth_admin, get_db
 
 router = APIRouter(prefix="/admin/lease-renewals", tags=["Lease Renewal Security"])
@@ -60,6 +66,30 @@ def _validated_recommendation(value: Any) -> str:
     if recommendation not in _RECOMMENDATIONS:
         raise HTTPException(status_code=400, detail="renewal_recommendation_invalid")
     return recommendation
+
+
+def _analysis_view(contract: Dict[str, Any], current_rent: float) -> Dict[str, Any]:
+    """Remove direct tenant PII before advisory LLM/rule analysis."""
+    return {
+        **contract,
+        "tenant_name": None,
+        "tenant_email": None,
+        "tenant_phone": None,
+        "monthly_rent": current_rent,
+    }
+
+
+async def _safe_recommendation(db, contract: Dict[str, Any], current_rent: float):
+    """Produce advisory output without making the renewal list unavailable."""
+    analysis = _analysis_view(contract, current_rent)
+    ctx = await _lease_market_context(db, analysis)
+    try:
+        rec = await _llm_analyze(analysis, ctx)
+        _validated_recommendation((rec or {}).get("recommendation", "renew"))
+        _rent((rec or {}).get("proposed_rent", current_rent))
+    except Exception:
+        rec = _rule_based_recommendation(analysis, ctx)
+    return ctx, rec
 
 
 async def _proposal(db, proposal_id: str) -> Dict[str, Any]:
@@ -125,6 +155,8 @@ def _proposal_doc(contract: Dict[str, Any], ctx: Dict[str, Any], rec: Dict[str, 
     recommendation = _validated_recommendation(rec.get("recommendation", "renew"))
     proposed_rent = _rent(rec.get("proposed_rent", current_rent))
     prop = contract.get("_property") or {}
+    raw_highlights = rec.get("highlights") or []
+    highlights = list(raw_highlights)[:20] if isinstance(raw_highlights, (list, tuple)) else []
     return {
         "lease_id": lease_id,
         "property_id": str(contract.get("property_id") or ""),
@@ -140,7 +172,7 @@ def _proposal_doc(contract: Dict[str, Any], ctx: Dict[str, Any], rec: Dict[str, 
         "proposed_rent": proposed_rent,
         "confidence": str(rec.get("confidence") or "med")[:16],
         "rationale": str(rec.get("rationale") or "")[:4000],
-        "highlights": list(rec.get("highlights") or [])[:20],
+        "highlights": highlights,
         "market_signals": ctx,
         "status": "draft",
         "authority_source": "rental_contracts",
@@ -165,6 +197,11 @@ async def secure_list_proposals(
     active = await db.rental_contracts.find({"status": "active"}).to_list(500)
 
     for raw in active:
+        lease_id = str(raw.get("_id") or "")
+        if not lease_id:
+            continue
+        if await db.lease_renewal_proposals.find_one({"lease_id": lease_id}):
+            continue
         try:
             end_dt = _parse_end(raw.get("end_date") or raw.get("lease_end_date"))
         except HTTPException:
@@ -179,19 +216,23 @@ async def secure_list_proposals(
         prop = await db.properties.find_one({"_id": ObjectId(property_id)})
         if not prop or prop.get("archived_at"):
             continue
-
-        canonical = {
-            **raw,
-            "_canonical_end": end_dt,
-            "_canonical_rent": _rent(raw.get("rent_amount", raw.get("monthly_rent", 0)), "renewal_contract_rent_invalid"),
-            "_property": prop,
-        }
-        lease_for_analysis = {**raw, "monthly_rent": canonical["_canonical_rent"]}
-        ctx = await _lease_market_context(db, lease_for_analysis)
-        rec = await _llm_analyze(lease_for_analysis, ctx)
-        proposal = _proposal_doc(canonical, ctx, rec, now)
+        try:
+            current_rent = _rent(
+                raw.get("rent_amount", raw.get("monthly_rent", 0)),
+                "renewal_contract_rent_invalid",
+            )
+            canonical = {
+                **raw,
+                "_canonical_end": end_dt,
+                "_canonical_rent": current_rent,
+                "_property": prop,
+            }
+            ctx, rec = await _safe_recommendation(db, raw, current_rent)
+            proposal = _proposal_doc(canonical, ctx, rec, now)
+        except HTTPException:
+            continue
         await db.lease_renewal_proposals.update_one(
-            {"lease_id": str(raw.get("_id"))},
+            {"lease_id": lease_id},
             {"$setOnInsert": proposal},
             upsert=True,
         )
@@ -210,9 +251,7 @@ async def secure_refresh_proposal(proposal_id: str, db=Depends(get_db), admin=De
     if doc.get("status") != "draft":
         raise HTTPException(status_code=409, detail="renewal_proposal_not_editable")
     canonical = await _assert_current_contract(db, doc)
-    lease_for_analysis = {**canonical, "monthly_rent": canonical["_canonical_rent"]}
-    ctx = await _lease_market_context(db, lease_for_analysis)
-    rec = await _llm_analyze(lease_for_analysis, ctx)
+    ctx, rec = await _safe_recommendation(db, canonical, canonical["_canonical_rent"])
     now = datetime.now(timezone.utc)
     refreshed = _proposal_doc(canonical, ctx, rec, now)
     mutable = {
