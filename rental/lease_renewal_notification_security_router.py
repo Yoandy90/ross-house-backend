@@ -92,7 +92,7 @@ async def _ensure_outbox_intent(
     return getattr(result, "upserted_id", None) is not None
 
 
-@router.post("/{proposal_id}/approve")
+@router.post("/{proposal_id}/approve", name="secure_approve_proposal")
 async def secure_approve_and_queue(
     proposal_id: str,
     db=Depends(get_db),
