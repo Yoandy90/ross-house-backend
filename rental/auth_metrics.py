@@ -41,6 +41,10 @@ from .lease_renewal_tenant_response_router import (
     router as lease_renewal_tenant_response_router,
     ensure_indexes as ensure_lease_renewal_response_indexes,
 )
+from .lease_renewal_contract_generation_router import (
+    router as lease_renewal_contract_generation_router,
+    ensure_indexes as ensure_lease_renewal_contract_generation_indexes,
+)
 
 logger = logging.getLogger("auth_metrics")
 router = APIRouter(tags=["observability"])
@@ -68,6 +72,7 @@ router.routes.extend(lease_lifecycle_security_router.routes)
 router.routes.extend(lease_lifecycle_recovery_router.routes)
 # Notification-aware approve replaces the prior secure approve route while all
 # other canonical renewal routes remain unchanged.
+router.routes.extend(lease_renewal_contract_generation_router.routes)
 router.routes.extend(lease_renewal_tenant_response_router.routes)
 router.routes.extend(lease_renewal_delivery_recovery_router.routes)
 router.routes.extend(lease_renewal_notification_sender_router.routes)
@@ -99,7 +104,8 @@ async def _ensure_tenant_identity_indexes() -> None:
     try:
         await ensure_lease_renewal_notification_indexes(get_db())
         await ensure_lease_renewal_response_indexes(get_db())
-        logger.info("lease renewal notification and response indexes ready")
+        await ensure_lease_renewal_contract_generation_indexes(get_db())
+        logger.info("lease renewal notification, response, and generation indexes ready")
     except Exception as exc:
         logger.warning("lease renewal notification indexes deferred: %s", exc)
 
