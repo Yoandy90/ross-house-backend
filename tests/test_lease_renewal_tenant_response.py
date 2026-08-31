@@ -55,6 +55,7 @@ def test_acceptance_records_intent_without_contractual_authority(monkeypatch):
     assert result['ok'] is True and result['idempotent'] is False
     saved = db.lease_renewal_responses.docs[0]
     assert saved['authority'] == 'tenant_authenticated_intent_only'
+    assert saved['_id'] == proposal['_id']
     assert saved['creates_contract'] is False
     assert saved['activates_occupancy'] is False
     assert db.rental_contracts.docs[0]['status'] == 'active'
@@ -97,6 +98,14 @@ def test_cross_tenant_and_unsent_offer_are_hidden(monkeypatch):
     assert exc.value.detail == 'renewal_offer_not_released'
 
 
+def test_missing_proposal_tenant_snapshot_fails_closed(monkeypatch):
+    db, proposal, tenant = fixture(); proposal['tenant_id'] = ''
+    monkeypatch.setattr(response, 'resolve_authenticated_tenant', lambda _user: async_value({'_id': ObjectId(tenant['_id'])}))
+    with pytest.raises(HTTPException) as exc:
+        run(response.respond_to_renewal(str(proposal['_id']), {'decision': 'accept', 'terms_digest': '0' * 64}, db, tenant))
+    assert exc.value.detail == 'renewal_offer_tenant_snapshot_invalid'
+
+
 def test_repeated_identical_response_is_idempotent_but_change_is_blocked(monkeypatch):
     db, proposal, tenant = fixture()
     monkeypatch.setattr(response, 'resolve_authenticated_tenant', lambda _user: async_value({'_id': ObjectId(tenant['_id'])}))
@@ -113,4 +122,3 @@ def test_source_does_not_mutate_contract_occupancy_payment_or_signature():
     source = open('rental/lease_renewal_tenant_response_router.py', encoding='utf-8').read()
     for forbidden in ('rental_contracts.update', 'properties.update', 'rent_payments.update', 'signatures.update', 'force_activate'):
         assert forbidden not in source
-
