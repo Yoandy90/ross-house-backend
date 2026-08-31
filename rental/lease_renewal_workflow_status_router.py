@@ -10,10 +10,10 @@ from __future__ import annotations
 from typing import Any, Dict, Optional
 
 from bson import ObjectId
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 
 from .lease_renewal_contract_generation_router import _renewal_contract_id
-from .lease_renewal_security_router import _proposal, _validated_recommendation
+from .lease_renewal_security_router import _proposal, _rent, _validated_recommendation
 from .shared import auth_admin, get_db
 
 router = APIRouter(prefix="/admin/lease-renewals", tags=["Lease Renewal Workflow Status"])
@@ -264,6 +264,49 @@ def _view(proposal_id: str, flow: Dict[str, Any]) -> Dict[str, Any]:
         },
         "next_action": next_action,
     }
+
+
+def _summary(flow: Dict[str, Any]) -> Dict[str, Any]:
+    proposal = flow["proposal"]
+    return {
+        "property_address": str(proposal.get("property_address") or "")[:500],
+        "lease_end_date": str(proposal.get("lease_end_date") or "")[:32],
+        "proposed_rent": _rent(proposal.get("proposed_rent")),
+    }
+
+
+async def _list_workflows(db, limit: int) -> Dict[str, Any]:
+    proposals = await db.lease_renewal_proposals.find({}).sort("updated_at", -1).limit(limit).to_list(limit)
+    items = []
+    for proposal in proposals:
+        proposal_id = str(proposal.get("_id") or "")
+        if not ObjectId.is_valid(proposal_id):
+            continue
+        try:
+            flow = await _verified_workflow(db, proposal_id)
+            items.append({**_view(proposal_id, flow), "summary": _summary(flow)})
+        except HTTPException:
+            # A corrupt workflow stays visible for operational attention, but
+            # no partial state or inferred action is returned to the client.
+            items.append({
+                "ok": False,
+                "read_only": True,
+                "integrity": "unavailable",
+                "proposal_id": proposal_id,
+                "summary": None,
+                "next_action": None,
+            })
+    return {"ok": True, "read_only": True, "items": items, "total": len(items)}
+
+
+@router.get("/workflow-statuses")
+async def list_workflow_statuses(
+    limit: int = Query(default=50, ge=1, le=50),
+    db=Depends(get_db),
+    admin=Depends(auth_admin),
+):
+    del admin
+    return await _list_workflows(db, limit)
 
 
 @router.get("/{proposal_id}/workflow-status")
