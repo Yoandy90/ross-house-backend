@@ -58,14 +58,15 @@ def fixture(stage="draft"):
     if stage in {"accepted", "contract", "completed", "recovery"}:
         response = {"_id": ObjectId(proposal_id), "proposal_id": proposal_id, "lease_id": str(old_id),
                     "property_id": str(property_id), "tenant_id": str(tenant_id), "decision": "accept",
-                    "terms_digest": "digest-secret"}
+                    "terms_digest": "d" * 64}
         db.lease_renewal_responses.docs.append(response)
     if stage in {"contract", "completed", "recovery"}:
         new_id = _renewal_contract_id(proposal_id)
         new = {"_id": new_id, "status": "pending_signatures", "property_id": str(property_id),
                "tenant_id": str(tenant_id), "unit_id": None, "start_date": "2026-09-01",
                "end_date": "2027-08-31", "renewal_source": {"proposal_id": proposal_id,
-               "prior_contract_id": str(old_id)}, "tenant_email": "must-not-leak@example.com"}
+               "prior_contract_id": str(old_id), "terms_digest": "d" * 64},
+               "tenant_email": "must-not-leak@example.com"}
         db.rental_contracts.docs.append(new)
     if stage in {"completed", "recovery"}:
         new = db.rental_contracts.docs[1]; new["status"] = "active" if stage == "completed" else "pending_activation"
@@ -132,6 +133,26 @@ def test_contract_requires_acceptance_and_exact_source():
     assert exc.value.detail == "renewal_workflow_contract_source_changed"
 
 
+def test_delivery_requires_approval_and_contract_terms_require_exact_digest():
+    db, proposal_id, proposal = fixture("sent"); proposal["status"] = "draft"
+    with pytest.raises(HTTPException) as exc: run(status._verified_workflow(db, proposal_id))
+    assert exc.value.detail == "renewal_workflow_delivery_before_approval"
+    db, proposal_id, _ = fixture("contract")
+    db.rental_contracts.docs[1]["renewal_source"]["terms_digest"] = "e" * 64
+    with pytest.raises(HTTPException) as exc: run(status._verified_workflow(db, proposal_id))
+    assert exc.value.detail == "renewal_workflow_contract_terms_changed"
+
+
+def test_rollover_stage_is_bounded_and_terminal_contract_needs_completion():
+    db, proposal_id, _ = fixture("recovery")
+    db.lease_renewal_rollovers.docs[0]["stage"] = "claim=secret-value"
+    with pytest.raises(HTTPException) as exc: run(status._verified_workflow(db, proposal_id))
+    assert exc.value.detail == "renewal_workflow_rollover_stage_invalid"
+    db, proposal_id, _ = fixture("contract"); db.rental_contracts.docs[1]["status"] = "terminated"
+    with pytest.raises(HTTPException) as exc: run(status._verified_workflow(db, proposal_id))
+    assert exc.value.detail == "renewal_workflow_terminal_contract_without_completed_rollover"
+
+
 def test_duplicate_stage_records_and_unknown_states_fail_closed():
     db, proposal_id, _ = fixture("sent")
     db.lease_renewal_notification_outbox.docs.append(dict(db.lease_renewal_notification_outbox.docs[0], _id=ObjectId()))
@@ -146,4 +167,3 @@ def test_module_contains_no_mutation_or_provider_calls():
     source = open("rental/lease_renewal_workflow_status_router.py", encoding="utf-8").read()
     for forbidden in ("update_one(", "insert_one(", "delete_one(", "sendgrid", "twilio", "requests."):
         assert forbidden not in source.lower()
-
