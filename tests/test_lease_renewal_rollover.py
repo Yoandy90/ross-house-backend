@@ -115,6 +115,18 @@ def test_partial_failure_retains_claim_and_requires_recovery():
     assert tenant['current_contract_id'] == str(new['_id'])
 
 
+def test_final_audit_update_failure_returns_exact_committed_authority():
+    db, proposal_id, old, new, prop, tenant = fixture()
+    db.lease_renewal_rollovers.fail_on = lambda query, update: query.get('state') == 'committed' and update.get('$set', {}).get('state') == 'completed'
+    result = run(rollover._rollover_under_lock(db, proposal_id, 'admin', date.today()))
+    assert result['state'] == 'committed'
+    assert old['status'] == 'expired' and new['status'] == 'active'
+    assert not old.get('lifecycle_claim_id') and not new.get('lifecycle_claim_id')
+    assert prop['current_contract_id'] == str(new['_id'])
+    assert tenant['current_contract_id'] == str(new['_id'])
+    assert run(rollover._rollover_under_lock(db, proposal_id, 'admin', date.today()))['idempotent'] is True
+
+
 def test_changed_projection_and_extra_payload_fail_closed():
     db, proposal_id, _old, _new, prop, _tenant = fixture(); prop['current_contract_id'] = str(ObjectId())
     with pytest.raises(HTTPException) as exc:
