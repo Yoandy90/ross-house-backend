@@ -27,16 +27,24 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _actor_key(admin: Any) -> str:
+def _actor_keys(admin: Any) -> set[str]:
+    keys: set[str] = set()
     if isinstance(admin, dict):
         if admin.get("_id"):
-            return "id:" + str(admin["_id"]).strip().lower()
+            keys.add("id:" + str(admin["_id"]).strip().lower())
         if admin.get("email"):
-            return "email:" + str(admin["email"]).strip().lower()
-    value = str(admin or "").strip().lower()
-    if not value:
+            keys.add("email:" + str(admin["email"]).strip().lower())
+    else:
+        value = str(admin or "").strip().lower()
+        if value:
+            keys.add(value if value.startswith(("id:", "email:", "actor:")) else "actor:" + value)
+    if not keys:
         raise HTTPException(status_code=403, detail="renewal_rollover_recovery_admin_identity_missing")
-    return "actor:" + value
+    return keys
+
+
+def _actor_key(admin: Any) -> str:
+    return sorted(_actor_keys(admin))[0]
 
 
 def _relation(value: Any, expected: str) -> str:
@@ -60,6 +68,8 @@ async def _record_and_pair(db, proposal_id: str, rollover_id: str):
         raise HTTPException(status_code=404, detail="renewal_rollover_not_found")
     old, new = await _load_pair(db, proposal_id)
     if (
+        record.get("_id") != new["_id"]
+        or
         str(record.get("prior_contract_id") or "") != str(old["_id"])
         or str(record.get("renewal_contract_id") or "") != str(new["_id"])
         or str(record.get("property_id") or "") != str(new.get("property_id") or "")
@@ -90,8 +100,11 @@ async def _observation(db, record: Dict[str, Any], old: Dict[str, Any], new: Dic
         "renewal_status": str(new.get("status") or ""),
         "prior_claim": _relation(old.get("lifecycle_claim_id"), claim),
         "renewal_claim": _relation(new.get("lifecycle_claim_id"), claim),
+        "prior_claim_target_exact": old.get("lifecycle_claim_id") in (None, "") or old.get("lifecycle_claim_target") == "renewal_rollover",
+        "renewal_claim_target_exact": new.get("lifecycle_claim_id") in (None, "") or new.get("lifecycle_claim_target") == "renewal_rollover",
         "resource_owner": _owner((resource or {}).get("current_contract_id"), old_id, new_id),
         "resource_status": str((resource or {}).get("status") or ""),
+        "resource_manually_set": bool((resource or {}).get("status_manually_set")) if not unit_id else False,
         "resource_tenant_exact": str((resource or {}).get("current_tenant_id") or "") == tenant_id,
         "tenant_owner": _owner((tenant or {}).get("current_contract_id"), old_id, new_id),
         "tenant_property_exact": str((tenant or {}).get("current_property_id") or "") == property_id,
@@ -109,6 +122,8 @@ def _assert_recoverable(observed: Dict[str, Any]) -> None:
         raise HTTPException(status_code=409, detail="renewal_rollover_recovery_state_invalid")
     if observed["prior_claim"] == "foreign" or observed["renewal_claim"] == "foreign":
         raise HTTPException(status_code=409, detail="renewal_rollover_recovery_foreign_claim")
+    if not observed["prior_claim_target_exact"] or not observed["renewal_claim_target_exact"]:
+        raise HTTPException(status_code=409, detail="renewal_rollover_recovery_claim_target_changed")
     fully_committed = (
         observed["prior_status"] == "expired"
         and observed["renewal_status"] == "active"
@@ -125,7 +140,7 @@ def _assert_recoverable(observed: Dict[str, Any]) -> None:
         raise HTTPException(status_code=409, detail="renewal_rollover_recovery_new_status_invalid")
     if observed["resource_owner"] not in {"prior", "renewal"} or observed["tenant_owner"] not in {"prior", "renewal"}:
         raise HTTPException(status_code=409, detail="renewal_rollover_recovery_projection_foreign")
-    if observed["resource_status"] != "rented" or not all(
+    if observed["resource_status"] != "rented" or observed["resource_manually_set"] or not all(
         (observed["resource_tenant_exact"], observed["tenant_property_exact"], observed["tenant_unit_exact"])
     ):
         raise HTTPException(status_code=409, detail="renewal_rollover_recovery_projection_context_changed")
@@ -204,12 +219,16 @@ async def _clear_exact_claim(db, contract_id: ObjectId, claim: str, target_statu
         raise HTTPException(status_code=409, detail="renewal_rollover_recovery_claim_clear_changed")
 
 
-async def _complete(db, proposal_id: str, rollover_id: str, recovery_id: str, confirmer: str):
+async def _complete(
+    db, proposal_id: str, rollover_id: str, recovery_id: str, confirmer: str,
+    confirmer_keys: set[str] | None = None,
+):
     record, old, new = await _record_and_pair(db, proposal_id, rollover_id)
     recovery = record.get("manual_recovery") or {}
     if recovery.get("recovery_id") != recovery_id or recovery.get("status") != "proposed":
         raise HTTPException(status_code=409, detail="renewal_rollover_recovery_proposal_changed")
-    if recovery.get("proposed_by") == confirmer:
+    proposed_keys = set(recovery.get("proposed_by_keys") or [recovery.get("proposed_by")])
+    if proposed_keys.intersection(confirmer_keys or {confirmer}):
         raise HTTPException(status_code=409, detail="renewal_rollover_recovery_second_admin_required")
     observed = await _observation(db, record, old, new)
     if _digest(observed) != recovery.get("observed_digest"):
@@ -315,7 +334,8 @@ async def propose_recovery(proposal_id: str, rollover_id: str, body: Dict[str, A
                  {"manual_recovery.status": {"$nin": ["proposed", "confirming"]}}]},
         {"$set": {"manual_recovery": {"recovery_id": recovery_id, "action": "complete",
                                       "observed_digest": supplied, "status": "proposed",
-                                      "proposed_by": _actor_key(admin), "proposed_at": _now()},
+                                      "proposed_by": _actor_key(admin),
+                                      "proposed_by_keys": sorted(_actor_keys(admin)), "proposed_at": _now()},
                   "updated_at": _now()}},
     )
     if getattr(result, "matched_count", 0) != 1:
@@ -334,12 +354,14 @@ async def confirm_recovery(proposal_id: str, rollover_id: str, body: Dict[str, A
     recovery = record.get("manual_recovery") or {}
     if recovery.get("recovery_id") != recovery_id or recovery.get("observed_digest") != digest:
         raise HTTPException(status_code=409, detail="renewal_rollover_recovery_proposal_changed")
-    actor = _actor_key(admin)
-    if recovery.get("proposed_by") == actor:
+    actor_keys = _actor_keys(admin)
+    actor = sorted(actor_keys)[0]
+    proposed_keys = set(recovery.get("proposed_by_keys") or [recovery.get("proposed_by")])
+    if proposed_keys.intersection(actor_keys):
         raise HTTPException(status_code=409, detail="renewal_rollover_recovery_second_admin_required")
     property_id = str(new.get("property_id") or "")
     token = await acquire_property_mutation_lock(property_id, "renewal_rollover_recovery", actor, db=db)
     try:
-        return await _complete(db, proposal_id, rollover_id, recovery_id, actor)
+        return await _complete(db, proposal_id, rollover_id, recovery_id, actor, actor_keys)
     finally:
         await release_property_mutation_lock(property_id, token, db=db)
