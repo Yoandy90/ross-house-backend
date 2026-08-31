@@ -68,6 +68,8 @@ async def _offer(db, proposal: Dict[str, Any], tenant_id: str):
     canonical = await _assert_current_contract(db, proposal)
     if str(canonical.get("tenant_id") or "") != tenant_id:
         raise HTTPException(status_code=403, detail="renewal_offer_not_owned")
+    if str(proposal.get("tenant_id") or "") != tenant_id:
+        raise HTTPException(status_code=409, detail="renewal_offer_tenant_snapshot_invalid")
     deliveries = await db.lease_renewal_notification_outbox.find({
         "proposal_id": str(proposal["_id"]), "tenant_id": tenant_id, "status": "sent"
     }).limit(2).to_list(2)
@@ -150,6 +152,7 @@ async def respond_to_renewal(
 
     now = _now()
     doc = {
+        "_id": proposal["_id"],
         "proposal_id": proposal_id,
         "lease_id": terms["lease_id"],
         "property_id": terms["property_id"],
@@ -164,8 +167,7 @@ async def respond_to_renewal(
         "updated_at": now,
     }
     try:
-        result = await db.lease_renewal_responses.insert_one(doc)
-        doc["_id"] = result.inserted_id
+        await db.lease_renewal_responses.insert_one(doc)
     except DuplicateKeyError:
         raced = await db.lease_renewal_responses.find_one({"proposal_id": proposal_id})
         if raced and raced.get("tenant_id") == tenant_id and raced.get("terms_digest") == digest and raced.get("decision") == decision:
@@ -177,4 +179,3 @@ async def respond_to_renewal(
 async def ensure_indexes(db) -> None:
     await db.lease_renewal_responses.create_index("proposal_id", unique=True)
     await db.lease_renewal_responses.create_index([("tenant_id", 1), ("created_at", -1)])
-
