@@ -50,6 +50,7 @@ from .lease_renewal_rollover_router import (
     ensure_indexes as ensure_lease_renewal_rollover_indexes,
 )
 from .lease_renewal_rollover_recovery_router import router as lease_renewal_rollover_recovery_router
+from .lease_renewal_workflow_status_router import router as lease_renewal_workflow_status_router
 
 logger = logging.getLogger("auth_metrics")
 router = APIRouter(tags=["observability"])
@@ -77,6 +78,7 @@ router.routes.extend(lease_lifecycle_security_router.routes)
 router.routes.extend(lease_lifecycle_recovery_router.routes)
 # Notification-aware approve replaces the prior secure approve route while all
 # other canonical renewal routes remain unchanged.
+router.routes.extend(lease_renewal_workflow_status_router.routes)
 router.routes.extend(lease_renewal_rollover_recovery_router.routes)
 router.routes.extend(lease_renewal_rollover_router.routes)
 router.routes.extend(lease_renewal_contract_generation_router.routes)
