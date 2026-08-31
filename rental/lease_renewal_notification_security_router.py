@@ -154,3 +154,4 @@ async def ensure_indexes(db) -> None:
     await db.lease_renewal_notification_outbox.create_index("proposal_id", unique=True)
     await db.lease_renewal_notification_outbox.create_index([("status", 1), ("next_attempt_at", 1), ("created_at", 1)])
     await db.lease_renewal_notification_outbox.create_index("claim_id", sparse=True)
+    await db.lease_renewal_notification_outbox.create_index("recovery.resolution_id", sparse=True)
