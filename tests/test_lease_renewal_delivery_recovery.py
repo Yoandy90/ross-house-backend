@@ -107,10 +107,16 @@ def test_stale_snapshot_and_arbitrary_evidence_fail_closed():
     assert exc.value.detail == 'renewal_recovery_evidence_reference_invalid'
 
 
+def test_boolean_attempt_snapshot_is_not_accepted_as_integer_one():
+    doc = fixture(); body = proposal_body(); body['expected_attempts'] = True
+    with pytest.raises(HTTPException) as exc:
+        run(recovery.propose_resolution(str(doc['_id']), body, DB(doc), {'_id': 'admin-a'}))
+    assert exc.value.detail == 'renewal_recovery_expected_attempts_invalid'
+
+
 def test_recovery_source_has_no_provider_call_or_retry_transition():
     source = open('rental/lease_renewal_delivery_recovery_router.py', encoding='utf-8').read().lower()
     assert 'sendgrid' not in source
     assert 'twilio' not in source
     assert 'retryable_failure' not in source
     assert 'automatic_retry_allowed": false' in source
-
