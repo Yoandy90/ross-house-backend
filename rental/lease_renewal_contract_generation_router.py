@@ -92,6 +92,31 @@ async def _assert_existing_occupancy(db, old: Dict[str, Any], prop: Dict[str, An
             raise HTTPException(status_code=409, detail="renewal_source_property_tenant_changed")
 
 
+async def _assert_no_competing_future_contract(db, old: Dict[str, Any], generated_id: ObjectId) -> None:
+    blocked = [
+        "draft", "pending", "pending_signature", "pending_tenant", "pending_landlord",
+        "pending_signatures", "pending_activation", "active",
+    ]
+    excluded = [old["_id"], generated_id]
+    tenant_conflict = await db.rental_contracts.find({
+        "tenant_id": str(old.get("tenant_id") or ""),
+        "status": {"$in": blocked},
+        "_id": {"$nin": excluded},
+    }).limit(1).to_list(1)
+    if tenant_conflict:
+        raise HTTPException(status_code=409, detail="renewal_tenant_contract_conflict")
+
+    unit_id = str(old.get("unit_id") or "").strip()
+    resource = {"unit_id": unit_id} if unit_id else {"property_id": str(old.get("property_id") or "")}
+    resource_conflict = await db.rental_contracts.find({
+        **resource,
+        "status": {"$in": blocked},
+        "_id": {"$nin": excluded},
+    }).limit(1).to_list(1)
+    if resource_conflict:
+        raise HTTPException(status_code=409, detail="renewal_resource_contract_conflict")
+
+
 def _existing_view(contract: Dict[str, Any], idempotent: bool):
     return {
         "ok": True,
@@ -126,6 +151,7 @@ async def _generate_under_lock(db, proposal_id: str, actor: str):
     prop = old.get("_property") or {}
     await _assert_existing_occupancy(db, old, prop)
     contract_oid = _renewal_contract_id(proposal_id)
+    await _assert_no_competing_future_contract(db, old, contract_oid)
     existing = await db.rental_contracts.find_one({"_id": contract_oid})
     if existing:
         source = existing.get("renewal_source") or {}
@@ -138,6 +164,14 @@ async def _generate_under_lock(db, proposal_id: str, actor: str):
     end = _add_months(start, months) - timedelta(days=1)
     now = _now()
     rent = _rent(proposal.get("proposed_rent"))
+    tenant = await db.tenants.find_one({"_id": ObjectId(tenant_id)})
+    if not tenant:
+        raise HTTPException(status_code=409, detail="renewal_canonical_tenant_missing")
+    old_landlord = str(old.get("landlord_id") or "").strip()
+    property_owner = str(prop.get("owner_id") or "").strip()
+    if old_landlord and property_owner and old_landlord != property_owner:
+        raise HTTPException(status_code=409, detail="renewal_landlord_owner_changed")
+    landlord_id = property_owner or old_landlord
     due_day = _bounded_int(old.get("payment_due_day"), 1, 1, 31, "renewal_source_due_day_invalid")
     grace_days = _bounded_int(old.get("late_fee_grace_days"), 5, 0, 31, "renewal_source_grace_days_invalid")
     deposit = _rent(old.get("deposit_amount", 0), "renewal_source_deposit_invalid")
@@ -152,10 +186,10 @@ async def _generate_under_lock(db, proposal_id: str, actor: str):
         "unit_id": old.get("unit_id"),
         "unit_name": old.get("unit_name", ""),
         "tenant_id": tenant_id,
-        "tenant_name": old.get("tenant_name", ""),
-        "tenant_phone": old.get("tenant_phone", ""),
-        "tenant_email": old.get("tenant_email", ""),
-        "landlord_id": old.get("landlord_id") or prop.get("owner_id"),
+        "tenant_name": tenant.get("name", ""),
+        "tenant_phone": tenant.get("phone", ""),
+        "tenant_email": tenant.get("email", ""),
+        "landlord_id": landlord_id,
         "lease_type": old.get("lease_type", "residential"),
         "start_date": start.isoformat(),
         "end_date": end.isoformat(),
@@ -226,4 +260,3 @@ async def generate_renewal_contract(
 
 async def ensure_indexes(db) -> None:
     await db.rental_contracts.create_index("renewal_source.proposal_id", unique=True, sparse=True)
-
