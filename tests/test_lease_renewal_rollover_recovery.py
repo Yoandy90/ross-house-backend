@@ -74,10 +74,11 @@ def fixture():
     proposal_id = str(ObjectId()); old_id = ObjectId(); new_id = _renewal_contract_id(proposal_id)
     pid, tid = ObjectId(), ObjectId(); claim = 'claim-secret-never-returned'
     old = {'_id': old_id, 'status': 'expired', 'property_id': str(pid), 'tenant_id': str(tid), 'unit_id': None,
-           'end_date': date.today().isoformat(), 'lifecycle_claim_id': claim}
+           'end_date': date.today().isoformat(), 'lifecycle_claim_id': claim,
+           'lifecycle_claim_target': 'renewal_rollover'}
     new = {'_id': new_id, 'status': 'pending_activation', 'property_id': str(pid), 'tenant_id': str(tid), 'unit_id': None,
            'start_date': date.today().isoformat(), 'tenant_signature': 't', 'admin_signature': 'a',
-           'lifecycle_claim_id': claim,
+           'lifecycle_claim_id': claim, 'lifecycle_claim_target': 'renewal_rollover',
            'renewal_source': {'proposal_id': proposal_id, 'prior_contract_id': str(old_id)}}
     prop = {'_id': pid, 'status': 'rented', 'status_manually_set': False,
             'current_contract_id': str(new_id), 'current_tenant_id': str(tid)}
@@ -131,6 +132,19 @@ def test_same_admin_and_stale_digest_fail_before_mutation():
         run(recovery._complete(db, proposal_id, str(record['_id']), proposed['recovery_id'], 'id:admin-b'))
     assert exc.value.detail == 'renewal_rollover_recovery_observation_changed'
     assert record['manual_recovery']['status'] == 'proposed'
+
+
+def test_same_admin_cannot_switch_from_id_to_email_identity():
+    db, proposal_id, record, *_ = fixture()
+    observed = run(recovery._observation(db, record, db.rental_contracts.docs[0], db.rental_contracts.docs[1]))
+    digest = recovery._digest(observed)
+    proposed = run(recovery.propose_recovery(
+        proposal_id, str(record['_id']), {'action': 'complete', 'observed_digest': digest},
+        db, {'_id': 'admin-a', 'email': 'ADMIN@example.com'}))
+    with pytest.raises(HTTPException) as exc:
+        run(recovery._complete(db, proposal_id, str(record['_id']), proposed['recovery_id'],
+                               'email:admin@example.com', {'email:admin@example.com'}))
+    assert exc.value.detail == 'renewal_rollover_recovery_second_admin_required'
 
 
 def test_foreign_projection_and_foreign_property_claim_fail_closed():
