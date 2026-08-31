@@ -144,6 +144,8 @@ async def propose_resolution(
     _assert_recoverable(doc, now)
     expected_status = str(body.get("expected_status") or "")
     expected_attempts = body.get("expected_attempts")
+    if isinstance(expected_attempts, bool) or not isinstance(expected_attempts, int):
+        raise HTTPException(status_code=400, detail="renewal_recovery_expected_attempts_invalid")
     if expected_status != doc.get("status") or expected_attempts != int(doc.get("attempts") or 0):
         raise HTTPException(status_code=409, detail="renewal_recovery_snapshot_stale")
     actor = _actor(admin)
@@ -227,4 +229,3 @@ async def confirm_resolution(
     if getattr(result, "matched_count", 0) != 1:
         raise HTTPException(status_code=409, detail="renewal_recovery_state_changed")
     return {"ok": True, "status": outcome, "automatic_retry_allowed": False}
-
