@@ -29,6 +29,13 @@ _CONTRACT_STATES = {
     "pending_signatures", "pending_activation", "active", "expired", "terminated",
 }
 _ROLLOVER_STATES = {"claimed", "transferring", "committed", "recovery_required", "completed"}
+_ROLLOVER_STAGES = {
+    "record_created", "claim_prior", "claim_renewal", "transfer_projections",
+    "expire_prior", "activate_renewal", "commit_record", "clear_claims",
+    "clear_prior_claim", "clear_renewal_claim", "complete", "complete_record",
+    "normalize_projections", "manual_recovery_confirmed",
+    "manual_recovery_clear_claims", "manual_recovery_finalize_record",
+}
 
 
 def _id(value: Any, detail: str) -> str:
@@ -85,6 +92,8 @@ async def _verified_workflow(db, proposal_id: str) -> Dict[str, Any]:
     )
     delivery_state = None
     if delivery:
+        if proposal_state not in {"approved", "sent"}:
+            raise HTTPException(status_code=409, detail="renewal_workflow_delivery_before_approval")
         _exact(delivery, {"lease_id": lease_id, "property_id": property_id, "tenant_id": tenant_id},
                "renewal_workflow_delivery_binding_changed")
         delivery_state = _bounded_state(
@@ -100,6 +109,8 @@ async def _verified_workflow(db, proposal_id: str) -> Dict[str, Any]:
     )
     decision = None
     if response:
+        if response.get("_id") != proposal.get("_id"):
+            raise HTTPException(status_code=409, detail="renewal_workflow_response_identity_changed")
         _exact(response, {"lease_id": lease_id, "property_id": property_id, "tenant_id": tenant_id},
                "renewal_workflow_response_binding_changed")
         decision = _bounded_state(
@@ -125,12 +136,18 @@ async def _verified_workflow(db, proposal_id: str) -> Dict[str, Any]:
             raise HTTPException(status_code=409, detail="renewal_workflow_contract_unit_changed")
         if decision != "accept":
             raise HTTPException(status_code=409, detail="renewal_workflow_contract_without_acceptance")
+        terms_digest = str((response or {}).get("terms_digest") or "")
+        if len(terms_digest) != 64 or any(ch not in "0123456789abcdef" for ch in terms_digest.lower()):
+            raise HTTPException(status_code=409, detail="renewal_workflow_response_digest_invalid")
+        if str(source.get("terms_digest") or "").lower() != terms_digest.lower():
+            raise HTTPException(status_code=409, detail="renewal_workflow_contract_terms_changed")
         contract_state = _bounded_state(
             new.get("status"), _CONTRACT_STATES, "renewal_workflow_contract_state_invalid"
         )
 
     rollover = await db.lease_renewal_rollovers.find_one({"_id": renewal_id}) if new else None
     rollover_state = None
+    rollover_stage = None
     if rollover:
         _exact(
             rollover,
@@ -142,8 +159,15 @@ async def _verified_workflow(db, proposal_id: str) -> Dict[str, Any]:
         rollover_state = _bounded_state(
             rollover.get("state"), _ROLLOVER_STATES, "renewal_workflow_rollover_state_invalid"
         )
+        rollover_stage = _bounded_state(
+            rollover.get("stage"), _ROLLOVER_STAGES, "renewal_workflow_rollover_stage_invalid"
+        )
+        if rollover_state != "completed" and contract_state not in {"pending_activation", "active"}:
+            raise HTTPException(status_code=409, detail="renewal_workflow_rollover_contract_state_invalid")
     if contract_state == "active" and rollover_state not in {"committed", "recovery_required", "completed"}:
         raise HTTPException(status_code=409, detail="renewal_workflow_active_without_rollover")
+    if contract_state in {"expired", "terminated"} and rollover_state != "completed":
+        raise HTTPException(status_code=409, detail="renewal_workflow_terminal_contract_without_completed_rollover")
 
     return {
         "proposal": proposal,
@@ -157,6 +181,7 @@ async def _verified_workflow(db, proposal_id: str) -> Dict[str, Any]:
         "contract_state": contract_state,
         "rollover": rollover,
         "rollover_state": rollover_state,
+        "rollover_stage": rollover_stage,
     }
 
 
@@ -233,7 +258,7 @@ def _view(proposal_id: str, flow: Dict[str, Any]) -> Dict[str, Any]:
         },
         "rollover": None if not rollover else {
             "state": flow["rollover_state"],
-            "stage": str(rollover.get("stage") or "")[:80],
+            "stage": flow["rollover_stage"],
             "manual_recovery_required": flow["rollover_state"] in {"recovery_required", "committed"},
             "automatic_retry_allowed": False,
         },
@@ -249,4 +274,3 @@ async def get_workflow_status(
 ):
     del admin
     return _view(proposal_id, await _verified_workflow(db, proposal_id))
-
