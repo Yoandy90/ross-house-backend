@@ -25,6 +25,8 @@ def matches(doc, query):
 
 class Cursor:
     def __init__(self, docs): self.docs = list(docs)
+    def sort(self, key, direction):
+        self.docs.sort(key=lambda doc: value(doc, key) or "", reverse=direction < 0); return self
     def limit(self, n): self.docs = self.docs[:n]; return self
     async def to_list(self, n): return self.docs[:n]
 
@@ -39,6 +41,7 @@ def fixture(stage="draft"):
     proposal_id, old_id, property_id, tenant_id = str(ObjectId()), ObjectId(), ObjectId(), ObjectId()
     proposal = {"_id": ObjectId(proposal_id), "status": "draft", "recommendation": "renew",
                 "lease_id": str(old_id), "property_id": str(property_id), "tenant_id": str(tenant_id),
+                "property_address": "123 Test St", "lease_end_date": "2026-08-31", "proposed_rent": 1200,
                 "tenant_email": "must-not-leak@example.com", "tenant_phone": "8065551111"}
     old = {"_id": old_id, "status": "active", "property_id": str(property_id),
            "tenant_id": str(tenant_id), "unit_id": None}
@@ -167,3 +170,17 @@ def test_module_contains_no_mutation_or_provider_calls():
     source = open("rental/lease_renewal_workflow_status_router.py", encoding="utf-8").read()
     for forbidden in ("update_one(", "insert_one(", "delete_one(", "sendgrid", "twilio", "requests."):
         assert forbidden not in source.lower()
+
+
+def test_read_only_list_uses_existing_proposals_and_isolates_corrupt_rows():
+    db, proposal_id, _ = fixture("draft")
+    listed = run(status._list_workflows(db, 50))
+    assert listed["read_only"] is True and listed["total"] == 1
+    assert listed["items"][0]["integrity"] == "verified"
+    assert listed["items"][0]["summary"]["proposed_rent"] >= 0
+    db.lease_renewal_proposals.docs[0]["status"] = "corrupt"
+    listed = run(status._list_workflows(db, 50))
+    assert listed["items"] == [{
+        "ok": False, "read_only": True, "integrity": "unavailable",
+        "proposal_id": proposal_id, "summary": None, "next_action": None,
+    }]
