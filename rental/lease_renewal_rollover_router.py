@@ -123,6 +123,12 @@ async def _rollover_under_lock(db, proposal_id: str, actor: str, today: Optional
     if existing:
         if existing.get("state") == "completed" and existing.get("proposal_id") == proposal_id:
             return {"ok": True, "idempotent": True, "state": "completed", "contract_id": str(new["_id"])}
+        if (
+            existing.get("state") == "committed"
+            and existing.get("proposal_id") == proposal_id
+            and await _authority_fully_committed(db, old, new)
+        ):
+            return {"ok": True, "idempotent": True, "state": "committed", "contract_id": str(new["_id"])}
         raise HTTPException(status_code=409, detail="renewal_rollover_recovery_pending")
     _assert_ready(old, new, today or _now().date())
     await _assert_single_active(db, old)
@@ -227,6 +233,9 @@ async def _rollover_under_lock(db, proposal_id: str, actor: str, today: Optional
             {"$set": {"state": "completed", "stage": "complete", "completed_at": _now(), "updated_at": _now()}},
         )
         if getattr(completed, "matched_count", 0) != 1:
+            latest = await db.lease_renewal_rollovers.find_one({"_id": rollover_oid, "claim_id": claim_id})
+            if (latest or {}).get("state") == "committed" and await _authority_fully_committed(db, old, new):
+                return {"ok": True, "idempotent": False, "state": "committed", "contract_id": str(new["_id"])}
             raise HTTPException(status_code=409, detail="renewal_rollover_completion_changed")
     except Exception:
         try:
@@ -254,6 +263,15 @@ async def _projection_view(db, old: Dict[str, Any], new: Dict[str, Any]):
         "resource_owner": "prior" if owner == str(old["_id"]) else "renewal" if owner == str(new["_id"]) else "other_or_missing",
         "tenant_owner": "prior" if tenant_owner == str(old["_id"]) else "renewal" if tenant_owner == str(new["_id"]) else "other_or_missing",
     }
+
+
+async def _authority_fully_committed(db, old: Dict[str, Any], new: Dict[str, Any]) -> bool:
+    if old.get("status") != "expired" or new.get("status") != "active":
+        return False
+    if old.get("lifecycle_claim_id") or new.get("lifecycle_claim_id"):
+        return False
+    observed = await _projection_view(db, old, new)
+    return observed == {"resource_owner": "renewal", "tenant_owner": "renewal"}
 
 
 @router.post("/{proposal_id}/rollover")
