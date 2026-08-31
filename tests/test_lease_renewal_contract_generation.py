@@ -25,8 +25,8 @@ class Cursor:
 class Collection:
     def __init__(self, docs=None): self.docs = list(docs or [])
     async def find_one(self, query):
-        return next((d for d in self.docs if all(d.get(k) == v for k, v in query.items())), None)
-    def find(self, query): return Cursor([d for d in self.docs if all(d.get(k) == v for k, v in query.items())])
+        return next((d for d in self.docs if matches(d, query)), None)
+    def find(self, query): return Cursor([d for d in self.docs if matches(d, query)])
     async def insert_one(self, doc): self.docs.append(doc); return InsertResult(doc['_id'])
 
 
@@ -41,8 +41,19 @@ def fixture(decision='accept', with_unit=False):
     terms = response._terms(proposal, canonical); digest = response._digest(terms)
     accepted = {'_id': qid, 'proposal_id': str(qid), 'lease_id': str(old_id), 'property_id': str(pid), 'tenant_id': str(tid), 'decision': decision, 'terms_digest': digest, 'terms': terms}
     class DB: pass
-    db = DB(); db.rental_contracts = Collection([old]); db.properties = Collection([prop]); db.tenants = Collection([{'_id': tid}]); db.lease_renewal_proposals = Collection([proposal]); db.lease_renewal_responses = Collection([accepted]); db.lease_renewal_notification_outbox = Collection([{'proposal_id': str(qid), 'tenant_id': str(tid), 'status': 'sent'}]); db.property_units = Collection([{'_id': unit_id, 'property_id': str(pid), 'current_contract_id': str(old_id), 'current_tenant_id': str(tid)}] if unit_id else [])
+    db = DB(); db.rental_contracts = Collection([old]); db.properties = Collection([prop]); db.tenants = Collection([{'_id': tid, 'name': 'Tenant Current', 'email': 'current@example.com'}]); db.lease_renewal_proposals = Collection([proposal]); db.lease_renewal_responses = Collection([accepted]); db.lease_renewal_notification_outbox = Collection([{'proposal_id': str(qid), 'tenant_id': str(tid), 'status': 'sent'}]); db.property_units = Collection([{'_id': unit_id, 'property_id': str(pid), 'current_contract_id': str(old_id), 'current_tenant_id': str(tid)}] if unit_id else [])
     return db, proposal, old
+
+
+def matches(doc, query):
+    for key, expected in query.items():
+        actual = doc.get(key)
+        if isinstance(expected, dict):
+            if '$in' in expected and actual not in expected['$in']: return False
+            if '$nin' in expected and actual in expected['$nin']: return False
+            if '$ne' in expected and actual == expected['$ne']: return False
+        elif actual != expected: return False
+    return True
 
 
 def test_accepted_response_generates_pending_signatures_without_occupancy_mutation():
@@ -53,6 +64,7 @@ def test_accepted_response_generates_pending_signatures_without_occupancy_mutati
     assert created['rent_amount'] == 1250
     assert created['start_date'] == (datetime.fromisoformat(old['end_date']).date() + timedelta(days=1)).isoformat()
     assert created['activation_authority'] == 'lease_lifecycle_only'
+    assert created['tenant_email'] == 'current@example.com'
     assert old['status'] == 'active'
     assert db.properties.docs[0]['current_contract_id'] == str(old['_id'])
 
@@ -96,6 +108,27 @@ def test_exact_old_unit_occupancy_can_coexist_but_other_claim_cannot():
     assert exc.value.detail == 'renewal_source_unit_occupancy_changed'
 
 
+def test_competing_tenant_or_resource_contract_fails_closed():
+    db, proposal, old = fixture()
+    db.rental_contracts.docs.append({'_id': ObjectId(), 'tenant_id': old['tenant_id'], 'property_id': str(ObjectId()), 'status': 'pending_signatures'})
+    with pytest.raises(HTTPException) as exc:
+        run(generation._generate_under_lock(db, str(proposal['_id']), 'admin'))
+    assert exc.value.detail == 'renewal_tenant_contract_conflict'
+
+    db, proposal, old = fixture()
+    db.rental_contracts.docs.append({'_id': ObjectId(), 'tenant_id': str(ObjectId()), 'property_id': old['property_id'], 'status': 'draft'})
+    with pytest.raises(HTTPException) as exc:
+        run(generation._generate_under_lock(db, str(proposal['_id']), 'admin'))
+    assert exc.value.detail == 'renewal_resource_contract_conflict'
+
+
+def test_landlord_owner_drift_fails_closed():
+    db, proposal, old = fixture(); old['landlord_id'] = str(ObjectId()); db.properties.docs[0]['owner_id'] = str(ObjectId())
+    with pytest.raises(HTTPException) as exc:
+        run(generation._generate_under_lock(db, str(proposal['_id']), 'admin'))
+    assert exc.value.detail == 'renewal_landlord_owner_changed'
+
+
 def test_effective_dates_handle_month_end_exactly(monkeypatch):
     monkeypatch.setenv('RENEWAL_TERM_MONTHS', '12')
     assert generation._add_months(datetime(2027, 1, 31).date(), 1).isoformat() == '2027-02-28'
@@ -107,4 +140,3 @@ def test_source_has_no_activation_occupancy_or_payment_write():
     assert '"status": "active"' not in source
     for forbidden in ('properties.update', 'property_units.update', 'tenants.update', 'rent_payments', 'force_activate'):
         assert forbidden not in source
-
