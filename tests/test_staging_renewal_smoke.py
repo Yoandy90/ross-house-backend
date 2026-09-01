@@ -124,3 +124,20 @@ def test_invalid_admin_read_model_fails_closed():
             admin_token="secret",
             opener=bad_opener,
         )
+
+
+def test_manual_workflow_is_dispatch_only_and_uses_protected_environment():
+    source = open(
+        ".github/workflows/staging-renewal-smoke.yml", encoding="utf-8"
+    ).read()
+    assert "workflow_dispatch:" in source
+    assert "pull_request:" not in source
+    assert "push:" not in source
+    assert "environment: staging" in source
+    assert "permissions:\n  contents: read" in source
+    assert "${{ vars.STAGING_BASE_URL }}" in source
+    assert "${{ secrets.STAGING_ADMIN_TOKEN }}" in source
+    assert "python scripts/staging_renewal_smoke.py" in source
+    assert "--base-url" not in source
+    assert "--admin-token" not in source
+    assert "curl " not in source
