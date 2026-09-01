@@ -30,6 +30,27 @@ from .lease_lifecycle_state_guard_router import router as lease_lifecycle_state_
 from .lease_lifecycle_security_router import router as lease_lifecycle_security_router
 from .lease_lifecycle_recovery_router import router as lease_lifecycle_recovery_router
 from .lease_creation_security_router import router as lease_creation_security_router
+from .lease_renewal_security_router import router as lease_renewal_security_router
+from .lease_renewal_notification_security_router import (
+    router as lease_renewal_notification_security_router,
+    ensure_indexes as ensure_lease_renewal_notification_indexes,
+)
+from .lease_renewal_notification_sender import router as lease_renewal_notification_sender_router
+from .lease_renewal_delivery_recovery_router import router as lease_renewal_delivery_recovery_router
+from .lease_renewal_tenant_response_router import (
+    router as lease_renewal_tenant_response_router,
+    ensure_indexes as ensure_lease_renewal_response_indexes,
+)
+from .lease_renewal_contract_generation_router import (
+    router as lease_renewal_contract_generation_router,
+    ensure_indexes as ensure_lease_renewal_contract_generation_indexes,
+)
+from .lease_renewal_rollover_router import (
+    router as lease_renewal_rollover_router,
+    ensure_indexes as ensure_lease_renewal_rollover_indexes,
+)
+from .lease_renewal_rollover_recovery_router import router as lease_renewal_rollover_recovery_router
+from .lease_renewal_workflow_status_router import router as lease_renewal_workflow_status_router
 
 logger = logging.getLogger("auth_metrics")
 router = APIRouter(tags=["observability"])
@@ -55,6 +76,22 @@ router.routes.extend(lease_creation_security_router.routes)
 router.routes.extend(lease_lifecycle_state_guard_router.routes)
 router.routes.extend(lease_lifecycle_security_router.routes)
 router.routes.extend(lease_lifecycle_recovery_router.routes)
+# Notification-aware approve replaces the prior secure approve route while all
+# other canonical renewal routes remain unchanged.
+router.routes.extend(lease_renewal_workflow_status_router.routes)
+router.routes.extend(lease_renewal_rollover_recovery_router.routes)
+router.routes.extend(lease_renewal_rollover_router.routes)
+router.routes.extend(lease_renewal_contract_generation_router.routes)
+router.routes.extend(lease_renewal_tenant_response_router.routes)
+router.routes.extend(lease_renewal_delivery_recovery_router.routes)
+router.routes.extend(lease_renewal_notification_sender_router.routes)
+router.routes.extend(lease_renewal_notification_security_router.routes)
+for _route in lease_renewal_security_router.routes:
+    _path = getattr(_route, "path", None)
+    _methods = getattr(_route, "methods", set())
+    if _path == "/admin/lease-renewals/{proposal_id}/approve" and "POST" in _methods:
+        continue
+    router.routes.append(_route)
 
 VALID_METRICS = {
     "legacy_fallback_used", "sidless_token_accepted", "sidless_token_rejected",
@@ -73,6 +110,14 @@ async def _ensure_tenant_identity_indexes() -> None:
         # Index availability improves performance but must never prevent the API
         # from starting. Runtime identity resolution still fails closed.
         logger.warning("tenant identity indexes deferred: %s", exc)
+    try:
+        await ensure_lease_renewal_notification_indexes(get_db())
+        await ensure_lease_renewal_response_indexes(get_db())
+        await ensure_lease_renewal_contract_generation_indexes(get_db())
+        await ensure_lease_renewal_rollover_indexes(get_db())
+        logger.info("lease renewal notification, response, generation, and rollover indexes ready")
+    except Exception as exc:
+        logger.warning("lease renewal notification indexes deferred: %s", exc)
 
 
 async def bump(metric: str) -> None:

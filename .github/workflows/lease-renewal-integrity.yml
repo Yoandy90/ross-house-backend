@@ -1,0 +1,36 @@
+name: Lease Renewal Integrity
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'rental/lease_renewal_security_router.py'
+      - 'rental/lease_renewals_router.py'
+      - 'rental/auth_metrics.py'
+      - 'tests/test_lease_renewal_integrity.py'
+      - '.github/workflows/lease-renewal-integrity.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lease-renewal-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  integrity:
+    name: Canonical renewal authority and transitions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install focused dependencies
+        run: python -m pip install --disable-pip-version-check fastapi==0.110.1 pydantic==2.10.6 pymongo==4.6.1 PyJWT==2.10.1 pytest pytest-asyncio
+      - name: Compile renewal boundary
+        run: python -m py_compile rental/lease_renewal_security_router.py rental/lease_renewals_router.py rental/auth_metrics.py
+      - name: Run renewal integrity tests
+        env:
+          PYTHONPATH: .
+        run: python -m pytest -q tests/test_lease_renewal_integrity.py

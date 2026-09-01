@@ -1,0 +1,35 @@
+name: Lease Renewal Notification Outbox
+
+on:
+  pull_request:
+    paths:
+      - 'rental/lease_renewal_notification_security_router.py'
+      - 'rental/lease_renewal_security_router.py'
+      - 'rental/auth_metrics.py'
+      - 'tests/test_lease_renewal_notification_outbox.py'
+      - '.github/workflows/lease-renewal-notification-outbox.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lease-renewal-notification-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  outbox-integrity:
+    name: Durable approval notification intent
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install focused dependencies
+        run: python -m pip install --disable-pip-version-check fastapi==0.110.1 pydantic==2.10.6 pymongo==4.6.1 PyJWT==2.10.1 pytest pytest-asyncio
+      - name: Compile notification boundary
+        run: python -m py_compile rental/lease_renewal_notification_security_router.py rental/lease_renewal_security_router.py rental/auth_metrics.py
+      - name: Run notification outbox tests
+        env:
+          PYTHONPATH: .
+        run: python -m pytest -q tests/test_lease_renewal_notification_outbox.py tests/test_lease_renewal_integrity.py
