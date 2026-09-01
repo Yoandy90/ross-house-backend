@@ -1,0 +1,35 @@
+name: Staging Renewal Smoke
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: staging-renewal-smoke
+  cancel-in-progress: false
+
+jobs:
+  renewal-smoke:
+    name: Read-only renewal smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment: staging
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Require protected staging configuration
+        env:
+          STAGING_BASE_URL: ${{ vars.STAGING_BASE_URL }}
+          STAGING_ADMIN_TOKEN: ${{ secrets.STAGING_ADMIN_TOKEN }}
+        run: |
+          test -n "$STAGING_BASE_URL" || { echo "STAGING_BASE_URL is not configured"; exit 1; }
+          test -n "$STAGING_ADMIN_TOKEN" || { echo "STAGING_ADMIN_TOKEN is not configured"; exit 1; }
+      - name: Run fail-closed renewal smoke
+        env:
+          STAGING_BASE_URL: ${{ vars.STAGING_BASE_URL }}
+          STAGING_ADMIN_TOKEN: ${{ secrets.STAGING_ADMIN_TOKEN }}
+        run: python scripts/staging_renewal_smoke.py
