@@ -110,6 +110,38 @@ def test_observation_is_stable_sanitized_and_read_only():
     assert first['prior_claim'] == 'exact' and first['renewal_claim'] == 'exact'
 
 
+def test_observation_exposes_only_bounded_pending_confirmation_handoff():
+    db, proposal_id, record, *_ = fixture()
+    before = run(recovery.observe_recovery(
+        proposal_id, str(record['_id']), db, {'_id': 'admin-a'}))
+    assert before['pending_confirmation'] is None
+    proposed, digest = propose(db, proposal_id, record)
+    view = run(recovery.observe_recovery(
+        proposal_id, str(record['_id']), db, {'_id': 'admin-b'}))
+    pending = view['pending_confirmation']
+    assert pending == {
+        'status': 'pending_confirmation',
+        'action': 'complete',
+        'recovery_id': proposed['recovery_id'],
+        'observed_digest': digest,
+        'observation_matches': True,
+        'confirmable': True,
+        'requires_second_admin': True,
+    }
+    assert record['claim_id'] not in repr(view)
+    assert 'proposed_by' not in repr(view)
+
+
+def test_corrupt_pending_confirmation_handoff_fails_closed():
+    db, proposal_id, record, *_ = fixture()
+    propose(db, proposal_id, record)
+    record['manual_recovery']['recovery_id'] = 'not-valid'
+    with pytest.raises(HTTPException) as exc:
+        run(recovery.observe_recovery(
+            proposal_id, str(record['_id']), db, {'_id': 'admin-b'}))
+    assert exc.value.detail == 'renewal_rollover_recovery_proposal_invalid'
+
+
 def test_two_admin_confirmation_completes_only_forward():
     db, proposal_id, record, old, new, prop, tenant = fixture()
     proposed, digest = propose(db, proposal_id, record)
