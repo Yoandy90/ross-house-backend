@@ -795,7 +795,7 @@ async def list_offer_responses(
 ):
     """Return bounded, newest-first offer responses to authenticated admins."""
     await auth_admin(request)
-    if action is not None and action not in {"accept", "counter", "call", "reject"}:
+    if action is not None and (not isinstance(action, str) or action not in {"accept", "counter", "call", "reject"}):
         raise HTTPException(status_code=422, detail="deal_finder_response_action_invalid")
     bounded_limit = min(max(limit, 1), 100)
     query = {"offer.response.action": {"$exists": True}}
