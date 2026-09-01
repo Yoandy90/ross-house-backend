@@ -10,6 +10,7 @@ on:
       - 'tests/test_staging_environment_safety.py'
       - 'tests/test_staging_renewal_smoke.py'
       - '.github/workflows/staging-environment-safety.yml'
+      - '.github/workflows/staging-renewal-smoke.yml'
 
 permissions:
   contents: read
