@@ -117,6 +117,32 @@ def _digest(observation: Dict[str, Any]) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def _pending_confirmation(record: Dict[str, Any], current_digest: str):
+    recovery = record.get("manual_recovery") or {}
+    if recovery.get("status") != "proposed":
+        return None
+    recovery_id = str(recovery.get("recovery_id") or "").lower()
+    observed_digest = str(recovery.get("observed_digest") or "").lower()
+    if (
+        recovery.get("action") != "complete"
+        or len(recovery_id) != 32
+        or any(c not in "0123456789abcdef" for c in recovery_id)
+        or len(observed_digest) != 64
+        or any(c not in "0123456789abcdef" for c in observed_digest)
+    ):
+        raise HTTPException(status_code=409, detail="renewal_rollover_recovery_proposal_invalid")
+    matches = secrets.compare_digest(observed_digest, current_digest)
+    return {
+        "status": "pending_confirmation",
+        "action": "complete",
+        "recovery_id": recovery_id,
+        "observed_digest": observed_digest,
+        "observation_matches": matches,
+        "confirmable": matches,
+        "requires_second_admin": True,
+    }
+
+
 def _assert_recoverable(observed: Dict[str, Any]) -> None:
     if observed["record_state"] not in {"recovery_required", "committed"}:
         raise HTTPException(status_code=409, detail="renewal_rollover_recovery_state_invalid")
@@ -305,9 +331,11 @@ async def observe_recovery(proposal_id: str, rollover_id: str, db=Depends(get_db
     record, old, new = await _record_and_pair(db, proposal_id, rollover_id)
     observed = await _observation(db, record, old, new)
     _assert_recoverable(observed)
+    observed_digest = _digest(observed)
     return {"ok": True, "read_only": True, "automatic_retry_allowed": False,
             "rollover_id": rollover_id, "proposal_id": proposal_id,
-            "observation": observed, "observed_digest": _digest(observed)}
+            "observation": observed, "observed_digest": observed_digest,
+            "pending_confirmation": _pending_confirmation(record, observed_digest)}
 
 
 @router.post("/{proposal_id}/rollover-recovery/{rollover_id}/propose")
