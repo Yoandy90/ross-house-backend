@@ -1,0 +1,28 @@
+name: Staging Environment Safety
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.env.staging.example'
+      - 'scripts/validate_staging_env.py'
+      - 'tests/test_staging_environment_safety.py'
+      - '.github/workflows/staging-environment-safety.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  staging-safety:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Compile validator
+        run: python -m py_compile scripts/validate_staging_env.py
+      - name: Validate committed template
+        run: python scripts/validate_staging_env.py --template .env.staging.example
+      - name: Run staging safety tests
+        run: python -m pip install --disable-pip-version-check pytest && python -m pytest -q tests/test_staging_environment_safety.py
