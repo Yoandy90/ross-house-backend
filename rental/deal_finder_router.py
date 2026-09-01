@@ -787,6 +787,32 @@ async def campaign_stats(request: Request):
             "note": "Entregadas = estimado por fecha de entrega esperada de Lob/USPS"}
 
 
+@router.get("/admin/deal-finder/responses")
+async def list_offer_responses(
+    request: Request,
+    action: Optional[str] = None,
+    limit: int = 50,
+):
+    """Return bounded, newest-first offer responses to authenticated admins."""
+    await auth_admin(request)
+    if action is not None and action not in {"accept", "counter", "call", "reject"}:
+        raise HTTPException(status_code=422, detail="deal_finder_response_action_invalid")
+    bounded_limit = min(max(limit, 1), 100)
+    query = {"offer.response.action": {"$exists": True}}
+    if action is not None:
+        query["offer.response.action"] = action
+    docs = await (
+        get_db().deal_finder_leads.find(query)
+        .sort([("offer.response.at", -1), ("_id", -1)])
+        .to_list(bounded_limit)
+    )
+    return {
+        "success": True,
+        "read_only": True,
+        "responses": [_lead_out(doc) for doc in docs],
+    }
+
+
 @router.get("/admin/deal-finder/stats")
 async def get_stats(request: Request):
     await auth_admin(request)
