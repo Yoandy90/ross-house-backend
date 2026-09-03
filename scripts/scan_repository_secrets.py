@@ -23,6 +23,14 @@ TEXT_SUFFIXES = {
 }
 TEXT_NAMES = {"Dockerfile", "Procfile"}
 
+MONGO_PLACEHOLDER_CREDENTIALS = (
+    "user:password@",
+    "staging_user:staging_password@",
+    "user:pass@",
+    "u:p@",
+    "isolated-user:isolated-pass@",
+)
+
 PATTERNS = (
     ("private-key", re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----")),
     ("github-token", re.compile(
@@ -65,6 +73,13 @@ def is_text_candidate(path: Path) -> bool:
     return path.name in TEXT_NAMES or path.suffix.lower() in TEXT_SUFFIXES
 
 
+def is_explicit_placeholder(label: str, matched: str) -> bool:
+    if label != "credentialed-mongo-uri":
+        return False
+    lowered = matched.lower()
+    return any(marker in lowered for marker in MONGO_PLACEHOLDER_CREDENTIALS)
+
+
 def scan_files(root: Path, paths: Iterable[Path]) -> list[Finding]:
     findings: list[Finding] = []
     resolved_root = root.resolve()
@@ -89,7 +104,8 @@ def scan_files(root: Path, paths: Iterable[Path]) -> list[Finding]:
         relative = resolved.relative_to(resolved_root).as_posix()
         for number, line in enumerate(content.splitlines(), 1):
             for label, pattern in PATTERNS:
-                if pattern.search(line):
+                match = pattern.search(line)
+                if match and not is_explicit_placeholder(label, match.group(0)):
                     findings.append(Finding(label, relative, number))
     return findings
 
