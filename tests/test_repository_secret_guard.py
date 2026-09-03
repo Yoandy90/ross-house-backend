@@ -71,3 +71,21 @@ def test_skips_binary_large_and_outside_root_files(tmp_path):
         assert scan_files(tmp_path, [binary, outside]) == []
     finally:
         outside.unlink(missing_ok=True)
+
+
+def test_allows_only_explicit_mongo_placeholder_credentials(tmp_path):
+    placeholders = [
+        "mongodb+srv://" + "USER:PASSWORD@cluster.example/db",
+        "mongodb+srv://" + "STAGING_USER:STAGING_PASSWORD@cluster.example/db",
+        "mongodb+srv://" + "u:p@cluster.example/db",
+        "mongodb+srv://" + "user:pass@cluster.example/db",
+        "mongodb+srv://" + "isolated-user:isolated-pass@cluster.example/db",
+    ]
+    target = write(tmp_path, "fixtures.txt", "\n".join(placeholders))
+    assert scan_files(tmp_path, [target]) == []
+
+    realistic = "mongodb+srv://" + "service_user:S3cretValue987@cluster.example/db"
+    target.write_text(realistic, encoding="utf-8")
+    findings = scan_files(tmp_path, [target])
+    assert labels(findings) == {"credentialed-mongo-uri"}
+    assert realistic not in repr(findings)
