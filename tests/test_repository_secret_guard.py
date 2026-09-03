@@ -20,7 +20,7 @@ def test_detects_high_confidence_secret_families_without_returning_values(tmp_pa
         "SG." + "a" * 20 + "." + "b" * 24,
         "AKIA" + "A" * 16,
         "ghp_" + "A" * 40,
-        "mongodb+srv://" + "user:password@cluster.example/db",
+        "mongodb+srv://" + "service_user:S3cretValue987@cluster.example/db",
         "-----BEGIN " + "PRIVATE KEY-----",
     ]
     target = write(tmp_path, "config.txt", "\n".join(values))
