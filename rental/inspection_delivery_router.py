@@ -8,7 +8,7 @@ import io
 import os
 import re
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Dict, Optional
 
 from bson import ObjectId
@@ -20,6 +20,7 @@ from .shared import auth_admin, get_db
 
 router = APIRouter(tags=["inspection-delivery"])
 MAX_ATTEMPTS = 3
+CLAIM_TTL_SECONDS = 300
 _EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 
 
@@ -183,10 +184,22 @@ async def queue_inspection_email(inspection_id: str, admin=Depends(auth_admin), 
 
 
 async def claim_next(db, worker_id: str) -> Optional[Dict[str, Any]]:
+    """Atomically claim fresh work or a stale claim that never reached the provider."""
     now = _now()
+    stale_before = now - timedelta(seconds=CLAIM_TTL_SECONDS)
     claim_id = uuid.uuid4().hex
     return await db.inspection_delivery_outbox.find_one_and_update(
-        {"status": {"$in": ["pending", "retryable_failure"]}, "attempts": {"$lt": MAX_ATTEMPTS}},
+        {
+            "attempts": {"$lt": MAX_ATTEMPTS},
+            "$or": [
+                {"status": {"$in": ["pending", "retryable_failure"]}},
+                {
+                    "status": "claimed",
+                    "provider_started_at": {"$exists": False},
+                    "claimed_at": {"$lt": stale_before},
+                },
+            ],
+        },
         {"$set": {"status": "claimed", "claim_id": claim_id, "claimed_by": str(worker_id)[:80],
                   "claimed_at": now, "updated_at": now}, "$inc": {"attempts": 1}},
         sort=[("created_at", 1)],
