@@ -354,6 +354,15 @@ def test_synthetic_tenant_session_is_linked_and_session_bound(monkeypatch):
     assert tenant["app_user_id"] == str(user["_id"])
     assert "password_hash" not in user
 
+    cleaned = run(fixtures.delete_renewal_lifecycle(
+        created["marker"], "DELETE_SYNTHETIC_RENEWAL", db, {}
+    ))
+    assert cleaned["clean"] is True
+    assert cleaned["deleted"]["app_users"] == 1
+    assert cleaned["deleted"]["auth_sessions"] == 1
+    assert db.app_users.docs == []
+    assert db.auth_sessions.docs == []
+
 
 def test_tenant_session_failure_rolls_back_identity(monkeypatch):
     allow(monkeypatch)
