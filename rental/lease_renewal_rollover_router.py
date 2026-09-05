@@ -69,11 +69,16 @@ def _assert_ready(old: Dict[str, Any], new: Dict[str, Any], today: date) -> None
     if not new.get("tenant_signature") or not (new.get("landlord_signature") or new.get("admin_signature")):
         raise HTTPException(status_code=409, detail="renewal_rollover_signatures_missing")
     start = _date(new.get("start_date"), "renewal_start_date_invalid")
+    end = _date(new.get("end_date"), "renewal_end_date_invalid")
     old_end = _date(old.get("end_date"), "renewal_prior_end_date_invalid")
+    if end < start:
+        raise HTTPException(status_code=409, detail="renewal_rollover_term_invalid")
     if (start - old_end).days != 1:
         raise HTTPException(status_code=409, detail="renewal_rollover_dates_not_contiguous")
     if today < start:
         raise HTTPException(status_code=409, detail="renewal_rollover_too_early")
+    if today > end:
+        raise HTTPException(status_code=409, detail="renewal_rollover_term_elapsed")
 
 
 async def _assert_single_active(db, old: Dict[str, Any]) -> None:
@@ -82,6 +87,20 @@ async def _assert_single_active(db, old: Dict[str, Any]) -> None:
     }).limit(2).to_list(2)
     if len(active) != 1 or active[0].get("_id") != old.get("_id"):
         raise HTTPException(status_code=409, detail="renewal_rollover_active_authority_changed")
+
+    unit_id = str(old.get("unit_id") or "").strip()
+    resource = (
+        {"unit_id": unit_id}
+        if unit_id
+        else {"property_id": str(old.get("property_id") or ""), "unit_id": {"$in": [None, ""]}}
+    )
+    resource_active = await db.rental_contracts.find({
+        **resource, "status": "active"
+    }).limit(2).to_list(2)
+    if len(resource_active) != 1 or resource_active[0].get("_id") != old.get("_id"):
+        raise HTTPException(
+            status_code=409, detail="renewal_rollover_resource_active_authority_changed"
+        )
 
 
 async def _transfer_projection(db, old: Dict[str, Any], new: Dict[str, Any], now: datetime) -> None:
