@@ -13,13 +13,18 @@ def success_responses():
                 "marker": "staging-renewal-" + "a" * 32,
                 "contract_id": "c1",
                 "tenant_id": "t1",
+                "lease_end_date": "2026-10-05",
             }
         ),
         ("GET", "/api/admin/staging-fixtures/renewal-source/staging-renewal-" + "a" * 32): (
             200, {"consistent": True, "present": {"property": True, "tenant": True, "contract": True}}
         ),
         ("GET", "/api/admin/lease-renewals/proposals"): (
-            200, {"proposals": [{"_id": "p1", "lease_id": "c1"}]}
+            200, {
+                "proposals": [
+                    {"_id": "p1", "lease_id": "c1", "proposed_rent": 1250.0}
+                ]
+            }
         ),
         ("GET", "/api/admin/lease-renewals/p1/workflow-status"): (
             200, {"proposal_id": "p1", "read_only": True}
@@ -99,6 +104,23 @@ def success_responses():
                 },
             },
         ),
+        ("POST", "/api/admin/lease-renewals/p1/generate-contract"): (
+            200,
+            {
+                "ok": True,
+                "idempotent": False,
+                "contract_id": "renewal-c1",
+                "status": "pending_signatures",
+                "start_date": "2026-10-06",
+                "end_date": "2027-10-05",
+                "rent_amount": 1250.0,
+                "proposal_id": "p1",
+                "prior_contract_id": "c1",
+                "terms_digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                "tenant_signed": False,
+                "landlord_or_admin_signed": False,
+            },
+        ),
         ("POST", "/api/auth/logout"): (200, {"success": True}),
     }
 
@@ -140,6 +162,21 @@ def test_source_cycle_passes_and_cleans(monkeypatch):
                     "tenant_response": {"decision": "accept", "recorded": True},
                     "next_action": "generate_contract",
                 }
+            if workflow_count == 5:
+                return 200, {
+                    "proposal_id": "p1",
+                    "read_only": True,
+                    "contract": {
+                        "contract_id": "renewal-c1",
+                        "status": "pending_signatures",
+                        "start_date": "2026-10-06",
+                        "end_date": "2027-10-05",
+                        "tenant_signed": False,
+                        "landlord_or_admin_signed": False,
+                    },
+                    "rollover": None,
+                    "next_action": "collect_contract_signatures",
+                }
         if (
             method == "POST"
             and path == "/api/tenant/lease-renewals/p1/respond"
@@ -153,6 +190,14 @@ def test_source_cycle_passes_and_cleans(monkeypatch):
                     "terms_digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
                 },
             }
+        if (
+            method == "POST"
+            and path == "/api/admin/lease-renewals/p1/generate-contract"
+            and calls.count((method, path)) == 2
+        ):
+            payload = dict(responses[(method, path)][1])
+            payload["idempotent"] = True
+            return 200, payload
         return responses[(method, path)]
 
     monkeypatch.setattr(cycle, "request_json", fake)
@@ -168,6 +213,9 @@ def test_source_cycle_passes_and_cleans(monkeypatch):
     assert "tenant-response-recorded" in checks
     assert "tenant-response-idempotent" in checks
     assert "accepted-state-verified" in checks
+    assert "contract-generated-pending-signatures" in checks
+    assert "contract-generation-idempotent" in checks
+    assert "pending-signatures-state-verified" in checks
     assert "tenant-session-revoked" in checks
     assert "lifecycle-cleaned" in checks
     assert "no-source-residuals" in checks
@@ -213,9 +261,10 @@ def test_logout_failure_fails_cycle_after_cleanup(monkeypatch):
 
     inspection_count = 0
     workflow_count = 0
+    generation_count = 0
 
     def fake(base, path, token, method="GET", body=None):
-        nonlocal inspection_count, workflow_count
+        nonlocal inspection_count, workflow_count, generation_count
         if method == "GET" and "/renewal-source/" in path:
             inspection_count += 1
             if inspection_count == 2:
@@ -251,6 +300,14 @@ def test_logout_failure_fails_cycle_after_cleanup(monkeypatch):
                     "tenant_response": {"decision": "accept", "recorded": True},
                     "next_action": "generate_contract",
                 }
+        if (
+            method == "POST"
+            and path == "/api/admin/lease-renewals/p1/generate-contract"
+        ):
+            generation_count += 1
+            payload = dict(responses[(method, path)][1])
+            payload["idempotent"] = generation_count > 1
+            return 200, payload
         return responses[(method, path)]
 
     monkeypatch.setattr(cycle, "request_json", fake)

@@ -118,6 +118,7 @@ async def _assert_no_competing_future_contract(db, old: Dict[str, Any], generate
 
 
 def _existing_view(contract: Dict[str, Any], idempotent: bool):
+    source = contract.get("renewal_source") or {}
     return {
         "ok": True,
         "idempotent": idempotent,
@@ -126,6 +127,14 @@ def _existing_view(contract: Dict[str, Any], idempotent: bool):
         "status": contract.get("status"),
         "start_date": contract.get("start_date"),
         "end_date": contract.get("end_date"),
+        "rent_amount": contract.get("rent_amount"),
+        "proposal_id": source.get("proposal_id"),
+        "prior_contract_id": source.get("prior_contract_id"),
+        "terms_digest": source.get("terms_digest"),
+        "tenant_signed": bool(contract.get("tenant_signature")),
+        "landlord_or_admin_signed": bool(
+            contract.get("landlord_signature") or contract.get("admin_signature")
+        ),
     }
 
 
