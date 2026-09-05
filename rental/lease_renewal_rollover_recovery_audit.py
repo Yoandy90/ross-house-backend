@@ -189,3 +189,18 @@ async def inspect_recovery_audit_chain(
         "events": safe_events,
     }
 
+
+async def ensure_indexes(db) -> None:
+    """Enforce deterministic recovery chains and bounded admin inspection."""
+    await db.lease_renewal_rollover_recovery_audit.create_index(
+        [
+            ("rollover_id", 1),
+            ("proposal_id", 1),
+            ("recovery_id", 1),
+            ("sequence", 1),
+        ],
+        unique=True,
+    )
+    await db.lease_renewal_rollover_recovery_audit.create_index(
+        [("occurred_at", -1), ("rollover_id", 1)]
+    )
