@@ -110,8 +110,22 @@ async def _assert_lineage(
         raise HTTPException(
             status_code=409, detail="renewal_rollover_response_terms_invalid"
         )
-    terms_expected = {"proposal_id": proposal_id, **expected}
-    if any(str(terms.get(key) or "") != value for key, value in terms_expected.items()):
+    recommendation = str(proposal.get("recommendation") or "").strip().lower()
+    if recommendation not in {"renew", "raise"}:
+        raise HTTPException(
+            status_code=409, detail="renewal_rollover_proposal_recommendation_invalid"
+        )
+    terms_expected = {
+        "proposal_id": proposal_id,
+        **expected,
+        "recommendation": recommendation,
+        "current_rent": f"{_rent(old.get('rent_amount'), 'renewal_rollover_prior_rent_invalid'):.2f}",
+        "proposed_rent": f"{_rent(proposal.get('proposed_rent'), 'renewal_rollover_proposal_rent_invalid'):.2f}",
+        "lease_end_date": _date(
+            old.get("end_date"), "renewal_prior_end_date_invalid"
+        ).isoformat(),
+    }
+    if terms != terms_expected:
         raise HTTPException(
             status_code=409, detail="renewal_rollover_response_terms_invalid"
         )
