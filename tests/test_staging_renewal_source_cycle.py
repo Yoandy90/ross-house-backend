@@ -276,9 +276,10 @@ def test_logout_failure_fails_cycle_after_cleanup(monkeypatch):
 
     inspection_count = 0
     workflow_count = 0
+    generation_count = 0
 
     def fake(base, path, token, method="GET", body=None):
-        nonlocal inspection_count, workflow_count
+        nonlocal inspection_count, workflow_count, generation_count
         if method == "GET" and "/renewal-source/" in path:
             inspection_count += 1
             if inspection_count == 2:
@@ -314,6 +315,14 @@ def test_logout_failure_fails_cycle_after_cleanup(monkeypatch):
                     "tenant_response": {"decision": "accept", "recorded": True},
                     "next_action": "generate_contract",
                 }
+        if (
+            method == "POST"
+            and path == "/api/admin/lease-renewals/p1/generate-contract"
+        ):
+            generation_count += 1
+            payload = dict(responses[(method, path)][1])
+            payload["idempotent"] = generation_count > 1
+            return 200, payload
         return responses[(method, path)]
 
     monkeypatch.setattr(cycle, "request_json", fake)
