@@ -141,6 +141,62 @@ async def test_modern_tenant_ambiguous_identity_fails_closed(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_modern_signature_rejects_duplicate_role_evidence(monkeypatch):
+    actor = {"_id": "app-user-1", "role": "tenant", "email": "tenant@example.com"}
+    async def canonical(_actor): return {"_id": "tenant-1"}
+    monkeypatch.setattr(signatures_router, "resolve_authenticated_tenant", canonical)
+    with pytest.raises(HTTPException) as exc:
+        await signatures_router._authorize_contract_signer(
+            actor,
+            {
+                "tenant_id": "tenant-1",
+                "status": "pending_signatures",
+                "tenant_signature": "data:image/png;base64,existing",
+            },
+            _DB(),
+        )
+    assert exc.value.status_code == 409
+    assert exc.value.detail == "contract_role_already_signed"
+
+
+@pytest.mark.asyncio
+async def test_legacy_admin_cannot_sign_terminal_or_duplicate_contract(monkeypatch):
+    admin = {"_id": "admin-1", "role": "admin", "email": "admin@example.com"}
+    async def fake_admin(_request): return admin
+    monkeypatch.setattr(legacy_guard, "auth_admin", fake_admin)
+
+    class Request:
+        client = None
+        async def json(self):
+            return {"signature": "data:image/png;base64,synthetic", "role": "admin"}
+
+    class Contracts:
+        def __init__(self, lease): self.lease = lease
+        async def find_one(self, query): return self.lease
+        async def update_one(self, query, update):
+            raise AssertionError("invalid signature must not write")
+
+    class DB:
+        def __init__(self, lease): self.rental_contracts = Contracts(lease)
+
+    for lease, detail in (
+        ({"_id": "lease", "status": "active"}, "contract_not_in_signable_state"),
+        ({
+            "_id": "lease",
+            "status": "pending_signatures",
+            "admin_signature": "data:image/png;base64,existing",
+        }, "contract_role_already_signed"),
+    ):
+        monkeypatch.setattr(legacy_guard, "get_db", lambda lease=lease: DB(lease))
+        with pytest.raises(HTTPException) as exc:
+            await legacy_guard.secure_legacy_lease_sign(
+                "507f1f77bcf86cd799439011", Request()
+            )
+        assert exc.value.status_code == 409
+        assert exc.value.detail == detail
+
+
+@pytest.mark.asyncio
 async def test_modern_signature_rejects_terminal_or_activation_states(monkeypatch):
     actor = {"_id": "app-user-1", "role": "tenant", "email": "tenant@example.com"}
     async def canonical(_actor): return {"_id": "tenant-1"}
@@ -162,13 +218,16 @@ def test_signatures_never_directly_activate_occupancy():
     assert "update_data['status'] = 'active'" not in modern
     assert "{'status': 'rented'" not in modern
     assert "startswith('data:image/')" in modern
-    assert 'write_filter = {"_id": object_id, "status": expected_status}' in legacy
+    assert 'signature_field: {"$in": [None, ""]}' in legacy
     assert "resolve_authenticated_tenant" in legacy
     assert 'find_one({\n            "email"' not in legacy
     assert "resolve_authenticated_tenant" in modern
     assert '"email": {"$regex"' not in modern
     assert "contract_not_in_signable_state" in modern
     assert "'status': expected_status" in modern
+    assert "update_field_absent = {update_field: {'$in': [None, '']}}" in modern
+    assert "contract_role_already_signed" in legacy
+    assert "contract_role_already_signed" in modern
 
 
 def test_secure_legacy_route_is_registered_before_historical_handler():
