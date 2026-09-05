@@ -177,6 +177,30 @@ def test_source_cycle_passes_and_cleans(monkeypatch):
                     "rollover": None,
                     "next_action": "collect_contract_signatures",
                 }
+            if workflow_count == 6:
+                return 200, {
+                    "proposal_id": "p1", "read_only": True,
+                    "contract": {
+                        "contract_id": "renewal-c1",
+                        "status": "pending_signatures",
+                        "tenant_signed": True,
+                        "landlord_or_admin_signed": False,
+                    },
+                    "rollover": None,
+                    "next_action": "collect_contract_signatures",
+                }
+            if workflow_count == 7:
+                return 200, {
+                    "proposal_id": "p1", "read_only": True,
+                    "contract": {
+                        "contract_id": "renewal-c1",
+                        "status": "pending_activation",
+                        "tenant_signed": True,
+                        "landlord_or_admin_signed": True,
+                    },
+                    "rollover": None,
+                    "next_action": "await_effective_date_or_rollover",
+                }
         if (
             method == "POST"
             and path == "/api/tenant/lease-renewals/p1/respond"
@@ -198,6 +222,14 @@ def test_source_cycle_passes_and_cleans(monkeypatch):
             payload = dict(responses[(method, path)][1])
             payload["idempotent"] = True
             return 200, payload
+        if method == "POST" and path == "/api/signatures/sign":
+            return 200, {
+                "success": True,
+                "signature_id": (
+                    "tenant-signature" if token == "tenant-session-token"
+                    else "admin-signature"
+                ),
+            }
         return responses[(method, path)]
 
     monkeypatch.setattr(cycle, "request_json", fake)
@@ -216,6 +248,10 @@ def test_source_cycle_passes_and_cleans(monkeypatch):
     assert "contract-generated-pending-signatures" in checks
     assert "contract-generation-idempotent" in checks
     assert "pending-signatures-state-verified" in checks
+    assert "tenant-signature-recorded" in checks
+    assert "tenant-signature-state-verified" in checks
+    assert "admin-signature-recorded" in checks
+    assert "pending-activation-state-verified" in checks
     assert "tenant-session-revoked" in checks
     assert "lifecycle-cleaned" in checks
     assert "no-source-residuals" in checks
