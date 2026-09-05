@@ -186,3 +186,13 @@ async def inspect_rollover_audit_chain(
         "events": safe_events,
     }
 
+
+async def ensure_indexes(db) -> None:
+    """Keep audit inspection bounded and enforce one event per chain step."""
+    await db.lease_renewal_rollover_audit.create_index(
+        [("rollover_id", 1), ("proposal_id", 1), ("sequence", 1)],
+        unique=True,
+    )
+    await db.lease_renewal_rollover_audit.create_index(
+        [("occurred_at", -1), ("rollover_id", 1)]
+    )

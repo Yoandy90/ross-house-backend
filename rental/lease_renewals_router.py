@@ -358,8 +358,30 @@ async def reject_proposal(proposal_id: str, body: Dict[str, Any] = Body(default=
 
 
 async def ensure_indexes(db) -> None:
-    try:
-        await db.lease_renewal_proposals.create_index("lease_id", unique=True)
-        await db.lease_renewal_proposals.create_index("status")
-    except Exception as e:
-        logger.warning(f"[lease-renewals] index: {e}")
+    """Create the complete renewal subsystem index contract.
+
+    Startup must fail this readiness step if any index cannot be created; a
+    partial index set must never be reported as ready.
+    """
+    await db.lease_renewal_proposals.create_index("lease_id", unique=True)
+    await db.lease_renewal_proposals.create_index("status")
+    await db.lease_renewal_proposals.create_index(
+        [("status", 1), ("days_until_end", 1), ("updated_at", -1)]
+    )
+
+    from .lease_renewal_contract_generation_router import ensure_indexes as contract_indexes
+    from .lease_renewal_notification_security_router import ensure_indexes as notification_indexes
+    from .lease_renewal_rollover_audit import ensure_indexes as rollover_audit_indexes
+    from .lease_renewal_rollover_recovery_audit import ensure_indexes as recovery_audit_indexes
+    from .lease_renewal_rollover_router import ensure_indexes as rollover_indexes
+    from .lease_renewal_tenant_response_router import ensure_indexes as response_indexes
+
+    for ensure in (
+        notification_indexes,
+        response_indexes,
+        contract_indexes,
+        rollover_indexes,
+        rollover_audit_indexes,
+        recovery_audit_indexes,
+    ):
+        await ensure(db)
