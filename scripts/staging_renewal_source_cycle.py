@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import os
+from datetime import date, timedelta
+from decimal import Decimal, InvalidOperation
 import sys
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -312,6 +314,90 @@ def run_cycle(raw_base: str, token: str) -> list[str]:
         ):
             raise CycleFailure("accepted workflow state mismatch")
         checks.append("accepted-state-verified")
+
+        status, generated = request_json(
+            base,
+            f"/api/admin/lease-renewals/{quote(proposal_id)}/generate-contract",
+            token,
+            method="POST",
+            body={},
+        )
+        generated = require(
+            status, generated, "renewal contract generation failed"
+        )
+        contract_id_new = str(generated.get("contract_id") or "")
+        expected_start = date.fromisoformat(
+            str(created.get("lease_end_date") or "")
+        ) + timedelta(days=1)
+        try:
+            generated_rent = Decimal(str(generated.get("rent_amount")))
+            proposed_rent = Decimal(str(matches[0].get("proposed_rent")))
+            generated_start = date.fromisoformat(str(generated.get("start_date") or ""))
+            generated_end = date.fromisoformat(str(generated.get("end_date") or ""))
+        except (InvalidOperation, TypeError, ValueError) as exc:
+            raise CycleFailure("generated contract values are invalid") from exc
+        if (
+            generated.get("ok") is not True
+            or generated.get("idempotent") is not False
+            or not contract_id_new
+            or generated.get("status") != "pending_signatures"
+            or generated.get("proposal_id") != proposal_id
+            or generated.get("prior_contract_id") != contract_id
+            or generated.get("terms_digest") != terms_digest
+            or generated.get("tenant_signed") is not False
+            or generated.get("landlord_or_admin_signed") is not False
+            or generated_start != expected_start
+            or generated_end < generated_start
+            or generated_rent != proposed_rent
+        ):
+            raise CycleFailure("generated renewal contract mismatch")
+        checks.append("contract-generated-pending-signatures")
+
+        status, repeated_contract = request_json(
+            base,
+            f"/api/admin/lease-renewals/{quote(proposal_id)}/generate-contract",
+            token,
+            method="POST",
+            body={},
+        )
+        repeated_contract = require(
+            status, repeated_contract, "renewal contract generation replay failed"
+        )
+        if (
+            repeated_contract.get("ok") is not True
+            or repeated_contract.get("idempotent") is not True
+            or repeated_contract.get("contract_id") != contract_id_new
+            or repeated_contract.get("status") != "pending_signatures"
+            or repeated_contract.get("start_date") != generated.get("start_date")
+            or repeated_contract.get("end_date") != generated.get("end_date")
+            or Decimal(str(repeated_contract.get("rent_amount"))) != proposed_rent
+        ):
+            raise CycleFailure("renewal contract generation is not idempotent")
+        checks.append("contract-generation-idempotent")
+
+        status, contract_workflow = request_json(
+            base,
+            f"/api/admin/lease-renewals/{quote(proposal_id)}/workflow-status",
+            token,
+        )
+        contract_workflow = require(
+            status, contract_workflow, "generated contract workflow read model failed"
+        )
+        contract_view = contract_workflow.get("contract") or {}
+        if (
+            contract_workflow.get("proposal_id") != proposal_id
+            or contract_workflow.get("read_only") is not True
+            or contract_view.get("contract_id") != contract_id_new
+            or contract_view.get("status") != "pending_signatures"
+            or contract_view.get("start_date") != generated.get("start_date")
+            or contract_view.get("end_date") != generated.get("end_date")
+            or contract_view.get("tenant_signed") is not False
+            or contract_view.get("landlord_or_admin_signed") is not False
+            or contract_workflow.get("rollover") is not None
+            or contract_workflow.get("next_action") != "collect_contract_signatures"
+        ):
+            raise CycleFailure("generated contract workflow state mismatch")
+        checks.append("pending-signatures-state-verified")
     except Exception as exc:
         primary_error = exc
     finally:
