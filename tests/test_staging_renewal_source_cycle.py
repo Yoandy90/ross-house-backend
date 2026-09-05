@@ -103,9 +103,10 @@ def test_logout_failure_fails_cycle_after_cleanup(monkeypatch):
     responses[("POST", "/api/auth/logout")] = (500, {"detail": "failed"})
 
     inspection_count = 0
+    workflow_count = 0
 
     def fake(base, path, token, method="GET", body=None):
-        nonlocal inspection_count
+        nonlocal inspection_count, workflow_count
         if method == "GET" and "/renewal-source/" in path:
             inspection_count += 1
             if inspection_count == 2:
@@ -115,6 +116,16 @@ def test_logout_failure_fails_cycle_after_cleanup(monkeypatch):
                         "tenant": False,
                         "contract": False,
                     }
+                }
+        if method == "GET" and path.endswith("/workflow-status"):
+            workflow_count += 1
+            if workflow_count == 2:
+                return 200, {
+                    "proposal_id": "p1",
+                    "read_only": True,
+                    "proposal": {"status": "approved"},
+                    "delivery": None,
+                    "next_action": "repair_notification_intent",
                 }
         return responses[(method, path)]
 
