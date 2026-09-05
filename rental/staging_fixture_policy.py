@@ -5,7 +5,7 @@ import re
 from collections.abc import Mapping
 
 _TRUTHY = {"1", "true", "yes", "on"}
-_MARKER = re.compile(r"^staging-renewal-[0-9a-f]{32}$")
+_MARKER = re.compile(r"^staging-(renewal|inspection)-[0-9a-f]{32}$")
 _EXTERNAL_DELIVERY_KEYS = (
     "SENDGRID_API_KEY",
     "TWILIO_ACCOUNT_SID",
