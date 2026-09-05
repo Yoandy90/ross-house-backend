@@ -22,6 +22,18 @@ from .shared import auth_admin, get_db
 
 router = APIRouter(prefix="/admin/lease-renewals", tags=["Lease Renewal Rollover Recovery"])
 
+_RECOVERY_STAGES_BY_STATE = {
+    "recovery_required": {
+        "claim_prior", "claim_renewal", "transfer_projections", "expire_prior",
+        "activate_renewal", "commit_record", "clear_prior_claim",
+        "clear_renewal_claim", "complete", "normalize_projections",
+    },
+    "committed": {
+        "clear_claims", "manual_recovery_clear_claims",
+        "manual_recovery_finalize_record",
+    },
+}
+
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
@@ -97,6 +109,7 @@ async def _observation(db, record: Dict[str, Any], old: Dict[str, Any], new: Dic
     return {
         "record_state": str(record.get("state") or ""),
         "record_stage": str(record.get("stage") or ""),
+        "automatic_retry_disabled": record.get("automatic_retry_allowed") is False,
         "prior_status": str(old.get("status") or ""),
         "renewal_status": str(new.get("status") or ""),
         "prior_claim": _relation(old.get("lifecycle_claim_id"), claim),
@@ -145,8 +158,15 @@ def _pending_confirmation(record: Dict[str, Any], current_digest: str):
 
 
 def _assert_recoverable(observed: Dict[str, Any]) -> None:
-    if observed["record_state"] not in {"recovery_required", "committed"}:
+    if not observed["automatic_retry_disabled"]:
+        raise HTTPException(status_code=409, detail="renewal_rollover_recovery_fence_invalid")
+    allowed_stages = _RECOVERY_STAGES_BY_STATE.get(observed["record_state"])
+    if allowed_stages is None:
         raise HTTPException(status_code=409, detail="renewal_rollover_recovery_state_invalid")
+    if observed["record_stage"] not in allowed_stages:
+        raise HTTPException(
+            status_code=409, detail="renewal_rollover_recovery_state_stage_invalid"
+        )
     if observed["prior_claim"] == "foreign" or observed["renewal_claim"] == "foreign":
         raise HTTPException(status_code=409, detail="renewal_rollover_recovery_foreign_claim")
     if not observed["prior_claim_target_exact"] or not observed["renewal_claim_target_exact"]:
