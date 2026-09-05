@@ -12,7 +12,8 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Dict, Optional
 
 from bson import ObjectId
-from fastapi import APIRouter, Depends, HTTPException, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
+from pydantic import BaseModel, Field
 from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError
 
@@ -22,6 +23,8 @@ router = APIRouter(tags=["inspection-delivery"])
 MAX_ATTEMPTS = 3
 CLAIM_TTL_SECONDS = 300
 _EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+_RETRYABLE_FAILURE_RE = re.compile(r"^(provider_not_configured|provider_http_(429|5\d\d))$")
+_DELIVERY_STATUSES = {"pending", "claimed", "retryable_failure", "sent", "failed", "ambiguous_provider_result"}
 
 
 class ProviderRetryableFailure(Exception):
@@ -317,6 +320,92 @@ async def process_claimed(db, intent: Dict[str, Any],
                           provider=confirmation.get("provider"),
                           provider_message_id=confirmation.get("provider_message_id"))
     return "sent" if saved else "claim_lost_after_provider_confirmation"
+
+
+class ManualDeliveryRetryRequest(BaseModel):
+    reason: str = Field(min_length=8, max_length=300)
+
+
+def _public_intent(row: Dict[str, Any]) -> Dict[str, Any]:
+    fields = (
+        "_id", "inspection_id", "tenant_id", "status", "attempts", "failure_code",
+        "provider", "provider_message_id", "created_by", "created_at", "updated_at",
+        "claimed_at", "provider_started_at", "sent_at", "manual_retry_at",
+        "manual_retry_by", "manual_retry_reason",
+    )
+    result = {key: row.get(key) for key in fields if row.get(key) is not None}
+    for key, value in list(result.items()):
+        if isinstance(value, (ObjectId, datetime)):
+            result[key] = str(value)
+    return result
+
+
+@router.get("/admin/inspections/delivery-outbox")
+async def list_delivery_outbox(
+    status: Optional[str] = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=100),
+    admin=Depends(auth_admin),
+    db=Depends(get_db),
+):
+    del admin
+    if status and status not in _DELIVERY_STATUSES:
+        raise HTTPException(status_code=400, detail="delivery_status_invalid")
+    query = {"status": status} if status else {}
+    rows = await db.inspection_delivery_outbox.find(query).sort("updated_at", -1).limit(limit).to_list(limit)
+    return {"success": True, "items": [_public_intent(row) for row in rows], "limit": limit}
+
+
+@router.post("/admin/inspections/delivery-outbox/{intent_id}/retry")
+async def retry_failed_delivery(
+    intent_id: str,
+    payload: ManualDeliveryRetryRequest,
+    admin=Depends(auth_admin),
+    db=Depends(get_db),
+):
+    if not ObjectId.is_valid(intent_id):
+        raise HTTPException(status_code=400, detail="delivery_intent_id_invalid")
+    current = await db.inspection_delivery_outbox.find_one({"_id": ObjectId(intent_id)})
+    if not current:
+        raise HTTPException(status_code=404, detail="delivery_intent_not_found")
+    if current.get("status") == "ambiguous_provider_result":
+        raise HTTPException(status_code=409, detail="ambiguous_delivery_manual_review_required")
+    failure_code = str(current.get("failure_code") or "")
+    if current.get("status") != "failed" or not _RETRYABLE_FAILURE_RE.fullmatch(failure_code):
+        raise HTTPException(status_code=409, detail="delivery_not_safely_retryable")
+
+    actor = str(admin.get("email") or admin.get("_id") or "admin") if isinstance(admin, dict) else str(admin)
+    now = _now()
+    updated = await db.inspection_delivery_outbox.find_one_and_update(
+        {"_id": ObjectId(intent_id), "status": "failed", "failure_code": failure_code},
+        {
+            "$set": {
+                "status": "pending",
+                "attempts": 0,
+                "automatic_retry_allowed": True,
+                "manual_retry_at": now,
+                "manual_retry_by": actor,
+                "manual_retry_reason": payload.reason.strip(),
+                "updated_at": now,
+            },
+            "$unset": {
+                "claim_id": "", "claimed_by": "", "claimed_at": "",
+                "provider_started_at": "", "sent_at": "",
+                "provider": "", "provider_message_id": "",
+            },
+        },
+        return_document=ReturnDocument.AFTER,
+    )
+    if not updated:
+        raise HTTPException(status_code=409, detail="delivery_retry_state_changed")
+    await db.admin_audit_logs.insert_one({
+        "admin_user_id": actor,
+        "action": "inspection_delivery_manual_retry",
+        "resource_type": "inspection_delivery_outbox",
+        "resource_id": intent_id,
+        "metadata": {"failure_code": failure_code, "reason": payload.reason.strip()},
+        "timestamp": now,
+    })
+    return {"success": True, "item": _public_intent(updated)}
 
 
 @router.post("/admin/inspections/delivery-outbox/process-next")
