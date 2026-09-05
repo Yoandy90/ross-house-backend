@@ -16,7 +16,7 @@ from typing import Any, Dict
 from bson import ObjectId
 from fastapi import APIRouter, Body, Depends, HTTPException
 
-from .lease_renewal_rollover_router import _load_pair
+from .lease_renewal_rollover_router import _assert_lineage, _load_pair
 from .property_mutation_lock import acquire_property_mutation_lock, release_property_mutation_lock
 from .shared import auth_admin, get_db
 
@@ -67,6 +67,7 @@ async def _record_and_pair(db, proposal_id: str, rollover_id: str):
     if not record:
         raise HTTPException(status_code=404, detail="renewal_rollover_not_found")
     old, new = await _load_pair(db, proposal_id)
+    await _assert_lineage(db, proposal_id, old, new)
     if (
         record.get("_id") != new["_id"]
         or
