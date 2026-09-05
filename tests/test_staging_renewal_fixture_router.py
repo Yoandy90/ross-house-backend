@@ -15,8 +15,17 @@ class Result:
         self.deleted_count = deleted_count
 
 
+def value(doc, path):
+    current = doc
+    for part in path.split("."):
+        if not isinstance(current, dict):
+            return None
+        current = current.get(part)
+    return current
+
+
 def matches(doc, query):
-    return all(doc.get(key) == value for key, value in query.items())
+    return all(value(doc, key) == expected for key, expected in query.items())
 
 
 class Collection:
@@ -43,6 +52,9 @@ class DB:
         self.tenants = Collection()
         self.rental_contracts = Collection()
         self.lease_renewal_proposals = Collection()
+        self.lease_renewal_responses = Collection()
+        self.lease_renewal_notification_outbox = Collection()
+        self.lease_renewal_rollovers = Collection()
 
 
 def allow(monkeypatch):
@@ -142,3 +154,73 @@ def test_server_registers_fixture_router_only_for_staging():
     source = open("server.py", encoding="utf-8").read()
     assert 'if _ENV == "staging":' in source
     assert "staging_renewal_fixture_router" in source
+
+
+def test_full_lifecycle_cleanup_verifies_and_deletes_exact_graph(monkeypatch):
+    from bson import ObjectId
+    from rental.lease_renewal_contract_generation_router import _renewal_contract_id
+
+    allow(monkeypatch)
+    db = DB()
+    created = run(fixtures.create_renewal_source(
+        {"confirmation": "CREATE_SYNTHETIC_RENEWAL"}, db, {}
+    ))
+    proposal_id = ObjectId()
+    proposal_text = str(proposal_id)
+    old_id = created["contract_id"]
+    property_id = created["property_id"]
+    tenant_id = created["tenant_id"]
+    renewal_id = _renewal_contract_id(proposal_text)
+
+    db.lease_renewal_proposals.docs.append({
+        "_id": proposal_id, "lease_id": old_id,
+        "property_id": property_id, "tenant_id": tenant_id,
+    })
+    db.lease_renewal_responses.docs.append({
+        "proposal_id": proposal_text, "lease_id": old_id,
+        "property_id": property_id, "tenant_id": tenant_id,
+    })
+    db.lease_renewal_notification_outbox.docs.append({
+        "proposal_id": proposal_text, "tenant_id": tenant_id,
+    })
+    db.rental_contracts.docs.append({
+        "_id": renewal_id, "property_id": property_id, "tenant_id": tenant_id,
+        "renewal_source": {
+            "proposal_id": proposal_text, "prior_contract_id": old_id,
+        },
+    })
+    db.lease_renewal_rollovers.docs.append({
+        "_id": renewal_id, "proposal_id": proposal_text,
+        "prior_contract_id": old_id, "renewal_contract_id": str(renewal_id),
+        "property_id": property_id, "tenant_id": tenant_id,
+    })
+
+    result = run(fixtures.delete_renewal_lifecycle(
+        created["marker"], "DELETE_SYNTHETIC_RENEWAL", db, {}
+    ))
+    assert result["clean"] is True
+    assert all(not collection.docs for collection in (
+        db.properties, db.tenants, db.rental_contracts,
+        db.lease_renewal_proposals, db.lease_renewal_responses,
+        db.lease_renewal_notification_outbox, db.lease_renewal_rollovers,
+    ))
+
+
+def test_full_cleanup_fails_closed_on_foreign_binding(monkeypatch):
+    from bson import ObjectId
+
+    allow(monkeypatch)
+    db = DB()
+    created = run(fixtures.create_renewal_source(
+        {"confirmation": "CREATE_SYNTHETIC_RENEWAL"}, db, {}
+    ))
+    db.lease_renewal_proposals.docs.append({
+        "_id": ObjectId(), "lease_id": created["contract_id"],
+        "property_id": str(ObjectId()), "tenant_id": created["tenant_id"],
+    })
+    with pytest.raises(HTTPException) as exc:
+        run(fixtures.delete_renewal_lifecycle(
+            created["marker"], "DELETE_SYNTHETIC_RENEWAL", db, {}
+        ))
+    assert exc.value.detail == "fixture_proposal_binding_changed"
+    assert db.properties.docs and db.rental_contracts.docs

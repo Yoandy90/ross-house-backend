@@ -9,6 +9,7 @@ from bson import ObjectId
 from fastapi import APIRouter, Body, Depends, HTTPException, Query
 
 from rental.shared import auth_admin, get_db
+from rental.lease_renewal_contract_generation_router import _renewal_contract_id
 from rental.staging_fixture_policy import (
     StagingFixturePolicyError,
     assert_staging_fixture_allowed,
@@ -198,4 +199,112 @@ async def delete_renewal_source(
         "marker": marker,
         "deleted": deleted,
         "clean": sum(deleted.values()) == 3,
+    }
+
+
+def _binding_mismatch(doc: dict | None, expected: dict) -> bool:
+    return bool(doc) and any(str(doc.get(key) or "") != str(value) for key, value in expected.items())
+
+
+@router.delete("/renewal-lifecycle/{marker}")
+async def delete_renewal_lifecycle(
+    marker: str,
+    confirmation: str = Query(default=""),
+    db=Depends(get_db),
+    admin=Depends(auth_admin),
+):
+    """Delete an exact synthetic renewal graph after verifying every binding."""
+    del admin
+    _assert_allowed()
+    marker = _marker_or_400(marker)
+    if confirmation != _DELETE_CONFIRMATION:
+        raise HTTPException(status_code=400, detail="fixture_delete_confirmation_required")
+
+    old = await db.rental_contracts.find_one(
+        {"staging_fixture_marker": marker, "synthetic": True}
+    )
+    prop = await db.properties.find_one(
+        {"staging_fixture_marker": marker, "synthetic": True}
+    )
+    tenant = await db.tenants.find_one(
+        {"staging_fixture_marker": marker, "synthetic": True}
+    )
+    if not old or not prop or not tenant:
+        raise HTTPException(status_code=409, detail="fixture_source_incomplete")
+
+    old_id, property_id, tenant_id = str(old["_id"]), str(prop["_id"]), str(tenant["_id"])
+    if _binding_mismatch(
+        old, {"property_id": property_id, "tenant_id": tenant_id}
+    ):
+        raise HTTPException(status_code=409, detail="fixture_source_binding_changed")
+
+    proposal = await db.lease_renewal_proposals.find_one({"lease_id": old_id})
+    proposal_id = str(proposal.get("_id") or "") if proposal else ""
+    expected = {
+        "lease_id": old_id,
+        "property_id": property_id,
+        "tenant_id": tenant_id,
+    }
+    if _binding_mismatch(proposal, expected):
+        raise HTTPException(status_code=409, detail="fixture_proposal_binding_changed")
+
+    response = outbox = renewal = rollover = None
+    renewal_id = None
+    if proposal:
+        if not ObjectId.is_valid(proposal_id):
+            raise HTTPException(status_code=409, detail="fixture_proposal_id_invalid")
+        renewal_id = _renewal_contract_id(proposal_id)
+        response = await db.lease_renewal_responses.find_one({"proposal_id": proposal_id})
+        outbox = await db.lease_renewal_notification_outbox.find_one({"proposal_id": proposal_id})
+        renewal = await db.rental_contracts.find_one({"_id": renewal_id})
+        rollover = await db.lease_renewal_rollovers.find_one({"_id": renewal_id})
+
+        if _binding_mismatch(response, {"proposal_id": proposal_id, **expected}):
+            raise HTTPException(status_code=409, detail="fixture_response_binding_changed")
+        if _binding_mismatch(outbox, {"proposal_id": proposal_id, "tenant_id": tenant_id}):
+            raise HTTPException(status_code=409, detail="fixture_outbox_binding_changed")
+        renewal_source = (renewal or {}).get("renewal_source") or {}
+        if renewal and (
+            _binding_mismatch(renewal, {"property_id": property_id, "tenant_id": tenant_id})
+            or _binding_mismatch(
+                renewal_source,
+                {"proposal_id": proposal_id, "prior_contract_id": old_id},
+            )
+        ):
+            raise HTTPException(status_code=409, detail="fixture_renewal_contract_binding_changed")
+        if _binding_mismatch(
+            rollover,
+            {
+                "proposal_id": proposal_id,
+                "prior_contract_id": old_id,
+                "renewal_contract_id": str(renewal_id),
+                "property_id": property_id,
+                "tenant_id": tenant_id,
+            },
+        ):
+            raise HTTPException(status_code=409, detail="fixture_rollover_binding_changed")
+
+    deleted: dict[str, int] = {}
+    if proposal:
+        targets = (
+            ("lease_renewal_rollovers", {"_id": renewal_id, "proposal_id": proposal_id}),
+            ("rental_contracts", {"_id": renewal_id, "renewal_source.proposal_id": proposal_id}),
+            ("lease_renewal_responses", {"proposal_id": proposal_id, "lease_id": old_id}),
+            ("lease_renewal_notification_outbox", {"proposal_id": proposal_id, "tenant_id": tenant_id}),
+            ("lease_renewal_proposals", {"_id": proposal["_id"], "lease_id": old_id}),
+        )
+        for name, query in targets:
+            result = await getattr(db, name).delete_many(query)
+            deleted[name] = int(result.deleted_count)
+
+    source_deleted = await _cleanup_source(db, marker)
+    for name, count in source_deleted.items():
+        deleted[f"source_{name}"] = count
+    clean = all(count == 1 for count in source_deleted.values())
+    return {
+        "ok": True,
+        "synthetic": True,
+        "marker": marker,
+        "deleted": deleted,
+        "clean": clean,
     }
