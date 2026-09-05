@@ -176,6 +176,44 @@ def run_cycle(raw_base: str, token: str) -> list[str]:
         ):
             raise CycleFailure("approved workflow state mismatch")
         checks.append("pending-delivery-verified")
+
+        status, simulated = request_json(
+            base,
+            f"/api/admin/staging-fixtures/renewal-delivery/{quote(marker)}",
+            token,
+            method="POST",
+            body={"confirmation": "SIMULATE_SYNTHETIC_DELIVERY"},
+        )
+        simulated = require(
+            status, simulated, "synthetic delivery simulation failed"
+        )
+        if (
+            simulated.get("synthetic") is not True
+            or simulated.get("proposal_id") != proposal_id
+            or simulated.get("status") != "sent"
+            or simulated.get("attempts") != 1
+            or simulated.get("provider") != "staging-simulator"
+        ):
+            raise CycleFailure("synthetic delivery simulation mismatch")
+        checks.append("delivery-simulated")
+
+        status, sent_workflow = request_json(
+            base,
+            f"/api/admin/lease-renewals/{quote(proposal_id)}/workflow-status",
+            token,
+        )
+        sent_workflow = require(
+            status, sent_workflow, "sent workflow read model failed"
+        )
+        if (
+            sent_workflow.get("proposal_id") != proposal_id
+            or sent_workflow.get("read_only") is not True
+            or (sent_workflow.get("delivery") or {}).get("status") != "sent"
+            or (sent_workflow.get("delivery") or {}).get("attempts") != 1
+            or sent_workflow.get("next_action") != "await_tenant_response"
+        ):
+            raise CycleFailure("simulated sent workflow state mismatch")
+        checks.append("sent-state-verified")
     except Exception as exc:
         primary_error = exc
     finally:
