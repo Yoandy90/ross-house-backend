@@ -89,3 +89,25 @@ def test_allows_only_explicit_mongo_placeholder_credentials(tmp_path):
     findings = scan_files(tmp_path, [target])
     assert labels(findings) == {"credentialed-mongo-uri"}
     assert realistic not in repr(findings)
+
+
+def test_blocks_sensitive_credential_filenames_even_without_key_content(tmp_path):
+    blocked = [
+        write(tmp_path, "ios/AuthKey_SAMPLE.p8", "placeholder"),
+        write(tmp_path, "android/google-play-service-account.json", "{}"),
+        write(tmp_path, "config/backup-service-account-key.json", "{}"),
+    ]
+    findings = scan_files(tmp_path, blocked)
+    assert len(findings) == 3
+    assert labels(findings) == {"sensitive-filename"}
+    assert all(finding.line == 0 for finding in findings)
+    assert {finding.path for finding in findings} == {
+        "ios/AuthKey_SAMPLE.p8",
+        "android/google-play-service-account.json",
+        "config/backup-service-account-key.json",
+    }
+
+
+def test_does_not_block_generic_public_configuration_filename(tmp_path):
+    target = write(tmp_path, "config/service-account.example.json", "{}")
+    assert scan_files(tmp_path, [target]) == []
