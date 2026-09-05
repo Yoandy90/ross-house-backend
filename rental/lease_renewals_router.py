@@ -48,6 +48,9 @@ from .shared import get_db, auth_admin
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/admin/lease-renewals", tags=["Lease Renewals"])
+# Historical handler functions below remain as helper-compatible code only.
+# Public routes are registered exclusively by lease_renewal_security_router so
+# security cannot depend on FastAPI route-registration order.
 
 MODEL_PROVIDER = "anthropic"
 MODEL_NAME = "claude-sonnet-4-5-20250929"
@@ -221,7 +224,6 @@ def _rule_based_recommendation(lease: Dict[str, Any], ctx: Dict[str, Any]) -> Di
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-@router.get("/proposals")
 async def list_proposals(status: Optional[str] = None, db=Depends(get_db), admin=Depends(auth_admin)):
     """List existing proposals + auto-generate for any lease ending soon that doesn't have one yet."""
     now = datetime.now(timezone.utc)
@@ -287,7 +289,6 @@ async def list_proposals(status: Optional[str] = None, db=Depends(get_db), admin
     return {"proposals": [_serialize(d) for d in docs], "total": len(docs)}
 
 
-@router.post("/refresh/{proposal_id}")
 async def refresh_proposal(proposal_id: str, db=Depends(get_db), admin=Depends(auth_admin)):
     doc = await db.lease_renewal_proposals.find_one({"_id": ObjectId(proposal_id)})
     if not doc:
@@ -313,7 +314,6 @@ async def refresh_proposal(proposal_id: str, db=Depends(get_db), admin=Depends(a
     return _serialize(updated)
 
 
-@router.patch("/{proposal_id}")
 async def edit_proposal(proposal_id: str, body: Dict[str, Any] = Body(...), db=Depends(get_db), admin=Depends(auth_admin)):
     updates: Dict[str, Any] = {}
     for k in ("proposed_rent", "recommendation", "rationale", "status"):
@@ -327,7 +327,6 @@ async def edit_proposal(proposal_id: str, body: Dict[str, Any] = Body(...), db=D
     return _serialize(d)
 
 
-@router.post("/{proposal_id}/approve")
 async def approve_proposal(proposal_id: str, db=Depends(get_db), admin=Depends(auth_admin)):
     """Approve + mark for tenant notification (email/SMS is queued in future 3c or handled here in future)."""
     doc = await db.lease_renewal_proposals.find_one({"_id": ObjectId(proposal_id)})
@@ -345,7 +344,6 @@ async def approve_proposal(proposal_id: str, db=Depends(get_db), admin=Depends(a
     return {"ok": True}
 
 
-@router.post("/{proposal_id}/reject")
 async def reject_proposal(proposal_id: str, body: Dict[str, Any] = Body(default={}), db=Depends(get_db), admin=Depends(auth_admin)):
     reason = (body or {}).get("reason", "")
     await db.lease_renewal_proposals.update_one(

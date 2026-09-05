@@ -107,21 +107,27 @@ def contract_and_proposal(status="draft"):
     return contract, proposal, prop
 
 
-def test_renewal_security_routes_win_runtime_precedence():
+def test_renewal_routes_have_one_canonical_security_handler():
     app = FastAPI()
     app.include_router(security_router, prefix="/api")
     app.include_router(historical_router, prefix="/api")
     expected = {
-        ("/api/admin/lease-renewals/proposals", "GET"): ("secure_list_proposals", "list_proposals"),
-        ("/api/admin/lease-renewals/refresh/{proposal_id}", "POST"): ("secure_refresh_proposal", "refresh_proposal"),
-        ("/api/admin/lease-renewals/{proposal_id}", "PATCH"): ("secure_edit_proposal", "edit_proposal"),
-        ("/api/admin/lease-renewals/{proposal_id}/approve", "POST"): ("secure_approve_proposal", "approve_proposal"),
-        ("/api/admin/lease-renewals/{proposal_id}/reject", "POST"): ("secure_reject_proposal", "reject_proposal"),
+        ("/api/admin/lease-renewals/proposals", "GET"): "secure_list_proposals",
+        ("/api/admin/lease-renewals/refresh/{proposal_id}", "POST"): "secure_refresh_proposal",
+        ("/api/admin/lease-renewals/{proposal_id}", "PATCH"): "secure_edit_proposal",
+        ("/api/admin/lease-renewals/{proposal_id}/approve", "POST"): "secure_approve_proposal",
+        ("/api/admin/lease-renewals/{proposal_id}/reject", "POST"): "secure_reject_proposal",
     }
-    for (path, method), names in expected.items():
-        matches = [r for r in app.routes if getattr(r, "path", None) == path and method in getattr(r, "methods", set())]
-        assert len(matches) == 2
-        assert (matches[0].name, matches[1].name) == names
+    for (path, method), name in expected.items():
+        matches = [
+            route
+            for route in app.routes
+            if getattr(route, "path", None) == path
+            and method in getattr(route, "methods", set())
+        ]
+        assert len(matches) == 1
+        assert matches[0].name == name
+    assert historical_router.routes == []
 
 
 def test_generic_edit_cannot_set_status(monkeypatch):
