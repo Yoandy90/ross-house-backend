@@ -11,8 +11,9 @@ def run(coro):
 
 
 class Result:
-    def __init__(self, deleted_count=0):
+    def __init__(self, deleted_count=0, matched_count=0):
         self.deleted_count = deleted_count
+        self.matched_count = matched_count
 
 
 def value(doc, path):
@@ -38,6 +39,13 @@ class Collection:
 
     async def find_one(self, query):
         return next((doc for doc in self.docs if matches(doc, query)), None)
+
+    async def update_one(self, query, update):
+        for doc in self.docs:
+            if matches(doc, query):
+                doc.update(update.get("$set", {}))
+                return Result(matched_count=1)
+        return Result(matched_count=0)
 
     async def delete_many(self, query):
         self.delete_queries.append(query)
@@ -224,3 +232,81 @@ def test_full_cleanup_fails_closed_on_foreign_binding(monkeypatch):
         ))
     assert exc.value.detail == "fixture_proposal_binding_changed"
     assert db.properties.docs and db.rental_contracts.docs
+
+
+def test_simulated_delivery_marks_only_exact_synthetic_intent(monkeypatch):
+    from bson import ObjectId
+
+    allow(monkeypatch)
+    db = DB()
+    created = run(fixtures.create_renewal_source(
+        {"confirmation": "CREATE_SYNTHETIC_RENEWAL"}, db, {}
+    ))
+    proposal_id = ObjectId()
+    db.lease_renewal_proposals.docs.append({
+        "_id": proposal_id,
+        "lease_id": created["contract_id"],
+        "property_id": created["property_id"],
+        "tenant_id": created["tenant_id"],
+        "status": "approved",
+    })
+    db.lease_renewal_notification_outbox.docs.append({
+        "_id": ObjectId(),
+        "proposal_id": str(proposal_id),
+        "lease_id": created["contract_id"],
+        "property_id": created["property_id"],
+        "tenant_id": created["tenant_id"],
+        "status": "pending",
+        "attempts": 0,
+    })
+
+    result = run(fixtures.simulate_renewal_delivery(
+        created["marker"],
+        {"confirmation": "SIMULATE_SYNTHETIC_DELIVERY"},
+        db,
+        {},
+    ))
+    assert result["status"] == "sent"
+    assert result["attempts"] == 1
+    intent = db.lease_renewal_notification_outbox.docs[0]
+    assert intent["status"] == "sent"
+    assert intent["provider"] == "staging-simulator"
+    assert intent["staging_simulated"] is True
+    assert intent["automatic_retry_allowed"] is False
+
+
+def test_simulated_delivery_fails_closed_on_foreign_binding(monkeypatch):
+    from bson import ObjectId
+
+    allow(monkeypatch)
+    db = DB()
+    created = run(fixtures.create_renewal_source(
+        {"confirmation": "CREATE_SYNTHETIC_RENEWAL"}, db, {}
+    ))
+    proposal_id = ObjectId()
+    db.lease_renewal_proposals.docs.append({
+        "_id": proposal_id,
+        "lease_id": created["contract_id"],
+        "property_id": created["property_id"],
+        "tenant_id": created["tenant_id"],
+        "status": "approved",
+    })
+    db.lease_renewal_notification_outbox.docs.append({
+        "_id": ObjectId(),
+        "proposal_id": str(proposal_id),
+        "lease_id": created["contract_id"],
+        "property_id": created["property_id"],
+        "tenant_id": str(ObjectId()),
+        "status": "pending",
+        "attempts": 0,
+    })
+
+    with pytest.raises(HTTPException) as exc:
+        run(fixtures.simulate_renewal_delivery(
+            created["marker"],
+            {"confirmation": "SIMULATE_SYNTHETIC_DELIVERY"},
+            db,
+            {},
+        ))
+    assert exc.value.detail == "fixture_outbox_binding_changed"
+    assert db.lease_renewal_notification_outbox.docs[0]["status"] == "pending"

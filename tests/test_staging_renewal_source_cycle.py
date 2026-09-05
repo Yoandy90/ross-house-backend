@@ -27,6 +27,16 @@ def success_responses():
                 "queued_now": True,
             }
         ),
+        ("POST", "/api/admin/staging-fixtures/renewal-delivery/staging-renewal-" + "a" * 32): (
+            200,
+            {
+                "synthetic": True,
+                "proposal_id": "p1",
+                "status": "sent",
+                "attempts": 1,
+                "provider": "staging-simulator",
+            },
+        ),
         (
             "GET",
             "/api/admin/lease-renewals/notification-outbox?status=pending&limit=200",
@@ -63,18 +73,24 @@ def test_source_cycle_passes_and_cleans(monkeypatch):
             and calls.count((method, path)) == 2
         ):
             return 200, {"consistent": False, "present": {"property": False, "tenant": False, "contract": False}}
-        if (
-            method == "GET"
-            and path == "/api/admin/lease-renewals/p1/workflow-status"
-            and calls.count((method, path)) == 2
-        ):
-            return 200, {
-                "proposal_id": "p1",
-                "read_only": True,
-                "proposal": {"status": "approved"},
-                "delivery": {"status": "pending", "attempts": 0},
-                "next_action": "send_notification",
-            }
+        if method == "GET" and path == "/api/admin/lease-renewals/p1/workflow-status":
+            workflow_count = calls.count((method, path))
+            if workflow_count == 2:
+                return 200, {
+                    "proposal_id": "p1",
+                    "read_only": True,
+                    "proposal": {"status": "approved"},
+                    "delivery": {"status": "pending", "attempts": 0},
+                    "next_action": "send_notification",
+                }
+            if workflow_count == 3:
+                return 200, {
+                    "proposal_id": "p1",
+                    "read_only": True,
+                    "proposal": {"status": "approved"},
+                    "delivery": {"status": "sent", "attempts": 1},
+                    "next_action": "await_tenant_response",
+                }
         return responses[(method, path)]
 
     monkeypatch.setattr(cycle, "request_json", fake)
@@ -83,6 +99,8 @@ def test_source_cycle_passes_and_cleans(monkeypatch):
     assert "proposal-approved" in checks
     assert "notification-intent-safe" in checks
     assert "pending-delivery-verified" in checks
+    assert "delivery-simulated" in checks
+    assert "sent-state-verified" in checks
     assert "lifecycle-cleaned" in checks
     assert "no-source-residuals" in checks
     assert calls[-1] == ("POST", "/api/auth/logout")
@@ -149,6 +167,14 @@ def test_logout_failure_fails_cycle_after_cleanup(monkeypatch):
                     "proposal": {"status": "approved"},
                     "delivery": {"status": "pending", "attempts": 0},
                     "next_action": "send_notification",
+                }
+            if workflow_count == 3:
+                return 200, {
+                    "proposal_id": "p1",
+                    "read_only": True,
+                    "proposal": {"status": "approved"},
+                    "delivery": {"status": "sent", "attempts": 1},
+                    "next_action": "await_tenant_response",
                 }
         return responses[(method, path)]
 
