@@ -252,6 +252,36 @@ def test_unclaimed_partial_authority_and_extra_actions_are_rejected():
     assert exc.value.detail == 'renewal_rollover_recovery_payload_invalid'
 
 
+def test_recovery_requires_disabled_retry_and_valid_state_stage_pair():
+    db, _proposal_id, record, old, new, *_ = fixture()
+    record["automatic_retry_allowed"] = True
+    observed = run(recovery._observation(db, record, old, new))
+    with pytest.raises(HTTPException) as exc:
+        recovery._assert_recoverable(observed)
+    assert exc.value.detail == "renewal_rollover_recovery_fence_invalid"
+
+    db, _proposal_id, record, old, new, *_ = fixture()
+    record.pop("automatic_retry_allowed")
+    observed = run(recovery._observation(db, record, old, new))
+    with pytest.raises(HTTPException) as exc:
+        recovery._assert_recoverable(observed)
+    assert exc.value.detail == "renewal_rollover_recovery_fence_invalid"
+
+    db, _proposal_id, record, old, new, *_ = fixture()
+    record["stage"] = "unknown_stage"
+    observed = run(recovery._observation(db, record, old, new))
+    with pytest.raises(HTTPException) as exc:
+        recovery._assert_recoverable(observed)
+    assert exc.value.detail == "renewal_rollover_recovery_state_stage_invalid"
+
+    record["state"] = "committed"
+    record["stage"] = "activate_renewal"
+    observed = run(recovery._observation(db, record, old, new))
+    with pytest.raises(HTTPException) as exc:
+        recovery._assert_recoverable(observed)
+    assert exc.value.detail == "renewal_rollover_recovery_state_stage_invalid"
+
+
 def test_failure_retains_recovery_fence_and_never_enables_automatic_retry():
     db, proposal_id, record, old, new, *_ = fixture(); proposed, _ = propose(db, proposal_id, record)
     db.rental_contracts.fail_on = lambda query, update: query.get('_id') == new['_id'] and update.get('$set', {}).get('status') == 'active'
