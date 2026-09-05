@@ -26,7 +26,14 @@ def value(doc, path):
 
 
 def matches(doc, query):
-    return all(value(doc, key) == expected for key, expected in query.items())
+    for key, expected in query.items():
+        actual = value(doc, key)
+        if isinstance(expected, dict) and "$in" in expected:
+            if actual not in expected["$in"]:
+                return False
+        elif actual != expected:
+            return False
+    return True
 
 
 class Collection:
@@ -44,6 +51,8 @@ class Collection:
         for doc in self.docs:
             if matches(doc, query):
                 doc.update(update.get("$set", {}))
+                for key in update.get("$unset", {}):
+                    doc.pop(key, None)
                 return Result(matched_count=1)
         return Result(matched_count=0)
 
@@ -63,6 +72,8 @@ class DB:
         self.lease_renewal_responses = Collection()
         self.lease_renewal_notification_outbox = Collection()
         self.lease_renewal_rollovers = Collection()
+        self.app_users = Collection()
+        self.auth_sessions = Collection()
 
 
 def allow(monkeypatch):
@@ -310,3 +321,70 @@ def test_simulated_delivery_fails_closed_on_foreign_binding(monkeypatch):
         ))
     assert exc.value.detail == "fixture_outbox_binding_changed"
     assert db.lease_renewal_notification_outbox.docs[0]["status"] == "pending"
+
+
+def test_synthetic_tenant_session_is_linked_and_session_bound(monkeypatch):
+    allow(monkeypatch)
+    db = DB()
+    created = run(fixtures.create_renewal_source(
+        {"confirmation": "CREATE_SYNTHETIC_RENEWAL"}, db, {}
+    ))
+
+    async def issue_token(user_id, email, role, request):
+        assert role == "tenant"
+        assert email.endswith("@invalid.example")
+        db.auth_sessions.docs.append({"user_id": user_id, "sid": "a" * 32})
+        return "synthetic-session-token"
+
+    monkeypatch.setattr(fixtures, "create_session_token", issue_token)
+    result = run(fixtures.create_renewal_tenant_session(
+        created["marker"],
+        None,
+        {"confirmation": "CREATE_SYNTHETIC_TENANT_SESSION"},
+        db,
+        {},
+    ))
+    assert result["token"] == "synthetic-session-token"
+    assert result["session_bound"] is True
+    assert len(db.app_users.docs) == len(db.auth_sessions.docs) == 1
+    user = db.app_users.docs[0]
+    tenant = db.tenants.docs[0]
+    assert user["role"] == "tenant"
+    assert user["tenant_id"] == created["tenant_id"]
+    assert tenant["app_user_id"] == str(user["_id"])
+    assert "password_hash" not in user
+
+    cleaned = run(fixtures.delete_renewal_lifecycle(
+        created["marker"], "DELETE_SYNTHETIC_RENEWAL", db, {}
+    ))
+    assert cleaned["clean"] is True
+    assert cleaned["deleted"]["app_users"] == 1
+    assert cleaned["deleted"]["auth_sessions"] == 1
+    assert db.app_users.docs == []
+    assert db.auth_sessions.docs == []
+
+
+def test_tenant_session_failure_rolls_back_identity(monkeypatch):
+    allow(monkeypatch)
+    db = DB()
+    created = run(fixtures.create_renewal_source(
+        {"confirmation": "CREATE_SYNTHETIC_RENEWAL"}, db, {}
+    ))
+
+    async def fail_token(user_id, email, role, request):
+        db.auth_sessions.docs.append({"user_id": user_id, "sid": "b" * 32})
+        raise RuntimeError("session failed")
+
+    monkeypatch.setattr(fixtures, "create_session_token", fail_token)
+    with pytest.raises(HTTPException) as exc:
+        run(fixtures.create_renewal_tenant_session(
+            created["marker"],
+            None,
+            {"confirmation": "CREATE_SYNTHETIC_TENANT_SESSION"},
+            db,
+            {},
+        ))
+    assert exc.value.detail == "fixture_tenant_session_rolled_back"
+    assert db.app_users.docs == []
+    assert db.auth_sessions.docs == []
+    assert "app_user_id" not in db.tenants.docs[0]

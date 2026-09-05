@@ -6,9 +6,9 @@ from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 from bson import ObjectId
-from fastapi import APIRouter, Body, Depends, HTTPException, Query
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
 
-from rental.shared import auth_admin, get_db
+from rental.shared import auth_admin, create_session_token, get_db
 from rental.lease_renewal_contract_generation_router import _renewal_contract_id
 from rental.staging_fixture_policy import (
     StagingFixturePolicyError,
@@ -20,6 +20,7 @@ router = APIRouter(prefix="/admin/staging-fixtures", tags=["staging-fixtures"])
 _CREATE_CONFIRMATION = "CREATE_SYNTHETIC_RENEWAL"
 _DELETE_CONFIRMATION = "DELETE_SYNTHETIC_RENEWAL"
 _SIMULATE_DELIVERY_CONFIRMATION = "SIMULATE_SYNTHETIC_DELIVERY"
+_CREATE_TENANT_SESSION_CONFIRMATION = "CREATE_SYNTHETIC_TENANT_SESSION"
 
 
 def _assert_allowed() -> None:
@@ -207,6 +208,100 @@ def _binding_mismatch(doc: dict | None, expected: dict) -> bool:
     return bool(doc) and any(str(doc.get(key) or "") != str(value) for key, value in expected.items())
 
 
+@router.post("/renewal-tenant-session/{marker}")
+async def create_renewal_tenant_session(
+    marker: str,
+    request: Request,
+    body: dict = Body(...),
+    db=Depends(get_db),
+    admin=Depends(auth_admin),
+):
+    """Create one session-bound synthetic tenant identity for the exact fixture."""
+    del admin
+    _assert_allowed()
+    marker = _marker_or_400(marker)
+    if (
+        set(body) != {"confirmation"}
+        or body.get("confirmation") != _CREATE_TENANT_SESSION_CONFIRMATION
+    ):
+        raise HTTPException(
+            status_code=400, detail="fixture_tenant_session_confirmation_required"
+        )
+
+    tenant = await db.tenants.find_one(
+        {"staging_fixture_marker": marker, "synthetic": True}
+    )
+    if not tenant:
+        raise HTTPException(status_code=409, detail="fixture_source_incomplete")
+    if str(tenant.get("app_user_id") or "").strip():
+        raise HTTPException(status_code=409, detail="fixture_tenant_identity_exists")
+    if await db.app_users.find_one(
+        {"staging_fixture_marker": marker, "synthetic": True}
+    ):
+        raise HTTPException(status_code=409, detail="fixture_tenant_identity_exists")
+
+    tenant_id = str(tenant["_id"])
+    user_id = ObjectId()
+    email = f"tenant-{marker}@invalid.example"
+    user = {
+        "_id": user_id,
+        "name": "STAGING TEST TENANT",
+        "email": email,
+        "phone": "",
+        "role": "tenant",
+        "status": "active",
+        "tenant_id": tenant_id,
+        "synthetic": True,
+        "staging_fixture_marker": marker,
+        "created_at": datetime.now(timezone.utc),
+    }
+    linked = False
+    try:
+        await db.app_users.insert_one(user)
+        result = await db.tenants.update_one(
+            {
+                "_id": tenant["_id"],
+                "staging_fixture_marker": marker,
+                "synthetic": True,
+                "app_user_id": {"$in": [None, ""]},
+            },
+            {"$set": {"app_user_id": str(user_id)}},
+        )
+        if getattr(result, "matched_count", 0) != 1:
+            raise RuntimeError("tenant link changed")
+        linked = True
+        token = await create_session_token(
+            str(user_id), email, "tenant", request
+        )
+    except Exception as exc:
+        await db.auth_sessions.delete_many({"user_id": str(user_id)})
+        if linked:
+            await db.tenants.update_one(
+                {"_id": tenant["_id"], "app_user_id": str(user_id)},
+                {"$unset": {"app_user_id": ""}},
+            )
+        await db.app_users.delete_many(
+            {
+                "_id": user_id,
+                "staging_fixture_marker": marker,
+                "synthetic": True,
+            }
+        )
+        raise HTTPException(
+            status_code=500, detail="fixture_tenant_session_rolled_back"
+        ) from exc
+
+    return {
+        "ok": True,
+        "synthetic": True,
+        "marker": marker,
+        "tenant_id": tenant_id,
+        "user_id": str(user_id),
+        "token": token,
+        "session_bound": True,
+    }
+
+
 @router.post("/renewal-delivery/{marker}")
 async def simulate_renewal_delivery(
     marker: str,
@@ -330,6 +425,29 @@ async def delete_renewal_lifecycle(
         raise HTTPException(status_code=409, detail="fixture_source_incomplete")
 
     old_id, property_id, tenant_id = str(old["_id"]), str(prop["_id"]), str(tenant["_id"])
+    linked_user_id = str(tenant.get("app_user_id") or "").strip()
+    app_user = None
+    if linked_user_id:
+        if not ObjectId.is_valid(linked_user_id):
+            raise HTTPException(status_code=409, detail="fixture_app_user_id_invalid")
+        app_user = await db.app_users.find_one({"_id": ObjectId(linked_user_id)})
+        if (
+            not app_user
+            or app_user.get("synthetic") is not True
+            or app_user.get("staging_fixture_marker") != marker
+            or app_user.get("role") != "tenant"
+            or str(app_user.get("tenant_id") or "") != tenant_id
+        ):
+            raise HTTPException(
+                status_code=409, detail="fixture_tenant_identity_binding_changed"
+            )
+    elif await db.app_users.find_one(
+        {"staging_fixture_marker": marker, "synthetic": True}
+    ):
+        raise HTTPException(
+            status_code=409, detail="fixture_tenant_identity_binding_changed"
+        )
+
     if _binding_mismatch(
         old, {"property_id": property_id, "tenant_id": tenant_id}
     ):
@@ -393,6 +511,21 @@ async def delete_renewal_lifecycle(
         for name, query in targets:
             result = await getattr(db, name).delete_many(query)
             deleted[name] = int(result.deleted_count)
+
+    if app_user:
+        session_result = await db.auth_sessions.delete_many(
+            {"user_id": str(app_user["_id"])}
+        )
+        deleted["auth_sessions"] = int(session_result.deleted_count)
+        user_result = await db.app_users.delete_many(
+            {
+                "_id": app_user["_id"],
+                "staging_fixture_marker": marker,
+                "synthetic": True,
+                "tenant_id": tenant_id,
+            }
+        )
+        deleted["app_users"] = int(user_result.deleted_count)
 
     source_deleted = await _cleanup_source(db, marker)
     for name, count in source_deleted.items():
