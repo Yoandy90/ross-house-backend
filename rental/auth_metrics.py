@@ -22,6 +22,10 @@ from .maintenance_security_router import router as maintenance_security_router
 from .maintenance_ownership_security_router import router as maintenance_ownership_security_router
 from .maintenance_dispatch_security_router import router as maintenance_dispatch_security_router
 from .inspection_security_router import router as inspection_security_router
+from .inspection_delivery_router import (
+    router as inspection_delivery_router,
+    ensure_indexes as ensure_inspection_delivery_indexes,
+)
 from .property_visibility_security_router import router as property_visibility_security_router
 from .property_archival_security_router import router as property_archival_security_router
 from .property_lifecycle_security_router import router as property_lifecycle_security_router
@@ -68,6 +72,7 @@ router.routes.extend(section8_security_router.routes)
 router.routes.extend(maintenance_security_router.routes)
 router.routes.extend(maintenance_ownership_security_router.routes)
 router.routes.extend(maintenance_dispatch_security_router.routes)
+router.routes.extend(inspection_delivery_router.routes)
 router.routes.extend(inspection_security_router.routes)
 router.routes.extend(property_visibility_security_router.routes)
 router.routes.extend(property_archival_security_router.routes)
@@ -113,11 +118,12 @@ async def _ensure_tenant_identity_indexes() -> None:
         # from starting. Runtime identity resolution still fails closed.
         logger.warning("tenant identity indexes deferred: %s", exc)
     try:
+        await ensure_inspection_delivery_indexes(get_db())
         await ensure_lease_renewal_notification_indexes(get_db())
         await ensure_lease_renewal_response_indexes(get_db())
         await ensure_lease_renewal_contract_generation_indexes(get_db())
         await ensure_lease_renewal_rollover_indexes(get_db())
-        logger.info("lease renewal notification, response, generation, and rollover indexes ready")
+        logger.info("inspection delivery and lease renewal indexes ready")
     except Exception as exc:
         logger.warning("lease renewal notification indexes deferred: %s", exc)
 
