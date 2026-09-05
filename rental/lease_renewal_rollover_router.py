@@ -16,6 +16,8 @@ from fastapi import APIRouter, Body, Depends, HTTPException
 from pymongo.errors import DuplicateKeyError
 
 from .lease_renewal_contract_generation_router import _renewal_contract_id
+from .lease_renewal_security_router import _rent
+from .lease_renewal_tenant_response_router import _digest
 from .property_mutation_lock import (
     acquire_property_mutation_lock,
     assert_property_lifecycle_recovery_clear,
@@ -61,6 +63,103 @@ async def _load_pair(db, proposal_id: str):
         if str(old.get(field) or "") != str(new.get(field) or ""):
             raise HTTPException(status_code=409, detail=f"renewal_rollover_{field}_mismatch")
     return old, new
+
+
+async def _assert_lineage(
+    db, proposal_id: str, old: Dict[str, Any], new: Dict[str, Any]
+) -> None:
+    proposal = await db.lease_renewal_proposals.find_one(
+        {"_id": ObjectId(proposal_id)}
+    )
+    if not proposal or proposal.get("status") != "approved":
+        raise HTTPException(status_code=409, detail="renewal_rollover_proposal_invalid")
+
+    expected = {
+        "lease_id": str(old["_id"]),
+        "property_id": str(old.get("property_id") or ""),
+        "tenant_id": str(old.get("tenant_id") or ""),
+    }
+    if any(str(proposal.get(key) or "") != value for key, value in expected.items()):
+        raise HTTPException(
+            status_code=409, detail="renewal_rollover_proposal_binding_changed"
+        )
+    if str(proposal.get("unit_id") or old.get("unit_id") or "").strip() != str(
+        old.get("unit_id") or ""
+    ).strip():
+        raise HTTPException(
+            status_code=409, detail="renewal_rollover_proposal_unit_changed"
+        )
+
+    responses = await db.lease_renewal_responses.find(
+        {"proposal_id": proposal_id}
+    ).limit(2).to_list(2)
+    if len(responses) != 1:
+        raise HTTPException(
+            status_code=409, detail="renewal_rollover_response_cardinality_invalid"
+        )
+    response = responses[0]
+    if response.get("_id") != proposal.get("_id") or response.get("decision") != "accept":
+        raise HTTPException(status_code=409, detail="renewal_rollover_response_invalid")
+    if any(str(response.get(key) or "") != value for key, value in expected.items()):
+        raise HTTPException(
+            status_code=409, detail="renewal_rollover_response_binding_changed"
+        )
+
+    terms = response.get("terms")
+    if not isinstance(terms, dict):
+        raise HTTPException(
+            status_code=409, detail="renewal_rollover_response_terms_invalid"
+        )
+    recommendation = str(proposal.get("recommendation") or "").strip().lower()
+    if recommendation not in {"renew", "raise"}:
+        raise HTTPException(
+            status_code=409, detail="renewal_rollover_proposal_recommendation_invalid"
+        )
+    terms_expected = {
+        "proposal_id": proposal_id,
+        **expected,
+        "recommendation": recommendation,
+        "current_rent": f"{_rent(old.get('rent_amount'), 'renewal_rollover_prior_rent_invalid'):.2f}",
+        "proposed_rent": f"{_rent(proposal.get('proposed_rent'), 'renewal_rollover_proposal_rent_invalid'):.2f}",
+        "lease_end_date": _date(
+            old.get("end_date"), "renewal_prior_end_date_invalid"
+        ).isoformat(),
+    }
+    if terms != terms_expected:
+        raise HTTPException(
+            status_code=409, detail="renewal_rollover_response_terms_invalid"
+        )
+    digest = _digest(terms)
+    stored_digest = str(response.get("terms_digest") or "").lower()
+    source = new.get("renewal_source") or {}
+    if (
+        len(stored_digest) != 64
+        or not secrets.compare_digest(stored_digest, digest)
+        or str(source.get("response_id") or "") != str(response["_id"])
+        or not secrets.compare_digest(
+            str(source.get("terms_digest") or "").lower(), digest
+        )
+    ):
+        raise HTTPException(
+            status_code=409, detail="renewal_rollover_terms_lineage_changed"
+        )
+
+    response_rent = _rent(
+        terms.get("proposed_rent"), "renewal_rollover_response_rent_invalid"
+    )
+    proposal_rent = _rent(
+        proposal.get("proposed_rent"), "renewal_rollover_proposal_rent_invalid"
+    )
+    renewal_rent = _rent(
+        new.get("rent_amount"), "renewal_rollover_contract_rent_invalid"
+    )
+    if (
+        abs(response_rent - proposal_rent) > 0.005
+        or abs(renewal_rent - proposal_rent) > 0.005
+    ):
+        raise HTTPException(
+            status_code=409, detail="renewal_rollover_rent_lineage_changed"
+        )
 
 
 def _assert_ready(old: Dict[str, Any], new: Dict[str, Any], today: date) -> None:
@@ -149,6 +248,7 @@ async def _rollover_under_lock(db, proposal_id: str, actor: str, today: Optional
         ):
             return {"ok": True, "idempotent": True, "state": "committed", "contract_id": str(new["_id"])}
         raise HTTPException(status_code=409, detail="renewal_rollover_recovery_pending")
+    await _assert_lineage(db, proposal_id, old, new)
     _assert_ready(old, new, today or _now().date())
     await _assert_single_active(db, old)
 

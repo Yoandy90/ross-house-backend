@@ -6,6 +6,7 @@ from bson import ObjectId
 from fastapi import HTTPException
 
 import rental.lease_renewal_rollover_router as rollover
+import rental.lease_renewal_tenant_response_router as tenant_response
 from rental.lease_renewal_contract_generation_router import _renewal_contract_id
 
 
@@ -62,14 +63,65 @@ class Collection:
 
 
 def fixture():
-    proposal_id = str(ObjectId()); old_id = ObjectId(); new_id = _renewal_contract_id(proposal_id)
-    pid, tid = ObjectId(), ObjectId(); start = date.today(); old_end = start - timedelta(days=1)
-    old = {'_id': old_id, 'status': 'active', 'property_id': str(pid), 'tenant_id': str(tid), 'unit_id': None, 'end_date': old_end.isoformat()}
-    new = {'_id': new_id, 'status': 'pending_activation', 'property_id': str(pid), 'tenant_id': str(tid), 'unit_id': None, 'start_date': start.isoformat(), 'end_date': (start + timedelta(days=365)).isoformat(), 'tenant_signature': 'tenant-sig', 'admin_signature': 'admin-sig', 'renewal_source': {'proposal_id': proposal_id, 'prior_contract_id': str(old_id)}}
-    prop = {'_id': pid, 'status': 'rented', 'status_manually_set': False, 'current_contract_id': str(old_id), 'current_tenant_id': str(tid)}
-    tenant = {'_id': tid, 'current_contract_id': str(old_id), 'current_property_id': str(pid), 'current_unit_id': None}
+    proposal_oid = ObjectId()
+    proposal_id = str(proposal_oid)
+    old_id = ObjectId()
+    new_id = _renewal_contract_id(proposal_id)
+    pid, tid = ObjectId(), ObjectId()
+    start = date.today()
+    old_end = start - timedelta(days=1)
+    old = {
+        '_id': old_id, 'status': 'active', 'property_id': str(pid),
+        'tenant_id': str(tid), 'unit_id': None, 'end_date': old_end.isoformat(),
+        'rent_amount': 1200.0,
+    }
+    proposal = {
+        '_id': proposal_oid, 'status': 'approved', 'lease_id': str(old_id),
+        'property_id': str(pid), 'tenant_id': str(tid), 'unit_id': None,
+        'recommendation': 'renew', 'current_rent': 1200.0,
+        'proposed_rent': 1250.0, 'lease_end_date': old_end.isoformat(),
+    }
+    terms = {
+        'proposal_id': proposal_id, 'lease_id': str(old_id),
+        'property_id': str(pid), 'tenant_id': str(tid),
+        'recommendation': 'renew', 'current_rent': '1200.00',
+        'proposed_rent': '1250.00', 'lease_end_date': old_end.isoformat(),
+    }
+    digest = tenant_response._digest(terms)
+    response = {
+        '_id': proposal_oid, 'proposal_id': proposal_id, 'decision': 'accept',
+        'lease_id': str(old_id), 'property_id': str(pid), 'tenant_id': str(tid),
+        'terms': terms, 'terms_digest': digest,
+    }
+    new = {
+        '_id': new_id, 'status': 'pending_activation',
+        'property_id': str(pid), 'tenant_id': str(tid), 'unit_id': None,
+        'start_date': start.isoformat(),
+        'end_date': (start + timedelta(days=365)).isoformat(),
+        'rent_amount': 1250.0, 'tenant_signature': 'tenant-sig',
+        'admin_signature': 'admin-sig',
+        'renewal_source': {
+            'proposal_id': proposal_id, 'response_id': proposal_id,
+            'prior_contract_id': str(old_id), 'terms_digest': digest,
+        },
+    }
+    prop = {
+        '_id': pid, 'status': 'rented', 'status_manually_set': False,
+        'current_contract_id': str(old_id), 'current_tenant_id': str(tid),
+    }
+    tenant = {
+        '_id': tid, 'current_contract_id': str(old_id),
+        'current_property_id': str(pid), 'current_unit_id': None,
+    }
     class DB: pass
-    db = DB(); db.rental_contracts = Collection([old, new]); db.properties = Collection([prop]); db.property_units = Collection(); db.tenants = Collection([tenant]); db.lease_renewal_rollovers = Collection()
+    db = DB()
+    db.rental_contracts = Collection([old, new])
+    db.properties = Collection([prop])
+    db.property_units = Collection()
+    db.tenants = Collection([tenant])
+    db.lease_renewal_proposals = Collection([proposal])
+    db.lease_renewal_responses = Collection([response])
+    db.lease_renewal_rollovers = Collection()
     return db, proposal_id, old, new, prop, tenant
 
 
@@ -133,6 +185,45 @@ def test_competing_active_resource_authority_fails_before_claim():
         run(rollover._rollover_under_lock(db, proposal_id, 'admin', date.today()))
     assert exc.value.detail == 'renewal_rollover_resource_active_authority_changed'
     assert db.lease_renewal_rollovers.docs == []
+
+
+def test_tampered_response_digest_or_contract_rent_fails_before_claim():
+    db, proposal_id, _old, _new, *_ = fixture()
+    db.lease_renewal_responses.docs[0]['terms']['proposed_rent'] = '1.00'
+    with pytest.raises(HTTPException) as exc:
+        run(rollover._rollover_under_lock(db, proposal_id, 'admin', date.today()))
+    assert exc.value.detail == 'renewal_rollover_response_terms_invalid'
+    assert db.lease_renewal_rollovers.docs == []
+
+    db, proposal_id, _old, new, *_ = fixture()
+    new['renewal_source']['terms_digest'] = '0' * 64
+    with pytest.raises(HTTPException) as exc:
+        run(rollover._rollover_under_lock(db, proposal_id, 'admin', date.today()))
+    assert exc.value.detail == 'renewal_rollover_terms_lineage_changed'
+    assert db.lease_renewal_rollovers.docs == []
+
+    db, proposal_id, _old, new, *_ = fixture()
+    new['rent_amount'] = 1.0
+    with pytest.raises(HTTPException) as exc:
+        run(rollover._rollover_under_lock(db, proposal_id, 'admin', date.today()))
+    assert exc.value.detail == 'renewal_rollover_rent_lineage_changed'
+    assert db.lease_renewal_rollovers.docs == []
+
+
+def test_duplicate_or_declined_response_fails_before_claim():
+    db, proposal_id, _old, _new, *_ = fixture()
+    db.lease_renewal_responses.docs.append(
+        dict(db.lease_renewal_responses.docs[0])
+    )
+    with pytest.raises(HTTPException) as exc:
+        run(rollover._rollover_under_lock(db, proposal_id, 'admin', date.today()))
+    assert exc.value.detail == 'renewal_rollover_response_cardinality_invalid'
+
+    db, proposal_id, _old, _new, *_ = fixture()
+    db.lease_renewal_responses.docs[0]['decision'] = 'decline'
+    with pytest.raises(HTTPException) as exc:
+        run(rollover._rollover_under_lock(db, proposal_id, 'admin', date.today()))
+    assert exc.value.detail == 'renewal_rollover_response_invalid'
 
 
 def test_partial_failure_retains_claim_and_requires_recovery():
