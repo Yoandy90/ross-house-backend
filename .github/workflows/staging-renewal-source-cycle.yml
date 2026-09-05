@@ -32,4 +32,4 @@ jobs:
         env:
           STAGING_BASE_URL: ${{ vars.STAGING_BASE_URL }}
           STAGING_ADMIN_TOKEN: ${{ secrets.STAGING_ADMIN_TOKEN }}
-        run: python scripts/staging_renewal_source_cycle.py
+        run: python -m scripts.staging_renewal_source_cycle
