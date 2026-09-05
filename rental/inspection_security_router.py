@@ -6,7 +6,12 @@ from canonical rental records rather than accepted from the client.
 """
 from __future__ import annotations
 
+import base64
+import binascii
+import hashlib
 import json
+import re
+import uuid
 from datetime import datetime, timezone
 from typing import Any
 
@@ -21,6 +26,8 @@ router = APIRouter(tags=["inspection-security"])
 _TYPES = {"move_in", "move_out", "routine"}
 _TRANSITIONS = {"pending": {"pending", "in_progress"}, "in_progress": {"in_progress", "completed"}}
 _MAX_ROOMS_BYTES = 100_000
+_MAX_SIGNATURE_BYTES = 350_000
+_SIGNATURE_RE = re.compile(r"^data:image/(png|jpeg);base64,([A-Za-z0-9+/=]+)$")
 
 
 def _oid(value: Any, detail: str) -> ObjectId:
@@ -162,6 +169,79 @@ async def update_inspection(inspection_id: str, request: Request):
     if getattr(result, "matched_count", 0) != 1:
         raise HTTPException(status_code=409, detail="inspection_state_changed")
     return {"success": True, "inspection": _view({**current, **update})}
+
+
+def _signature_image(value: Any) -> tuple[str, str]:
+    if not isinstance(value, str) or len(value) > 500_000:
+        raise HTTPException(status_code=413, detail="inspection_signature_too_large")
+    match = _SIGNATURE_RE.fullmatch(value)
+    if not match:
+        raise HTTPException(status_code=400, detail="inspection_signature_format_invalid")
+    try:
+        decoded = base64.b64decode(match.group(2), validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="inspection_signature_format_invalid") from exc
+    if not decoded or len(decoded) > _MAX_SIGNATURE_BYTES:
+        raise HTTPException(status_code=413, detail="inspection_signature_too_large")
+    return value, hashlib.sha256(decoded).hexdigest()
+
+
+@router.post('/admin/inspections/{inspection_id}/signatures/{signer}')
+async def sign_inspection(inspection_id: str, signer: str, request: Request):
+    admin = await auth_admin(request)
+    if signer not in {"admin", "tenant"}:
+        raise HTTPException(status_code=400, detail="inspection_signer_invalid")
+    data = await request.json()
+    if not isinstance(data, dict) or data.get("consent_acknowledged") is not True:
+        raise HTTPException(status_code=400, detail="inspection_signature_consent_required")
+    signer_name = _text(data.get("signer_name"), limit=160, detail="inspection_signer_name_invalid")
+    if not signer_name:
+        raise HTTPException(status_code=400, detail="inspection_signer_name_required")
+    image_data_url, image_sha256 = _signature_image(data.get("signature_data_url"))
+
+    db = get_db()
+    oid = _oid(inspection_id, "inspection_id_invalid")
+    current = await db.inspections.find_one({"_id": oid})
+    if not current:
+        raise HTTPException(status_code=404, detail="inspection_not_found")
+    if current.get("archived_at"):
+        raise HTTPException(status_code=409, detail="inspection_archived")
+    if current.get("status") != "in_progress":
+        raise HTTPException(status_code=409, detail="inspection_signature_requires_in_progress")
+    if (current.get("signatures") or {}).get(signer):
+        raise HTTPException(status_code=409, detail="inspection_signature_immutable")
+
+    now = datetime.now(timezone.utc)
+    actor = str(admin.get("email") or admin.get("_id") or "admin") if isinstance(admin, dict) else str(admin)
+    client = getattr(request, "client", None)
+    evidence_id = uuid.uuid4().hex
+    evidence = {
+        "evidence_id": evidence_id,
+        "signer_role": signer,
+        "signer_name": signer_name,
+        "consent_acknowledged": True,
+        "signature_data_url": image_data_url,
+        "signature_sha256": image_sha256,
+        "signed_at": now.isoformat(),
+        "captured_by": actor,
+        "source_ip": str(getattr(client, "host", "") or "")[:64],
+    }
+    event = {key: value for key, value in evidence.items() if key != "signature_data_url"}
+    result = await db.inspections.update_one(
+        {
+            "_id": oid,
+            "status": "in_progress",
+            "archived_at": {"$exists": False},
+            f"signatures.{signer}": {"$exists": False},
+        },
+        {
+            "$set": {f"signatures.{signer}": evidence, "updated_at": now},
+            "$push": {"signature_events": event},
+        },
+    )
+    if getattr(result, "matched_count", 0) != 1:
+        raise HTTPException(status_code=409, detail="inspection_signature_state_changed")
+    return {"success": True, "signature": event}
 
 
 @router.delete('/admin/inspections/{inspection_id}')
