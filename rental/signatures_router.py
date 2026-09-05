@@ -71,6 +71,8 @@ async def _authorize_contract_signer(user: dict, contract: dict, db) -> tuple[st
         if not landlord_id or landlord_id != user_id:
             raise HTTPException(403, "No autorizado para firmar este contrato")
     _assert_contract_signing_state(contract, role)
+    if contract.get(f'{role}_signature'):
+        raise HTTPException(409, "contract_role_already_signed")
     return role, my_ids
 
 
@@ -205,9 +207,20 @@ async def submit_signature(request: Request):
         elif role == 'tenant':
             update_data['status'] = 'pending_signatures'
         expected_status = contract.get('status')
-        write_filter = {'_id': object_id, 'status': expected_status, 'updated_at': contract.get('updated_at')}
+        update_field_absent = {update_field: {'$in': [None, '']}}
+        write_filter = {
+            '_id': object_id,
+            'status': expected_status,
+            'updated_at': contract.get('updated_at'),
+            **update_field_absent,
+        }
         if contract.get('updated_at') is None:
-            write_filter = {'_id': object_id, 'status': expected_status, 'updated_at': {'$exists': False}}
+            write_filter = {
+                '_id': object_id,
+                'status': expected_status,
+                'updated_at': {'$exists': False},
+                **update_field_absent,
+            }
         write_result = await db.rental_contracts.update_one(write_filter, {'$set': update_data})
         if getattr(write_result, 'matched_count', 0) != 1:
             await db.signatures.update_one({'_id': result.inserted_id},
