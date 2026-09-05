@@ -20,7 +20,29 @@ def success_responses():
             200, {"proposal_id": "p1", "read_only": True}
         ),
         ("POST", "/api/admin/lease-renewals/p1/approve"): (
-            200, {"ok": True, "status": "approved"}
+            200, {
+                "ok": True,
+                "status": "approved",
+                "notification_queued": True,
+                "queued_now": True,
+            }
+        ),
+        (
+            "GET",
+            "/api/admin/lease-renewals/notification-outbox?status=pending&limit=200",
+        ): (
+            200,
+            {
+                "notifications": [
+                    {
+                        "proposal_id": "p1",
+                        "tenant_id": "t1",
+                        "status": "pending",
+                        "attempts": 0,
+                    }
+                ],
+                "total": 1,
+            },
         ),
         ("DELETE", "/api/admin/staging-fixtures/renewal-lifecycle/staging-renewal-" + "a" * 32 + "?confirmation=DELETE_SYNTHETIC_RENEWAL"): (
             200, {"clean": True}
@@ -50,8 +72,8 @@ def test_source_cycle_passes_and_cleans(monkeypatch):
                 "proposal_id": "p1",
                 "read_only": True,
                 "proposal": {"status": "approved"},
-                "delivery": None,
-                "next_action": "repair_notification_intent",
+                "delivery": {"status": "pending", "attempts": 0},
+                "next_action": "send_notification",
             }
         return responses[(method, path)]
 
@@ -59,7 +81,8 @@ def test_source_cycle_passes_and_cleans(monkeypatch):
     checks = cycle.run_cycle(BASE, TOKEN)
     assert "proposal-generated" in checks
     assert "proposal-approved" in checks
-    assert "approved-state-verified" in checks
+    assert "notification-intent-safe" in checks
+    assert "pending-delivery-verified" in checks
     assert "lifecycle-cleaned" in checks
     assert "no-source-residuals" in checks
     assert calls[-1] == ("POST", "/api/auth/logout")
@@ -124,8 +147,8 @@ def test_logout_failure_fails_cycle_after_cleanup(monkeypatch):
                     "proposal_id": "p1",
                     "read_only": True,
                     "proposal": {"status": "approved"},
-                    "delivery": None,
-                    "next_action": "repair_notification_intent",
+                    "delivery": {"status": "pending", "attempts": 0},
+                    "next_action": "send_notification",
                 }
         return responses[(method, path)]
 
