@@ -16,6 +16,14 @@ from rental.tenant_integrity import resolve_authenticated_tenant
 router = APIRouter(tags=["lease-signature-security"])
 _ALLOWED_ROLES = {"tenant", "landlord", "admin"}
 _TENANT_ROLES = {"tenant", "client"}
+_SIGNABLE_STATES = {
+    "tenant": {"pending_tenant", "pending_signatures"},
+    "landlord": {"pending_landlord", "pending_signatures"},
+    "admin": {
+        "draft", "pending", "pending_signature", "pending_signatures",
+        "pending_tenant", "pending_landlord",
+    },
+}
 
 
 def _norm(value) -> str:
@@ -103,9 +111,15 @@ async def secure_legacy_lease_sign(lease_id: str, request: Request):
     if not lease:
         raise HTTPException(status_code=404, detail="Contrato no encontrado")
     actor = await _authorize_actor(request, lease, signer_role)
+    expected_status = _norm(lease.get("status")).lower()
+    if expected_status not in _SIGNABLE_STATES[signer_role]:
+        raise HTTPException(status_code=409, detail="contract_not_in_signable_state")
+    signature_field = f"{signer_role}_signature"
+    if lease.get(signature_field):
+        raise HTTPException(status_code=409, detail="contract_role_already_signed")
+
     now = datetime.utcnow()
     update = {"updated_at": now}
-    expected_status = lease.get("status")
 
     if signer_role == "tenant":
         if expected_status not in ["pending_tenant", "pending_signatures"]:
@@ -130,7 +144,11 @@ async def secure_legacy_lease_sign(lease_id: str, request: Request):
         if lease.get("tenant_signature") and (lease.get("landlord_signature") or not lease.get("landlord_id")):
             update["status"] = "pending_activation"
 
-    write_filter = {"_id": object_id, "status": expected_status}
+    write_filter = {
+        "_id": object_id,
+        "status": expected_status,
+        signature_field: {"$in": [None, ""]},
+    }
     result = await db.rental_contracts.update_one(write_filter, {"$set": update})
     if getattr(result, "matched_count", 0) != 1:
         raise HTTPException(status_code=409, detail="lease_signature_state_changed")
