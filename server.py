@@ -537,6 +537,10 @@ try:
     app.include_router(manual_confirmations_router, prefix="/api")
     app.include_router(property_taxes_router, prefix="/api")
     app.include_router(admin_nav_router, prefix="/api")
+    # Synthetic fixture routes do not exist outside the explicit staging environment.
+    if _ENV == "staging":
+        from rental.staging_renewal_fixture_router import router as staging_fixture_router
+        app.include_router(staging_fixture_router, prefix="/api")
     # ensure_indexes() awaited inside lifespan startup.
 
     logger.info("  ✅ Credit Builder Router")
