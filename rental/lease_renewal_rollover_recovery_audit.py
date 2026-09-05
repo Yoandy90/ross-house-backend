@@ -116,7 +116,6 @@ async def append_recovery_audit_event(
     document = {
         "_id": _event_id(rollover_id, proposal_id, recovery_id, event),
         **body,
-        "integr_digest": digest,
         "integrity_digest": digest,
         "occurred_at": datetime.now(timezone.utc),
     }
