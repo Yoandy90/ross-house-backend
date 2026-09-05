@@ -192,6 +192,13 @@ def test_tampered_response_digest_or_contract_rent_fails_before_claim():
     db.lease_renewal_responses.docs[0]['terms']['proposed_rent'] = '1.00'
     with pytest.raises(HTTPException) as exc:
         run(rollover._rollover_under_lock(db, proposal_id, 'admin', date.today()))
+    assert exc.value.detail == 'renewal_rollover_response_terms_invalid'
+    assert db.lease_renewal_rollovers.docs == []
+
+    db, proposal_id, _old, new, *_ = fixture()
+    new['renewal_source']['terms_digest'] = '0' * 64
+    with pytest.raises(HTTPException) as exc:
+        run(rollover._rollover_under_lock(db, proposal_id, 'admin', date.today()))
     assert exc.value.detail == 'renewal_rollover_terms_lineage_changed'
     assert db.lease_renewal_rollovers.docs == []
 
