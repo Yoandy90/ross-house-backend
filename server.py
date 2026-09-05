@@ -16,6 +16,8 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 
+from rental.background_job_policy import should_disable_background_jobs
+
 # ─── Configuration ────────────────────────────────────────────
 MONGO_URL = os.environ.get("MONGO_URL", "")
 DB_NAME = os.environ.get("DB_NAME", "taxportal")
@@ -108,6 +110,15 @@ async def lifespan(app: FastAPI):
         logger.info("   ✅ Lease Renewals indexes ready")
     except Exception as e:
         logger.warning(f"   ⚠️ Lease Renewals indexes deferred: {e}")
+
+    # Staging must never execute autonomous jobs (payments, messages, or syncs).
+    # DISABLE_BACKGROUND_JOBS also provides an explicit kill switch elsewhere.
+    if should_disable_background_jobs():
+        logger.warning("   ⏸️ Background jobs disabled for this environment")
+        yield
+        client.close()
+        logger.info("🏠 Ross House Rentals API stopped.")
+        return
 
     # Start property/contract sync cron job in the background
     sync_task = None
