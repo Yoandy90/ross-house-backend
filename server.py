@@ -128,6 +128,20 @@ async def lifespan(app: FastAPI):
         logger.info("🏠 Ross House Rentals API stopped.")
         return
 
+    # Inspection emails are side-effecting: require an explicit opt-in even when
+    # the environment-wide background-job policy permits autonomous work.
+    inspection_delivery_task = None
+    try:
+        import asyncio
+        from rental.inspection_delivery_worker import inspection_delivery_loop, worker_enabled
+        if worker_enabled():
+            inspection_delivery_task = asyncio.create_task(inspection_delivery_loop(db))
+            logger.info("   ✅ Inspection delivery worker scheduled")
+        else:
+            logger.warning("   ⏸️ Inspection delivery worker disabled (explicit opt-in required)")
+    except Exception as e:
+        logger.warning(f"   ⚠️ Inspection delivery worker not started: {e}")
+
     # Start property/contract sync cron job in the background
     sync_task = None
     try:
@@ -272,7 +286,14 @@ async def lifespan(app: FastAPI):
 
     yield
 
-    # Graceful shutdown of cron
+    # Graceful shutdown of autonomous workers and cron jobs.
+    if inspection_delivery_task and not inspection_delivery_task.done():
+        inspection_delivery_task.cancel()
+        try:
+            await inspection_delivery_task
+        except asyncio.CancelledError:
+            pass
+
     if sync_task and not sync_task.done():
         sync_task.cancel()
         try:
