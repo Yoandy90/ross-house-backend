@@ -17,7 +17,7 @@ REQUIRED = {
     "REFRESH_TOKENS_ENABLED", "ALLOW_LEGACY_USER_SESSIONS",
     "REQUIRE_SESSION_SID", "STRIPE_SECRET_KEY",
     "STRIPE_PUBLISHABLE_KEY", "STRIPE_WEBHOOK_SECRET",
-    "RENEWAL_TERM_MONTHS", "DISABLE_BACKGROUND_JOBS",
+    "RENEWAL_TERM_MONTHS", "DISABLE_BACKGROUND_JOBS", "STAGING_FIXTURES_ENABLED",
 }
 SECRET_KEYS = {
     "TENANT_JWT_SECRET", "JWT_SECRET_KEY", "REFRESH_DERIVE_KEY",
@@ -72,6 +72,8 @@ def validate(values: dict[str, str], template: bool) -> list[str]:
 
     if values.get("DISABLE_BACKGROUND_JOBS", "").lower() != "true":
         errors.append("DISABLE_BACKGROUND_JOBS must be true in staging")
+    if values.get("STAGING_FIXTURES_ENABLED", "").lower() not in {"true", "false"}:
+        errors.append("STAGING_FIXTURES_ENABLED must be true or false")
 
     if values.get("REFRESH_TOKENS_ENABLED", "").lower() != "true":
         errors.append("REFRESH_TOKENS_ENABLED must be true")
