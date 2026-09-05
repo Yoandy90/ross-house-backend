@@ -16,7 +16,10 @@ from fastapi import APIRouter, Body, Depends, HTTPException
 from pymongo.errors import DuplicateKeyError
 
 from .lease_renewal_contract_generation_router import _renewal_contract_id
-from .lease_renewal_rollover_audit import append_rollover_audit_event
+from .lease_renewal_rollover_audit import (
+    append_rollover_audit_event,
+    inspect_rollover_audit_chain,
+)
 from .lease_renewal_security_router import _rent
 from .lease_renewal_tenant_response_router import _digest
 from .property_mutation_lock import (
@@ -504,6 +507,9 @@ async def inspect_rollover(
         "prior_claim_exact": bool(claim and old.get("lifecycle_claim_id") == claim),
         "renewal_claim_exact": bool(claim and new.get("lifecycle_claim_id") == claim),
         "projections": await _projection_view(db, old, new),
+        "audit": await inspect_rollover_audit_chain(
+            db, rollover_id=rollover_id, proposal_id=proposal_id
+        ),
     }
 
 

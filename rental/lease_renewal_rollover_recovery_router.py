@@ -17,7 +17,10 @@ from bson import ObjectId
 from fastapi import APIRouter, Body, Depends, HTTPException
 
 from .lease_renewal_rollover_router import _assert_lineage, _load_pair
-from .lease_renewal_rollover_recovery_audit import append_recovery_audit_event
+from .lease_renewal_rollover_recovery_audit import (
+    append_recovery_audit_event,
+    inspect_recovery_audit_chain,
+)
 from .property_mutation_lock import acquire_property_mutation_lock, release_property_mutation_lock
 from .shared import auth_admin, get_db
 
@@ -395,12 +398,47 @@ async def observe_recovery(proposal_id: str, rollover_id: str, db=Depends(get_db
     del admin
     record, old, new = await _record_and_pair(db, proposal_id, rollover_id)
     observed = await _observation(db, record, old, new)
-    _assert_recoverable(observed)
+    if observed["record_state"] == "completed":
+        completed_exact = (
+            observed["record_stage"] == "complete"
+            and observed["automatic_retry_disabled"]
+            and observed["prior_status"] == "expired"
+            and observed["renewal_status"] == "active"
+            and observed["prior_claim"] == "missing"
+            and observed["renewal_claim"] == "missing"
+            and observed["resource_owner"] == "renewal"
+            and observed["tenant_owner"] == "renewal"
+            and observed["resource_status"] == "rented"
+            and not observed["resource_manually_set"]
+            and observed["resource_tenant_exact"]
+            and observed["tenant_property_exact"]
+            and observed["tenant_unit_exact"]
+        )
+        if not completed_exact:
+            raise HTTPException(
+                status_code=409,
+                detail="renewal_rollover_recovery_completed_state_invalid",
+            )
+    else:
+        _assert_recoverable(observed)
     observed_digest = _digest(observed)
+    recovery_id = str((record.get("manual_recovery") or {}).get("recovery_id") or "").lower()
+    audit = None
+    if (
+        len(recovery_id) == 32
+        and all(char in "0123456789abcdef" for char in recovery_id)
+    ):
+        audit = await inspect_recovery_audit_chain(
+            db,
+            rollover_id=rollover_id,
+            proposal_id=proposal_id,
+            recovery_id=recovery_id,
+        )
     return {"ok": True, "read_only": True, "automatic_retry_allowed": False,
             "rollover_id": rollover_id, "proposal_id": proposal_id,
             "observation": observed, "observed_digest": observed_digest,
-            "pending_confirmation": _pending_confirmation(record, observed_digest)}
+            "pending_confirmation": _pending_confirmation(record, observed_digest),
+            "audit": audit}
 
 
 @router.post("/{proposal_id}/rollover-recovery/{rollover_id}/propose")

@@ -131,3 +131,58 @@ async def append_rollover_audit_event(
         ):
             return {"idempotent": True, "integrity_digest": digest}
         raise HTTPException(status_code=409, detail="renewal_rollover_audit_conflict")
+
+def _safe_timestamp(value: Any) -> str:
+    if isinstance(value, datetime):
+        return value.astimezone(timezone.utc).isoformat()
+    return ""
+
+
+def _safe_sequence(value: Any) -> int:
+    return value if isinstance(value, int) and not isinstance(value, bool) else -1
+
+
+async def inspect_rollover_audit_chain(
+    db, *, rollover_id: str, proposal_id: str
+) -> Dict[str, Any]:
+    rows = await db.lease_renewal_rollover_audit.find(
+        {"rollover_id": rollover_id, "proposal_id": proposal_id}
+    ).to_list(len(ROLLOVER_AUDIT_EVENTS) + 1)
+    rows = sorted(rows, key=lambda row: _safe_sequence(row.get("sequence")))
+    valid = len(rows) <= len(ROLLOVER_AUDIT_EVENTS)
+    previous_digest = ""
+    safe_events = []
+    for index, row in enumerate(rows):
+        expected_event = (
+            ROLLOVER_AUDIT_EVENTS[index]
+            if index < len(ROLLOVER_AUDIT_EVENTS)
+            else ""
+        )
+        row_valid = (
+            row.get("event") == expected_event
+            and row.get("sequence") == index + 1
+            and str(row.get("rollover_id") or "") == rollover_id
+            and str(row.get("proposal_id") or "") == proposal_id
+            and verify_rollover_audit_event(row)
+            and secrets.compare_digest(
+                str(row.get("previous_digest") or ""), previous_digest
+            )
+        )
+        valid = valid and row_valid
+        previous_digest = str(row.get("integrity_digest") or "")
+        safe_events.append({
+            "sequence": row.get("sequence"),
+            "event": str(row.get("event") or ""),
+            "occurred_at": _safe_timestamp(row.get("occurred_at")),
+        })
+    complete = valid and len(rows) == len(ROLLOVER_AUDIT_EVENTS)
+    return {
+        "status": "complete" if complete else "partial" if valid else "invalid",
+        "valid": valid,
+        "complete": complete,
+        "recorded_events": len(rows),
+        "expected_events": len(ROLLOVER_AUDIT_EVENTS),
+        "last_event": safe_events[-1]["event"] if safe_events else None,
+        "events": safe_events,
+    }
+
