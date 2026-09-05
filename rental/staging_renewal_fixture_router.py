@@ -19,6 +19,7 @@ from rental.staging_fixture_policy import (
 router = APIRouter(prefix="/admin/staging-fixtures", tags=["staging-fixtures"])
 _CREATE_CONFIRMATION = "CREATE_SYNTHETIC_RENEWAL"
 _DELETE_CONFIRMATION = "DELETE_SYNTHETIC_RENEWAL"
+_SIMULATE_DELIVERY_CONFIRMATION = "SIMULATE_SYNTHETIC_DELIVERY"
 
 
 def _assert_allowed() -> None:
@@ -204,6 +205,102 @@ async def delete_renewal_source(
 
 def _binding_mismatch(doc: dict | None, expected: dict) -> bool:
     return bool(doc) and any(str(doc.get(key) or "") != str(value) for key, value in expected.items())
+
+
+@router.post("/renewal-delivery/{marker}")
+async def simulate_renewal_delivery(
+    marker: str,
+    body: dict = Body(...),
+    db=Depends(get_db),
+    admin=Depends(auth_admin),
+):
+    """Confirm one exact synthetic outbox intent without contacting a provider."""
+    del admin
+    _assert_allowed()
+    marker = _marker_or_400(marker)
+    if (
+        set(body) != {"confirmation"}
+        or body.get("confirmation") != _SIMULATE_DELIVERY_CONFIRMATION
+    ):
+        raise HTTPException(
+            status_code=400, detail="fixture_delivery_confirmation_required"
+        )
+
+    old = await db.rental_contracts.find_one(
+        {"staging_fixture_marker": marker, "synthetic": True}
+    )
+    prop = await db.properties.find_one(
+        {"staging_fixture_marker": marker, "synthetic": True}
+    )
+    tenant = await db.tenants.find_one(
+        {"staging_fixture_marker": marker, "synthetic": True}
+    )
+    if not old or not prop or not tenant:
+        raise HTTPException(status_code=409, detail="fixture_source_incomplete")
+
+    lease_id = str(old["_id"])
+    property_id = str(prop["_id"])
+    tenant_id = str(tenant["_id"])
+    proposal = await db.lease_renewal_proposals.find_one({"lease_id": lease_id})
+    if not proposal or proposal.get("status") != "approved":
+        raise HTTPException(
+            status_code=409, detail="fixture_approved_proposal_required"
+        )
+    expected = {
+        "lease_id": lease_id,
+        "property_id": property_id,
+        "tenant_id": tenant_id,
+    }
+    if _binding_mismatch(proposal, expected):
+        raise HTTPException(status_code=409, detail="fixture_proposal_binding_changed")
+
+    proposal_id = str(proposal.get("_id") or "")
+    if not ObjectId.is_valid(proposal_id):
+        raise HTTPException(status_code=409, detail="fixture_proposal_id_invalid")
+    outbox = await db.lease_renewal_notification_outbox.find_one(
+        {"proposal_id": proposal_id}
+    )
+    if not outbox:
+        raise HTTPException(
+            status_code=409, detail="fixture_pending_delivery_required"
+        )
+    if _binding_mismatch(outbox, {"proposal_id": proposal_id, **expected}):
+        raise HTTPException(status_code=409, detail="fixture_outbox_binding_changed")
+    if outbox.get("status") != "pending" or outbox.get("attempts") != 0:
+        raise HTTPException(status_code=409, detail="fixture_delivery_state_changed")
+
+    now = datetime.now(timezone.utc)
+    result = await db.lease_renewal_notification_outbox.update_one(
+        {
+            "_id": outbox["_id"],
+            "proposal_id": proposal_id,
+            "status": "pending",
+            "attempts": 0,
+        },
+        {
+            "$set": {
+                "status": "sent",
+                "attempts": 1,
+                "provider": "staging-simulator",
+                "provider_message_id": marker,
+                "sent_at": now,
+                "updated_at": now,
+                "automatic_retry_allowed": False,
+                "staging_simulated": True,
+            }
+        },
+    )
+    if getattr(result, "matched_count", 0) != 1:
+        raise HTTPException(status_code=409, detail="fixture_delivery_state_changed")
+    return {
+        "ok": True,
+        "synthetic": True,
+        "marker": marker,
+        "proposal_id": proposal_id,
+        "status": "sent",
+        "attempts": 1,
+        "provider": "staging-simulator",
+    }
 
 
 @router.delete("/renewal-lifecycle/{marker}")
