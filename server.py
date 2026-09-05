@@ -111,6 +111,14 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"   ⚠️ Lease Renewals indexes deferred: {e}")
 
+    # Ensure inspection lifecycle indexes
+    try:
+        from rental.inspection_security_router import ensure_indexes as _inspection_ix
+        await _inspection_ix(db)
+        logger.info("   ✅ Inspection indexes ready")
+    except Exception as e:
+        logger.warning(f"   ⚠️ Inspection indexes deferred: {e}")
+
     # Staging must never execute autonomous jobs (payments, messages, or syncs).
     # DISABLE_BACKGROUND_JOBS also provides an explicit kill switch elsewhere.
     if should_disable_background_jobs():
