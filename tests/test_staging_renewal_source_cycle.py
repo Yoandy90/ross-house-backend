@@ -177,21 +177,6 @@ def test_source_cycle_passes_and_cleans(monkeypatch):
                     "rollover": None,
                     "next_action": "collect_contract_signatures",
                 }
-            if workflow_count == 5:
-                return 200, {
-                    "proposal_id": "p1",
-                    "read_only": True,
-                    "contract": {
-                        "contract_id": "renewal-c1",
-                        "status": "pending_signatures",
-                        "start_date": "2026-10-06",
-                        "end_date": "2027-10-05",
-                        "tenant_signed": False,
-                        "landlord_or_admin_signed": False,
-                    },
-                    "rollover": None,
-                    "next_action": "collect_contract_signatures",
-                }
         if (
             method == "POST"
             and path == "/api/tenant/lease-renewals/p1/respond"
