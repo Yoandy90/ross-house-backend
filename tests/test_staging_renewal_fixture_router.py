@@ -1,0 +1,144 @@
+import asyncio
+
+import pytest
+from fastapi import HTTPException
+
+import rental.staging_renewal_fixture_router as fixtures
+
+
+def run(coro):
+    return asyncio.run(coro)
+
+
+class Result:
+    def __init__(self, deleted_count=0):
+        self.deleted_count = deleted_count
+
+
+def matches(doc, query):
+    return all(doc.get(key) == value for key, value in query.items())
+
+
+class Collection:
+    def __init__(self):
+        self.docs = []
+        self.delete_queries = []
+
+    async def insert_one(self, doc):
+        self.docs.append(dict(doc))
+
+    async def find_one(self, query):
+        return next((doc for doc in self.docs if matches(doc, query)), None)
+
+    async def delete_many(self, query):
+        self.delete_queries.append(query)
+        before = len(self.docs)
+        self.docs = [doc for doc in self.docs if not matches(doc, query)]
+        return Result(before - len(self.docs))
+
+
+class DB:
+    def __init__(self):
+        self.properties = Collection()
+        self.tenants = Collection()
+        self.rental_contracts = Collection()
+        self.lease_renewal_proposals = Collection()
+
+
+def allow(monkeypatch):
+    monkeypatch.setenv("ENVIRONMENT", "staging")
+    monkeypatch.setenv("DB_NAME", "ross_house_staging")
+    monkeypatch.setenv("DISABLE_BACKGROUND_JOBS", "true")
+    monkeypatch.setenv("STAGING_FIXTURES_ENABLED", "true")
+    monkeypatch.delenv("SENDGRID_API_KEY", raising=False)
+    monkeypatch.delenv("TWILIO_ACCOUNT_SID", raising=False)
+    monkeypatch.delenv("TWILIO_AUTH_TOKEN", raising=False)
+
+
+def test_create_inspect_and_exact_cleanup(monkeypatch):
+    allow(monkeypatch)
+    db = DB()
+    created = run(
+        fixtures.create_renewal_source(
+            {"confirmation": "CREATE_SYNTHETIC_RENEWAL"}, db, {"role": "admin"}
+        )
+    )
+    assert created["ok"] is True and created["synthetic"] is True
+    assert created["marker"].startswith("staging-renewal-")
+    assert len(db.properties.docs) == len(db.tenants.docs) == len(db.rental_contracts.docs) == 1
+
+    inspected = run(
+        fixtures.inspect_renewal_source(created["marker"], db, {"role": "admin"})
+    )
+    assert inspected["present"] == {
+        "property": True,
+        "tenant": True,
+        "contract": True,
+    }
+    assert inspected["consistent"] is True
+    assert "email" not in inspected and "phone" not in inspected
+
+    deleted = run(
+        fixtures.delete_renewal_source(
+            created["marker"], "DELETE_SYNTHETIC_RENEWAL", db, {"role": "admin"}
+        )
+    )
+    assert deleted["clean"] is True
+    assert deleted["deleted"] == {
+        "rental_contracts": 1,
+        "tenants": 1,
+        "properties": 1,
+    }
+    for collection in (db.properties, db.tenants, db.rental_contracts):
+        assert collection.delete_queries == [
+            {"staging_fixture_marker": created["marker"], "synthetic": True}
+        ]
+
+
+def test_confirmations_fail_before_writes(monkeypatch):
+    allow(monkeypatch)
+    db = DB()
+    with pytest.raises(HTTPException) as create_error:
+        run(fixtures.create_renewal_source({"confirmation": "wrong"}, db, {}))
+    assert create_error.value.detail == "fixture_create_confirmation_required"
+    assert not db.properties.docs
+
+    marker = "staging-renewal-" + ("a" * 32)
+    with pytest.raises(HTTPException) as delete_error:
+        run(fixtures.delete_renewal_source(marker, "wrong", db, {}))
+    assert delete_error.value.detail == "fixture_delete_confirmation_required"
+
+
+def test_policy_blocks_route_when_flag_is_off(monkeypatch):
+    allow(monkeypatch)
+    monkeypatch.setenv("STAGING_FIXTURES_ENABLED", "false")
+    with pytest.raises(HTTPException) as exc:
+        run(fixtures.create_renewal_source(
+            {"confirmation": "CREATE_SYNTHETIC_RENEWAL"}, DB(), {}
+        ))
+    assert exc.value.status_code == 404
+    assert exc.value.detail == "staging_fixtures_not_enabled"
+
+
+def test_cleanup_refuses_when_proposal_exists(monkeypatch):
+    allow(monkeypatch)
+    db = DB()
+    created = run(fixtures.create_renewal_source(
+        {"confirmation": "CREATE_SYNTHETIC_RENEWAL"}, db, {}
+    ))
+    db.lease_renewal_proposals.docs.append(
+        {"lease_id": created["contract_id"], "status": "draft"}
+    )
+    with pytest.raises(HTTPException) as exc:
+        run(fixtures.delete_renewal_source(
+            created["marker"], "DELETE_SYNTHETIC_RENEWAL", db, {}
+        ))
+    assert exc.value.status_code == 409
+    assert exc.value.detail == "fixture_has_derived_lifecycle_data"
+    assert db.properties.docs
+
+
+def test_server_registers_fixture_router_only_for_staging():
+    source = open("server.py", encoding="utf-8").read()
+    assert 'if _ENV == "staging":' in source
+    assert "staging_renewal_fixture_router" in source
