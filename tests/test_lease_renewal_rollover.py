@@ -4,8 +4,13 @@ from datetime import date, datetime, timedelta, timezone
 import pytest
 from bson import ObjectId
 from fastapi import HTTPException
+from pymongo.errors import DuplicateKeyError
 
 import rental.lease_renewal_rollover_router as rollover
+from rental.lease_renewal_rollover_audit import (
+    ROLLOVER_AUDIT_EVENTS,
+    verify_rollover_audit_event,
+)
 import rental.lease_renewal_tenant_response_router as tenant_response
 from rental.lease_renewal_contract_generation_router import _renewal_contract_id
 
@@ -49,7 +54,10 @@ class Collection:
     def __init__(self, docs=None): self.docs = list(docs or []); self.fail_on = None
     async def find_one(self, query, *args): return next((d for d in self.docs if matches(d, query)), None)
     def find(self, query): return Cursor([d for d in self.docs if matches(d, query)])
-    async def insert_one(self, doc): self.docs.append(doc)
+    async def insert_one(self, doc):
+        if any(existing.get("_id") == doc.get("_id") for existing in self.docs):
+            raise DuplicateKeyError("duplicate _id")
+        self.docs.append(doc)
     async def update_one(self, query, update):
         doc = next((d for d in self.docs if matches(d, query)), None)
         if not doc: return Result(0)
@@ -122,6 +130,7 @@ def fixture():
     db.lease_renewal_proposals = Collection([proposal])
     db.lease_renewal_responses = Collection([response])
     db.lease_renewal_rollovers = Collection()
+    db.lease_renewal_rollover_audit = Collection()
     return db, proposal_id, old, new, prop, tenant
 
 
@@ -133,6 +142,17 @@ def test_rollover_transfers_exact_authority_without_available_window():
     assert prop['status'] == 'rented' and prop['current_contract_id'] == str(new['_id'])
     assert tenant['current_contract_id'] == str(new['_id'])
     assert 'lifecycle_claim_id' not in old and 'lifecycle_claim_id' not in new
+    events = db.lease_renewal_rollover_audit.docs
+    assert [event["event"] for event in events] == list(ROLLOVER_AUDIT_EVENTS)
+    assert [event["sequence"] for event in events] == list(range(1, 12))
+    assert all(verify_rollover_audit_event(event) for event in events)
+    assert events[0]["previous_digest"] == ""
+    assert all(
+        events[index]["previous_digest"] == events[index - 1]["integrity_digest"]
+        for index in range(1, len(events))
+    )
+    assert "claim_id" not in repr(events)
+    assert "claim-secret" not in repr(events)
 
 
 def test_rollover_is_idempotent_only_after_completed_record():
@@ -142,6 +162,15 @@ def test_rollover_is_idempotent_only_after_completed_record():
     record = db.lease_renewal_rollovers.docs[0]
     assert record['state'] == 'completed' and first['idempotent'] is False
     assert second['idempotent'] is True and second['contract_id'] == first['contract_id']
+
+
+def test_completed_retry_rejects_a_tampered_audit_chain():
+    db, proposal_id, *_ = fixture()
+    run(rollover._rollover_under_lock(db, proposal_id, "admin", date.today()))
+    db.lease_renewal_rollover_audit.docs[4]["evidence"]["stage"] = "tampered"
+    with pytest.raises(HTTPException) as exc:
+        run(rollover._rollover_under_lock(db, proposal_id, "admin", date.today()))
+    assert exc.value.detail == "renewal_rollover_audit_chain_invalid"
 
 
 def test_too_early_or_noncontiguous_dates_fail_before_claim():
