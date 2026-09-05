@@ -8,7 +8,12 @@ TOKEN = "synthetic-token"
 def success_responses():
     return {
         ("POST", "/api/admin/staging-fixtures/renewal-source"): (
-            200, {"synthetic": True, "marker": "staging-renewal-" + "a" * 32, "contract_id": "c1"}
+            200, {
+                "synthetic": True,
+                "marker": "staging-renewal-" + "a" * 32,
+                "contract_id": "c1",
+                "tenant_id": "t1",
+            }
         ),
         ("GET", "/api/admin/staging-fixtures/renewal-source/staging-renewal-" + "a" * 32): (
             200, {"consistent": True, "present": {"property": True, "tenant": True, "contract": True}}
