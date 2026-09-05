@@ -113,6 +113,37 @@ def run_cycle(raw_base: str, token: str) -> list[str]:
         if workflow.get("proposal_id") != proposal_id or workflow.get("read_only") is not True:
             raise CycleFailure("workflow read model identity mismatch")
         checks.append("workflow-read-only")
+
+        status, approved = request_json(
+            base,
+            f"/api/admin/lease-renewals/{quote(proposal_id)}/approve",
+            token,
+            method="POST",
+            body={},
+        )
+        approved = require(status, approved, "synthetic proposal approval failed")
+        if approved.get("ok") is not True or approved.get("status") != "approved":
+            raise CycleFailure("synthetic proposal approval mismatch")
+        checks.append("proposal-approved")
+
+        status, approved_workflow = request_json(
+            base,
+            f"/api/admin/lease-renewals/{quote(proposal_id)}/workflow-status",
+            token,
+        )
+        approved_workflow = require(
+            status, approved_workflow, "approved workflow read model failed"
+        )
+        proposal_view = approved_workflow.get("proposal") or {}
+        if (
+            approved_workflow.get("proposal_id") != proposal_id
+            or approved_workflow.get("read_only") is not True
+            or proposal_view.get("status") != "approved"
+            or approved_workflow.get("delivery") is not None
+            or approved_workflow.get("next_action") != "repair_notification_intent"
+        ):
+            raise CycleFailure("approved workflow state mismatch")
+        checks.append("approved-state-verified")
     except Exception as exc:
         primary_error = exc
     finally:

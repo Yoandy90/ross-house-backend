@@ -19,6 +19,9 @@ def success_responses():
         ("GET", "/api/admin/lease-renewals/p1/workflow-status"): (
             200, {"proposal_id": "p1", "read_only": True}
         ),
+        ("POST", "/api/admin/lease-renewals/p1/approve"): (
+            200, {"ok": True, "status": "approved"}
+        ),
         ("DELETE", "/api/admin/staging-fixtures/renewal-lifecycle/staging-renewal-" + "a" * 32 + "?confirmation=DELETE_SYNTHETIC_RENEWAL"): (
             200, {"clean": True}
         ),
@@ -38,11 +41,25 @@ def test_source_cycle_passes_and_cleans(monkeypatch):
             and calls.count((method, path)) == 2
         ):
             return 200, {"consistent": False, "present": {"property": False, "tenant": False, "contract": False}}
+        if (
+            method == "GET"
+            and path == "/api/admin/lease-renewals/p1/workflow-status"
+            and calls.count((method, path)) == 2
+        ):
+            return 200, {
+                "proposal_id": "p1",
+                "read_only": True,
+                "proposal": {"status": "approved"},
+                "delivery": None,
+                "next_action": "repair_notification_intent",
+            }
         return responses[(method, path)]
 
     monkeypatch.setattr(cycle, "request_json", fake)
     checks = cycle.run_cycle(BASE, TOKEN)
     assert "proposal-generated" in checks
+    assert "proposal-approved" in checks
+    assert "approved-state-verified" in checks
     assert "lifecycle-cleaned" in checks
     assert "no-source-residuals" in checks
     assert calls[-1] == ("POST", "/api/auth/logout")
@@ -86,9 +103,10 @@ def test_logout_failure_fails_cycle_after_cleanup(monkeypatch):
     responses[("POST", "/api/auth/logout")] = (500, {"detail": "failed"})
 
     inspection_count = 0
+    workflow_count = 0
 
     def fake(base, path, token, method="GET", body=None):
-        nonlocal inspection_count
+        nonlocal inspection_count, workflow_count
         if method == "GET" and "/renewal-source/" in path:
             inspection_count += 1
             if inspection_count == 2:
@@ -98,6 +116,16 @@ def test_logout_failure_fails_cycle_after_cleanup(monkeypatch):
                         "tenant": False,
                         "contract": False,
                     }
+                }
+        if method == "GET" and path.endswith("/workflow-status"):
+            workflow_count += 1
+            if workflow_count == 2:
+                return 200, {
+                    "proposal_id": "p1",
+                    "read_only": True,
+                    "proposal": {"status": "approved"},
+                    "delivery": None,
+                    "next_action": "repair_notification_intent",
                 }
         return responses[(method, path)]
 
