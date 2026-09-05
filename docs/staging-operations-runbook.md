@@ -73,6 +73,8 @@ verification window.
 3. Confirm the job uses the `staging` environment.
 4. Approve the environment gate if GitHub requests it.
 
+The workflow revokes the temporary admin session after every run (including failures). A fresh staging-only token is required for each retry.
+
 A successful run reports these checks without exposing values:
 
 - `health-and-database`;
@@ -97,6 +99,8 @@ signatures, payments, occupancy changes, notifications, or provider calls.
 Do not weaken a guard to make a failed run pass.
 
 ## 6. Evidence and go/no-go
+
+After the run, remove `STAGING_ADMIN_TOKEN` from the GitHub environment and demote or disable the synthetic administrator.
 
 Record the backend main SHA, workflow run URL, timestamp, staging hostname,
 and PASS/FAIL result. Do not record tokens, credentials, tenant contact data,
