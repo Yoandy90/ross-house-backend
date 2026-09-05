@@ -72,8 +72,8 @@ def test_source_cycle_passes_and_cleans(monkeypatch):
                 "proposal_id": "p1",
                 "read_only": True,
                 "proposal": {"status": "approved"},
-                "delivery": None,
-                "next_action": "repair_notification_intent",
+                "delivery": {"status": "pending", "attempts": 0},
+                "next_action": "send_notification",
             }
         return responses[(method, path)]
 
