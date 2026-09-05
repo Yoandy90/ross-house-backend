@@ -282,6 +282,58 @@ def test_recovery_requires_disabled_retry_and_valid_state_stage_pair():
     assert exc.value.detail == "renewal_rollover_recovery_state_stage_invalid"
 
 
+def test_interrupted_confirmation_resumes_only_for_same_confirmer():
+    db, proposal_id, record, old, new, *_ = fixture()
+    proposed, _ = propose(db, proposal_id, record)
+    recovery_record = record["manual_recovery"]
+    recovery_record["status"] = "confirming"
+    recovery_record["confirmed_by"] = "id:admin-b"
+    recovery_record["confirmed_by_keys"] = ["id:admin-b"]
+    record["stage"] = "manual_recovery_confirmed"
+
+    with pytest.raises(HTTPException) as exc:
+        run(recovery._complete(
+            db, proposal_id, str(record["_id"]), proposed["recovery_id"],
+            "id:admin-c", {"id:admin-c"},
+        ))
+    assert exc.value.detail == "renewal_rollover_recovery_confirmer_changed"
+    assert record["state"] == "recovery_required"
+    assert new["status"] == "pending_activation"
+
+    result = run(recovery._complete(
+        db, proposal_id, str(record["_id"]), proposed["recovery_id"],
+        "id:admin-b", {"id:admin-b"},
+    ))
+    assert result["state"] == "completed"
+    assert record["manual_recovery"]["status"] == "confirmed"
+    assert old["status"] == "expired" and new["status"] == "active"
+
+
+def test_interrupted_confirmation_finalizes_already_committed_authority():
+    db, proposal_id, record, old, new, _prop, _tenant = fixture()
+    proposed, _ = propose(db, proposal_id, record)
+    record["state"] = "committed"
+    record["stage"] = "manual_recovery_clear_claims"
+    record["manual_recovery"].update({
+        "status": "confirming",
+        "confirmed_by": "id:admin-b",
+        "confirmed_by_keys": ["id:admin-b"],
+    })
+    new["status"] = "active"
+    old.pop("lifecycle_claim_id")
+    old.pop("lifecycle_claim_target")
+    new.pop("lifecycle_claim_id")
+    new.pop("lifecycle_claim_target")
+
+    result = run(recovery._complete(
+        db, proposal_id, str(record["_id"]), proposed["recovery_id"],
+        "id:admin-b", {"id:admin-b"},
+    ))
+    assert result["state"] == "completed"
+    assert record["state"] == "completed"
+    assert record["manual_recovery"]["status"] == "confirmed"
+
+
 def test_failure_retains_recovery_fence_and_never_enables_automatic_retry():
     db, proposal_id, record, old, new, *_ = fixture(); proposed, _ = propose(db, proposal_id, record)
     db.rental_contracts.fail_on = lambda query, update: query.get('_id') == new['_id'] and update.get('$set', {}).get('status') == 'active'
