@@ -16,6 +16,7 @@ from fastapi import APIRouter, Body, Depends, HTTPException
 from pymongo.errors import DuplicateKeyError
 
 from .lease_renewal_contract_generation_router import _renewal_contract_id
+from .lease_renewal_rollover_audit import append_rollover_audit_event
 from .lease_renewal_security_router import _rent
 from .lease_renewal_tenant_response_router import _digest
 from .property_mutation_lock import (
@@ -41,6 +42,20 @@ def _date(value: Any, detail: str) -> date:
         return date.fromisoformat(str(value or "")[:10])
     except (TypeError, ValueError) as exc:
         raise HTTPException(status_code=409, detail=detail) from exc
+
+
+async def _audit_transition(
+    db, rollover_id: ObjectId, proposal_id: str, event: str, actor: str,
+    state: str, stage: str,
+) -> None:
+    await append_rollover_audit_event(
+        db,
+        rollover_id=str(rollover_id),
+        proposal_id=proposal_id,
+        event=event,
+        actor=actor,
+        evidence={"state": state, "stage": stage},
+    )
 
 
 async def _load_pair(db, proposal_id: str):
@@ -240,6 +255,10 @@ async def _rollover_under_lock(db, proposal_id: str, actor: str, today: Optional
     existing = await db.lease_renewal_rollovers.find_one({"_id": rollover_oid})
     if existing:
         if existing.get("state") == "completed" and existing.get("proposal_id") == proposal_id:
+            await _audit_transition(
+                db, rollover_oid, proposal_id, "rollover_completed",
+                str(existing.get("created_by") or actor), "completed", "complete",
+            )
             return {"ok": True, "idempotent": True, "state": "completed", "contract_id": str(new["_id"])}
         if (
             existing.get("state") == "committed"
@@ -276,6 +295,10 @@ async def _rollover_under_lock(db, proposal_id: str, actor: str, today: Optional
 
     stage = "claim_prior"
     try:
+        await _audit_transition(
+            db, rollover_oid, proposal_id, "record_created", actor,
+            "claimed", "record_created",
+        )
         old_claim = await db.rental_contracts.update_one(
             {"_id": old["_id"], "status": "active",
              "$or": [{"lifecycle_claim_id": {"$exists": False}}, {"lifecycle_claim_id": None}]},
@@ -284,6 +307,10 @@ async def _rollover_under_lock(db, proposal_id: str, actor: str, today: Optional
         )
         if getattr(old_claim, "matched_count", 0) != 1:
             raise HTTPException(status_code=409, detail="renewal_rollover_prior_claim_changed")
+        await _audit_transition(
+            db, rollover_oid, proposal_id, "prior_claimed", actor,
+            "claimed", "claim_prior",
+        )
 
         stage = "claim_renewal"
         new_claim = await db.rental_contracts.update_one(
@@ -294,6 +321,10 @@ async def _rollover_under_lock(db, proposal_id: str, actor: str, today: Optional
         )
         if getattr(new_claim, "matched_count", 0) != 1:
             raise HTTPException(status_code=409, detail="renewal_rollover_new_claim_changed")
+        await _audit_transition(
+            db, rollover_oid, proposal_id, "renewal_claimed", actor,
+            "claimed", "claim_renewal",
+        )
 
         transferring = await db.lease_renewal_rollovers.update_one(
             {"_id": rollover_oid, "state": "claimed", "claim_id": claim_id},
@@ -301,8 +332,16 @@ async def _rollover_under_lock(db, proposal_id: str, actor: str, today: Optional
         )
         if getattr(transferring, "matched_count", 0) != 1:
             raise HTTPException(status_code=409, detail="renewal_rollover_record_changed")
+        await _audit_transition(
+            db, rollover_oid, proposal_id, "transfer_started", actor,
+            "transferring", "transfer_projections",
+        )
         stage = "transfer_projections"
         await _transfer_projection(db, old, new, _now())
+        await _audit_transition(
+            db, rollover_oid, proposal_id, "projections_transferred", actor,
+            "transferring", "transfer_projections",
+        )
 
         stage = "expire_prior"
         expired = await db.rental_contracts.update_one(
@@ -312,6 +351,10 @@ async def _rollover_under_lock(db, proposal_id: str, actor: str, today: Optional
         )
         if getattr(expired, "matched_count", 0) != 1:
             raise HTTPException(status_code=409, detail="renewal_rollover_prior_status_changed")
+        await _audit_transition(
+            db, rollover_oid, proposal_id, "prior_expired", actor,
+            "transferring", "expire_prior",
+        )
 
         stage = "activate_renewal"
         activated = await db.rental_contracts.update_one(
@@ -321,6 +364,10 @@ async def _rollover_under_lock(db, proposal_id: str, actor: str, today: Optional
         )
         if getattr(activated, "matched_count", 0) != 1:
             raise HTTPException(status_code=409, detail="renewal_rollover_new_status_changed")
+        await _audit_transition(
+            db, rollover_oid, proposal_id, "renewal_activated", actor,
+            "transferring", "activate_renewal",
+        )
 
         stage = "commit_record"
         committed = await db.lease_renewal_rollovers.update_one(
@@ -329,6 +376,10 @@ async def _rollover_under_lock(db, proposal_id: str, actor: str, today: Optional
         )
         if getattr(committed, "matched_count", 0) != 1:
             raise HTTPException(status_code=409, detail="renewal_rollover_record_changed")
+        await _audit_transition(
+            db, rollover_oid, proposal_id, "record_committed", actor,
+            "committed", "clear_claims",
+        )
 
         stage = "clear_prior_claim"
         cleared_old = await db.rental_contracts.update_one(
@@ -337,6 +388,10 @@ async def _rollover_under_lock(db, proposal_id: str, actor: str, today: Optional
         )
         if getattr(cleared_old, "matched_count", 0) != 1:
             raise HTTPException(status_code=409, detail="renewal_rollover_prior_claim_clear_changed")
+        await _audit_transition(
+            db, rollover_oid, proposal_id, "prior_claim_cleared", actor,
+            "committed", "clear_prior_claim",
+        )
 
         stage = "clear_renewal_claim"
         cleared_new = await db.rental_contracts.update_one(
@@ -345,6 +400,10 @@ async def _rollover_under_lock(db, proposal_id: str, actor: str, today: Optional
         )
         if getattr(cleared_new, "matched_count", 0) != 1:
             raise HTTPException(status_code=409, detail="renewal_rollover_new_claim_clear_changed")
+        await _audit_transition(
+            db, rollover_oid, proposal_id, "renewal_claim_cleared", actor,
+            "committed", "clear_renewal_claim",
+        )
 
         stage = "complete"
         completed = await db.lease_renewal_rollovers.update_one(
@@ -356,6 +415,10 @@ async def _rollover_under_lock(db, proposal_id: str, actor: str, today: Optional
             if (latest or {}).get("state") == "committed" and await _authority_fully_committed(db, old, new):
                 return {"ok": True, "idempotent": False, "state": "committed", "contract_id": str(new["_id"])}
             raise HTTPException(status_code=409, detail="renewal_rollover_completion_changed")
+        await _audit_transition(
+            db, rollover_oid, proposal_id, "rollover_completed", actor,
+            "completed", "complete",
+        )
     except Exception:
         try:
             await db.lease_renewal_rollovers.update_one(
