@@ -17,6 +17,7 @@ from bson import ObjectId
 from fastapi import APIRouter, Body, Depends, HTTPException
 
 from .lease_renewal_rollover_router import _assert_lineage, _load_pair
+from .lease_renewal_rollover_recovery_audit import append_recovery_audit_event
 from .property_mutation_lock import acquire_property_mutation_lock, release_property_mutation_lock
 from .shared import auth_admin, get_db
 
@@ -69,6 +70,20 @@ def _relation(value: Any, expected: str) -> str:
 def _owner(value: Any, old_id: str, new_id: str) -> str:
     value = str(value or "")
     return "prior" if value == old_id else "renewal" if value == new_id else "other_or_missing"
+
+
+async def _audit_recovery(
+    db, record: Dict[str, Any], proposal_id: str, recovery_id: str,
+    event: str, actor: str,
+) -> None:
+    await append_recovery_audit_event(
+        db,
+        rollover_id=str(record["_id"]),
+        proposal_id=proposal_id,
+        recovery_id=recovery_id,
+        event=event,
+        actor=actor,
+    )
 
 
 async def _record_and_pair(db, proposal_id: str, rollover_id: str):
@@ -314,6 +329,10 @@ async def _complete(
     )
     stage = "normalize_projections"
     try:
+        await _audit_recovery(
+            db, record, proposal_id, recovery_id,
+            "recovery_execution_started", confirmer,
+        )
         await _set_projection_to_renewal(db, old, new, _now())
         stage = "expire_prior"
         await _set_status(db, old, ["active", "expired"], "expired", claim,
@@ -330,11 +349,19 @@ async def _complete(
         )
         if getattr(committed, "matched_count", 0) != 1:
             raise HTTPException(status_code=409, detail="renewal_rollover_recovery_record_changed")
+        await _audit_recovery(
+            db, record, proposal_id, recovery_id,
+            "recovery_record_committed", confirmer,
+        )
         stage = "clear_prior_claim"
         await _clear_exact_claim(db, old["_id"], claim, "expired")
         stage = "clear_renewal_claim"
         await _clear_exact_claim(db, new["_id"], claim, "active")
         stage = "complete_record"
+        await _audit_recovery(
+            db, record, proposal_id, recovery_id,
+            "recovery_completion_ready", confirmer,
+        )
         completed = await db.lease_renewal_rollovers.update_one(
             {"_id": record["_id"], "claim_id": claim, "state": "committed",
              "manual_recovery.recovery_id": recovery_id, "manual_recovery.status": "confirming"},
@@ -406,6 +433,19 @@ async def propose_recovery(proposal_id: str, rollover_id: str, body: Dict[str, A
     )
     if getattr(result, "matched_count", 0) != 1:
         raise HTTPException(status_code=409, detail="renewal_rollover_recovery_observation_changed")
+    try:
+        await _audit_recovery(
+            db, record, proposal_id, recovery_id, "recovery_proposed",
+            _actor_key(admin),
+        )
+    except Exception:
+        await db.lease_renewal_rollovers.update_one(
+            {"_id": record["_id"], "manual_recovery.recovery_id": recovery_id,
+             "manual_recovery.status": "proposed"},
+            {"$set": {"manual_recovery.status": "failed",
+                      "manual_recovery.audit_failed_at": _now(), "updated_at": _now()}},
+        )
+        raise
     return {"ok": True, "state": "pending_confirmation", "action": "complete", "recovery_id": recovery_id}
 
 
