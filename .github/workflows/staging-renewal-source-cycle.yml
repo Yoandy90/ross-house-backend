@@ -1,0 +1,35 @@
+name: Staging Renewal Source Cycle
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: staging-renewal-source-cycle
+  cancel-in-progress: false
+
+jobs:
+  source-cycle:
+    name: Synthetic source, proposal, and cleanup
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment: staging
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - name: Require protected staging configuration
+        env:
+          STAGING_BASE_URL: ${{ vars.STAGING_BASE_URL }}
+          STAGING_ADMIN_TOKEN: ${{ secrets.STAGING_ADMIN_TOKEN }}
+        run: |
+          test -n "$STAGING_BASE_URL" || { echo "STAGING_BASE_URL is not configured"; exit 1; }
+          test -n "$STAGING_ADMIN_TOKEN" || { echo "STAGING_ADMIN_TOKEN is not configured"; exit 1; }
+      - name: Run controlled source cycle
+        env:
+          STAGING_BASE_URL: ${{ vars.STAGING_BASE_URL }}
+          STAGING_ADMIN_TOKEN: ${{ secrets.STAGING_ADMIN_TOKEN }}
+        run: python scripts/staging_renewal_source_cycle.py
