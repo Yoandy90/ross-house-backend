@@ -4,8 +4,13 @@ from datetime import date
 import pytest
 from bson import ObjectId
 from fastapi import HTTPException
+from pymongo.errors import DuplicateKeyError
 
 import rental.lease_renewal_rollover_recovery_router as recovery
+from rental.lease_renewal_rollover_recovery_audit import (
+    RECOVERY_AUDIT_EVENTS,
+    verify_recovery_audit_event,
+)
 import rental.lease_renewal_tenant_response_router as tenant_response
 from rental.lease_renewal_contract_generation_router import _renewal_contract_id
 
@@ -58,6 +63,10 @@ class Collection:
     def __init__(self, docs=None): self.docs = list(docs or []); self.fail_on = None
     async def find_one(self, query, *args): return next((d for d in self.docs if matches(d, query)), None)
     def find(self, query): return Cursor([d for d in self.docs if matches(d, query)])
+    async def insert_one(self, doc):
+        if any(existing.get("_id") == doc.get("_id") for existing in self.docs):
+            raise DuplicateKeyError("duplicate _id")
+        self.docs.append(doc)
     async def update_one(self, query, update):
         doc = next((d for d in self.docs if matches(d, query)), None)
         if not doc or (self.fail_on and self.fail_on(query, update)): return Result(0)
@@ -139,6 +148,7 @@ def fixture():
     db.lease_renewal_proposals = Collection([proposal])
     db.lease_renewal_responses = Collection([response])
     db.lease_renewal_rollovers = Collection([record])
+    db.lease_renewal_rollover_recovery_audit = Collection()
     return db, proposal_id, record, old, new, prop, tenant
 
 
@@ -200,6 +210,17 @@ def test_two_admin_confirmation_completes_only_forward():
     assert tenant['current_contract_id'] == str(new['_id'])
     assert not old.get('lifecycle_claim_id') and not new.get('lifecycle_claim_id')
     assert record['manual_recovery']['observed_digest'] == digest
+    events = db.lease_renewal_rollover_recovery_audit.docs
+    assert [event["event"] for event in events] == list(RECOVERY_AUDIT_EVENTS)
+    assert [event["sequence"] for event in events] == [1, 2, 3, 4]
+    assert all(verify_recovery_audit_event(event) for event in events)
+    assert events[0]["previous_digest"] == ""
+    assert all(
+        events[index]["previous_digest"] == events[index - 1]["integrity_digest"]
+        for index in range(1, len(events))
+    )
+    assert record["claim_id"] not in repr(events)
+    assert "claim_id" not in repr(events)
 
 
 def test_same_admin_and_stale_digest_fail_before_mutation():
@@ -212,6 +233,20 @@ def test_same_admin_and_stale_digest_fail_before_mutation():
         run(recovery._complete(db, proposal_id, str(record['_id']), proposed['recovery_id'], 'id:admin-b'))
     assert exc.value.detail == 'renewal_rollover_recovery_observation_changed'
     assert record['manual_recovery']['status'] == 'proposed'
+
+
+def test_confirmation_fails_closed_when_recovery_audit_was_tampered():
+    db, proposal_id, record, *_ = fixture()
+    proposed, _ = propose(db, proposal_id, record)
+    db.lease_renewal_rollover_recovery_audit.docs[0]["actor"] = "tampered"
+    with pytest.raises(HTTPException) as exc:
+        run(recovery._complete(
+            db, proposal_id, str(record["_id"]), proposed["recovery_id"],
+            "id:admin-b", {"id:admin-b"},
+        ))
+    assert exc.value.detail == "renewal_recovery_audit_chain_invalid"
+    assert record["state"] == "recovery_required"
+    assert record["manual_recovery"]["status"] == "failed"
 
 
 def test_same_admin_cannot_switch_from_id_to_email_identity():
