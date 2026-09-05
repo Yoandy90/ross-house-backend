@@ -406,7 +406,6 @@ async def delete_renewal_lifecycle(
     admin=Depends(auth_admin),
 ):
     """Delete an exact synthetic renewal graph after verifying every binding."""
-    del admin
     _assert_allowed()
     marker = _marker_or_400(marker)
     if confirmation != _DELETE_CONFIRMATION:
@@ -499,9 +498,47 @@ async def delete_renewal_lifecycle(
         ):
             raise HTTPException(status_code=409, detail="fixture_rollover_binding_changed")
 
+        signature_rows = await db.signatures.find({
+            "document_id": str(renewal_id),
+            "document_type": "contract",
+        }).limit(3).to_list(3)
+        if len(signature_rows) > 2:
+            raise HTTPException(
+                status_code=409, detail="fixture_signature_cardinality_changed"
+            )
+        expected_signers = {
+            "tenant": str((app_user or {}).get("_id") or ""),
+            "admin": str(admin.get("_id") or "") if isinstance(admin, dict) else "",
+        }
+        seen_roles: set[str] = set()
+        for signature_row in signature_rows:
+            role = str(signature_row.get("signer_role") or "")
+            if (
+                role not in expected_signers
+                or role in seen_roles
+                or not expected_signers[role]
+                or str(signature_row.get("signer_id") or "") != expected_signers[role]
+                or not renewal
+                or signature_row.get("signature_data") != renewal.get(f"{role}_signature")
+            ):
+                raise HTTPException(
+                    status_code=409, detail="fixture_signature_binding_changed"
+                )
+            seen_roles.add(role)
+    else:
+        signature_rows = []
+
     deleted: dict[str, int] = {}
     if proposal:
         targets = (
+            (
+                "signatures",
+                {
+                    "_id": {"$in": [row["_id"] for row in signature_rows]},
+                    "document_id": str(renewal_id),
+                    "document_type": "contract",
+                },
+            ),
             ("lease_renewal_rollovers", {"_id": renewal_id, "proposal_id": proposal_id}),
             ("rental_contracts", {"_id": renewal_id, "renewal_source.proposal_id": proposal_id}),
             ("lease_renewal_responses", {"proposal_id": proposal_id, "lease_id": old_id}),
