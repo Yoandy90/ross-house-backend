@@ -50,6 +50,7 @@ class Result:
 
 class Cursor:
     def __init__(self, docs): self.docs = list(docs)
+    def limit(self, n): self.docs = self.docs[:n]; return self
     async def to_list(self, n): return self.docs[:n]
 
 
