@@ -21,6 +21,7 @@ from .section8_security_router import router as section8_security_router
 from .maintenance_security_router import router as maintenance_security_router
 from .maintenance_ownership_security_router import router as maintenance_ownership_security_router
 from .maintenance_dispatch_security_router import router as maintenance_dispatch_security_router
+from .inspection_security_router import router as inspection_security_router
 from .property_visibility_security_router import router as property_visibility_security_router
 from .property_archival_security_router import router as property_archival_security_router
 from .property_lifecycle_security_router import router as property_lifecycle_security_router
@@ -67,6 +68,7 @@ router.routes.extend(section8_security_router.routes)
 router.routes.extend(maintenance_security_router.routes)
 router.routes.extend(maintenance_ownership_security_router.routes)
 router.routes.extend(maintenance_dispatch_security_router.routes)
+router.routes.extend(inspection_security_router.routes)
 router.routes.extend(property_visibility_security_router.routes)
 router.routes.extend(property_archival_security_router.routes)
 router.routes.extend(property_lifecycle_security_router.routes)
