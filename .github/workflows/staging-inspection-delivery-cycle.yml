@@ -1,0 +1,27 @@
+name: Staging Inspection Delivery Cycle
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: staging-inspection-delivery-cycle
+  cancel-in-progress: false
+
+jobs:
+  staging-inspection-delivery:
+    environment: staging
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Validate staging delivery monitor and safe retry
+        env:
+          STAGING_BASE_URL: ${{ vars.STAGING_BASE_URL }}
+          STAGING_ADMIN_TOKEN: ${{ secrets.STAGING_ADMIN_TOKEN }}
+        run: python scripts/staging_inspection_delivery_cycle.py

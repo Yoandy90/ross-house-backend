@@ -46,3 +46,8 @@ def test_marker_is_exact_and_unforgeable_by_prefix():
     for invalid in ("", "staging-renewal-", marker + "-other", "production-" + ("a" * 32)):
         with pytest.raises(StagingFixturePolicyError, match="fixture_marker_invalid"):
             validate_fixture_marker(invalid)
+
+
+def test_inspection_fixture_marker_is_allowed():
+    marker = "staging-inspection-" + ("b" * 32)
+    assert validate_fixture_marker(marker) == marker
