@@ -10,7 +10,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
-from staging_renewal_smoke import SmokeFailure, validate_base_url
+from scripts.staging_renewal_smoke import SmokeFailure, validate_base_url
 
 
 class CycleFailure(RuntimeError):
@@ -142,10 +142,15 @@ def run_cycle(raw_base: str, token: str) -> list[str]:
             except Exception as exc:
                 cleanup_error = exc
         try:
-            request_json(base, "/api/auth/logout", token, method="POST", body={})
+            logout_status, _ = request_json(
+                base, "/api/auth/logout", token, method="POST", body={}
+            )
+            if logout_status != 200:
+                raise CycleFailure("session revocation failed")
             checks.append("session-revoked")
-        except Exception:
-            pass
+        except Exception as exc:
+            if primary_error is None and cleanup_error is None:
+                primary_error = exc
         if cleanup_error:
             raise cleanup_error
     if primary_error:
