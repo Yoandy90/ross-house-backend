@@ -188,6 +188,13 @@ def test_observation_exposes_only_bounded_pending_confirmation_handoff():
     }
     assert record['claim_id'] not in repr(view)
     assert 'proposed_by' not in repr(view)
+    audit = view["audit"]
+    assert audit["status"] == "partial"
+    assert audit["valid"] is True and audit["complete"] is False
+    assert audit["recorded_events"] == 1
+    assert "actor" not in repr(audit)
+    assert "digest" not in repr(audit)
+    assert "claim_id" not in repr(audit)
 
 
 def test_corrupt_pending_confirmation_handoff_fails_closed():
@@ -221,6 +228,31 @@ def test_two_admin_confirmation_completes_only_forward():
     )
     assert record["claim_id"] not in repr(events)
     assert "claim_id" not in repr(events)
+    view = run(recovery.observe_recovery(
+        proposal_id, str(record["_id"]), db, {"_id": "admin-b"},
+    ))
+    audit = view["audit"]
+    assert audit["status"] == "complete"
+    assert audit["valid"] is True and audit["complete"] is True
+    assert audit["recorded_events"] == audit["expected_events"] == 4
+    assert "actor" not in repr(audit)
+    assert "digest" not in repr(audit)
+    assert "claim_id" not in repr(audit)
+
+
+def test_completed_recovery_inspection_rejects_changed_authority():
+    db, proposal_id, record, _old, _new, prop, _tenant = fixture()
+    proposed, _ = propose(db, proposal_id, record)
+    run(recovery._complete(
+        db, proposal_id, str(record["_id"]), proposed["recovery_id"],
+        "id:admin-b", {"id:admin-b"},
+    ))
+    prop["current_contract_id"] = str(ObjectId())
+    with pytest.raises(HTTPException) as exc:
+        run(recovery.observe_recovery(
+            proposal_id, str(record["_id"]), db, {"_id": "admin-b"},
+        ))
+    assert exc.value.detail == "renewal_rollover_recovery_completed_state_invalid"
 
 
 def test_same_admin_and_stale_digest_fail_before_mutation():
