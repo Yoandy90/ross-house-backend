@@ -1,4 +1,6 @@
 import asyncio
+import base64
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -123,4 +125,44 @@ def test_delete_archives_without_hard_delete(monkeypatch):
 def test_rooms_payload_is_bounded():
     with pytest.raises(HTTPException) as exc:
         secure._rooms({"room": "x" * 100_001})
+    assert exc.value.status_code == 413
+
+
+
+def test_signature_requires_consent_and_in_progress(monkeypatch):
+    iid = ObjectId()
+    db = DB({"_id": iid, "status": "pending", "property_id": "p"})
+    monkeypatch.setattr(secure, "get_db", lambda: db)
+    signature = "data:image/png;base64," + base64.b64encode(b"signature").decode()
+    with pytest.raises(HTTPException) as exc:
+        run(secure.sign_inspection(str(iid), "tenant", Request({
+            "signer_name": "Tenant", "signature_data_url": signature,
+            "consent_acknowledged": True,
+        })))
+    assert exc.value.detail == "inspection_signature_requires_in_progress"
+
+
+def test_signature_evidence_is_hashed_and_atomically_appended(monkeypatch):
+    iid = ObjectId()
+    db = DB({"_id": iid, "status": "in_progress", "property_id": "p"})
+    monkeypatch.setattr(secure, "get_db", lambda: db)
+    raw = b"bounded-signature"
+    signature = "data:image/png;base64," + base64.b64encode(raw).decode()
+    response = run(secure.sign_inspection(str(iid), "admin", Request({
+        "signer_name": "Inspector",
+        "signature_data_url": signature,
+        "consent_acknowledged": True,
+    })))
+    event = response["signature"]
+    assert event["signature_sha256"] == hashlib.sha256(raw).hexdigest()
+    assert event["consent_acknowledged"] is True
+    update = db.inspections.updates[0][1]
+    assert update["$set"]["signatures.admin"]["signature_data_url"] == signature
+    assert "signature_data_url" not in update["$push"]["signature_events"]
+
+
+def test_signature_payload_is_bounded():
+    oversized = "data:image/png;base64," + ("A" * 500_001)
+    with pytest.raises(HTTPException) as exc:
+        secure._signature_image(oversized)
     assert exc.value.status_code == 413
