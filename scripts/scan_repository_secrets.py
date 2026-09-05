@@ -69,6 +69,17 @@ def tracked_files(root: Path) -> list[Path]:
     ]
 
 
+def is_sensitive_filename(path: Path) -> bool:
+    name = path.name.lower()
+    return name.endswith(".p8") or (
+        name.endswith(".json")
+        and (
+            "google-play-service-account" in name
+            or "service-account-key" in name
+        )
+    )
+
+
 def is_text_candidate(path: Path) -> bool:
     return path.name in TEXT_NAMES or path.suffix.lower() in TEXT_SUFFIXES
 
@@ -93,7 +104,13 @@ def scan_files(root: Path, paths: Iterable[Path]) -> list[Finding]:
             resolved.relative_to(resolved_root)
         except ValueError:
             continue
-        if not resolved.is_file() or not is_text_candidate(resolved):
+        if not resolved.is_file():
+            continue
+        relative = resolved.relative_to(resolved_root).as_posix()
+        if is_sensitive_filename(resolved):
+            findings.append(Finding("sensitive-filename", relative, 0))
+            continue
+        if not is_text_candidate(resolved):
             continue
         try:
             if resolved.stat().st_size > MAX_TEXT_BYTES:
@@ -101,7 +118,6 @@ def scan_files(root: Path, paths: Iterable[Path]) -> list[Finding]:
             content = resolved.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
             continue
-        relative = resolved.relative_to(resolved_root).as_posix()
         for number, line in enumerate(content.splitlines(), 1):
             for label, pattern in PATTERNS:
                 match = pattern.search(line)
