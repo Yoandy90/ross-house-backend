@@ -398,6 +398,76 @@ def run_cycle(raw_base: str, token: str) -> list[str]:
         ):
             raise CycleFailure("generated contract workflow state mismatch")
         checks.append("pending-signatures-state-verified")
+
+        signature_body = {
+            "document_id": contract_id_new,
+            "document_type": "contract",
+            "signature_data": "data:image/png;base64,iVBORw0KGgo=",
+            "method": "touch",
+            "device_info": "staging-renewal-cycle",
+        }
+        status, tenant_signed = request_json(
+            base, "/api/signatures/sign", tenant_token,
+            method="POST", body=signature_body,
+        )
+        tenant_signed = require(
+            status, tenant_signed, "synthetic tenant signature failed"
+        )
+        if tenant_signed.get("success") is not True or not tenant_signed.get("signature_id"):
+            raise CycleFailure("synthetic tenant signature mismatch")
+        checks.append("tenant-signature-recorded")
+
+        status, tenant_signed_workflow = request_json(
+            base,
+            f"/api/admin/lease-renewals/{quote(proposal_id)}/workflow-status",
+            token,
+        )
+        tenant_signed_workflow = require(
+            status, tenant_signed_workflow, "tenant-signed workflow read model failed"
+        )
+        tenant_signed_contract = tenant_signed_workflow.get("contract") or {}
+        if (
+            tenant_signed_contract.get("contract_id") != contract_id_new
+            or tenant_signed_contract.get("status") != "pending_signatures"
+            or tenant_signed_contract.get("tenant_signed") is not True
+            or tenant_signed_contract.get("landlord_or_admin_signed") is not False
+            or tenant_signed_workflow.get("rollover") is not None
+            or tenant_signed_workflow.get("next_action") != "collect_contract_signatures"
+        ):
+            raise CycleFailure("tenant-signed workflow state mismatch")
+        checks.append("tenant-signature-state-verified")
+
+        status, admin_signed = request_json(
+            base, "/api/signatures/sign", token,
+            method="POST", body=signature_body,
+        )
+        admin_signed = require(
+            status, admin_signed, "synthetic admin signature failed"
+        )
+        if admin_signed.get("success") is not True or not admin_signed.get("signature_id"):
+            raise CycleFailure("synthetic admin signature mismatch")
+        checks.append("admin-signature-recorded")
+
+        status, fully_signed_workflow = request_json(
+            base,
+            f"/api/admin/lease-renewals/{quote(proposal_id)}/workflow-status",
+            token,
+        )
+        fully_signed_workflow = require(
+            status, fully_signed_workflow, "fully-signed workflow read model failed"
+        )
+        fully_signed_contract = fully_signed_workflow.get("contract") or {}
+        if (
+            fully_signed_contract.get("contract_id") != contract_id_new
+            or fully_signed_contract.get("status") != "pending_activation"
+            or fully_signed_contract.get("tenant_signed") is not True
+            or fully_signed_contract.get("landlord_or_admin_signed") is not True
+            or fully_signed_workflow.get("rollover") is not None
+            or fully_signed_workflow.get("next_action")
+            != "await_effective_date_or_rollover"
+        ):
+            raise CycleFailure("fully-signed workflow state mismatch")
+        checks.append("pending-activation-state-verified")
     except Exception as exc:
         primary_error = exc
     finally:
