@@ -27,10 +27,11 @@ _RECOVERY_STAGES_BY_STATE = {
         "claim_prior", "claim_renewal", "transfer_projections", "expire_prior",
         "activate_renewal", "commit_record", "clear_prior_claim",
         "clear_renewal_claim", "complete", "normalize_projections",
+        "manual_recovery_confirmed",
     },
     "committed": {
         "clear_claims", "manual_recovery_clear_claims",
-        "manual_recovery_finalize_record",
+        "manual_recovery_finalize_record", "manual_recovery_confirmed",
     },
 }
 
@@ -272,29 +273,45 @@ async def _complete(
 ):
     record, old, new = await _record_and_pair(db, proposal_id, rollover_id)
     recovery = record.get("manual_recovery") or {}
-    if recovery.get("recovery_id") != recovery_id or recovery.get("status") != "proposed":
+    status = recovery.get("status")
+    if recovery.get("recovery_id") != recovery_id or status not in {"proposed", "confirming"}:
         raise HTTPException(status_code=409, detail="renewal_rollover_recovery_proposal_changed")
+    actor_keys = confirmer_keys or {confirmer}
     proposed_keys = set(recovery.get("proposed_by_keys") or [recovery.get("proposed_by")])
-    if proposed_keys.intersection(confirmer_keys or {confirmer}):
+    if proposed_keys.intersection(actor_keys):
         raise HTTPException(status_code=409, detail="renewal_rollover_recovery_second_admin_required")
     observed = await _observation(db, record, old, new)
-    if _digest(observed) != recovery.get("observed_digest"):
-        raise HTTPException(status_code=409, detail="renewal_rollover_recovery_observation_changed")
     _assert_recoverable(observed)
     claim = str(record["claim_id"])
+
+    if status == "proposed":
+        if _digest(observed) != recovery.get("observed_digest"):
+            raise HTTPException(status_code=409, detail="renewal_rollover_recovery_observation_changed")
+        started = await db.lease_renewal_rollovers.update_one(
+            {"_id": record["_id"], "proposal_id": proposal_id, "claim_id": claim,
+             "state": record["state"], "stage": record["stage"],
+             "manual_recovery.recovery_id": recovery_id, "manual_recovery.status": "proposed",
+             "manual_recovery.observed_digest": recovery["observed_digest"]},
+            {"$set": {"manual_recovery.status": "confirming",
+                      "manual_recovery.confirmed_by": confirmer,
+                      "manual_recovery.confirmed_by_keys": sorted(actor_keys),
+                      "manual_recovery.confirmed_at": _now(),
+                      "stage": "manual_recovery_confirmed", "updated_at": _now()}},
+        )
+        if getattr(started, "matched_count", 0) != 1:
+            raise HTTPException(status_code=409, detail="renewal_rollover_recovery_proposal_changed")
+    else:
+        confirmed_keys = set(
+            recovery.get("confirmed_by_keys") or [recovery.get("confirmed_by")]
+        )
+        if not confirmed_keys.intersection(actor_keys):
+            raise HTTPException(
+                status_code=409, detail="renewal_rollover_recovery_confirmer_changed"
+            )
+
     await _assert_no_foreign_property_claim(
         db, str(record["property_id"]), claim, {old["_id"], new["_id"]}
     )
-    started = await db.lease_renewal_rollovers.update_one(
-        {"_id": record["_id"], "proposal_id": proposal_id, "claim_id": claim,
-         "state": record["state"], "stage": record["stage"],
-         "manual_recovery.recovery_id": recovery_id, "manual_recovery.status": "proposed",
-         "manual_recovery.observed_digest": recovery["observed_digest"]},
-        {"$set": {"manual_recovery.status": "confirming", "manual_recovery.confirmed_by": confirmer,
-                  "manual_recovery.confirmed_at": _now(), "stage": "manual_recovery_confirmed", "updated_at": _now()}},
-    )
-    if getattr(started, "matched_count", 0) != 1:
-        raise HTTPException(status_code=409, detail="renewal_rollover_recovery_proposal_changed")
     stage = "normalize_projections"
     try:
         await _set_projection_to_renewal(db, old, new, _now())
