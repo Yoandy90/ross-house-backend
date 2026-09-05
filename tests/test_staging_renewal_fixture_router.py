@@ -36,6 +36,16 @@ def matches(doc, query):
     return True
 
 
+class Cursor:
+    def __init__(self, docs):
+        self.docs = list(docs)
+    def limit(self, count):
+        self.docs = self.docs[:count]
+        return self
+    async def to_list(self, count):
+        return self.docs[:count]
+
+
 class Collection:
     def __init__(self):
         self.docs = []
@@ -46,6 +56,9 @@ class Collection:
 
     async def find_one(self, query):
         return next((doc for doc in self.docs if matches(doc, query)), None)
+
+    def find(self, query):
+        return Cursor(doc for doc in self.docs if matches(doc, query))
 
     async def update_one(self, query, update):
         for doc in self.docs:
@@ -74,6 +87,7 @@ class DB:
         self.lease_renewal_rollovers = Collection()
         self.app_users = Collection()
         self.auth_sessions = Collection()
+        self.signatures = Collection()
 
 
 def allow(monkeypatch):
@@ -202,11 +216,18 @@ def test_full_lifecycle_cleanup_verifies_and_deletes_exact_graph(monkeypatch):
     db.lease_renewal_notification_outbox.docs.append({
         "proposal_id": proposal_text, "tenant_id": tenant_id,
     })
+    signature_data = "data:image/png;base64,synthetic"
     db.rental_contracts.docs.append({
         "_id": renewal_id, "property_id": property_id, "tenant_id": tenant_id,
+        "admin_signature": signature_data,
         "renewal_source": {
             "proposal_id": proposal_text, "prior_contract_id": old_id,
         },
+    })
+    db.signatures.docs.append({
+        "_id": ObjectId(), "document_id": str(renewal_id),
+        "document_type": "contract", "signer_id": "admin-1",
+        "signer_role": "admin", "signature_data": signature_data,
     })
     db.lease_renewal_rollovers.docs.append({
         "_id": renewal_id, "proposal_id": proposal_text,
@@ -215,13 +236,14 @@ def test_full_lifecycle_cleanup_verifies_and_deletes_exact_graph(monkeypatch):
     })
 
     result = run(fixtures.delete_renewal_lifecycle(
-        created["marker"], "DELETE_SYNTHETIC_RENEWAL", db, {}
+        created["marker"], "DELETE_SYNTHETIC_RENEWAL", db, {"_id": "admin-1"}
     ))
     assert result["clean"] is True
     assert all(not collection.docs for collection in (
         db.properties, db.tenants, db.rental_contracts,
         db.lease_renewal_proposals, db.lease_renewal_responses,
         db.lease_renewal_notification_outbox, db.lease_renewal_rollovers,
+        db.signatures,
     ))
 
 
