@@ -79,3 +79,31 @@ def test_refuses_missing_token():
         assert False, "missing token must fail"
     except cycle.CycleFailure as exc:
         assert "STAGING_ADMIN_TOKEN is required" in str(exc)
+
+
+def test_logout_failure_fails_cycle_after_cleanup(monkeypatch):
+    responses = success_responses()
+    responses[("POST", "/api/auth/logout")] = (500, {"detail": "failed"})
+
+    inspection_count = 0
+
+    def fake(base, path, token, method="GET", body=None):
+        nonlocal inspection_count
+        if method == "GET" and "/renewal-source/" in path:
+            inspection_count += 1
+            if inspection_count == 2:
+                return 200, {
+                    "present": {
+                        "property": False,
+                        "tenant": False,
+                        "contract": False,
+                    }
+                }
+        return responses[(method, path)]
+
+    monkeypatch.setattr(cycle, "request_json", fake)
+    try:
+        cycle.run_cycle(BASE, TOKEN)
+        assert False, "logout failure must fail the cycle"
+    except cycle.CycleFailure as exc:
+        assert "session revocation failed" in str(exc)
