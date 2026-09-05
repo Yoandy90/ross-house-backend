@@ -65,7 +65,7 @@ def fixture():
     proposal_id = str(ObjectId()); old_id = ObjectId(); new_id = _renewal_contract_id(proposal_id)
     pid, tid = ObjectId(), ObjectId(); start = date.today(); old_end = start - timedelta(days=1)
     old = {'_id': old_id, 'status': 'active', 'property_id': str(pid), 'tenant_id': str(tid), 'unit_id': None, 'end_date': old_end.isoformat()}
-    new = {'_id': new_id, 'status': 'pending_activation', 'property_id': str(pid), 'tenant_id': str(tid), 'unit_id': None, 'start_date': start.isoformat(), 'tenant_signature': 'tenant-sig', 'admin_signature': 'admin-sig', 'renewal_source': {'proposal_id': proposal_id, 'prior_contract_id': str(old_id)}}
+    new = {'_id': new_id, 'status': 'pending_activation', 'property_id': str(pid), 'tenant_id': str(tid), 'unit_id': None, 'start_date': start.isoformat(), 'end_date': (start + timedelta(days=365)).isoformat(), 'tenant_signature': 'tenant-sig', 'admin_signature': 'admin-sig', 'renewal_source': {'proposal_id': proposal_id, 'prior_contract_id': str(old_id)}}
     prop = {'_id': pid, 'status': 'rented', 'status_manually_set': False, 'current_contract_id': str(old_id), 'current_tenant_id': str(tid)}
     tenant = {'_id': tid, 'current_contract_id': str(old_id), 'current_property_id': str(pid), 'current_unit_id': None}
     class DB: pass
@@ -101,6 +101,38 @@ def test_too_early_or_noncontiguous_dates_fail_before_claim():
     with pytest.raises(HTTPException) as exc:
         run(rollover._rollover_under_lock(db, proposal_id, 'admin', date.today() + timedelta(days=2)))
     assert exc.value.detail == 'renewal_rollover_dates_not_contiguous'
+
+
+def test_elapsed_or_inverted_renewal_term_fails_before_claim():
+    db, proposal_id, _old, new, *_ = fixture()
+    after_term = date.fromisoformat(new['end_date']) + timedelta(days=1)
+    with pytest.raises(HTTPException) as exc:
+        run(rollover._rollover_under_lock(db, proposal_id, 'admin', after_term))
+    assert exc.value.detail == 'renewal_rollover_term_elapsed'
+    assert db.lease_renewal_rollovers.docs == []
+
+    new['end_date'] = (
+        date.fromisoformat(new['start_date']) - timedelta(days=1)
+    ).isoformat()
+    with pytest.raises(HTTPException) as exc:
+        run(rollover._rollover_under_lock(db, proposal_id, 'admin', date.today()))
+    assert exc.value.detail == 'renewal_rollover_term_invalid'
+    assert db.lease_renewal_rollovers.docs == []
+
+
+def test_competing_active_resource_authority_fails_before_claim():
+    db, proposal_id, old, _new, *_ = fixture()
+    db.rental_contracts.docs.append({
+        '_id': ObjectId(),
+        'status': 'active',
+        'property_id': old['property_id'],
+        'tenant_id': str(ObjectId()),
+        'unit_id': None,
+    })
+    with pytest.raises(HTTPException) as exc:
+        run(rollover._rollover_under_lock(db, proposal_id, 'admin', date.today()))
+    assert exc.value.detail == 'renewal_rollover_resource_active_authority_changed'
+    assert db.lease_renewal_rollovers.docs == []
 
 
 def test_partial_failure_retains_claim_and_requires_recovery():
