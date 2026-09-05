@@ -138,13 +138,17 @@ def _safe_timestamp(value: Any) -> str:
     return ""
 
 
+def _safe_sequence(value: Any) -> int:
+    return value if isinstance(value, int) and not isinstance(value, bool) else -1
+
+
 async def inspect_rollover_audit_chain(
     db, *, rollover_id: str, proposal_id: str
 ) -> Dict[str, Any]:
     rows = await db.lease_renewal_rollover_audit.find(
         {"rollover_id": rollover_id, "proposal_id": proposal_id}
     ).to_list(len(ROLLOVER_AUDIT_EVENTS) + 1)
-    rows = sorted(rows, key=lambda row: int(row.get("sequence") or 0))
+    rows = sorted(rows, key=lambda row: _safe_sequence(row.get("sequence")))
     valid = len(rows) <= len(ROLLOVER_AUDIT_EVENTS)
     previous_digest = ""
     safe_events = []
