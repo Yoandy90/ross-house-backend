@@ -60,6 +60,7 @@ def run_cycle(raw_base: str, token: str) -> list[str]:
         raise CycleFailure("STAGING_ADMIN_TOKEN is required")
 
     marker = ""
+    tenant_token = ""
     checks: list[str] = []
     primary_error: Exception | None = None
     try:
@@ -214,10 +215,121 @@ def run_cycle(raw_base: str, token: str) -> list[str]:
         ):
             raise CycleFailure("simulated sent workflow state mismatch")
         checks.append("sent-state-verified")
+
+        status, identity = request_json(
+            base,
+            f"/api/admin/staging-fixtures/renewal-tenant-session/{quote(marker)}",
+            token,
+            method="POST",
+            body={"confirmation": "CREATE_SYNTHETIC_TENANT_SESSION"},
+        )
+        identity = require(
+            status, identity, "synthetic tenant session creation failed"
+        )
+        tenant_token = str(identity.get("token") or "")
+        if (
+            identity.get("synthetic") is not True
+            or identity.get("tenant_id") != str(created.get("tenant_id") or "")
+            or identity.get("session_bound") is not True
+            or not tenant_token
+        ):
+            raise CycleFailure("synthetic tenant identity mismatch")
+        checks.append("tenant-session-created")
+
+        status, offers = request_json(
+            base, "/api/tenant/lease-renewals", tenant_token
+        )
+        offers = require(status, offers, "tenant renewal offer listing failed")
+        matching_offers = [
+            item
+            for item in offers.get("offers", [])
+            if isinstance(item, dict)
+            and str(item.get("proposal_id") or "") == proposal_id
+        ]
+        if len(matching_offers) != 1:
+            raise CycleFailure("expected exactly one synthetic tenant offer")
+        offer = matching_offers[0]
+        terms_digest = str(offer.get("terms_digest") or "").lower()
+        if (
+            len(terms_digest) != 64
+            or any(ch not in "0123456789abcdef" for ch in terms_digest)
+            or "accept" not in (offer.get("allowed_decisions") or [])
+            or offer.get("response") is not None
+        ):
+            raise CycleFailure("synthetic tenant offer is invalid")
+        checks.append("tenant-offer-verified")
+
+        response_path = (
+            f"/api/tenant/lease-renewals/{quote(proposal_id)}/respond"
+        )
+        response_body = {"decision": "accept", "terms_digest": terms_digest}
+        status, responded = request_json(
+            base,
+            response_path,
+            tenant_token,
+            method="POST",
+            body=response_body,
+        )
+        responded = require(status, responded, "tenant renewal response failed")
+        response_view = responded.get("response") or {}
+        if (
+            responded.get("ok") is not True
+            or responded.get("idempotent") is not False
+            or response_view.get("decision") != "accept"
+            or response_view.get("terms_digest") != terms_digest
+        ):
+            raise CycleFailure("synthetic tenant response mismatch")
+        checks.append("tenant-response-recorded")
+
+        status, repeated = request_json(
+            base,
+            response_path,
+            tenant_token,
+            method="POST",
+            body=response_body,
+        )
+        repeated = require(
+            status, repeated, "tenant renewal response replay failed"
+        )
+        if repeated.get("ok") is not True or repeated.get("idempotent") is not True:
+            raise CycleFailure("tenant renewal response is not idempotent")
+        checks.append("tenant-response-idempotent")
+
+        status, accepted_workflow = request_json(
+            base,
+            f"/api/admin/lease-renewals/{quote(proposal_id)}/workflow-status",
+            token,
+        )
+        accepted_workflow = require(
+            status, accepted_workflow, "accepted workflow read model failed"
+        )
+        if (
+            accepted_workflow.get("proposal_id") != proposal_id
+            or accepted_workflow.get("read_only") is not True
+            or (accepted_workflow.get("tenant_response") or {}).get("decision")
+            != "accept"
+            or accepted_workflow.get("next_action") != "generate_contract"
+        ):
+            raise CycleFailure("accepted workflow state mismatch")
+        checks.append("accepted-state-verified")
     except Exception as exc:
         primary_error = exc
     finally:
         cleanup_error: Exception | None = None
+        if tenant_token:
+            try:
+                tenant_logout_status, _ = request_json(
+                    base,
+                    "/api/auth/logout",
+                    tenant_token,
+                    method="POST",
+                    body={},
+                )
+                if tenant_logout_status != 200:
+                    raise CycleFailure("tenant session revocation failed")
+                checks.append("tenant-session-revoked")
+            except Exception as exc:
+                cleanup_error = exc
         if marker:
             query = urlencode({"confirmation": "DELETE_SYNTHETIC_RENEWAL"})
             try:
@@ -241,7 +353,8 @@ def run_cycle(raw_base: str, token: str) -> list[str]:
                     raise CycleFailure("synthetic source residuals remain")
                 checks.append("no-source-residuals")
             except Exception as exc:
-                cleanup_error = exc
+                if cleanup_error is None:
+                    cleanup_error = exc
         try:
             logout_status, _ = request_json(
                 base, "/api/auth/logout", token, method="POST", body={}
