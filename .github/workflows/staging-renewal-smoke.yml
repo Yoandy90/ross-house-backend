@@ -17,8 +17,8 @@ jobs:
     timeout-minutes: 5
     environment: staging
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.11'
       - name: Require protected staging configuration
@@ -33,3 +33,31 @@ jobs:
           STAGING_BASE_URL: ${{ vars.STAGING_BASE_URL }}
           STAGING_ADMIN_TOKEN: ${{ secrets.STAGING_ADMIN_TOKEN }}
         run: python scripts/staging_renewal_smoke.py
+      - name: Revoke temporary staging session
+        if: ${{ always() }}
+        continue-on-error: true
+        env:
+          STAGING_BASE_URL: ${{ vars.STAGING_BASE_URL }}
+          STAGING_ADMIN_TOKEN: ${{ secrets.STAGING_ADMIN_TOKEN }}
+        run: |
+          if [ -z "$STAGING_BASE_URL" ] || [ -z "$STAGING_ADMIN_TOKEN" ]; then
+            exit 0
+          fi
+          python - <<'PY'
+          import os
+          from urllib.request import Request, urlopen
+
+          request = Request(
+              os.environ["STAGING_BASE_URL"].rstrip("/") + "/api/auth/logout",
+              data=b"{}",
+              headers={
+                  "Authorization": "Bearer " + os.environ["STAGING_ADMIN_TOKEN"],
+                  "Content-Type": "application/json",
+              },
+              method="POST",
+          )
+          with urlopen(request, timeout=10) as response:
+              if response.status != 200:
+                  raise RuntimeError("temporary session revocation failed")
+          print("temporary staging session revoked")
+          PY
