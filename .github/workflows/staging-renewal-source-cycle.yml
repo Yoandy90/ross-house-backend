@@ -12,7 +12,7 @@ concurrency:
 
 jobs:
   source-cycle:
-    name: Synthetic source, approval, and cleanup
+    name: Synthetic source, safe notification intent, and cleanup
     runs-on: ubuntu-latest
     timeout-minutes: 5
     environment: staging
@@ -28,7 +28,7 @@ jobs:
         run: |
           test -n "$STAGING_BASE_URL" || { echo "STAGING_BASE_URL is not configured"; exit 1; }
           test -n "$STAGING_ADMIN_TOKEN" || { echo "STAGING_ADMIN_TOKEN is not configured"; exit 1; }
-      - name: Run controlled approval cycle
+      - name: Run controlled notification-intent cycle
         env:
           STAGING_BASE_URL: ${{ vars.STAGING_BASE_URL }}
           STAGING_ADMIN_TOKEN: ${{ secrets.STAGING_ADMIN_TOKEN }}
