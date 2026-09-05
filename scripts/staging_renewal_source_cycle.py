@@ -122,9 +122,40 @@ def run_cycle(raw_base: str, token: str) -> list[str]:
             body={},
         )
         approved = require(status, approved, "synthetic proposal approval failed")
-        if approved.get("ok") is not True or approved.get("status") != "approved":
+        if (
+            approved.get("ok") is not True
+            or approved.get("status") != "approved"
+            or approved.get("notification_queued") is not True
+            or approved.get("queued_now") is not True
+        ):
             raise CycleFailure("synthetic proposal approval mismatch")
         checks.append("proposal-approved")
+
+        status, outbox = request_json(
+            base,
+            "/api/admin/lease-renewals/notification-outbox?status=pending&limit=200",
+            token,
+        )
+        outbox = require(status, outbox, "notification outbox inspection failed")
+        matching_intents = [
+            item
+            for item in outbox.get("notifications", [])
+            if isinstance(item, dict)
+            and str(item.get("proposal_id") or "") == proposal_id
+        ]
+        if len(matching_intents) != 1:
+            raise CycleFailure("expected exactly one synthetic notification intent")
+        intent = matching_intents[0]
+        if (
+            intent.get("status") != "pending"
+            or intent.get("attempts") != 0
+            or any(
+                field in intent
+                for field in ("tenant_email", "tenant_phone", "tenant_name")
+            )
+        ):
+            raise CycleFailure("synthetic notification intent is unsafe")
+        checks.append("notification-intent-safe")
 
         status, approved_workflow = request_json(
             base,
@@ -139,11 +170,12 @@ def run_cycle(raw_base: str, token: str) -> list[str]:
             approved_workflow.get("proposal_id") != proposal_id
             or approved_workflow.get("read_only") is not True
             or proposal_view.get("status") != "approved"
-            or approved_workflow.get("delivery") is not None
-            or approved_workflow.get("next_action") != "repair_notification_intent"
+            or (approved_workflow.get("delivery") or {}).get("status") != "pending"
+            or (approved_workflow.get("delivery") or {}).get("attempts") != 0
+            or approved_workflow.get("next_action") != "send_notification"
         ):
             raise CycleFailure("approved workflow state mismatch")
-        checks.append("approved-state-verified")
+        checks.append("pending-delivery-verified")
     except Exception as exc:
         primary_error = exc
     finally:
