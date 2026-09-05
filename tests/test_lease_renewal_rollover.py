@@ -289,6 +289,28 @@ def test_changed_projection_and_extra_payload_fail_closed():
     assert exc.value.detail == 'renewal_rollover_payload_must_be_empty'
 
 
+def test_inspection_reports_safe_complete_or_invalid_audit_status():
+    db, proposal_id, _old, new, *_ = fixture()
+    run(rollover._rollover_under_lock(db, proposal_id, "admin", date.today()))
+    view = run(rollover.inspect_rollover(
+        proposal_id, str(new["_id"]), db, {"_id": "admin"},
+    ))
+    audit = view["audit"]
+    assert audit["status"] == "complete"
+    assert audit["valid"] is True and audit["complete"] is True
+    assert audit["recorded_events"] == audit["expected_events"] == 11
+    assert "actor" not in repr(audit)
+    assert "digest" not in repr(audit)
+    assert "claim_id" not in repr(audit)
+
+    db.lease_renewal_rollover_audit.docs[3]["event"] = "tampered"
+    view = run(rollover.inspect_rollover(
+        proposal_id, str(new["_id"]), db, {"_id": "admin"},
+    ))
+    assert view["audit"]["status"] == "invalid"
+    assert view["audit"]["valid"] is False
+
+
 def test_inspection_is_read_only_and_hides_claim_value():
     source = open('rental/lease_renewal_rollover_router.py', encoding='utf-8').read()
     assert 'automatic_retry_allowed": False' in source
