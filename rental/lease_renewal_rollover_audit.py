@@ -97,12 +97,17 @@ async def append_rollover_audit_event(
 
     sequence = _EVENT_SEQUENCE[event]
     previous_digest = ""
-    if sequence > 1:
-        previous_event = ROLLOVER_AUDIT_EVENTS[sequence - 2]
+    for previous_event in ROLLOVER_AUDIT_EVENTS[: sequence - 1]:
         previous = await db.lease_renewal_rollover_audit.find_one(
             {"_id": _event_id(rollover_id, proposal_id, previous_event)}
         )
-        if not previous or not verify_rollover_audit_event(previous):
+        if (
+            not previous
+            or not verify_rollover_audit_event(previous)
+            or not secrets.compare_digest(
+                str(previous.get("previous_digest") or ""), previous_digest
+            )
+        ):
             raise HTTPException(status_code=409, detail="renewal_rollover_audit_chain_invalid")
         previous_digest = str(previous["integrity_digest"])
 
