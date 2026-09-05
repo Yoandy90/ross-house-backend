@@ -6,6 +6,7 @@ from bson import ObjectId
 from fastapi import HTTPException
 
 import rental.lease_renewal_rollover_recovery_router as recovery
+import rental.lease_renewal_tenant_response_router as tenant_response
 from rental.lease_renewal_contract_generation_router import _renewal_contract_id
 
 
@@ -71,26 +72,72 @@ class Collection:
 
 
 def fixture():
-    proposal_id = str(ObjectId()); old_id = ObjectId(); new_id = _renewal_contract_id(proposal_id)
-    pid, tid = ObjectId(), ObjectId(); claim = 'claim-secret-never-returned'
-    old = {'_id': old_id, 'status': 'expired', 'property_id': str(pid), 'tenant_id': str(tid), 'unit_id': None,
-           'end_date': date.today().isoformat(), 'lifecycle_claim_id': claim,
-           'lifecycle_claim_target': 'renewal_rollover'}
-    new = {'_id': new_id, 'status': 'pending_activation', 'property_id': str(pid), 'tenant_id': str(tid), 'unit_id': None,
-           'start_date': date.today().isoformat(), 'tenant_signature': 't', 'admin_signature': 'a',
-           'lifecycle_claim_id': claim, 'lifecycle_claim_target': 'renewal_rollover',
-           'renewal_source': {'proposal_id': proposal_id, 'prior_contract_id': str(old_id)}}
-    prop = {'_id': pid, 'status': 'rented', 'status_manually_set': False,
-            'current_contract_id': str(new_id), 'current_tenant_id': str(tid)}
-    tenant = {'_id': tid, 'current_contract_id': str(new_id),
-              'current_property_id': str(pid), 'current_unit_id': None}
-    record = {'_id': new_id, 'proposal_id': proposal_id, 'prior_contract_id': str(old_id),
-              'renewal_contract_id': str(new_id), 'property_id': str(pid), 'tenant_id': str(tid),
-              'claim_id': claim, 'state': 'recovery_required', 'stage': 'activate_renewal',
-              'automatic_retry_allowed': False}
+    proposal_oid = ObjectId()
+    proposal_id = str(proposal_oid)
+    old_id = ObjectId()
+    new_id = _renewal_contract_id(proposal_id)
+    pid, tid = ObjectId(), ObjectId()
+    claim = 'claim-secret-never-returned'
+    old_end = date.today()
+    old = {
+        '_id': old_id, 'status': 'expired', 'property_id': str(pid),
+        'tenant_id': str(tid), 'unit_id': None, 'end_date': old_end.isoformat(),
+        'rent_amount': 1200.0, 'lifecycle_claim_id': claim,
+        'lifecycle_claim_target': 'renewal_rollover',
+    }
+    proposal = {
+        '_id': proposal_oid, 'status': 'approved', 'lease_id': str(old_id),
+        'property_id': str(pid), 'tenant_id': str(tid), 'unit_id': None,
+        'recommendation': 'renew', 'current_rent': 1200.0,
+        'proposed_rent': 1250.0, 'lease_end_date': old_end.isoformat(),
+    }
+    terms = {
+        'proposal_id': proposal_id, 'lease_id': str(old_id),
+        'property_id': str(pid), 'tenant_id': str(tid),
+        'recommendation': 'renew', 'current_rent': '1200.00',
+        'proposed_rent': '1250.00', 'lease_end_date': old_end.isoformat(),
+    }
+    digest = tenant_response._digest(terms)
+    response = {
+        '_id': proposal_oid, 'proposal_id': proposal_id, 'decision': 'accept',
+        'lease_id': str(old_id), 'property_id': str(pid), 'tenant_id': str(tid),
+        'terms': terms, 'terms_digest': digest,
+    }
+    new = {
+        '_id': new_id, 'status': 'pending_activation',
+        'property_id': str(pid), 'tenant_id': str(tid), 'unit_id': None,
+        'start_date': date.today().isoformat(), 'rent_amount': 1250.0,
+        'tenant_signature': 't', 'admin_signature': 'a',
+        'lifecycle_claim_id': claim, 'lifecycle_claim_target': 'renewal_rollover',
+        'renewal_source': {
+            'proposal_id': proposal_id, 'response_id': proposal_id,
+            'prior_contract_id': str(old_id), 'terms_digest': digest,
+        },
+    }
+    prop = {
+        '_id': pid, 'status': 'rented', 'status_manually_set': False,
+        'current_contract_id': str(new_id), 'current_tenant_id': str(tid),
+    }
+    tenant = {
+        '_id': tid, 'current_contract_id': str(new_id),
+        'current_property_id': str(pid), 'current_unit_id': None,
+    }
+    record = {
+        '_id': new_id, 'proposal_id': proposal_id,
+        'prior_contract_id': str(old_id), 'renewal_contract_id': str(new_id),
+        'property_id': str(pid), 'tenant_id': str(tid), 'claim_id': claim,
+        'state': 'recovery_required', 'stage': 'activate_renewal',
+        'automatic_retry_allowed': False,
+    }
     class DB: pass
-    db = DB(); db.rental_contracts = Collection([old, new]); db.properties = Collection([prop])
-    db.property_units = Collection(); db.tenants = Collection([tenant]); db.lease_renewal_rollovers = Collection([record])
+    db = DB()
+    db.rental_contracts = Collection([old, new])
+    db.properties = Collection([prop])
+    db.property_units = Collection()
+    db.tenants = Collection([tenant])
+    db.lease_renewal_proposals = Collection([proposal])
+    db.lease_renewal_responses = Collection([response])
+    db.lease_renewal_rollovers = Collection([record])
     return db, proposal_id, record, old, new, prop, tenant
 
 
