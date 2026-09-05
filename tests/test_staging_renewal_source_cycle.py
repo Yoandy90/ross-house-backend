@@ -57,6 +57,43 @@ def success_responses():
         ("DELETE", "/api/admin/staging-fixtures/renewal-lifecycle/staging-renewal-" + "a" * 32 + "?confirmation=DELETE_SYNTHETIC_RENEWAL"): (
             200, {"clean": True}
         ),
+        (
+            "POST",
+            "/api/admin/staging-fixtures/renewal-tenant-session/staging-renewal-" + "a" * 32,
+        ): (
+            200,
+            {
+                "synthetic": True,
+                "tenant_id": "t1",
+                "session_bound": True,
+                "token": "tenant-session-token",
+            },
+        ),
+        ("GET", "/api/tenant/lease-renewals"): (
+            200,
+            {
+                "offers": [
+                    {
+                        "proposal_id": "p1",
+                        "terms_digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                        "allowed_decisions": ["accept", "decline"],
+                        "response": None,
+                    }
+                ],
+                "total": 1,
+            },
+        ),
+        ("POST", "/api/tenant/lease-renewals/p1/respond"): (
+            200,
+            {
+                "ok": True,
+                "idempotent": False,
+                "response": {
+                    "decision": "accept",
+                    "terms_digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                },
+            },
+        ),
         ("POST", "/api/auth/logout"): (200, {"success": True}),
     }
 
@@ -91,6 +128,26 @@ def test_source_cycle_passes_and_cleans(monkeypatch):
                     "delivery": {"status": "sent", "attempts": 1},
                     "next_action": "await_tenant_response",
                 }
+            if workflow_count == 4:
+                return 200, {
+                    "proposal_id": "p1",
+                    "read_only": True,
+                    "tenant_response": {"decision": "accept", "recorded": True},
+                    "next_action": "generate_contract",
+                }
+        if (
+            method == "POST"
+            and path == "/api/tenant/lease-renewals/p1/respond"
+            and calls.count((method, path)) == 2
+        ):
+            return 200, {
+                "ok": True,
+                "idempotent": True,
+                "response": {
+                    "decision": "accept",
+                    "terms_digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                },
+            }
         return responses[(method, path)]
 
     monkeypatch.setattr(cycle, "request_json", fake)
@@ -101,6 +158,12 @@ def test_source_cycle_passes_and_cleans(monkeypatch):
     assert "pending-delivery-verified" in checks
     assert "delivery-simulated" in checks
     assert "sent-state-verified" in checks
+    assert "tenant-session-created" in checks
+    assert "tenant-offer-verified" in checks
+    assert "tenant-response-recorded" in checks
+    assert "tenant-response-idempotent" in checks
+    assert "accepted-state-verified" in checks
+    assert "tenant-session-revoked" in checks
     assert "lifecycle-cleaned" in checks
     assert "no-source-residuals" in checks
     assert calls[-1] == ("POST", "/api/auth/logout")
@@ -175,6 +238,13 @@ def test_logout_failure_fails_cycle_after_cleanup(monkeypatch):
                     "proposal": {"status": "approved"},
                     "delivery": {"status": "sent", "attempts": 1},
                     "next_action": "await_tenant_response",
+                }
+            if workflow_count == 4:
+                return 200, {
+                    "proposal_id": "p1",
+                    "read_only": True,
+                    "tenant_response": {"decision": "accept", "recorded": True},
+                    "next_action": "generate_contract",
                 }
         return responses[(method, path)]
 
