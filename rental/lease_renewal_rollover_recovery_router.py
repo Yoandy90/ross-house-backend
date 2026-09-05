@@ -398,7 +398,29 @@ async def observe_recovery(proposal_id: str, rollover_id: str, db=Depends(get_db
     del admin
     record, old, new = await _record_and_pair(db, proposal_id, rollover_id)
     observed = await _observation(db, record, old, new)
-    _assert_recoverable(observed)
+    if observed["record_state"] == "completed":
+        completed_exact = (
+            observed["record_stage"] == "complete"
+            and observed["automatic_retry_disabled"]
+            and observed["prior_status"] == "expired"
+            and observed["renewal_status"] == "active"
+            and observed["prior_claim"] == "missing"
+            and observed["renewal_claim"] == "missing"
+            and observed["resource_owner"] == "renewal"
+            and observed["tenant_owner"] == "renewal"
+            and observed["resource_status"] == "rented"
+            and not observed["resource_manually_set"]
+            and observed["resource_tenant_exact"]
+            and observed["tenant_property_exact"]
+            and observed["tenant_unit_exact"]
+        )
+        if not completed_exact:
+            raise HTTPException(
+                status_code=409,
+                detail="renewal_rollover_recovery_completed_state_invalid",
+            )
+    else:
+        _assert_recoverable(observed)
     observed_digest = _digest(observed)
     recovery_id = str((record.get("manual_recovery") or {}).get("recovery_id") or "").lower()
     audit = None
