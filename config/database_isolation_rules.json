@@ -44,12 +44,14 @@
       "trucker_"
     ],
     "exact": [
+      "admin_users",
       "admin_tax_returns",
       "asylum_judge_stats",
       "completed_tax_returns",
       "employer_eins",
       "form_4506c",
       "imported_tax_seasons",
+      "loans",
       "metro2_exports",
       "occc_audit_trail",
       "season_clients"
