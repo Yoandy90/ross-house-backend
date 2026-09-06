@@ -1,0 +1,58 @@
+{
+  "version": 1,
+  "migration_authorized": false,
+  "rental_namespace_candidates": {
+    "prefixes": [
+      "deal_finder_",
+      "lease_",
+      "mashvisor_",
+      "owner_",
+      "property_",
+      "rental_",
+      "syndication_",
+      "tenant_"
+    ],
+    "exact": [
+      "autopay_config",
+      "city_utility_accounts",
+      "city_utility_invoices",
+      "contracts",
+      "inspections",
+      "investments",
+      "maintenance_requests",
+      "marketplace_listings",
+      "properties",
+      "rent_reporting_enrollments",
+      "screening_reports",
+      "service_providers",
+      "title_companies",
+      "utility_payments"
+    ]
+  },
+  "external_namespace_candidates": {
+    "prefixes": [
+      "bk_",
+      "bolita_",
+      "cab_",
+      "immigration_",
+      "iris_",
+      "lending_",
+      "loan_",
+      "payroll_",
+      "regulated_loan_",
+      "tax_",
+      "trucker_"
+    ],
+    "exact": [
+      "admin_tax_returns",
+      "asylum_judge_stats",
+      "completed_tax_returns",
+      "employer_eins",
+      "form_4506c",
+      "imported_tax_seasons",
+      "metro2_exports",
+      "occc_audit_trail",
+      "season_clients"
+    ]
+  }
+}
