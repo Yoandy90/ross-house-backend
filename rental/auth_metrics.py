@@ -26,6 +26,7 @@ from .inspection_delivery_router import (
     router as inspection_delivery_router,
     ensure_indexes as ensure_inspection_delivery_indexes,
 )
+from .production_readiness_router import router as production_readiness_router
 from .property_visibility_security_router import router as property_visibility_security_router
 from .property_archival_security_router import router as property_archival_security_router
 from .property_lifecycle_security_router import router as property_lifecycle_security_router
@@ -74,6 +75,7 @@ router.routes.extend(maintenance_ownership_security_router.routes)
 router.routes.extend(maintenance_dispatch_security_router.routes)
 router.routes.extend(inspection_delivery_router.routes)
 router.routes.extend(inspection_security_router.routes)
+router.routes.extend(production_readiness_router.routes)
 router.routes.extend(property_visibility_security_router.routes)
 router.routes.extend(property_archival_security_router.routes)
 router.routes.extend(property_lifecycle_security_router.routes)
