@@ -1,11 +1,21 @@
 {
-  "version": 1,
+  "version": 2,
   "source_database": "taxportal",
   "target_database": "ross_house_production",
   "target_owner": "Ross House Rentals LLC",
   "migration_authorized": false,
   "default_action": "block",
   "inventory_sha256": "<64 lowercase hexadecimal characters>",
+  "contract_sha256": "<64 lowercase hexadecimal characters>",
+  "collections_sha256": "<canonical SHA-256 of collections>",
+  "provenance": {
+    "evidence_id": "evd-<derived SHA-256>",
+    "prepared_by": "<preparer identity>",
+    "approved_by": "<different approver identity>",
+    "prepared_at": "<UTC ISO-8601 timestamp ending in Z>",
+    "approved_at": "<UTC ISO-8601 timestamp ending in Z>",
+    "expires_at": "<UTC timestamp no more than 30 days after approval>"
+  },
   "collections": [
     {
       "name": "<collection name>",

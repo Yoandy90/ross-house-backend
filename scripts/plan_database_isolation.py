@@ -12,6 +12,7 @@ import argparse
 import hashlib
 import json
 import re
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 RUNTIME_SUFFIXES = {".py", ".js", ".ts", ".tsx"}
@@ -99,7 +100,8 @@ def load_rules(path: Path) -> dict:
 
 
 def load_filter_contract(path: Path) -> dict:
-    contract = json.loads(path.read_text(encoding="utf-8-sig"))
+    raw = path.read_bytes()
+    contract = json.loads(raw.decode("utf-8-sig"))
     if contract.get("source_database") != "taxportal":
         raise ValueError("filter_contract_source_invalid")
     if contract.get("target_database") != "ross_house_production":
@@ -114,6 +116,7 @@ def load_filter_contract(path: Path) -> dict:
         or set(requirements) != FILTER_REQUIREMENTS
     ):
         raise ValueError("filter_contract_requirements_invalid")
+    contract["_contract_sha256"] = hashlib.sha256(raw).hexdigest()
     return contract
 
 
@@ -212,37 +215,136 @@ def _validate_evidence_detail(requirement: str, detail: object) -> None:
             raise ValueError("filter_evidence_external_source_prohibited")
 
 
+def _utc_timestamp(value: object, field: str) -> datetime:
+    if not isinstance(value, str) or not value.endswith("Z"):
+        raise ValueError(f"filter_evidence_{field}_invalid")
+    try:
+        parsed = datetime.fromisoformat(value[:-1] + "+00:00")
+    except ValueError as exc:
+        raise ValueError(f"filter_evidence_{field}_invalid") from exc
+    if parsed.tzinfo != timezone.utc:
+        raise ValueError(f"filter_evidence_{field}_invalid")
+    return parsed
+
+
+def _canonical_sha256(value: object) -> str:
+    rendered = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    )
+    return hashlib.sha256(rendered.encode("utf-8")).hexdigest()
+
+
+def _expected_evidence_id(
+    inventory_sha256: str,
+    contract_sha256: str,
+    collections_sha256: str,
+    provenance: dict,
+) -> str:
+    binding = ":".join(
+        (
+            inventory_sha256,
+            contract_sha256,
+            collections_sha256,
+            provenance["prepared_by"],
+            provenance["approved_by"],
+            provenance["approved_at"],
+        )
+    )
+    return "evd-" + hashlib.sha256(binding.encode("utf-8")).hexdigest()
+
+
 def apply_offline_filter_evidence(
-    rows: list[dict], evidence: dict, inventory_sha256: str
+    rows: list[dict],
+    evidence: dict,
+    inventory_sha256: str,
+    contract_sha256: str,
+    *,
+    now: datetime | None = None,
 ) -> dict:
-    """Validate offline evidence only; never build queries or authorize migration."""
+    """Approve bound offline evidence only; never build queries or authorize migration."""
     fixed = {
-        "version": 1,
+        "version": 2,
         "source_database": "taxportal",
         "target_database": "ross_house_production",
         "target_owner": "Ross House Rentals LLC",
         "migration_authorized": False,
         "default_action": "block",
     }
-    allowed_fields = {*fixed, "inventory_sha256", "collections"}
-    if set(evidence) != allowed_fields:
+    allowed_fields = {
+        *fixed,
+        "inventory_sha256",
+        "contract_sha256",
+        "collections_sha256",
+        "provenance",
+        "collections",
+    }
+    if not isinstance(evidence, dict) or set(evidence) != allowed_fields:
         raise ValueError("filter_evidence_package_fields_invalid")
     for field, expected in fixed.items():
         if evidence.get(field) != expected:
             raise ValueError(f"filter_evidence_{field}_invalid")
-    digest = evidence.get("inventory_sha256")
-    if not isinstance(digest, str) or not SHA256_RE.fullmatch(digest):
-        raise ValueError("filter_evidence_inventory_sha256_invalid")
-    if digest != inventory_sha256:
-        raise ValueError("filter_evidence_inventory_hash_mismatch")
+    for field, expected in (
+        ("inventory_sha256", inventory_sha256),
+        ("contract_sha256", contract_sha256),
+    ):
+        digest = evidence.get(field)
+        if not isinstance(digest, str) or not SHA256_RE.fullmatch(digest):
+            raise ValueError(f"filter_evidence_{field}_invalid")
+        if digest != expected:
+            raise ValueError(f"filter_evidence_{field}_mismatch")
     entries = evidence.get("collections")
     if not isinstance(entries, list):
         raise ValueError("filter_evidence_collections_invalid")
+    collections_sha256 = evidence.get("collections_sha256")
+    if (
+        not isinstance(collections_sha256, str)
+        or not SHA256_RE.fullmatch(collections_sha256)
+        or collections_sha256 != _canonical_sha256(entries)
+    ):
+        raise ValueError("filter_evidence_collections_hash_mismatch")
+    provenance = evidence.get("provenance")
+    provenance_fields = {
+        "evidence_id",
+        "prepared_by",
+        "approved_by",
+        "prepared_at",
+        "approved_at",
+        "expires_at",
+    }
+    if not isinstance(provenance, dict) or set(provenance) != provenance_fields:
+        raise ValueError("filter_evidence_provenance_invalid")
+    for field in ("prepared_by", "approved_by"):
+        value = provenance.get(field)
+        if not isinstance(value, str) or not value.strip() or "*" in value:
+            raise ValueError(f"filter_evidence_{field}_invalid")
+    if provenance["prepared_by"].casefold() == provenance["approved_by"].casefold():
+        raise ValueError("filter_evidence_separation_of_duties_required")
+    prepared_at = _utc_timestamp(provenance.get("prepared_at"), "prepared_at")
+    approved_at = _utc_timestamp(provenance.get("approved_at"), "approved_at")
+    expires_at = _utc_timestamp(provenance.get("expires_at"), "expires_at")
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        raise ValueError("filter_evidence_now_must_be_timezone_aware")
+    current = current.astimezone(timezone.utc)
+    if not prepared_at <= approved_at <= expires_at:
+        raise ValueError("filter_evidence_timeline_invalid")
+    if expires_at - approved_at > timedelta(days=30):
+        raise ValueError("filter_evidence_validity_window_too_long")
+    if current < approved_at:
+        raise ValueError("filter_evidence_approval_not_yet_effective")
+    if current >= expires_at:
+        raise ValueError("filter_evidence_expired")
+    expected_id = _expected_evidence_id(
+        inventory_sha256, contract_sha256, collections_sha256, provenance
+    )
+    if provenance.get("evidence_id") != expected_id:
+        raise ValueError("filter_evidence_id_binding_invalid")
+
     row_map = {
         row["name"]: row for row in rows if row.get("filter_requirement")
     }
     seen = set()
-    validated_names = []
+    approved_names = []
     for entry in entries:
         if (
             not isinstance(entry, dict)
@@ -261,13 +363,15 @@ def apply_offline_filter_evidence(
         if requirement != row["filter_requirement"]:
             raise ValueError(f"filter_evidence_requirement_mismatch:{name}")
         _validate_evidence_detail(requirement, entry["evidence"])
-        validated_names.append(name)
-    for name in validated_names:
-        row_map[name]["filter_status"] = "offline_evidence_validated"
+        approved_names.append(name)
+    for name in approved_names:
+        row_map[name]["filter_status"] = "offline_evidence_approved"
+        row_map[name]["evidence_id"] = provenance["evidence_id"]
     return {
         "submitted": len(entries),
-        "validated": len(entries),
+        "approved": len(entries),
         "still_blocked": len(row_map) - len(entries),
+        "evidence_id": provenance["evidence_id"],
     }
 
 
@@ -391,7 +495,10 @@ def build_evidence(
         if filter_contract is None:
             raise ValueError("filter_evidence_requires_contract")
         filter_evidence_counts = apply_offline_filter_evidence(
-            rows, filter_evidence, inventory["_inventory_sha256"]
+            rows,
+            filter_evidence,
+            inventory["_inventory_sha256"],
+            filter_contract["_contract_sha256"],
         )
     external_runtime_dependencies = [
         row["name"]
@@ -405,6 +512,9 @@ def build_evidence(
         "target_owner": rules["target_owner"],
         "exclusive_target": True,
         "inventory_sha256": inventory["_inventory_sha256"],
+        "filter_contract_sha256": (
+            filter_contract["_contract_sha256"] if filter_contract else None
+        ),
         "collection_count": len(rows),
         "runtime_referenced_count": referenced,
         "unreferenced_count": len(rows) - referenced,
