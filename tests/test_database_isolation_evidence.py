@@ -152,7 +152,10 @@ def test_incomplete_relationship_and_missing_discriminator_are_rejected():
         apply_offline_filter_evidence(data, package("a" * 64, [discriminator]), "a" * 64)
 
 
-@pytest.mark.parametrize("external", ["taxportal", "Ross Tax", "loans", "Ross Lending"])
+@pytest.mark.parametrize(
+    "external",
+    ["taxportal", "Ross Tax", "ross_tax", "loans", "Ross Lending", "ross-lending"],
+)
 def test_external_system_discriminators_are_prohibited(external):
     data = rows()
     apply_filter_contract(data, contract())
@@ -173,3 +176,21 @@ def test_requirement_substitution_and_unknown_collection_are_rejected():
     unknown["name"] = "loans"
     with pytest.raises(ValueError, match="unknown_collection:loans"):
         apply_offline_filter_evidence(data, package("a" * 64, [unknown]), "a" * 64)
+
+
+def test_unexpected_package_fields_and_failed_batch_are_atomic():
+    data = rows()
+    apply_filter_contract(data, contract())
+    unexpected = package("a" * 64, evidence_entries(), query={"$ne": None})
+    with pytest.raises(ValueError, match="package_fields_invalid"):
+        apply_offline_filter_evidence(data, unexpected, "a" * 64)
+
+    entries = evidence_entries()
+    entries[-1]["evidence"]["reviewer"] = ""
+    with pytest.raises(ValueError, match="reviewer_invalid"):
+        apply_offline_filter_evidence(
+            data, package("a" * 64, entries), "a" * 64
+        )
+    assert all(
+        row["filter_status"] == "blocked_pending_evidence" for row in data
+    )

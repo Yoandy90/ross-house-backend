@@ -192,7 +192,11 @@ def _validate_evidence_detail(requirement: str, detail: object) -> None:
             raise ValueError("filter_evidence_discriminator_fields_invalid")
         _strict_strings(detail.get("field_paths"), "field_paths")
         values = _strict_strings(detail.get("allowed_values"), "allowed_values")
-        if any(value.casefold() in FORBIDDEN_SOURCE_MARKERS for value in values):
+        normalized = {
+            re.sub(r"[^a-z0-9]+", " ", value.casefold()).strip()
+            for value in values
+        }
+        if normalized & FORBIDDEN_SOURCE_MARKERS:
             raise ValueError("filter_evidence_external_source_prohibited")
     elif requirement == "manual_schema_review":
         required = {"field_paths", "ownership_basis", "reviewer", "reviewed_at"}
@@ -220,6 +224,9 @@ def apply_offline_filter_evidence(
         "migration_authorized": False,
         "default_action": "block",
     }
+    allowed_fields = {*fixed, "inventory_sha256", "collections"}
+    if set(evidence) != allowed_fields:
+        raise ValueError("filter_evidence_package_fields_invalid")
     for field, expected in fixed.items():
         if evidence.get(field) != expected:
             raise ValueError(f"filter_evidence_{field}_invalid")
@@ -235,6 +242,7 @@ def apply_offline_filter_evidence(
         row["name"]: row for row in rows if row.get("filter_requirement")
     }
     seen = set()
+    validated_names = []
     for entry in entries:
         if (
             not isinstance(entry, dict)
@@ -253,7 +261,9 @@ def apply_offline_filter_evidence(
         if requirement != row["filter_requirement"]:
             raise ValueError(f"filter_evidence_requirement_mismatch:{name}")
         _validate_evidence_detail(requirement, entry["evidence"])
-        row["filter_status"] = "offline_evidence_validated"
+        validated_names.append(name)
+    for name in validated_names:
+        row_map[name]["filter_status"] = "offline_evidence_validated"
     return {
         "submitted": len(entries),
         "validated": len(entries),
