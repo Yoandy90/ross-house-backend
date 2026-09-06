@@ -6,6 +6,7 @@ from scripts.plan_database_isolation import (
     build_evidence,
     load_inventory,
     load_rules,
+    migration_strategy,
     namespace_evidence,
 )
 
@@ -64,6 +65,15 @@ def test_plan_reports_runtime_evidence_without_authorizing_migration(tmp_path):
         "conflicting_namespace_evidence": 0,
         "no_namespace_evidence": 0,
     }
+    assert report["strategy_counts"] == {
+        "blocked_conflict": 0,
+        "collection_copy_candidate": 1,
+        "dormant_rental_candidate": 0,
+        "external_name_collision": 0,
+        "external_exclusion_candidate": 1,
+        "document_filter_required": 0,
+        "unreferenced_manual_review": 0,
+    }
     assert report["collections"][0]["runtime_references"] == [
         "rental/properties_router.py"
     ]
@@ -117,3 +127,25 @@ def test_rules_file_must_never_authorize_migration(tmp_path):
 
     with pytest.raises(ValueError, match="rules_must_be_fail_closed"):
         load_rules(rules_path)
+
+
+@pytest.mark.parametrize(
+    "evidence,referenced,expected",
+    [
+        ("conflicting_namespace_evidence", True, "blocked_conflict"),
+        ("rental_namespace_candidates", True, "collection_copy_candidate"),
+        ("rental_namespace_candidates", False, "dormant_rental_candidate"),
+        ("external_namespace_candidates", True, "external_name_collision"),
+        (
+            "external_namespace_candidates",
+            False,
+            "external_exclusion_candidate",
+        ),
+        ("no_namespace_evidence", True, "document_filter_required"),
+        ("no_namespace_evidence", False, "unreferenced_manual_review"),
+    ],
+)
+def test_migration_strategy_only_prioritizes_manual_review(
+    evidence, referenced, expected
+):
+    assert migration_strategy(evidence, referenced) == expected
