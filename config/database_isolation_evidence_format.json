@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "source_database": "taxportal",
+  "target_database": "ross_house_production",
+  "target_owner": "Ross House Rentals LLC",
+  "migration_authorized": false,
+  "default_action": "block",
+  "inventory_sha256": "<64 lowercase hexadecimal characters>",
+  "collections": [
+    {
+      "name": "<collection name>",
+      "requirement": "<explicit_root_id_allowlist|relationship_closure|source_discriminator|manual_schema_review>",
+      "evidence": {
+        "root_ids": ["<exact non-empty id>"]
+      }
+    }
+  ]
+}
