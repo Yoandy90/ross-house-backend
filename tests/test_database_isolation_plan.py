@@ -4,6 +4,7 @@ import pytest
 
 from scripts.plan_database_isolation import (
     build_evidence,
+    has_collection_reference,
     load_inventory,
     load_rules,
     migration_strategy,
@@ -50,7 +51,7 @@ def test_plan_reports_runtime_evidence_without_authorizing_migration(tmp_path):
     write_inventory(inventory_path)
     (tmp_path / "rental").mkdir()
     (tmp_path / "rental" / "properties_router.py").write_text(
-        'COLLECTION = "properties"\n', encoding="utf-8"
+        'result = await db.properties.find_one({})\n', encoding="utf-8"
     )
     (tmp_path / "tests").mkdir()
     (tmp_path / "tests" / "tax_test.py").write_text(
@@ -161,6 +162,32 @@ def test_migration_strategy_only_prioritizes_manual_review(
     evidence, referenced, expected
 ):
     assert migration_strategy(evidence, referenced) == expected
+
+
+def test_reference_detection_ignores_prose_and_local_variable_names():
+    content = '''
+async def notify(db):
+    """Legacy loans format is not a collection access."""
+    admin_users = await db.app_users.find({}).to_list(50)
+    return admin_users
+'''
+
+    assert has_collection_reference(content, "admin_users") is False
+    assert has_collection_reference(content, "loans") is False
+    assert has_collection_reference(content, "app_users") is True
+
+
+def test_reference_detection_supports_collection_constants_and_subscripts():
+    content = '''
+VAULT_AUDIT_COLL = "vault_audit_log"
+OTHER_VALUE = "loans"
+await db[VAULT_AUDIT_COLL].insert_one({})
+await db["rental_payments"].find_one({})
+'''
+
+    assert has_collection_reference(content, "vault_audit_log") is True
+    assert has_collection_reference(content, "rental_payments") is True
+    assert has_collection_reference(content, "loans") is False
 
 
 @pytest.mark.parametrize(
