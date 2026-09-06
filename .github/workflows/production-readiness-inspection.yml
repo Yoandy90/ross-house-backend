@@ -1,0 +1,45 @@
+name: Production Readiness Inspection
+
+on:
+  workflow_dispatch:
+    inputs:
+      scope:
+        description: Readiness gate to verify
+        required: true
+        default: deploy
+        type: choice
+        options:
+          - deploy
+          - inspection-delivery
+
+permissions:
+  contents: read
+
+concurrency:
+  group: production-readiness-inspection
+  cancel-in-progress: false
+
+jobs:
+  inspect:
+    name: GET-only production readiness inspection
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment: production
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Require protected production configuration
+        env:
+          PRODUCTION_BASE_URL: ${{ vars.PRODUCTION_BASE_URL }}
+          PRODUCTION_ADMIN_TOKEN: ${{ secrets.PRODUCTION_ADMIN_TOKEN }}
+        run: |
+          test -n "$PRODUCTION_BASE_URL" || { echo "PRODUCTION_BASE_URL is not configured"; exit 1; }
+          test -n "$PRODUCTION_ADMIN_TOKEN" || { echo "PRODUCTION_ADMIN_TOKEN is not configured"; exit 1; }
+      - name: Run fail-closed GET-only inspection
+        env:
+          PRODUCTION_BASE_URL: ${{ vars.PRODUCTION_BASE_URL }}
+          PRODUCTION_ADMIN_TOKEN: ${{ secrets.PRODUCTION_ADMIN_TOKEN }}
+          PRODUCTION_READINESS_SCOPE: ${{ inputs.scope }}
+        run: python scripts/production_readiness_inspection.py
