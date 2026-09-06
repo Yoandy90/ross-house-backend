@@ -19,6 +19,15 @@ EVIDENCE_GROUPS = (
     "rental_namespace_candidates",
     "external_namespace_candidates",
 )
+MIGRATION_STRATEGIES = (
+    "blocked_conflict",
+    "collection_copy_candidate",
+    "dormant_rental_candidate",
+    "external_name_collision",
+    "external_exclusion_candidate",
+    "document_filter_required",
+    "unreferenced_manual_review",
+)
 
 
 def runtime_files(repository_root: Path) -> list[Path]:
@@ -77,6 +86,29 @@ def namespace_evidence(name: str, rules: dict) -> str:
     return "no_namespace_evidence"
 
 
+def migration_strategy(evidence: str, has_runtime_references: bool) -> str:
+    """Prioritize review without ever authorizing a migration operation."""
+    if evidence == "conflicting_namespace_evidence":
+        return "blocked_conflict"
+    if evidence == "rental_namespace_candidates":
+        return (
+            "collection_copy_candidate"
+            if has_runtime_references
+            else "dormant_rental_candidate"
+        )
+    if evidence == "external_namespace_candidates":
+        return (
+            "external_name_collision"
+            if has_runtime_references
+            else "external_exclusion_candidate"
+        )
+    return (
+        "document_filter_required"
+        if has_runtime_references
+        else "unreferenced_manual_review"
+    )
+
+
 def build_evidence(inventory: dict, repository_root: Path, rules: dict) -> dict:
     sources = {
         path: path.read_text(encoding="utf-8", errors="ignore")
@@ -93,6 +125,7 @@ def build_evidence(inventory: dict, repository_root: Path, rules: dict) -> dict:
             for path, content in sources.items()
             if pattern.search(content)
         ]
+        evidence = namespace_evidence(name, rules)
         rows.append(
             {
                 "name": name,
@@ -101,7 +134,10 @@ def build_evidence(inventory: dict, repository_root: Path, rules: dict) -> dict:
                 ),
                 "index_count": int(collection.get("index_count") or 0),
                 "runtime_references": references,
-                "namespace_evidence": namespace_evidence(name, rules),
+                "namespace_evidence": evidence,
+                "migration_strategy": migration_strategy(
+                    evidence, bool(references)
+                ),
                 "review_status": "manual_review_required",
             }
         )
@@ -115,6 +151,12 @@ def build_evidence(inventory: dict, repository_root: Path, rules: dict) -> dict:
             "no_namespace_evidence",
         )
     }
+    strategy_counts = {
+        strategy: sum(row["migration_strategy"] == strategy for row in rows)
+        for strategy in MIGRATION_STRATEGIES
+    }
+    if sum(strategy_counts.values()) != len(rows):
+        raise ValueError("migration_strategy_count_mismatch")
     return {
         "database_name": str(inventory.get("database_name") or ""),
         "collection_count": len(rows),
@@ -122,6 +164,7 @@ def build_evidence(inventory: dict, repository_root: Path, rules: dict) -> dict:
         "unreferenced_count": len(rows) - referenced,
         "migration_authorized": False,
         "namespace_counts": namespace_counts,
+        "strategy_counts": strategy_counts,
         "warning": (
             "Evidence only. A runtime reference does not prove exclusive "
             "Ross House ownership. Every collection requires explicit review."
