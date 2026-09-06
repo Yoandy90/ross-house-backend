@@ -4,8 +4,10 @@ import pytest
 
 from scripts.plan_database_isolation import (
     build_evidence,
+    apply_filter_contract,
     has_collection_reference,
     load_inventory,
+    load_filter_contract,
     load_rules,
     migration_strategy,
     namespace_evidence,
@@ -188,6 +190,81 @@ await db["rental_payments"].find_one({})
     assert has_collection_reference(content, "vault_audit_log") is True
     assert has_collection_reference(content, "rental_payments") is True
     assert has_collection_reference(content, "loans") is False
+
+
+def test_filter_contract_requires_exact_coverage_and_blocks_every_row():
+    rows = [
+        {"name": "app_users", "migration_strategy": "document_filter_required"},
+        {"name": "properties", "migration_strategy": "collection_copy_candidate"},
+    ]
+    contract = {
+        "requirements": {
+            "explicit_root_id_allowlist": {
+                "evidence": "approved IDs",
+                "collections": ["app_users"],
+            }
+        }
+    }
+
+    counts = apply_filter_contract(rows, contract)
+
+    assert counts == {"explicit_root_id_allowlist": 1}
+    assert rows[0]["filter_status"] == "blocked_pending_evidence"
+    assert rows[0]["filter_requirement"] == "explicit_root_id_allowlist"
+    assert rows[1]["filter_requirement"] is None
+
+
+def test_filter_contract_rejects_missing_duplicate_and_extra_collections():
+    rows = [
+        {"name": "app_users", "migration_strategy": "document_filter_required"}
+    ]
+    base = {"evidence": "required", "collections": []}
+
+    with pytest.raises(ValueError, match="filter_contract_missing:app_users"):
+        apply_filter_contract(rows, {"requirements": {"manual": base}})
+
+    with pytest.raises(ValueError, match="filter_collection_duplicate:app_users"):
+        apply_filter_contract(
+            rows,
+            {
+                "requirements": {
+                    "one": {"evidence": "required", "collections": ["app_users"]},
+                    "two": {"evidence": "required", "collections": ["app_users"]},
+                }
+            },
+        )
+
+    with pytest.raises(ValueError, match="filter_contract_extra:users"):
+        apply_filter_contract(
+            rows,
+            {
+                "requirements": {
+                    "manual": {
+                        "evidence": "required",
+                        "collections": ["app_users", "users"],
+                    }
+                }
+            },
+        )
+
+
+def test_filter_contract_file_is_fail_closed(tmp_path):
+    path = tmp_path / "filter-contract.json"
+    path.write_text(
+        json.dumps(
+            {
+                "source_database": "taxportal",
+                "target_database": "ross_house_production",
+                "migration_authorized": True,
+                "default_action": "block",
+                "requirements": {"manual": {"evidence": "required", "collections": []}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="filter_contract_must_be_fail_closed"):
+        load_filter_contract(path)
 
 
 @pytest.mark.parametrize(
