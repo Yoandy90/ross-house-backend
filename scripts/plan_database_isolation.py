@@ -23,8 +23,7 @@ MIGRATION_STRATEGIES = (
     "blocked_conflict",
     "collection_copy_candidate",
     "dormant_rental_candidate",
-    "external_name_collision",
-    "external_exclusion_candidate",
+    "prohibited_external_collection",
     "document_filter_required",
     "unreferenced_manual_review",
 )
@@ -56,6 +55,14 @@ def load_inventory(path: Path) -> dict:
 
 def load_rules(path: Path) -> dict:
     rules = json.loads(path.read_text(encoding="utf-8-sig"))
+    if rules.get("source_database") != "taxportal":
+        raise ValueError("source_database_must_be_taxportal")
+    if rules.get("target_database") != "ross_house_production":
+        raise ValueError("target_database_must_be_ross_house_production")
+    if rules.get("target_owner") != "Ross House Rentals LLC":
+        raise ValueError("target_owner_must_be_ross_house_rentals")
+    if rules.get("exclusive_target") is not True:
+        raise ValueError("target_database_must_be_exclusive")
     if rules.get("migration_authorized") is not False:
         raise ValueError("rules_must_be_fail_closed")
     for group in EVIDENCE_GROUPS:
@@ -97,11 +104,7 @@ def migration_strategy(evidence: str, has_runtime_references: bool) -> str:
             else "dormant_rental_candidate"
         )
     if evidence == "external_namespace_candidates":
-        return (
-            "external_name_collision"
-            if has_runtime_references
-            else "external_exclusion_candidate"
-        )
+        return "prohibited_external_collection"
     return (
         "document_filter_required"
         if has_runtime_references
@@ -157,17 +160,27 @@ def build_evidence(inventory: dict, repository_root: Path, rules: dict) -> dict:
     }
     if sum(strategy_counts.values()) != len(rows):
         raise ValueError("migration_strategy_count_mismatch")
+    external_runtime_dependencies = [
+        row["name"]
+        for row in rows
+        if row["namespace_evidence"] == "external_namespace_candidates"
+        and row["runtime_references"]
+    ]
     return {
-        "database_name": str(inventory.get("database_name") or ""),
+        "source_database": str(inventory.get("database_name") or ""),
+        "target_database": rules["target_database"],
+        "target_owner": rules["target_owner"],
+        "exclusive_target": True,
         "collection_count": len(rows),
         "runtime_referenced_count": referenced,
         "unreferenced_count": len(rows) - referenced,
         "migration_authorized": False,
         "namespace_counts": namespace_counts,
         "strategy_counts": strategy_counts,
+        "external_runtime_dependencies": external_runtime_dependencies,
         "warning": (
-            "Evidence only. A runtime reference does not prove exclusive "
-            "Ross House ownership. Every collection requires explicit review."
+            "Evidence only. External namespaces are prohibited from the target. "
+            "Generic collections require document-level ownership filters."
         ),
         "collections": rows,
     }
