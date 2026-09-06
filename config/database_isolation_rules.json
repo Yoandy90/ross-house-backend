@@ -1,5 +1,9 @@
 {
   "version": 1,
+  "source_database": "taxportal",
+  "target_database": "ross_house_production",
+  "target_owner": "Ross House Rentals LLC",
+  "exclusive_target": true,
   "migration_authorized": false,
   "rental_namespace_candidates": {
     "prefixes": [
