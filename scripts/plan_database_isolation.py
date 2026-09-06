@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Build a fail-closed, read-only collection ownership evidence report."""
+"""Build a fail-closed, read-only collection ownership evidence report.
+
+The script consumes the metadata-only JSON produced by
+``production_database_inventory.py`` and scans this repository for exact
+collection-name references. It never connects to MongoDB and never labels a
+collection as safe to migrate automatically.
+"""
 from __future__ import annotations
 
 import argparse
@@ -10,27 +16,45 @@ from pathlib import Path
 
 RUNTIME_SUFFIXES = {".py", ".js", ".ts", ".tsx"}
 IGNORED_PARTS = {".git", ".venv", "node_modules", "tests", "scripts"}
-EVIDENCE_GROUPS = ("rental_namespace_candidates", "external_namespace_candidates")
+EVIDENCE_GROUPS = (
+    "rental_namespace_candidates",
+    "external_namespace_candidates",
+)
 MIGRATION_STRATEGIES = (
-    "blocked_conflict", "collection_copy_candidate", "dormant_rental_candidate",
-    "prohibited_external_collection", "document_filter_required",
+    "blocked_conflict",
+    "collection_copy_candidate",
+    "dormant_rental_candidate",
+    "prohibited_external_collection",
+    "document_filter_required",
     "unreferenced_manual_review",
 )
 FILTER_REQUIREMENTS = {
-    "explicit_root_id_allowlist", "relationship_closure",
-    "source_discriminator", "manual_schema_review",
+    "explicit_root_id_allowlist",
+    "relationship_closure",
+    "source_discriminator",
+    "manual_schema_review",
 }
 FORBIDDEN_SOURCE_MARKERS = {
-    "ross tax", "ross tax preparation", "ross lending", "tax portal",
-    "taxportal", "loan", "loans", "lending",
+    "ross tax",
+    "ross tax preparation",
+    "ross lending",
+    "tax portal",
+    "taxportal",
+    "loan",
+    "loans",
+    "lending",
 }
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 def runtime_files(repository_root: Path) -> list[Path]:
-    return sorted(path for path in repository_root.rglob("*") if path.is_file()
-                  and path.suffix in RUNTIME_SUFFIXES
-                  and not any(part in IGNORED_PARTS for part in path.parts))
+    return sorted(
+        path
+        for path in repository_root.rglob("*")
+        if path.is_file()
+        and path.suffix in RUNTIME_SUFFIXES
+        and not any(part in IGNORED_PARTS for part in path.parts)
+    )
 
 
 def load_inventory(path: Path) -> dict:
@@ -85,7 +109,10 @@ def load_filter_contract(path: Path) -> dict:
     if contract.get("default_action") != "block":
         raise ValueError("filter_contract_default_must_block")
     requirements = contract.get("requirements")
-    if not isinstance(requirements, dict) or set(requirements) != FILTER_REQUIREMENTS:
+    if (
+        not isinstance(requirements, dict)
+        or set(requirements) != FILTER_REQUIREMENTS
+    ):
         raise ValueError("filter_contract_requirements_invalid")
     return contract
 
@@ -103,26 +130,42 @@ def apply_filter_contract(rows: list[dict], contract: dict) -> dict:
             if name in assignments:
                 raise ValueError(f"filter_collection_duplicate:{name}")
             assignments[name] = requirement
-    required = {row["name"] for row in rows
-                if row["migration_strategy"] == "document_filter_required"}
-    missing, extra = sorted(required - set(assignments)), sorted(set(assignments) - required)
+
+    required = {
+        row["name"]
+        for row in rows
+        if row["migration_strategy"] == "document_filter_required"
+    }
+    assigned = set(assignments)
+    missing = sorted(required - assigned)
+    extra = sorted(assigned - required)
     if missing:
         raise ValueError(f"filter_contract_missing:{','.join(missing)}")
     if extra:
         raise ValueError(f"filter_contract_extra:{','.join(extra)}")
+
     for row in rows:
-        row["filter_requirement"] = assignments.get(row["name"])
-        if row["filter_requirement"]:
+        requirement = assignments.get(row["name"])
+        row["filter_requirement"] = requirement
+        if requirement:
             row["filter_status"] = "blocked_pending_evidence"
-    return {key: len(value["collections"])
-            for key, value in contract["requirements"].items()}
+
+    return {
+        requirement: len(definition["collections"])
+        for requirement, definition in contract["requirements"].items()
+    }
 
 
 def _strict_strings(value: object, field: str) -> list[str]:
     if not isinstance(value, list) or not value:
         raise ValueError(f"filter_evidence_{field}_invalid")
-    if any(not isinstance(item, str) or not item.strip() or item != item.strip()
-           or "*" in item for item in value):
+    if any(
+        not isinstance(item, str)
+        or not item.strip()
+        or item != item.strip()
+        or "*" in item
+        for item in value
+    ):
         raise ValueError(f"filter_evidence_{field}_invalid")
     if len(value) != len(set(value)):
         raise ValueError(f"filter_evidence_{field}_duplicate")
@@ -137,7 +180,8 @@ def _validate_evidence_detail(requirement: str, detail: object) -> None:
             raise ValueError("filter_evidence_allowlist_fields_invalid")
         _strict_strings(detail.get("root_ids"), "root_ids")
     elif requirement == "relationship_closure":
-        if set(detail) != {"root_collection", "relationship_paths", "root_ids"}:
+        required = {"root_collection", "relationship_paths", "root_ids"}
+        if set(detail) != required:
             raise ValueError("filter_evidence_relationship_fields_invalid")
         if detail.get("root_collection") not in {"app_users", "tenants"}:
             raise ValueError("filter_evidence_root_collection_invalid")
@@ -151,7 +195,8 @@ def _validate_evidence_detail(requirement: str, detail: object) -> None:
         if any(value.casefold() in FORBIDDEN_SOURCE_MARKERS for value in values):
             raise ValueError("filter_evidence_external_source_prohibited")
     elif requirement == "manual_schema_review":
-        if set(detail) != {"field_paths", "ownership_basis", "reviewer", "reviewed_at"}:
+        required = {"field_paths", "ownership_basis", "reviewer", "reviewed_at"}
+        if set(detail) != required:
             raise ValueError("filter_evidence_manual_review_fields_invalid")
         _strict_strings(detail.get("field_paths"), "field_paths")
         for field in ("ownership_basis", "reviewer", "reviewed_at"):
@@ -168,10 +213,12 @@ def apply_offline_filter_evidence(
 ) -> dict:
     """Validate offline evidence only; never build queries or authorize migration."""
     fixed = {
-        "version": 1, "source_database": "taxportal",
+        "version": 1,
+        "source_database": "taxportal",
         "target_database": "ross_house_production",
         "target_owner": "Ross House Rentals LLC",
-        "migration_authorized": False, "default_action": "block",
+        "migration_authorized": False,
+        "default_action": "block",
     }
     for field, expected in fixed.items():
         if evidence.get(field) != expected:
@@ -184,14 +231,21 @@ def apply_offline_filter_evidence(
     entries = evidence.get("collections")
     if not isinstance(entries, list):
         raise ValueError("filter_evidence_collections_invalid")
-    row_map = {row["name"]: row for row in rows if row.get("filter_requirement")}
+    row_map = {
+        row["name"]: row for row in rows if row.get("filter_requirement")
+    }
     seen = set()
     for entry in entries:
-        if not isinstance(entry, dict) or set(entry) != {"name", "requirement", "evidence"}:
+        if (
+            not isinstance(entry, dict)
+            or set(entry) != {"name", "requirement", "evidence"}
+        ):
             raise ValueError("filter_evidence_entry_invalid")
         name, requirement = entry["name"], entry["requirement"]
         if not isinstance(name, str) or not name or name in seen:
-            raise ValueError(f"filter_evidence_collection_duplicate_or_invalid:{name}")
+            raise ValueError(
+                f"filter_evidence_collection_duplicate_or_invalid:{name}"
+            )
         seen.add(name)
         row = row_map.get(name)
         if row is None:
@@ -200,96 +254,211 @@ def apply_offline_filter_evidence(
             raise ValueError(f"filter_evidence_requirement_mismatch:{name}")
         _validate_evidence_detail(requirement, entry["evidence"])
         row["filter_status"] = "offline_evidence_validated"
-    return {"submitted": len(entries), "validated": len(entries),
-            "still_blocked": len(row_map) - len(entries)}
+    return {
+        "submitted": len(entries),
+        "validated": len(entries),
+        "still_blocked": len(row_map) - len(entries),
+    }
 
 
 def namespace_evidence(name: str, rules: dict) -> str:
-    matches = [group for group in EVIDENCE_GROUPS
-               if name in rules[group]["exact"]
-               or any(name.startswith(prefix) for prefix in rules[group]["prefixes"])]
+    matches = []
+    for group in EVIDENCE_GROUPS:
+        value = rules[group]
+        if name in value["exact"] or any(
+            name.startswith(prefix) for prefix in value["prefixes"]
+        ):
+            matches.append(group)
     if len(matches) > 1:
         return "conflicting_namespace_evidence"
-    return matches[0] if matches else "no_namespace_evidence"
+    if matches:
+        return matches[0]
+    return "no_namespace_evidence"
 
 
 def migration_strategy(evidence: str, has_runtime_references: bool) -> str:
-    if evidence == "conflicting_namespace_evidence": return "blocked_conflict"
+    """Prioritize review without ever authorizing a migration operation."""
+    if evidence == "conflicting_namespace_evidence":
+        return "blocked_conflict"
     if evidence == "rental_namespace_candidates":
-        return "collection_copy_candidate" if has_runtime_references else "dormant_rental_candidate"
-    if evidence == "external_namespace_candidates": return "prohibited_external_collection"
-    return "document_filter_required" if has_runtime_references else "unreferenced_manual_review"
+        return (
+            "collection_copy_candidate"
+            if has_runtime_references
+            else "dormant_rental_candidate"
+        )
+    if evidence == "external_namespace_candidates":
+        return "prohibited_external_collection"
+    return (
+        "document_filter_required"
+        if has_runtime_references
+        else "unreferenced_manual_review"
+    )
 
 
 def has_collection_reference(content: str, name: str) -> bool:
+    """Match concrete database access, not prose or similarly named variables."""
     escaped = re.escape(name)
     database_expression = r"(?:db|[A-Za-z_][A-Za-z0-9_]*_db|get_db\(\))"
-    if re.search(rf"\b{database_expression}\s*\.\s*{escaped}\b", content) or re.search(
-        rf"\b{database_expression}\s*\[\s*(['\"]){escaped}\1\s*\]", content):
+    direct_attribute = re.compile(
+        rf"\b{database_expression}\s*\.\s*{escaped}\b"
+    )
+    direct_subscript = re.compile(
+        rf"\b{database_expression}\s*\[\s*(['\"]){escaped}\1\s*\]"
+    )
+    if direct_attribute.search(content) or direct_subscript.search(content):
         return True
-    assignment = re.compile(rf"(?m)^\s*([A-Z][A-Z0-9_]*(?:COLL|COLLECTION)[A-Z0-9_]*)\s*=\s*(['\"]){escaped}\2\s*$")
-    return any(re.search(rf"\b{database_expression}\s*\[\s*{re.escape(match.group(1))}\s*\]", content)
-               for match in assignment.finditer(content))
+
+    constant_assignment = re.compile(
+        rf"(?m)^\s*([A-Z][A-Z0-9_]*(?:COLL|COLLECTION)[A-Z0-9_]*)"
+        rf"\s*=\s*(['\"]){escaped}\2\s*$"
+    )
+    for match in constant_assignment.finditer(content):
+        constant = re.escape(match.group(1))
+        indirect_subscript = re.compile(
+            rf"\b{database_expression}\s*\[\s*{constant}\s*\]"
+        )
+        if indirect_subscript.search(content):
+            return True
+    return False
 
 
-def build_evidence(inventory: dict, repository_root: Path, rules: dict,
-                   filter_contract: dict | None = None,
-                   filter_evidence: dict | None = None) -> dict:
-    sources = {path: path.read_text(encoding="utf-8", errors="ignore")
-               for path in runtime_files(repository_root)}
+def build_evidence(
+    inventory: dict,
+    repository_root: Path,
+    rules: dict,
+    filter_contract: dict | None = None,
+    filter_evidence: dict | None = None,
+) -> dict:
+    sources = {
+        path: path.read_text(encoding="utf-8", errors="ignore")
+        for path in runtime_files(repository_root)
+    }
     rows = []
     for collection in inventory["collections"]:
         name = str(collection["name"])
-        references = [str(path.relative_to(repository_root)) for path, content in sources.items()
-                      if has_collection_reference(content, name)]
+        references = [
+            str(path.relative_to(repository_root))
+            for path, content in sources.items()
+            if has_collection_reference(content, name)
+        ]
         evidence = namespace_evidence(name, rules)
-        rows.append({"name": name, "estimated_documents": int(collection.get("estimated_documents") or 0),
-                     "index_count": int(collection.get("index_count") or 0),
-                     "runtime_references": references, "namespace_evidence": evidence,
-                     "migration_strategy": migration_strategy(evidence, bool(references)),
-                     "review_status": "manual_review_required"})
+        rows.append(
+            {
+                "name": name,
+                "estimated_documents": int(
+                    collection.get("estimated_documents") or 0
+                ),
+                "index_count": int(collection.get("index_count") or 0),
+                "runtime_references": references,
+                "namespace_evidence": evidence,
+                "migration_strategy": migration_strategy(
+                    evidence, bool(references)
+                ),
+                "review_status": "manual_review_required",
+            }
+        )
+
     referenced = sum(bool(row["runtime_references"]) for row in rows)
-    namespace_counts = {status: sum(row["namespace_evidence"] == status for row in rows)
-                        for status in (*EVIDENCE_GROUPS, "conflicting_namespace_evidence", "no_namespace_evidence")}
-    strategy_counts = {strategy: sum(row["migration_strategy"] == strategy for row in rows)
-                       for strategy in MIGRATION_STRATEGIES}
-    if sum(strategy_counts.values()) != len(rows): raise ValueError("migration_strategy_count_mismatch")
-    filter_counts = apply_filter_contract(rows, filter_contract) if filter_contract else None
-    evidence_counts = None
+    namespace_counts = {
+        status: sum(row["namespace_evidence"] == status for row in rows)
+        for status in (
+            *EVIDENCE_GROUPS,
+            "conflicting_namespace_evidence",
+            "no_namespace_evidence",
+        )
+    }
+    strategy_counts = {
+        strategy: sum(row["migration_strategy"] == strategy for row in rows)
+        for strategy in MIGRATION_STRATEGIES
+    }
+    if sum(strategy_counts.values()) != len(rows):
+        raise ValueError("migration_strategy_count_mismatch")
+    filter_requirement_counts = None
+    if filter_contract is not None:
+        filter_requirement_counts = apply_filter_contract(rows, filter_contract)
+    filter_evidence_counts = None
     if filter_evidence is not None:
-        if filter_contract is None: raise ValueError("filter_evidence_requires_contract")
-        evidence_counts = apply_offline_filter_evidence(rows, filter_evidence, inventory["_inventory_sha256"])
-    return {"source_database": str(inventory.get("database_name") or ""),
-            "target_database": rules["target_database"], "target_owner": rules["target_owner"],
-            "exclusive_target": True, "inventory_sha256": inventory["_inventory_sha256"],
-            "collection_count": len(rows), "runtime_referenced_count": referenced,
-            "unreferenced_count": len(rows)-referenced, "migration_authorized": False,
-            "namespace_counts": namespace_counts, "strategy_counts": strategy_counts,
-            "filter_contract_complete": filter_counts is not None,
-            "filter_requirement_counts": filter_counts, "filter_evidence_counts": evidence_counts,
-            "external_runtime_dependencies": [row["name"] for row in rows
-                if row["namespace_evidence"] == "external_namespace_candidates" and row["runtime_references"]],
-            "warning": "Evidence only. No executable filters or migration authorization are produced.",
-            "collections": rows}
+        if filter_contract is None:
+            raise ValueError("filter_evidence_requires_contract")
+        filter_evidence_counts = apply_offline_filter_evidence(
+            rows, filter_evidence, inventory["_inventory_sha256"]
+        )
+    external_runtime_dependencies = [
+        row["name"]
+        for row in rows
+        if row["namespace_evidence"] == "external_namespace_candidates"
+        and row["runtime_references"]
+    ]
+    return {
+        "source_database": str(inventory.get("database_name") or ""),
+        "target_database": rules["target_database"],
+        "target_owner": rules["target_owner"],
+        "exclusive_target": True,
+        "inventory_sha256": inventory["_inventory_sha256"],
+        "collection_count": len(rows),
+        "runtime_referenced_count": referenced,
+        "unreferenced_count": len(rows) - referenced,
+        "migration_authorized": False,
+        "namespace_counts": namespace_counts,
+        "strategy_counts": strategy_counts,
+        "filter_contract_complete": filter_requirement_counts is not None,
+        "filter_requirement_counts": filter_requirement_counts,
+        "filter_evidence_counts": filter_evidence_counts,
+        "external_runtime_dependencies": external_runtime_dependencies,
+        "warning": (
+            "Evidence only. External namespaces are prohibited from the target. "
+            "No executable filters or migration authorization are produced."
+        ),
+        "collections": rows,
+    }
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("inventory", type=Path)
-    parser.add_argument("--repository-root", type=Path, default=Path(__file__).resolve().parents[1])
-    parser.add_argument("--filter-contract", type=Path, default=Path(__file__).resolve().parents[1] / "config" / "database_isolation_filter_contract.json")
+    parser.add_argument(
+        "--repository-root",
+        type=Path,
+        default=Path(__file__).resolve().parents[1],
+    )
+    parser.add_argument(
+        "--filter-contract",
+        type=Path,
+        default=Path(__file__).resolve().parents[1]
+        / "config"
+        / "database_isolation_filter_contract.json",
+    )
     parser.add_argument("--filter-evidence", type=Path)
     parser.add_argument("--output", type=Path)
-    parser.add_argument("--rules", type=Path, default=Path(__file__).resolve().parents[1] / "config" / "database_isolation_rules.json")
+    parser.add_argument(
+        "--rules",
+        type=Path,
+        default=Path(__file__).resolve().parents[1]
+        / "config"
+        / "database_isolation_rules.json",
+    )
     args = parser.parse_args()
+
     inventory = load_inventory(args.inventory)
-    evidence = json.loads(args.filter_evidence.read_text(encoding="utf-8-sig")) if args.filter_evidence else None
-    report = build_evidence(inventory, args.repository_root.resolve(), load_rules(args.rules),
-                            load_filter_contract(args.filter_contract), evidence)
+    filter_evidence = (
+        json.loads(args.filter_evidence.read_text(encoding="utf-8-sig"))
+        if args.filter_evidence
+        else None
+    )
+    report = build_evidence(
+        inventory,
+        args.repository_root.resolve(),
+        load_rules(args.rules),
+        load_filter_contract(args.filter_contract),
+        filter_evidence,
+    )
     rendered = json.dumps(report, indent=2, sort_keys=True)
-    if args.output: args.output.write_text(rendered + "\n", encoding="utf-8")
-    else: print(rendered)
+    if args.output:
+        args.output.write_text(rendered + "\n", encoding="utf-8")
+    else:
+        print(rendered)
     return 0
 
 
-if __name__ == "__main__": raise SystemExit(main())
+if __name__ == "__main__":
+    raise SystemExit(main())
