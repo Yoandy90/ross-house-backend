@@ -112,6 +112,33 @@ def migration_strategy(evidence: str, has_runtime_references: bool) -> str:
     )
 
 
+def has_collection_reference(content: str, name: str) -> bool:
+    """Match concrete database access, not prose or similarly named variables."""
+    escaped = re.escape(name)
+    database_expression = r"(?:db|[A-Za-z_][A-Za-z0-9_]*_db|get_db\(\))"
+    direct_attribute = re.compile(
+        rf"\b{database_expression}\s*\.\s*{escaped}\b"
+    )
+    direct_subscript = re.compile(
+        rf"\b{database_expression}\s*\[\s*(['\"]){escaped}\1\s*\]"
+    )
+    if direct_attribute.search(content) or direct_subscript.search(content):
+        return True
+
+    constant_assignment = re.compile(
+        rf"(?m)^\s*([A-Z][A-Z0-9_]*(?:COLL|COLLECTION)[A-Z0-9_]*)"
+        rf"\s*=\s*(['\"]){escaped}\2\s*$"
+    )
+    for match in constant_assignment.finditer(content):
+        constant = re.escape(match.group(1))
+        indirect_subscript = re.compile(
+            rf"\b{database_expression}\s*\[\s*{constant}\s*\]"
+        )
+        if indirect_subscript.search(content):
+            return True
+    return False
+
+
 def build_evidence(inventory: dict, repository_root: Path, rules: dict) -> dict:
     sources = {
         path: path.read_text(encoding="utf-8", errors="ignore")
@@ -120,13 +147,10 @@ def build_evidence(inventory: dict, repository_root: Path, rules: dict) -> dict:
     rows = []
     for collection in inventory["collections"]:
         name = str(collection["name"])
-        pattern = re.compile(
-            rf"(?<![A-Za-z0-9_]){re.escape(name)}(?![A-Za-z0-9_])"
-        )
         references = [
             str(path.relative_to(repository_root))
             for path, content in sources.items()
-            if pattern.search(content)
+            if has_collection_reference(content, name)
         ]
         evidence = namespace_evidence(name, rules)
         rows.append(
