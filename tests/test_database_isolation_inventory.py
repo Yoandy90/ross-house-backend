@@ -1,7 +1,7 @@
 import pytest
 
 from rental.database_isolation_inventory import (
-    MAX_COLLECTIONS,
+    MAX_PAGE_SIZE,
     build_database_isolation_inventory,
 )
 
@@ -49,6 +49,8 @@ async def test_inventory_returns_only_metadata_and_detects_shared_database():
     assert report["shared_database_detected"] is True
     assert report["migration_required"] is True
     assert report["collection_count"] == 2
+    assert report["has_more"] is False
+    assert report["next_cursor"] is None
     assert report["collections"] == [
         {"name": "app_users", "estimated_documents": 12, "index_count": 2},
         {"name": "properties", "estimated_documents": 4, "index_count": 1},
@@ -67,19 +69,47 @@ async def test_dedicated_database_is_not_marked_for_migration():
 
     assert report["shared_database_detected"] is False
     assert report["migration_required"] is False
-    assert report["contains_documents"] is False
+    assert report["page_contains_documents"] is False
 
 
 @pytest.mark.asyncio
-async def test_inventory_is_bounded():
+async def test_inventory_cursor_pages_every_collection_once():
     collections = {
         f"collection_{index:03d}": FakeCollection(index, ["_id_"])
-        for index in range(MAX_COLLECTIONS + 3)
+        for index in range(MAX_PAGE_SIZE + 3)
     }
-    report = await build_database_isolation_inventory(
-        FakeDatabase("taxportal", collections)
+    database = FakeDatabase("taxportal", collections)
+
+    first = await build_database_isolation_inventory(database)
+    second = await build_database_isolation_inventory(
+        database,
+        after=first["next_cursor"],
     )
 
-    assert len(report["collections"]) == MAX_COLLECTIONS
-    assert report["collection_count"] == MAX_COLLECTIONS + 3
-    assert report["collections_truncated"] is True
+    first_names = [row["name"] for row in first["collections"]]
+    second_names = [row["name"] for row in second["collections"]]
+    assert len(first_names) == MAX_PAGE_SIZE
+    assert first["has_more"] is True
+    assert first["next_cursor"] == first_names[-1]
+    assert second_names == [
+        f"collection_{index:03d}"
+        for index in range(MAX_PAGE_SIZE, MAX_PAGE_SIZE + 3)
+    ]
+    assert second["has_more"] is False
+    assert second["next_cursor"] is None
+    assert len(set(first_names + second_names)) == MAX_PAGE_SIZE + 3
+
+
+@pytest.mark.asyncio
+async def test_requested_page_size_is_bounded():
+    collections = {
+        f"collection_{index:03d}": FakeCollection(index, ["_id_"])
+        for index in range(MAX_PAGE_SIZE + 2)
+    }
+    report = await build_database_isolation_inventory(
+        FakeDatabase("taxportal", collections),
+        limit=MAX_PAGE_SIZE + 1000,
+    )
+
+    assert report["page_size"] == MAX_PAGE_SIZE
+    assert report["has_more"] is True
