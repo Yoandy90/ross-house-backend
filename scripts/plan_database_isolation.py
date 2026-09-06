@@ -78,6 +78,59 @@ def load_rules(path: Path) -> dict:
     return rules
 
 
+def load_filter_contract(path: Path) -> dict:
+    contract = json.loads(path.read_text(encoding="utf-8-sig"))
+    if contract.get("source_database") != "taxportal":
+        raise ValueError("filter_contract_source_invalid")
+    if contract.get("target_database") != "ross_house_production":
+        raise ValueError("filter_contract_target_invalid")
+    if contract.get("migration_authorized") is not False:
+        raise ValueError("filter_contract_must_be_fail_closed")
+    if contract.get("default_action") != "block":
+        raise ValueError("filter_contract_default_must_block")
+    requirements = contract.get("requirements")
+    if not isinstance(requirements, dict) or not requirements:
+        raise ValueError("filter_contract_requirements_invalid")
+    return contract
+
+
+def apply_filter_contract(rows: list[dict], contract: dict) -> dict:
+    assignments = {}
+    for requirement, definition in contract["requirements"].items():
+        collections = definition.get("collections")
+        evidence = definition.get("evidence")
+        if not isinstance(collections, list) or not evidence:
+            raise ValueError(f"filter_requirement_invalid:{requirement}")
+        for name in collections:
+            if name in assignments:
+                raise ValueError(f"filter_collection_duplicate:{name}")
+            assignments[name] = requirement
+
+    required = {
+        row["name"]
+        for row in rows
+        if row["migration_strategy"] == "document_filter_required"
+    }
+    assigned = set(assignments)
+    missing = sorted(required - assigned)
+    extra = sorted(assigned - required)
+    if missing:
+        raise ValueError(f"filter_contract_missing:{','.join(missing)}")
+    if extra:
+        raise ValueError(f"filter_contract_extra:{','.join(extra)}")
+
+    for row in rows:
+        requirement = assignments.get(row["name"])
+        row["filter_requirement"] = requirement
+        if requirement:
+            row["filter_status"] = "blocked_pending_evidence"
+
+    return {
+        requirement: len(definition["collections"])
+        for requirement, definition in contract["requirements"].items()
+    }
+
+
 def namespace_evidence(name: str, rules: dict) -> str:
     matches = []
     for group in EVIDENCE_GROUPS:
@@ -139,7 +192,12 @@ def has_collection_reference(content: str, name: str) -> bool:
     return False
 
 
-def build_evidence(inventory: dict, repository_root: Path, rules: dict) -> dict:
+def build_evidence(
+    inventory: dict,
+    repository_root: Path,
+    rules: dict,
+    filter_contract: dict | None = None,
+) -> dict:
     sources = {
         path: path.read_text(encoding="utf-8", errors="ignore")
         for path in runtime_files(repository_root)
@@ -184,6 +242,9 @@ def build_evidence(inventory: dict, repository_root: Path, rules: dict) -> dict:
     }
     if sum(strategy_counts.values()) != len(rows):
         raise ValueError("migration_strategy_count_mismatch")
+    filter_requirement_counts = None
+    if filter_contract is not None:
+        filter_requirement_counts = apply_filter_contract(rows, filter_contract)
     external_runtime_dependencies = [
         row["name"]
         for row in rows
@@ -201,6 +262,8 @@ def build_evidence(inventory: dict, repository_root: Path, rules: dict) -> dict:
         "migration_authorized": False,
         "namespace_counts": namespace_counts,
         "strategy_counts": strategy_counts,
+        "filter_contract_complete": filter_requirement_counts is not None,
+        "filter_requirement_counts": filter_requirement_counts,
         "external_runtime_dependencies": external_runtime_dependencies,
         "warning": (
             "Evidence only. External namespaces are prohibited from the target. "
@@ -218,6 +281,13 @@ def main() -> int:
         type=Path,
         default=Path(__file__).resolve().parents[1],
     )
+    parser.add_argument(
+        "--filter-contract",
+        type=Path,
+        default=Path(__file__).resolve().parents[1]
+        / "config"
+        / "database_isolation_filter_contract.json",
+    )
     parser.add_argument("--output", type=Path)
     parser.add_argument(
         "--rules",
@@ -232,6 +302,7 @@ def main() -> int:
         load_inventory(args.inventory),
         args.repository_root.resolve(),
         load_rules(args.rules),
+        load_filter_contract(args.filter_contract),
     )
     rendered = json.dumps(report, indent=2, sort_keys=True)
     if args.output:

@@ -1,0 +1,54 @@
+{
+  "version": 1,
+  "source_database": "taxportal",
+  "target_database": "ross_house_production",
+  "migration_authorized": false,
+  "default_action": "block",
+  "requirements": {
+    "explicit_root_id_allowlist": {
+      "evidence": "Approved Ross House Rentals record IDs are required.",
+      "collections": ["app_users", "tenants"]
+    },
+    "relationship_closure": {
+      "evidence": "Every record must reference an approved Ross House root ID.",
+      "collections": [
+        "admin_2fa_settings", "admin_audit_logs", "admin_otp_challenges",
+        "admin_signatures", "admin_trusted_devices", "app_adoption_invites",
+        "auth_metrics_daily", "auth_sessions", "bank_transactions",
+        "checklist_photos", "consent_records", "credit_builder_enrollments",
+        "deleted_accounts", "document_requests", "expense_receipts",
+        "investor_password_resets", "legal_documents", "password_resets",
+        "payment_links", "payment_methods", "payment_methods_deleted",
+        "phone_otps", "plaid_items", "provider_payments",
+        "three_ds_evidence", "user_sessions", "vault_audit_log",
+        "xcel_notifications", "xcel_oauth_states", "zelle_submissions"
+      ]
+    },
+    "source_discriminator": {
+      "evidence": "A stored application/source marker must prove Rentals ownership.",
+      "collections": [
+        "ai_brain_logs", "ai_business_insights_cache", "ai_conversations",
+        "ai_messages", "analytics_ai_cache", "appointments", "blog_comments",
+        "chat_conversations", "chat_messages", "dnc_registrations",
+        "email_acks", "email_events", "email_inbox", "email_templates",
+        "faqs", "fb_oauth_states", "fb_webhook_events", "geo_cache",
+        "invoices", "lead_settings", "leads", "message_history",
+        "message_templates", "newsletter_campaigns", "newsletter_subscribers",
+        "phone_lookups", "processor_webhook_events", "public_chatbot_sessions",
+        "radar_clients", "rate_limit_events", "social_post_drafts",
+        "stripe_webhook_events", "tiktok_account", "tiktok_oauth_states",
+        "tiktok_posts", "visitor_events", "visitor_sessions"
+      ]
+    },
+    "manual_schema_review": {
+      "evidence": "Field names and relationships must be reviewed before a filter is designed.",
+      "collections": [
+        "admin_config", "ai_brain_config", "api_config", "app_settings",
+        "bofa_checkout_sessions", "helcim_checkout_sessions",
+        "helcim_saved_methods", "leases", "pm_service_waitlist",
+        "provider_settings", "users", "vault_customers",
+        "xcel_saving_tips_cache"
+      ]
+    }
+  }
+}
