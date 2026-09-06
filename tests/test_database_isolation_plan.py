@@ -2,7 +2,25 @@ import json
 
 import pytest
 
-from scripts.plan_database_isolation import build_evidence, load_inventory
+from scripts.plan_database_isolation import (
+    build_evidence,
+    load_inventory,
+    load_rules,
+    namespace_evidence,
+)
+
+
+RULES = {
+    "migration_authorized": False,
+    "rental_namespace_candidates": {
+        "prefixes": ["rental_", "property_"],
+        "exact": ["properties"],
+    },
+    "external_namespace_candidates": {
+        "prefixes": ["tax_"],
+        "exact": ["admin_tax_returns"],
+    },
+}
 
 
 def write_inventory(path, *, count=2, collections=None):
@@ -34,12 +52,18 @@ def test_plan_reports_runtime_evidence_without_authorizing_migration(tmp_path):
         'COLLECTION = "admin_tax_returns"\n', encoding="utf-8"
     )
 
-    report = build_evidence(load_inventory(inventory_path), tmp_path)
+    report = build_evidence(load_inventory(inventory_path), tmp_path, RULES)
 
     assert report["collection_count"] == 2
     assert report["runtime_referenced_count"] == 1
     assert report["unreferenced_count"] == 1
     assert report["migration_authorized"] is False
+    assert report["namespace_counts"] == {
+        "rental_namespace_candidates": 1,
+        "external_namespace_candidates": 1,
+        "conflicting_namespace_evidence": 0,
+        "no_namespace_evidence": 0,
+    }
     assert report["collections"][0]["runtime_references"] == [
         "rental/properties_router.py"
     ]
@@ -68,3 +92,28 @@ def test_plan_rejects_incomplete_or_duplicate_inventory(
 
     with pytest.raises(ValueError, match=error):
         load_inventory(inventory_path)
+
+
+def test_namespace_conflicts_remain_blocked_for_manual_review():
+    rules = {
+        **RULES,
+        "external_namespace_candidates": {
+            "prefixes": ["property_"],
+            "exact": [],
+        },
+    }
+
+    assert (
+        namespace_evidence("property_documents", rules)
+        == "conflicting_namespace_evidence"
+    )
+
+
+def test_rules_file_must_never_authorize_migration(tmp_path):
+    rules_path = tmp_path / "rules.json"
+    rules_path.write_text(
+        json.dumps({**RULES, "migration_authorized": True}), encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError, match="rules_must_be_fail_closed"):
+        load_rules(rules_path)
