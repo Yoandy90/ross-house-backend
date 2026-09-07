@@ -8,6 +8,8 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
+from scripts.offline_evidence_json import load_offline_json
+
 from scripts.build_root_evidence_package import PROVENANCE_FIELDS, write_private_package
 from scripts.plan_database_isolation import (
     _canonical_sha256, _expected_evidence_id,
@@ -171,14 +173,14 @@ def main():
     if args.action != "build" and (args.submission or args.require_complete):
         parser.error("--submission and --require-complete are build-only")
     inventory, contract = load_inventory(args.inventory), load_filter_contract(args.filter_contract)
-    package = json.loads(args.package.read_text(encoding="utf-8-sig"))
+    package = load_offline_json(args.package)
     now = datetime.now(timezone.utc)
     if args.action == "prepare":
         output = prepare_complete_submission(inventory, contract, package, now=now)
         report = {"status": "template_requires_independent_review", "migration_authorized": False,
                   "pending_supplemental_collections": len(output["collections"])}
     elif args.action == "build":
-        submission = json.loads(args.submission.read_text(encoding="utf-8-sig"))
+        submission = load_offline_json(args.submission)
         output, report = build_complete_evidence_package(inventory, contract, package, submission,
                               now=now, require_complete=args.require_complete)
     else:

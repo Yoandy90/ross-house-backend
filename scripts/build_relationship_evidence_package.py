@@ -8,6 +8,8 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
+from scripts.offline_evidence_json import load_offline_json
+
 from scripts.build_root_evidence_package import PROVENANCE_FIELDS, write_private_package
 from scripts.plan_database_isolation import (
     _canonical_sha256, _expected_evidence_id, _utc_timestamp, _reviewer_identity_key,
@@ -160,14 +162,14 @@ def main():
         parser.error("prepare does not accept --submission or --require-complete")
     inventory = load_inventory(args.inventory)
     contract = load_filter_contract(args.filter_contract)
-    roots = json.loads(args.root_package.read_text(encoding="utf-8-sig"))
+    roots = load_offline_json(args.root_package)
     now = datetime.now(timezone.utc)
     if args.action == "prepare":
         output = prepare_relationship_submission(inventory, contract, roots, now=now)
         summary = {"status": "template_requires_independent_review",
                    "migration_authorized": False, "collections": len(output["collections"])}
     else:
-        submission = json.loads(args.submission.read_text(encoding="utf-8-sig"))
+        submission = load_offline_json(args.submission)
         output, summary = build_relationship_evidence_package(
             inventory, contract, roots, submission, now=now,
             require_complete=args.require_complete,

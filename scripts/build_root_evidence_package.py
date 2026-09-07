@@ -9,6 +9,8 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
+from scripts.offline_evidence_json import load_offline_json
+
 from scripts.plan_database_isolation import (
     SHA256_RE,
     _canonical_sha256,
@@ -192,7 +194,7 @@ def main() -> int:
     package = build_root_evidence_package(
         load_inventory(args.inventory),
         load_filter_contract(args.filter_contract),
-        json.loads(args.submission.read_text(encoding="utf-8-sig")),
+        load_offline_json(args.submission),
         now=datetime.now(timezone.utc),
     )
     write_private_package(
