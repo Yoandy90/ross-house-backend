@@ -38,6 +38,10 @@ from pydantic import BaseModel
 
 from rental.shared import get_db, auth_admin
 from rental.property_taxes_router import fetch_account_tax_due
+from rental.opportunity_scan_lease import (
+    ScanLease, acquire_scan_lease, get_scan_lease_status,
+    release_scan_lease, renew_scan_lease,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -325,8 +329,21 @@ async def enrich_and_upsert(db, client: httpx.AsyncClient, base: str, county: st
 # Scan engine (background task)
 # ═══════════════════════════════════════════════════════════════
 
+async def _require_manual_scan_lease(db, lease: ScanLease):
+    if not await renew_scan_lease(db, lease):
+        raise RuntimeError("deal_finder_scan_lease_lost")
+
+
+async def _release_manual_scan_lease(db, lease: ScanLease, scan_id: str):
+    try:
+        if not await release_scan_lease(db, lease):
+            logger.warning(f"[deal_finder] scan {scan_id} no longer owns its lease")
+    except Exception as exc:
+        logger.error(f"[deal_finder] scan {scan_id} lease release failed: {exc}")
+
+
 async def _run_scan(scan_id: str, county: str, keywords: str,
-                    max_results: int, only_delinquent: bool):
+                    max_results: int, only_delinquent: bool, lease: ScanLease):
     db = get_db()
     base = COUNTIES[county]["base"]
     oid = ObjectId(scan_id)
@@ -341,6 +358,7 @@ async def _run_scan(scan_id: str, county: str, keywords: str,
             # Collect search results across pages
             results, page = [], 1
             while len(results) < max_results:
+                await _require_manual_scan_lease(db, lease)
                 data = await _search_page(client, base, keywords, token, page)
                 items = data.get("resultsList") or []
                 if not items:
@@ -359,6 +377,7 @@ async def _run_scan(scan_id: str, county: str, keywords: str,
 
             new_leads = updated = processed = 0
             for item in results:
+                await _require_manual_scan_lease(db, lease)
                 outcome, _lead, _became = await enrich_and_upsert(
                     db, client, base, county, item, only_delinquent)
                 processed += 1
@@ -368,12 +387,15 @@ async def _run_scan(scan_id: str, county: str, keywords: str,
                 elif outcome == "updated":
                     updated += 1
 
+            await _require_manual_scan_lease(db, lease)
             await _update(status="done", new_leads=new_leads, updated=updated,
                           finished_at=datetime.now(timezone.utc))
             logger.info(f"[deal_finder] scan {scan_id} done: {new_leads} new, {updated} updated")
     except Exception as e:
         logger.error(f"[deal_finder] scan {scan_id} failed: {e}")
         await _update(status="error", error=str(e), finished_at=datetime.now(timezone.utc))
+    finally:
+        await _release_manual_scan_lease(db, lease, scan_id)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -497,6 +519,7 @@ def _scan_out(doc: dict) -> dict:
     return {
         "id": str(doc["_id"]),
         "county": doc.get("county", ""),
+        "scan_kind": doc.get("scan_kind", "manual"),
         "keywords": doc.get("keywords", ""),
         "status": doc.get("status", ""),
         "total_found": doc.get("total_found", 0),
@@ -601,7 +624,7 @@ def _tp_to_lead(county: str, rec: dict) -> dict:
 
 
 async def _run_scan_trueprodigy(scan_id: str, county: str, query: str,
-                                max_results: int):
+                                max_results: int, lease: ScanLease):
     db = get_db()
     office = COUNTIES[county]["office"]
     oid = ObjectId(scan_id)
@@ -616,6 +639,7 @@ async def _run_scan_trueprodigy(scan_id: str, county: str, query: str,
 
             results, page = [], 1
             while len(results) < max_results:
+                await _require_manual_scan_lease(db, lease)
                 data = await _tp_search(client, token, query, year, page)
                 items = data.get("results") or []
                 if not items:
@@ -635,6 +659,7 @@ async def _run_scan_trueprodigy(scan_id: str, county: str, query: str,
 
             new_leads = updated = processed = 0
             for rec in results:
+                await _require_manual_scan_lease(db, lease)
                 lead = _tp_to_lead(county, rec)
                 if not lead["property_id"]:
                     continue
@@ -652,12 +677,15 @@ async def _run_scan_trueprodigy(scan_id: str, county: str, query: str,
                 else:
                     updated += 1
 
+            await _require_manual_scan_lease(db, lease)
             await _update(status="done", new_leads=new_leads, updated=updated,
                           finished_at=datetime.now(timezone.utc))
             logger.info(f"[deal_finder] TP scan {scan_id} done: {new_leads} new, {updated} updated")
     except Exception as e:
         logger.error(f"[deal_finder] TP scan {scan_id} failed: {e}")
         await _update(status="error", error=str(e), finished_at=datetime.now(timezone.utc))
+    finally:
+        await _release_manual_scan_lease(db, lease, scan_id)
 
 
 @router.post("/admin/deal-finder/scan")
@@ -675,8 +703,8 @@ async def start_scan(request: Request, body: ScanRequest):
     if not q:
         raise HTTPException(400, "Escribe qué buscar (ej. nombre de calle)")
 
-    running = await db.deal_finder_scans.find_one({"status": {"$in": ["searching", "enriching"]}})
-    if running:
+    lease = await acquire_scan_lease(db, "deal_finder")
+    if lease is None:
         raise HTTPException(409, "Ya hay un escaneo en curso — espera a que termine")
 
     platform = county.get("platform", "esearch")
@@ -685,28 +713,40 @@ async def start_scan(request: Request, body: ScanRequest):
         keywords = q
         max_results = max(1, min(body.max_results, 200))
         doc = {
-            "county": body.county, "keywords": keywords, "status": "searching",
+            "county": body.county, "keywords": keywords, "scan_kind": "manual",
+            "status": "searching",
             "total_found": 0, "total": 0, "processed": 0, "new_leads": 0, "updated": 0,
             "only_delinquent": False,
             "started_at": datetime.now(timezone.utc), "finished_at": None, "error": "",
         }
-        res = await db.deal_finder_scans.insert_one(doc)
-        scan_id = str(res.inserted_id)
-        asyncio.create_task(_run_scan_trueprodigy(scan_id, body.county, keywords, max_results))
+        try:
+            res = await db.deal_finder_scans.insert_one(doc)
+            scan_id = str(res.inserted_id)
+            asyncio.create_task(_run_scan_trueprodigy(
+                scan_id, body.county, keywords, max_results, lease))
+        except Exception:
+            await _release_manual_scan_lease(db, lease, "not-started")
+            raise
         return {"success": True, "scan_id": scan_id, "keywords": keywords}
 
     keywords = f'{field}:"{q}"' if " " in q else f"{field}:{q}"
     max_results = max(1, min(body.max_results, 100))
 
     doc = {
-        "county": body.county, "keywords": keywords, "status": "searching",
+        "county": body.county, "keywords": keywords, "scan_kind": "manual",
+        "status": "searching",
         "total_found": 0, "total": 0, "processed": 0, "new_leads": 0, "updated": 0,
         "only_delinquent": body.only_delinquent,
         "started_at": datetime.now(timezone.utc), "finished_at": None, "error": "",
     }
-    res = await db.deal_finder_scans.insert_one(doc)
-    scan_id = str(res.inserted_id)
-    asyncio.create_task(_run_scan(scan_id, body.county, keywords, max_results, body.only_delinquent))
+    try:
+        res = await db.deal_finder_scans.insert_one(doc)
+        scan_id = str(res.inserted_id)
+        asyncio.create_task(_run_scan(
+            scan_id, body.county, keywords, max_results, body.only_delinquent, lease))
+    except Exception:
+        await _release_manual_scan_lease(db, lease, "not-started")
+        raise
     return {"success": True, "scan_id": scan_id, "keywords": keywords}
 
 
@@ -1038,6 +1078,7 @@ async def get_cron_config(request: Request):
     db = get_db()
     cfg = await db.app_settings.find_one({"_id": "deal_finder_cron"}) or {}
     state = await db.app_settings.find_one({"_id": "deal_finder_cron_state"}) or {}
+    lease_state = await get_scan_lease_status(db, "deal_finder")
     from rental.deal_finder_cron import LETTERS, DEFAULT_MAX_PER_RUN, DEFAULT_ALERT_EMAIL
     letter_idx = int(state.get("letter_idx") or 0) % len(LETTERS)
     return {"success": True, "config": {
@@ -1050,7 +1091,7 @@ async def get_cron_config(request: Request):
         "cycles": int(state.get("cycles") or 0),
         "last_run": state["last_run"].isoformat() if state.get("last_run") else "",
         "last_result": state.get("last_result") or {},
-        "running": bool(state.get("manual_running")),
+        **lease_state,
     }}
 
 
@@ -1082,11 +1123,6 @@ async def run_cron_now(request: Request):
     """Ejecuta un lote del recorrido automático ahora mismo (background)."""
     await auth_admin(request)
     db = get_db()
-    running_scan = await db.deal_finder_scans.find_one({"status": {"$in": ["searching", "enriching"]}})
-    if running_scan:
-        raise HTTPException(409, "Hay un escaneo manual en curso — espera a que termine")
-
-    from rental.opportunity_scan_lease import acquire_scan_lease
     lease = await acquire_scan_lease(db, "deal_finder")
     if lease is None:
         raise HTTPException(409, "El radar automático ya está corriendo — espera a que termine")

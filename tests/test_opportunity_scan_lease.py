@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -8,7 +8,8 @@ from pymongo.errors import DuplicateKeyError
 
 from rental import deal_finder_cron
 from rental.opportunity_scan_lease import (
-    ScanLease, acquire_scan_lease, release_scan_lease, renew_scan_lease,
+    ScanLease, acquire_scan_lease, get_scan_lease_status,
+    release_scan_lease, renew_scan_lease,
 )
 
 
@@ -17,7 +18,7 @@ NOW = datetime(2026, 9, 7, 12, tzinfo=timezone.utc)
 
 def database():
     collection = SimpleNamespace(
-        find_one_and_update=AsyncMock(), update_one=AsyncMock(),
+        find_one=AsyncMock(), find_one_and_update=AsyncMock(), update_one=AsyncMock(),
     )
     return SimpleNamespace(app_settings=collection)
 
@@ -104,6 +105,42 @@ async def test_invalid_lease_inputs_fail_before_database_access(name, ttl):
     db.app_settings.find_one_and_update.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_public_status_reports_active_lease_without_owner_secret():
+    db = database()
+    db.app_settings.find_one.return_value = {
+        "lease_owner": "must-not-leak", "lease_generation": 8,
+        "lease_until": (NOW + timedelta(minutes=5)).replace(tzinfo=None),
+    }
+    status = await get_scan_lease_status(db, "deal_finder", now=NOW)
+    assert status == {
+        "running": True,
+        "lease_expires_at": "2026-09-07T12:05:00+00:00",
+        "lease_generation": 8,
+    }
+    assert "owner" not in status
+
+
+@pytest.mark.asyncio
+async def test_public_status_treats_expired_or_released_lease_as_idle():
+    db = database()
+    db.app_settings.find_one.return_value = {
+        "lease_owner": "old-worker", "lease_generation": 3,
+        "lease_until": NOW - timedelta(seconds=1),
+    }
+    assert await get_scan_lease_status(db, "deal_finder", now=NOW) == {
+        "running": False, "lease_expires_at": "", "lease_generation": 3,
+    }
+
+
+@pytest.mark.asyncio
+async def test_status_rejects_invalid_name_before_database_access():
+    db = database()
+    with pytest.raises(ValueError):
+        await get_scan_lease_status(db, "bad:name", now=NOW)
+    db.app_settings.find_one.assert_not_awaited()
+
+
 def test_manual_endpoint_uses_same_atomic_lease_without_legacy_flag():
     source = (Path(__file__).resolve().parents[1] / "rental/deal_finder_router.py").read_text()
     assert 'lease = await acquire_scan_lease(db, "deal_finder")' in source
@@ -121,3 +158,32 @@ def test_lease_is_renewed_before_cursor_write_and_alerts_remain_supported():
     assert final_state_block.index("renew_scan_lease(db, lease)") < final_state_block.index(
         '"_id": "deal_finder_cron_state"')
     assert "send_alert_email(db, new_opps, became)" in source
+
+
+def test_all_manual_scan_entry_points_share_the_atomic_lease():
+    source = (Path(__file__).resolve().parents[1] / "rental/deal_finder_router.py").read_text()
+    start = source[source.index("async def start_scan"):source.index("async def get_scan")]
+    run_now = source[source.index("async def run_cron_now"):source.index("async def analyze_lead")]
+    assert 'lease = await acquire_scan_lease(db, "deal_finder")' in start
+    assert 'lease = await acquire_scan_lease(db, "deal_finder")' in run_now
+    assert "deal_finder_scans.find_one" not in start
+    assert "deal_finder_scans.find_one" not in run_now
+    assert "_run_scan_trueprodigy(" in start and "max_results, lease" in start
+    assert "body.only_delinquent, lease" in start
+
+
+def test_manual_workers_renew_and_release_their_exact_lease():
+    source = (Path(__file__).resolve().parents[1] / "rental/deal_finder_router.py").read_text()
+    engine = source[source.index("async def _require_manual_scan_lease"):source.index("async def start_scan")]
+    assert "renew_scan_lease(db, lease)" in engine
+    assert engine.count("await _require_manual_scan_lease(db, lease)") >= 6
+    assert engine.count("await _release_manual_scan_lease(db, lease, scan_id)") == 2
+    assert engine.count('RuntimeError("deal_finder_scan_lease_lost")') == 1
+
+
+def test_cron_status_uses_authoritative_lease_without_exposing_legacy_flag():
+    source = (Path(__file__).resolve().parents[1] / "rental/deal_finder_router.py").read_text()
+    block = source[source.index("async def get_cron_config"):source.index("class CronConfigUpdate")]
+    assert 'get_scan_lease_status(db, "deal_finder")' in block
+    assert "**lease_state" in block
+    assert "manual_running" not in block
