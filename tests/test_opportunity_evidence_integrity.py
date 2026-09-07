@@ -9,12 +9,71 @@ from rental.opportunity_evidence import (
     add_evidence_atomic, address_probe, evidence_detail, evidence_id,
     get_evidence_review_history,
     parse_public_records_response,
+    parse_obituary_response,
     match_address, match_person, obituary_source_allowed, person_tokens,
     review_evidence_atomic, serialize_evidence_review_history,
 )
 
 
 NOW = datetime(2026, 9, 7, 18, tzinfo=timezone.utc)
+
+
+@pytest.mark.parametrize("raw", ['[{"address":"123 Main"}]',
+                                  '[{"name":"Jane", "age":true}]',
+                                  '[{"name":"Jane", "age":131}]',
+                                  '[{"name":"Jane", "city":{}}]', "broken"])
+def test_obituary_invalid_extraction_raises(raw):
+    with pytest.raises(ValueError, match="obituary_response_invalid"):
+        parse_obituary_response(raw)
+
+
+def test_obituary_valid_empty_and_bounded_records():
+    import json
+    assert parse_obituary_response("```json\n[]\n```") == []
+    records = [{"name": "Jane Doe", "age": 74, "city": "Dumas", "date": None,
+                "unexpected": "omit"}] * 60
+    result = parse_obituary_response(json.dumps(records))
+    assert len(result) == 50
+    assert result[0] == {"name": "Jane Doe", "age": 74, "city": "Dumas", "date": None}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scenario", ["missing_key", "provider_error", "invalid", "empty"])
+async def test_obituary_extractor_propagates_sanitized_failures(scenario):
+    import ast
+    source = (Path(__file__).resolve().parents[1] /
+              "rental/contact_enrichment_router.py").read_text()
+    handler = next(node for node in ast.parse(source).body
+                   if isinstance(node, ast.AsyncFunctionDef) and node.name == "_llm_extract_obituaries")
+    class RemoveImports(ast.NodeTransformer):
+        def visit_ImportFrom(self, node):
+            return None
+        def visit_Import(self, node):
+            return None
+    handler = RemoveImports().visit(handler)
+    chat = SimpleNamespace(send_message=AsyncMock(
+        return_value="[]" if scenario == "empty" else "broken"))
+    if scenario == "provider_error":
+        chat.send_message.side_effect = RuntimeError("private provider detail")
+    chat.with_model = lambda *args: chat
+    logger = SimpleNamespace(warning=lambda *args: None)
+    env = {
+        "os": SimpleNamespace(environ={} if scenario == "missing_key" else {"EMERGENT_LLM_KEY": "fake"}),
+        "secrets": SimpleNamespace(token_hex=lambda n: "fake"),
+        "LlmChat": lambda **kwargs: chat, "UserMessage": lambda **kwargs: kwargs,
+        "logger": logger, "parse_obituary_response": parse_obituary_response,
+    }
+    module = ast.fix_missing_locations(ast.Module(body=[handler], type_ignores=[]))
+    exec(compile(module, "isolated_obituary_extractor", "exec"), env)
+    if scenario == "empty":
+        assert await env["_llm_extract_obituaries"]("synthetic", "https://example.test") == []
+    else:
+        with pytest.raises(RuntimeError) as exc:
+            await env["_llm_extract_obituaries"]("synthetic", "https://example.test")
+        assert str(exc.value) == ("obituary_extraction_not_configured" if scenario == "missing_key"
+                                  else "obituary_extraction_failed")
+        if scenario == "missing_key":
+            chat.send_message.assert_not_awaited()
 
 
 @pytest.mark.parametrize("raw", ["[]", "```json\n[]\n```", "```\n[]\n```"])
