@@ -7,8 +7,9 @@ import pytest
 
 from rental.opportunity_evidence import (
     add_evidence_atomic, address_probe, evidence_detail, evidence_id,
+    get_evidence_review_history,
     match_address, match_person, obituary_source_allowed, person_tokens,
-    review_evidence_atomic,
+    review_evidence_atomic, serialize_evidence_review_history,
 )
 
 
@@ -182,6 +183,56 @@ async def test_review_returns_none_when_evidence_does_not_exist():
     collection.update_one.assert_not_awaited()
 
 
+def test_history_serialization_is_latest_first_bounded_and_private():
+    evidence = {
+        "evidence_id": "a" * 24,
+        "review_status": "confirmed",
+        "reviewed_at": "2026-09-07T18:00:00+00:00",
+        "review_note": "  current note  ",
+        "review_history": [
+            {"status": "dismissed", "reviewer_id": "private-admin",
+             "note": "old", "at": "2026-09-06T18:00:00+00:00"},
+            {"status": "confirmed", "reviewer_id": "private-admin",
+             "note": "  new  ", "at": "2026-09-07T18:00:00+00:00"},
+            {"status": "invalid", "reviewer_id": "leak",
+             "note": "ignored", "at": "2026-09-08T18:00:00+00:00"},
+        ],
+    }
+    result = serialize_evidence_review_history(evidence)
+    assert result["current_status"] == "confirmed"
+    assert result["review_note"] == "current note"
+    assert [event["status"] for event in result["history"]] == [
+        "confirmed", "dismissed"]
+    assert result["history"][0]["note"] == "new"
+    assert "reviewer_id" not in str(result)
+
+
+@pytest.mark.asyncio
+async def test_history_fetch_uses_narrow_projection_and_handles_missing():
+    evidence = {"evidence_id": "a" * 24, "review_history": []}
+    collection = SimpleNamespace(find_one=AsyncMock(return_value={
+        "motivation": {"details": [evidence]}}))
+    db = SimpleNamespace(deal_finder_leads=collection)
+    result = await get_evidence_review_history(db, "lead-1", "a" * 24)
+    assert result["evidence_id"] == "a" * 24
+    query, projection = collection.find_one.await_args.args
+    expected = {"$elemMatch": {"evidence_id": "a" * 24}}
+    assert query["motivation.details"] == expected
+    assert projection == {"_id": 0, "motivation.details": expected}
+    collection.find_one.return_value = None
+    assert await get_evidence_review_history(
+        db, "lead-1", "a" * 24) is None
+
+
+@pytest.mark.asyncio
+async def test_history_fetch_rejects_invalid_evidence_before_database_access():
+    collection = SimpleNamespace(find_one=AsyncMock())
+    db = SimpleNamespace(deal_finder_leads=collection)
+    with pytest.raises(ValueError, match="opportunity_evidence_id_invalid"):
+        await get_evidence_review_history(db, "lead-1", "bad")
+    collection.find_one.assert_not_awaited()
+
+
 def test_all_opportunity_sources_use_verified_atomic_evidence_boundary():
     source = (Path(__file__).resolve().parents[1] /
               "rental/contact_enrichment_router.py").read_text()
@@ -193,4 +244,6 @@ def test_all_opportunity_sources_use_verified_atomic_evidence_boundary():
     assert '{"$set": {"motivation": motivation}}' not in source
     assert '"review_status": detail["review_status"]' in source
     assert '@router.patch("/admin/deal-finder/leads/{lead_id}/evidence/{evidence_id_value}")' in source
+    assert '@router.get("/admin/deal-finder/leads/{lead_id}/evidence/{evidence_id_value}/history")' in source
+    assert "get_evidence_review_history(" in source
     assert "review_evidence_atomic(" in source
