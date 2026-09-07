@@ -10,6 +10,29 @@ ACTIONS = (
 )
 
 
+def _present(path: str) -> dict[str, Any]:
+    return {"$ne": [{"$ifNull": [path, ""]}, ""]}
+
+
+def next_action_expression() -> dict[str, Any]:
+    """Read-only recommendation; it never authorizes contact or sends anything."""
+    return {"$switch": {"branches": [
+        {"case": {"$eq": ["$response_action", "reject"]}, "then": "close_out"},
+        {"case": {"$gt": ["$pending_evidence", 0]}, "then": "review_evidence"},
+        {"case": {"$and": [
+            {"$eq": ["$response_action", "accept"]}, _present("$contract.generated_at"),
+        ]}, "then": "monitor"},
+        {"case": {"$eq": ["$response_action", "accept"]}, "then": "prepare_contract"},
+        {"case": {"$in": ["$response_action", ["counter", "call"]]}, "then": "negotiate"},
+        {"case": {"$and": [
+            {"$eq": ["$response_action", ""]}, "$has_sent_offer",
+        ]}, "then": "follow_up"},
+        {"case": {"$eq": [{"$ifNull": ["$ai_score", None]}, None]}, "then": "analyze"},
+        {"case": {"$not": ["$has_contact"]}, "then": "find_contact"},
+        {"case": {"$eq": [{"$ifNull": ["$offer", None]}, None]}, "then": "prepare_offer"},
+    ], "default": "monitor"}}
+
+
 def build_action_queue_pipeline(*, action: str = "", skip: int = 0,
                                 limit: int = 20) -> list[dict[str, Any]]:
     if action and action not in ACTIONS:
@@ -42,21 +65,27 @@ def build_action_queue_pipeline(*, action: str = "", skip: int = 0,
                 {"$gt": [{"$size": emails}, 0]},
             ]},
             "response_action": {"$ifNull": ["$offer.response.action", ""]},
+            # A draft slug or manually changed lead status is not proof of dispatch.
+            "has_sent_offer": {"$or": [
+                {"$gt": [{"$size": {"$filter": {
+                    "input": {"$cond": [{"$isArray": "$offer.sent_history"},
+                                          "$offer.sent_history", []]},
+                    "as": "sent", "cond": {"$and": [
+                        _present("$$sent.at"),
+                        {"$in": ["$$sent.channel", ["email", "sms"]]},
+                        {"$not": [{"$in": [{"$ifNull": ["$$sent.status", ""]},
+                                             ["failed", "undelivered", "canceled"]]}]},
+                    ]},
+                }}}, 0]},
+                {"$and": [{"$eq": ["$mail.mode", "live"]},
+                          _present("$mail.lob_id"), _present("$mail.mailed_at")]},
+            ]},
             "normalized_ai_score": {"$convert": {
                 "input": "$ai_score", "to": "double", "onError": 0, "onNull": 0,
             }},
         }},
         {"$set": {
-            "next_action": {"$switch": {"branches": [
-                {"case": {"$gt": ["$pending_evidence", 0]}, "then": "review_evidence"},
-                {"case": {"$eq": ["$response_action", "accept"]}, "then": "prepare_contract"},
-                {"case": {"$in": ["$response_action", ["counter", "call"]]}, "then": "negotiate"},
-                {"case": {"$eq": ["$response_action", "reject"]}, "then": "close_out"},
-                {"case": {"$eq": [{"$ifNull": ["$ai_score", None]}, None]}, "then": "analyze"},
-                {"case": {"$not": ["$has_contact"]}, "then": "find_contact"},
-                {"case": {"$eq": [{"$ifNull": ["$offer", None]}, None]}, "then": "prepare_offer"},
-                {"case": {"$eq": ["$response_action", ""]}, "then": "follow_up"},
-            ], "default": "monitor"}},
+            "next_action": next_action_expression(),
             "action_priority": {"$round": [{"$add": [
                 "$normalized_ai_score",
                 {"$multiply": ["$pending_evidence", 10]},
