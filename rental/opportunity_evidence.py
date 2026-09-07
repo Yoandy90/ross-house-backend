@@ -106,6 +106,27 @@ def obituary_source_allowed(url: str) -> bool:
             and not parsed.password and port in (None, 443))
 
 
+def parse_public_records_response(raw: str) -> list[dict]:
+    """Distinguish valid empty extraction from an unusable model response."""
+    text = raw.strip() if isinstance(raw, str) else ""
+    if text.startswith("```") and text.endswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text[:-3], flags=re.IGNORECASE).strip()
+    try:
+        records = json.loads(text)
+    except (ValueError, TypeError):
+        raise ValueError("public_records_response_invalid") from None
+    if not isinstance(records, list) or any(not isinstance(item, dict) for item in records):
+        raise ValueError("public_records_response_invalid")
+    # Reject malformed fields before any records can mutate leads.
+    for record in records:
+        for field in ("name", "address", "case_number", "date", "city"):
+            if record.get(field) is not None and not isinstance(record[field], str):
+                raise ValueError("public_records_response_invalid")
+        if not any(str(record.get(field) or "").strip() for field in ("name", "address")):
+            raise ValueError("public_records_response_invalid")
+    return records[:200]
+
+
 def evidence_id(source: str, record: dict) -> str:
     primary = record.get("case_number") or ""
     if not primary:
