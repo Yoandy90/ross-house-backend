@@ -8,6 +8,8 @@ import re
 import unicodedata
 from urllib.parse import urlsplit
 
+from pymongo import ReturnDocument
+
 
 _NAME_NOISE = {
     "JR", "SR", "II", "III", "IV", "THE", "OF", "ESTATE", "TRUST",
@@ -22,6 +24,16 @@ _STREET_SUFFIX = {
 _ADDRESS_NOISE = {"ST", "AVE", "DR", "LN", "RD", "BLVD", "CT", "PL", "HWY",
                   "CIR", "TRL", "PKWY", "N", "S", "E", "W", "NE", "NW", "SE", "SW"}
 _OBITUARY_HOSTS = {"echovita.com", "morrisonfuneraldirectors.com"}
+_REVIEW_STATUSES = {"needs_review", "confirmed", "dismissed"}
+_LEGACY_SOURCE_BY_SIGNAL = {
+    "possible_deceased": ["obituary"],
+    "probate_confirmed": ["probate"],
+    "eviction_filed": ["eviction"],
+    "divorce_filed": ["divorce"],
+    "tax_sale": ["tax_sale"],
+    "code_violation": ["code_violation"],
+    "vacant": ["vacancy"],
+}
 
 
 def _ascii_words(value: str) -> list[str]:
@@ -135,6 +147,7 @@ async def add_evidence_atomic(db, lead_id, signal: str | list[str], detail: dict
     signals = [signal] if isinstance(signal, str) else list(dict.fromkeys(signal))
     if not signals:
         raise ValueError("opportunity_evidence_signal_required")
+    detail = {**detail, "signals": signals}
     result = await db.deal_finder_leads.update_one(
         {"_id": lead_id, "motivation.details.evidence_id": {"$ne": eid}},
         [
@@ -155,3 +168,72 @@ async def add_evidence_atomic(db, lead_id, signal: str | list[str], detail: dict
         ],
     )
     return result.modified_count == 1
+
+
+async def review_evidence_atomic(db, lead_id, evidence_id_value: str, status: str,
+                                 reviewer_id: str, *, note: str = "", now=None) -> dict | None:
+    """Review one evidence item and safely reconcile its active signals."""
+    if not re.fullmatch(r"[a-f0-9]{24}", str(evidence_id_value or "")):
+        raise ValueError("opportunity_evidence_id_invalid")
+    if status not in _REVIEW_STATUSES:
+        raise ValueError("opportunity_evidence_status_invalid")
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        raise ValueError("opportunity_evidence_clock_must_be_aware")
+    event = {
+        "status": status,
+        "reviewer_id": str(reviewer_id or "")[:100],
+        "note": str(note or "").strip()[:500],
+        "at": current.astimezone(timezone.utc).isoformat(),
+    }
+    document = await db.deal_finder_leads.find_one_and_update(
+        {"_id": lead_id, "motivation.details": {
+            "$elemMatch": {"evidence_id": evidence_id_value}}},
+        {"$set": {
+            "motivation.details.$[evidence].review_status": status,
+            "motivation.details.$[evidence].reviewed_at": event["at"],
+            "motivation.details.$[evidence].reviewed_by": event["reviewer_id"],
+            "motivation.details.$[evidence].review_note": event["note"],
+            "motivation.updated_at": event["at"],
+         },
+         "$push": {"motivation.details.$[evidence].review_history": {
+             "$each": [event], "$slice": -50,
+         }}},
+        array_filters=[{"evidence.evidence_id": evidence_id_value}],
+        projection={"motivation": 1}, return_document=ReturnDocument.AFTER,
+    )
+    if not document:
+        return None
+    details = (document.get("motivation") or {}).get("details") or []
+    reviewed = next((item for item in details
+                     if item.get("evidence_id") == evidence_id_value), None)
+    if not reviewed:
+        return None
+    signals = [value for value in (reviewed.get("signals") or [])
+               if isinstance(value, str) and value]
+    if status == "dismissed":
+        for signal in signals:
+            legacy_sources = _LEGACY_SOURCE_BY_SIGNAL.get(signal, [])
+            conditions = [{"motivation.details": {"$not": {"$elemMatch": {
+                "signals": signal, "review_status": {"$ne": "dismissed"},
+            }}}}]
+            if legacy_sources:
+                conditions.append({"motivation.details": {"$not": {"$elemMatch": {
+                    "signals": {"$exists": False}, "source": {"$in": legacy_sources},
+                }}}})
+            await db.deal_finder_leads.update_one(
+                {"_id": lead_id, "$and": conditions},
+                {"$pull": {"motivation.signals": signal}},
+            )
+    elif signals:
+        await db.deal_finder_leads.update_one(
+            {"_id": lead_id},
+            {"$addToSet": {"motivation.signals": {"$each": signals}}},
+        )
+    final = await db.deal_finder_leads.find_one(
+        {"_id": lead_id}, {"motivation": 1}) or document
+    final_motivation = final.get("motivation") or {}
+    final_evidence = next((item for item in (final_motivation.get("details") or [])
+                           if item.get("evidence_id") == evidence_id_value), reviewed)
+    return {"evidence": final_evidence,
+            "signals": final_motivation.get("signals") or []}

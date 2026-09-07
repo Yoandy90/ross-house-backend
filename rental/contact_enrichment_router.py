@@ -15,7 +15,7 @@ import re
 import secrets
 import urllib.parse
 from datetime import datetime, timezone, timedelta
-from typing import Optional
+from typing import Literal, Optional
 
 import httpx
 from bson import ObjectId
@@ -26,6 +26,7 @@ from rental.shared import get_db, auth_admin
 from rental.opportunity_evidence import (
     add_evidence_atomic, address_probe, evidence_detail, evidence_id,
     match_address, match_person, obituary_source_allowed, person_tokens,
+    review_evidence_atomic,
 )
 
 logger = logging.getLogger(__name__)
@@ -570,6 +571,32 @@ async def public_records_import(request: Request, body: PublicRecordsImport):
 
     return {"success": True, "records_found": len(records),
             "matches": matches, "new_matches": new_matches, "signal": signal}
+
+
+class EvidenceReviewBody(BaseModel):
+    status: Literal["needs_review", "confirmed", "dismissed"]
+    note: str = ""
+
+
+@router.patch("/admin/deal-finder/leads/{lead_id}/evidence/{evidence_id_value}")
+async def review_opportunity_evidence(request: Request, lead_id: str,
+                                      evidence_id_value: str, body: EvidenceReviewBody):
+    """Confirm, dismiss or reopen one evidence item without deleting its history."""
+    admin = await auth_admin(request)
+    try:
+        oid = ObjectId(lead_id)
+    except Exception:
+        raise HTTPException(422, "lead_id inválido")
+    db = get_db()
+    reviewer_id = str(admin.get("id") or admin.get("_id") or "")
+    try:
+        result = await review_evidence_atomic(
+            db, oid, evidence_id_value, body.status, reviewer_id, note=body.note)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc))
+    if result is None:
+        raise HTTPException(404, "Evidencia no encontrada")
+    return {"success": True, **result}
 
 
 # ═══════════════════════════════════════════════════════════════

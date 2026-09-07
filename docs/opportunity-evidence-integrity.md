@@ -26,3 +26,17 @@ This change does not certify that a person is deceased or that a property is in
 probate. Those are potential acquisition signals requiring human verification
 against the linked public record. Tests use synthetic records only and perform
 no provider, database, email, Railway or production calls.
+
+## Review lifecycle
+
+An authenticated administrator can move an evidence item between `needs_review`,
+`confirmed` and `dismissed`. Each transition records the administrator ID, UTC
+timestamp and a bounded note in a 50-entry audit history. Transitions are appended
+and only the oldest overflow is trimmed; evidence identity and provider provenance
+are never deleted by the review action.
+
+Confirming or reopening evidence restores its associated motivation signals.
+Dismissal removes a signal only through a conditional write proving there is no
+other non-dismissed evidence for that signal. Legacy evidence without explicit
+signal metadata is treated conservatively and prevents automatic removal. The
+endpoint never sends communications or changes the lead's acquisition stage.

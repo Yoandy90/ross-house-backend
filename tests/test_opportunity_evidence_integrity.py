@@ -8,6 +8,7 @@ import pytest
 from rental.opportunity_evidence import (
     add_evidence_atomic, address_probe, evidence_detail, evidence_id,
     match_address, match_person, obituary_source_allowed, person_tokens,
+    review_evidence_atomic,
 )
 
 
@@ -98,7 +99,8 @@ async def test_atomic_add_dedupes_by_evidence_id_and_adds_all_signals():
     fields = pipeline[1]["$set"]
     assert fields["motivation.signals"]["$setUnion"][1] == [
         "probate", "preforeclosure"]
-    assert fields["motivation.details"]["$concatArrays"][1] == [detail]
+    saved_detail = fields["motivation.details"]["$concatArrays"][1][0]
+    assert saved_detail == {**detail, "signals": ["probate", "preforeclosure"]}
     assert fields["motivation.updated_at"] == detail["at"]
 
 
@@ -111,6 +113,75 @@ async def test_atomic_add_reports_existing_evidence_without_overwrite():
         db, "lead-1", "possible_deceased", {"evidence_id": "same", "at": "now"}) is False
 
 
+def review_database(status="confirmed"):
+    evidence = {
+        "evidence_id": "a" * 24, "signals": ["possible_deceased"],
+        "review_status": status,
+    }
+    collection = SimpleNamespace(
+        find_one_and_update=AsyncMock(return_value={
+            "motivation": {"details": [evidence], "signals": ["possible_deceased"]}}),
+        update_one=AsyncMock(return_value=SimpleNamespace(modified_count=1)),
+        find_one=AsyncMock(return_value={
+            "motivation": {"details": [evidence], "signals": ["possible_deceased"]}}),
+    )
+    return SimpleNamespace(deal_finder_leads=collection), collection
+
+
+@pytest.mark.asyncio
+async def test_confirm_review_is_audited_bounded_and_restores_signal():
+    db, collection = review_database("confirmed")
+    result = await review_evidence_atomic(
+        db, "lead-1", "a" * 24, "confirmed", "admin-7",
+        note="Confirmed in county file", now=NOW)
+    assert result["evidence"]["review_status"] == "confirmed"
+    query, update = collection.find_one_and_update.await_args.args
+    assert query["motivation.details"]["$elemMatch"] == {"evidence_id": "a" * 24}
+    history = update["$push"]["motivation.details.$[evidence].review_history"]
+    assert history["$slice"] == -50
+    assert history["$each"][0] == {
+        "status": "confirmed", "reviewer_id": "admin-7",
+        "note": "Confirmed in county file", "at": "2026-09-07T18:00:00+00:00",
+    }
+    assert collection.find_one_and_update.await_args.kwargs["array_filters"] == [
+        {"evidence.evidence_id": "a" * 24}]
+    restore = collection.update_one.await_args.args[1]
+    assert restore == {"$addToSet": {"motivation.signals": {
+        "$each": ["possible_deceased"]}}}
+
+
+@pytest.mark.asyncio
+async def test_dismiss_review_only_pulls_signal_without_active_or_legacy_support():
+    db, collection = review_database("dismissed")
+    await review_evidence_atomic(
+        db, "lead-1", "a" * 24, "dismissed", "admin-7", now=NOW)
+    query, update = collection.update_one.await_args.args
+    assert query["_id"] == "lead-1"
+    assert len(query["$and"]) == 2
+    assert update == {"$pull": {"motivation.signals": "possible_deceased"}}
+
+
+@pytest.mark.parametrize("evidence,status", [
+    ("bad", "confirmed"), ("a" * 24, "approved"),
+])
+@pytest.mark.asyncio
+async def test_review_rejects_invalid_inputs_before_database_access(evidence, status):
+    db, collection = review_database()
+    with pytest.raises(ValueError):
+        await review_evidence_atomic(
+            db, "lead-1", evidence, status, "admin-7", now=NOW)
+    collection.find_one_and_update.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_review_returns_none_when_evidence_does_not_exist():
+    db, collection = review_database()
+    collection.find_one_and_update.return_value = None
+    assert await review_evidence_atomic(
+        db, "lead-1", "a" * 24, "confirmed", "admin-7", now=NOW) is None
+    collection.update_one.assert_not_awaited()
+
+
 def test_all_opportunity_sources_use_verified_atomic_evidence_boundary():
     source = (Path(__file__).resolve().parents[1] /
               "rental/contact_enrichment_router.py").read_text()
@@ -121,3 +192,5 @@ def test_all_opportunity_sources_use_verified_atomic_evidence_boundary():
     assert ").limit(10)" in source
     assert '{"$set": {"motivation": motivation}}' not in source
     assert '"review_status": detail["review_status"]' in source
+    assert '@router.patch("/admin/deal-finder/leads/{lead_id}/evidence/{evidence_id_value}")' in source
+    assert "review_evidence_atomic(" in source
