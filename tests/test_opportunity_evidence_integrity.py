@@ -8,12 +8,77 @@ import pytest
 from rental.opportunity_evidence import (
     add_evidence_atomic, address_probe, evidence_detail, evidence_id,
     get_evidence_review_history,
+    parse_public_records_response,
     match_address, match_person, obituary_source_allowed, person_tokens,
     review_evidence_atomic, serialize_evidence_review_history,
 )
 
 
 NOW = datetime(2026, 9, 7, 18, tzinfo=timezone.utc)
+
+
+@pytest.mark.parametrize("raw", ["[]", "```json\n[]\n```", "```\n[]\n```"])
+def test_public_records_valid_empty_extraction(raw):
+    assert parse_public_records_response(raw) == []
+
+
+@pytest.mark.parametrize("raw", [None, "", "unavailable", "[", "{}", "null",
+                                  '[null]', '["name"]', '[{}]',
+                                  '[{"name": ["Jane"]}]',
+                                  '[{"name": "Jane", "date": 42}]',
+                                  '[{"name": "Jane"}, null]'])
+def test_public_records_malformed_extraction_is_never_empty_success(raw):
+    with pytest.raises(ValueError, match="public_records_response_invalid"):
+        parse_public_records_response(raw)
+
+
+def test_public_records_keeps_names_addresses_and_bounds_batch():
+    import json
+    records = [{"name": "Jane Doe", "address": None, "case_number": "P-1"},
+               {"name": None, "address": "123 Main St"}]
+    assert parse_public_records_response(json.dumps(records)) == records
+    assert len(parse_public_records_response(json.dumps(records * 150))) == 200
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("raw,expected_status", [("[]", 200), ("invalid", 502)])
+async def test_public_import_empty_or_invalid_response_receipts(raw, expected_status):
+    # Execute the real handler with isolated provider/auth/storage dependencies.
+    import ast
+    from fastapi import HTTPException
+    source = (Path(__file__).resolve().parents[1] /
+              "rental/contact_enrichment_router.py").read_text()
+    handler = next(node for node in ast.parse(source).body
+                   if isinstance(node, ast.AsyncFunctionDef) and node.name == "public_records_import")
+    handler.decorator_list = []
+    handler.body = [node for node in handler.body
+                    if not isinstance(node, (ast.Import, ast.ImportFrom))]
+    module = ast.fix_missing_locations(ast.Module(body=[handler], type_ignores=[]))
+    chat = SimpleNamespace(send_message=AsyncMock(return_value=raw))
+    chat.with_model = lambda *args: chat
+    receipt = AsyncMock()
+    db = object()
+    env = {
+        "Request": object, "PublicRecordsImport": object,
+        "auth_admin": AsyncMock(), "PUBLIC_SIGNAL_BY_TYPE": {"probate": "probate_confirmed"},
+        "os": SimpleNamespace(environ={"EMERGENT_LLM_KEY": "synthetic"}),
+        "secrets": SimpleNamespace(token_hex=lambda n: "synthetic"),
+        "LlmChat": lambda **kwargs: chat, "UserMessage": lambda **kwargs: kwargs,
+        "HTTPException": HTTPException, "get_db": lambda: db,
+        "parse_public_records_response": parse_public_records_response,
+        "record_source_run": receipt,
+    }
+    exec(compile(module, "isolated_public_import", "exec"), env)
+    body = SimpleNamespace(source_type="probate", text="Synthetic county index text")
+    if expected_status == 502:
+        with pytest.raises(HTTPException) as exc:
+            await env["public_records_import"](object(), body)
+        assert exc.value.status_code == 502
+        receipt.assert_not_awaited()
+    else:
+        result = await env["public_records_import"](object(), body)
+        assert result["success"] and result["records_found"] == 0
+        receipt.assert_awaited_once_with(db, "probate", scanned=0, matched=0)
 
 
 def test_person_match_is_order_independent_and_accent_safe():
