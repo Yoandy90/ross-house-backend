@@ -1,7 +1,7 @@
 """Operational freshness and coverage read model for opportunity sources."""
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 
@@ -58,6 +58,16 @@ def _utc_datetime(value: Any) -> datetime | None:
     return parsed.astimezone(timezone.utc)
 
 
+def _count(value: Any) -> int:
+    """Malformed legacy counters must not prevent other sources from loading."""
+    if isinstance(value, bool):
+        return 0
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
 def serialize_source_health(rows: list[dict[str, Any]], runs_document: dict | None,
                             *, stale_days: int = 30,
                             now: datetime | None = None) -> dict[str, Any]:
@@ -79,23 +89,24 @@ def serialize_source_health(rows: list[dict[str, Any]], runs_document: dict | No
         last_evidence_at = str(row.get("last_evidence_at") or "")[:50]
         freshness_at = last_run_at or last_evidence_at
         observed = _utc_datetime(freshness_at)
-        age_days = max(0, int((current - observed).total_seconds() // 86400)) if observed else None
+        valid_observation = observed is not None and observed <= current
+        age_days = int((current - observed).total_seconds() // 86400) if valid_observation else None
         if not freshness_at:
             status = "never_run"
-        elif observed is None:
+        elif not valid_observation:
             status = "invalid_timestamp"
-        elif age_days is not None and age_days > stale_days:
+        elif current - observed > timedelta(days=stale_days):
             status = "stale"
-        elif run.get("status") == "partial":
+        elif last_run_at and (run.get("status") != "success" or _count(run.get("errors")) > 0):
             status = "partial"
         elif not last_run_at:
             status = "observed_only"
         else:
             status = "healthy"
-        total = max(0, int(row.get("total") or 0))
-        pending = max(0, int(row.get("needs_review") or 0))
-        confirmed = max(0, int(row.get("confirmed") or 0))
-        dismissed = max(0, int(row.get("dismissed") or 0))
+        total = _count(row.get("total"))
+        pending = _count(row.get("needs_review"))
+        confirmed = _count(row.get("confirmed"))
+        dismissed = _count(row.get("dismissed"))
         sources.append({
             "source": source_id, "label": label, "status": status,
             "requires_attention": status in {
@@ -103,9 +114,9 @@ def serialize_source_health(rows: list[dict[str, Any]], runs_document: dict | No
             "last_run_at": last_run_at, "last_evidence_at": last_evidence_at,
             "age_days": age_days, "stale_after_days": stale_days,
             "last_run": {
-                "scanned": max(0, int(run.get("scanned") or 0)),
-                "matched": max(0, int(run.get("matched") or 0)),
-                "errors": max(0, int(run.get("errors") or 0)),
+                "scanned": _count(run.get("scanned")),
+                "matched": _count(run.get("matched")),
+                "errors": _count(run.get("errors")),
             },
             "evidence": {"total": total, "needs_review": pending,
                          "confirmed": confirmed, "dismissed": dismissed},
