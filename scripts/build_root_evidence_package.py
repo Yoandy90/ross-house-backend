@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -147,17 +148,32 @@ def build_root_evidence_package(
 
 
 def write_private_package(path: Path, package: dict, repository_root: Path) -> None:
-    destination = path.resolve()
+    # Resolve parent aliases, but never follow an existing destination symlink.
+    destination = path.parent.resolve() / path.name
     root = repository_root.resolve()
     if destination == root or root in destination.parents:
         raise ValueError("root_evidence_output_must_be_outside_repository")
     destination.parent.mkdir(parents=True, exist_ok=True)
     payload = (json.dumps(package, indent=2, sort_keys=True) + "\n").encode("utf-8")
-    descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=".root-evidence-", suffix=".tmp", dir=destination.parent
+    )
     try:
-        os.write(descriptor, payload)
+        try:
+            remaining = memoryview(payload)
+            while remaining:
+                written = os.write(descriptor, remaining)
+                if written <= 0:
+                    raise OSError("root_evidence_write_did_not_progress")
+                remaining = remaining[written:]
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        # A same-directory hard link publishes only the completed file and
+        # atomically refuses an existing destination, including a symlink.
+        os.link(temporary, destination)
     finally:
-        os.close(descriptor)
+        os.unlink(temporary)
 
 
 def main() -> int:
