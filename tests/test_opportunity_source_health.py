@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -12,6 +12,50 @@ from rental.opportunity_source_health import (
 
 
 NOW = datetime(2026, 9, 7, 20, tzinfo=timezone.utc)
+
+
+@pytest.mark.parametrize("elapsed,status", [
+    (timedelta(seconds=-1), "invalid_timestamp"),
+    (timedelta(0), "healthy"),
+    (timedelta(days=30), "healthy"),
+    (timedelta(days=30, seconds=1), "stale"),
+])
+def test_freshness_uses_exact_boundary_and_rejects_future(elapsed, status):
+    result = serialize_source_health([], {"sources": {"propertyradar": {
+        "last_run_at": (NOW - elapsed).isoformat(), "status": "success",
+    }}}, now=NOW)
+    item = result["sources"][0]
+    assert item["status"] == status
+    assert item["requires_attention"] == (status != "healthy")
+    if status == "invalid_timestamp":
+        assert item["age_days"] is None
+
+
+@pytest.mark.parametrize("timestamp", ["garbage", "2026-09-07T19:00:00",
+                                        "2026-09-08T00:00:00Z"])
+def test_legacy_evidence_dates_cannot_report_false_freshness(timestamp):
+    result = serialize_source_health([{
+        "_id": "propertyradar", "last_evidence_at": timestamp,
+    }], None, now=NOW)
+    assert result["sources"][0]["status"] == "invalid_timestamp"
+
+
+@pytest.mark.parametrize("status,errors", [(None, 0), ("unknown", 0), ("success", 1)])
+def test_receipt_needs_explicit_error_free_success(status, errors):
+    result = serialize_source_health([], {"sources": {"propertyradar": {
+        "last_run_at": NOW.isoformat(), "status": status, "errors": errors,
+    }}}, now=NOW)
+    assert result["sources"][0]["status"] == "partial"
+
+
+@pytest.mark.parametrize("bad_count", ["invalid", {}, [], float("inf"), float("nan"), True])
+def test_malformed_receipt_counters_do_not_break_other_sources(bad_count):
+    result = serialize_source_health([], {"sources": {"propertyradar": {
+        "last_run_at": NOW.isoformat(), "status": "partial",
+        "scanned": bad_count, "matched": bad_count, "errors": bad_count,
+    }}}, now=NOW)
+    assert result["sources"][0]["last_run"] == {"scanned": 0, "matched": 0, "errors": 0}
+    assert len(result["sources"]) == len(SOURCE_DEFINITIONS)
 
 
 def test_pipeline_is_bounded_and_treats_legacy_reviews_as_pending():
