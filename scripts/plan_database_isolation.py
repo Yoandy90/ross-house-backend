@@ -12,6 +12,7 @@ import argparse
 import hashlib
 import json
 import re
+import unicodedata
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -290,6 +291,25 @@ def _expected_evidence_id(
     return "evd-" + hashlib.sha256(binding.encode("utf-8")).hexdigest()
 
 
+def _reviewer_identity_key(value: object, field: str) -> str:
+    """Compare declared identities; this does not authenticate a reviewer."""
+    if not isinstance(value, str) or not value or value != value.strip():
+        raise ValueError(f"filter_evidence_{field}_invalid")
+    normalized = unicodedata.normalize("NFKC", value)
+    if (
+        not normalized.strip()
+        or normalized != normalized.strip()
+        or any(unicodedata.category(char).startswith("C") for char in value)
+        or any(unicodedata.category(char).startswith("C") for char in normalized)
+        or "*" in normalized
+        or ":" in normalized
+    ):
+        # Colons would make the existing evidence-ID separator ambiguous.
+        # Never include the submitted identity in the error.
+        raise ValueError(f"filter_evidence_{field}_invalid")
+    return " ".join(normalized.casefold().split())
+
+
 def apply_offline_filter_evidence(
     rows: list[dict],
     evidence: dict,
@@ -350,11 +370,11 @@ def apply_offline_filter_evidence(
     }
     if not isinstance(provenance, dict) or set(provenance) != provenance_fields:
         raise ValueError("filter_evidence_provenance_invalid")
-    for field in ("prepared_by", "approved_by"):
-        value = provenance.get(field)
-        if not isinstance(value, str) or not value.strip() or "*" in value:
-            raise ValueError(f"filter_evidence_{field}_invalid")
-    if provenance["prepared_by"].casefold() == provenance["approved_by"].casefold():
+    reviewer_keys = {
+        field: _reviewer_identity_key(provenance.get(field), field)
+        for field in ("prepared_by", "approved_by")
+    }
+    if reviewer_keys["prepared_by"] == reviewer_keys["approved_by"]:
         raise ValueError("filter_evidence_separation_of_duties_required")
     prepared_at = _utc_timestamp(provenance.get("prepared_at"), "prepared_at")
     approved_at = _utc_timestamp(provenance.get("approved_at"), "approved_at")
