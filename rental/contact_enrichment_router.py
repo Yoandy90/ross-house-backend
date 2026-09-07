@@ -25,6 +25,7 @@ from pydantic import BaseModel, Field
 from rental.shared import get_db, auth_admin
 from rental.opportunity_evidence import (
     add_evidence_atomic, address_probe, evidence_detail, evidence_id,
+    get_evidence_review_history,
     match_address, match_person, obituary_source_allowed, person_tokens,
     review_evidence_atomic,
 )
@@ -640,6 +641,24 @@ async def opportunity_action_queue(
         raise HTTPException(422, str(exc))
     rows = await get_db().deal_finder_leads.aggregate(pipeline).to_list(length=1)
     return serialize_action_queue(rows)
+
+
+@router.get("/admin/deal-finder/leads/{lead_id}/evidence/{evidence_id_value}/history")
+async def opportunity_evidence_history(request: Request, lead_id: str,
+                                       evidence_id_value: str):
+    """Return the sanitized audit timeline for one evidence item."""
+    await auth_admin(request)
+    try:
+        oid = ObjectId(lead_id)
+    except Exception:
+        raise HTTPException(422, "lead_id inválido")
+    try:
+        result = await get_evidence_review_history(get_db(), oid, evidence_id_value)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc))
+    if result is None:
+        raise HTTPException(404, "Evidencia no encontrada")
+    return result
 
 
 @router.patch("/admin/deal-finder/leads/{lead_id}/evidence/{evidence_id_value}")
