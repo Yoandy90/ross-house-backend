@@ -7,6 +7,8 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
+from scripts.offline_evidence_json import load_offline_json
+
 from scripts.plan_database_isolation import (
     SHA256_RE,
     apply_offline_filter_evidence,
@@ -187,7 +189,7 @@ def main() -> int:
     request = build_relationship_evidence_request(
         load_inventory(args.inventory),
         load_filter_contract(args.filter_contract),
-        json.loads(args.root_package.read_text(encoding="utf-8-sig")),
+        load_offline_json(args.root_package),
         now=datetime.now(timezone.utc),
     )
     rendered = json.dumps(request, indent=2, sort_keys=True)

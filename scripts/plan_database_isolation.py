@@ -16,6 +16,11 @@ import unicodedata
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+if __package__:
+    from scripts.offline_evidence_json import load_offline_json, parse_offline_json
+else:  # Preserve direct invocation: python scripts/plan_database_isolation.py.
+    from offline_evidence_json import load_offline_json, parse_offline_json
+
 RUNTIME_SUFFIXES = {".py", ".js", ".ts", ".tsx"}
 IGNORED_PARTS = {".git", ".venv", "node_modules", "tests", "scripts"}
 EVIDENCE_GROUPS = (
@@ -67,7 +72,7 @@ def runtime_files(repository_root: Path) -> list[Path]:
 
 def load_inventory(path: Path) -> dict:
     raw = path.read_bytes()
-    payload = json.loads(raw.decode("utf-8-sig"))
+    payload = parse_offline_json(raw)
     collections = payload.get("collections")
     expected = payload.get("collection_count")
     if not isinstance(collections, list) or not isinstance(expected, int):
@@ -82,7 +87,7 @@ def load_inventory(path: Path) -> dict:
 
 
 def load_rules(path: Path) -> dict:
-    rules = json.loads(path.read_text(encoding="utf-8-sig"))
+    rules = load_offline_json(path)
     if rules.get("source_database") != "taxportal":
         raise ValueError("source_database_must_be_taxportal")
     if rules.get("target_database") != "ross_house_production":
@@ -108,7 +113,7 @@ def load_rules(path: Path) -> dict:
 
 def load_filter_contract(path: Path) -> dict:
     raw = path.read_bytes()
-    contract = json.loads(raw.decode("utf-8-sig"))
+    contract = parse_offline_json(raw)
     if contract.get("source_database") != "taxportal":
         raise ValueError("filter_contract_source_invalid")
     if contract.get("target_database") != "ross_house_production":
@@ -634,7 +639,7 @@ def main() -> int:
 
     inventory = load_inventory(args.inventory)
     filter_evidence = (
-        json.loads(args.filter_evidence.read_text(encoding="utf-8-sig"))
+        load_offline_json(args.filter_evidence)
         if args.filter_evidence
         else None
     )
