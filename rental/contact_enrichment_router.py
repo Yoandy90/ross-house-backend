@@ -31,6 +31,9 @@ from rental.opportunity_evidence import (
 from rental.opportunity_evidence_queue import (
     build_evidence_queue_pipeline, bulk_review_evidence, serialize_evidence_queue,
 )
+from rental.opportunity_action_queue import (
+    build_action_queue_pipeline, serialize_action_queue,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["Contact Enrichment"])
@@ -619,6 +622,24 @@ async def bulk_review_opportunity_evidence(
         get_db(), [item.model_dump() for item in body.items], body.status,
         reviewer_id, note=body.note)
     return {"success": result["reviewed"] > 0, **result}
+
+
+@router.get("/admin/deal-finder/action-queue")
+async def opportunity_action_queue(
+    request: Request,
+    action: str = Query(default="", max_length=40),
+    skip: int = Query(default=0, ge=0, le=10_000),
+    limit: int = Query(default=20, ge=1, le=100),
+):
+    """Explainable next-best-action worklist for active opportunities."""
+    await auth_admin(request)
+    try:
+        pipeline = build_action_queue_pipeline(
+            action=action, skip=skip, limit=limit)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc))
+    rows = await get_db().deal_finder_leads.aggregate(pipeline).to_list(length=1)
+    return serialize_action_queue(rows)
 
 
 @router.patch("/admin/deal-finder/leads/{lead_id}/evidence/{evidence_id_value}")
