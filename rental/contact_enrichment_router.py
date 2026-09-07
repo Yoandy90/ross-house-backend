@@ -19,7 +19,7 @@ from typing import Literal, Optional
 
 import httpx
 from bson import ObjectId
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
 
 from rental.shared import get_db, auth_admin
@@ -27,6 +27,9 @@ from rental.opportunity_evidence import (
     add_evidence_atomic, address_probe, evidence_detail, evidence_id,
     match_address, match_person, obituary_source_allowed, person_tokens,
     review_evidence_atomic,
+)
+from rental.opportunity_evidence_queue import (
+    build_evidence_queue_pipeline, serialize_evidence_queue,
 )
 
 logger = logging.getLogger(__name__)
@@ -576,6 +579,22 @@ async def public_records_import(request: Request, body: PublicRecordsImport):
 class EvidenceReviewBody(BaseModel):
     status: Literal["needs_review", "confirmed", "dismissed"]
     note: str = ""
+
+
+@router.get("/admin/deal-finder/evidence-queue")
+async def opportunity_evidence_queue(
+    request: Request,
+    status: Literal["needs_review", "confirmed", "dismissed"] = "needs_review",
+    source: str = Query(default="", max_length=50),
+    skip: int = Query(default=0, ge=0, le=10_000),
+    limit: int = Query(default=25, ge=1, le=100),
+):
+    """Prioritized, paginated evidence queue with global review counters."""
+    await auth_admin(request)
+    pipeline = build_evidence_queue_pipeline(
+        status=status, source=source, skip=skip, limit=limit)
+    rows = await get_db().deal_finder_leads.aggregate(pipeline).to_list(length=1)
+    return serialize_evidence_queue(rows)
 
 
 @router.patch("/admin/deal-finder/leads/{lead_id}/evidence/{evidence_id_value}")
