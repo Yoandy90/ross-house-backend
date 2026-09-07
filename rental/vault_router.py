@@ -56,45 +56,15 @@ def _get_fernet() -> Fernet:
     return Fernet(raw_key.encode() if isinstance(raw_key, str) else raw_key)
 
 
-def _get_legacy_fernet() -> Optional[Fernet]:
-    """Legacy Fernet from the previous Ross Tax / Loans system. Used to
-    decrypt the 16 pre-existing payment_methods docs that have
-    `encrypted_number` / `encrypted_cvv`.
-
-    Tries env LEGACY_ENCRYPTION_KEY first, then falls back to the well-known
-    key from the legacy backend/.env.
-    """
-    legacy_key = os.environ.get("LEGACY_ENCRYPTION_KEY")
-    if not legacy_key:
-        logger.warning("LEGACY_ENCRYPTION_KEY not set — legacy card decryption disabled")
-        return None
-    try:
-        return Fernet(legacy_key.encode())
-    except Exception as e:
-        logger.warning(f"Legacy fernet init failed: {e}")
-        return None
+_LEGACY_PAYMENT_FIELDS = frozenset({
+    "routing_number", "account_number", "encrypted_number",
+    "encrypted_cvv", "nmi_vault_id",
+})
 
 
-def decrypt_legacy(token: str) -> str:
-    """Decrypt the OLD `encrypted_number` / `encrypted_cvv` format
-    (base64-wrapped Fernet ciphertext)."""
-    if not token:
-        return ""
-    cipher = _get_legacy_fernet()
-    if not cipher:
-        return ""
-    import base64 as _b64
-    # Try base64-wrapped first (legacy format)
-    try:
-        decoded = _b64.b64decode(token)
-        return cipher.decrypt(decoded).decode()
-    except Exception:
-        pass
-    # Try direct Fernet
-    try:
-        return cipher.decrypt(token.encode()).decode()
-    except Exception:
-        return ""
+def _is_legacy_payment_method(payment_method: dict) -> bool:
+    """Block unclassified formats inherited from other applications."""
+    return any(field in payment_method for field in _LEGACY_PAYMENT_FIELDS)
 
 
 def encrypt(value: str) -> str:
@@ -285,13 +255,14 @@ async def vault_list_payment_methods(request: Request):
 
     # ── Stripe cards (saved via /tenant/payment-methods/setup) ──
     async for pm in db.payment_methods.find({}).sort("created_at", -1):
-        # Normalize legacy field names
+        if _is_legacy_payment_method(pm):
+            continue
+        # Only Ross House encrypted/current field names are projected
         card_last4 = pm.get("card_last4") or pm.get("last4") or pm.get("last_4", "")
         card_brand = pm.get("card_brand") or pm.get("brand", "")
-        is_legacy = bool(pm.get("encrypted_number") or pm.get("nmi_vault_id"))
         items.append({
             "id": str(pm["_id"]),
-            "type": pm.get("type") or ("card" if (card_last4 or pm.get("encrypted_number")) else "bank"),
+            "type": pm.get("type") or ("card" if card_last4 else "bank"),
             "user_id": str(pm.get("user_id", "")),
             "user_name": pm.get("user_name") or pm.get("client_name") or pm.get("cardholder_name", ""),
             "user_email": pm.get("user_email", ""),
@@ -302,15 +273,14 @@ async def vault_list_payment_methods(request: Request):
             "account_type": pm.get("account_type", ""),
             "account_last4": pm.get("account_last4", ""),
             "routing_masked": (mask(decrypt(pm.get("routing_encrypted", "")), visible=4)
-                               if pm.get("routing_encrypted")
-                               else (mask(pm.get("routing_number", ""), visible=4) if pm.get("routing_number") else "")),
+                               if pm.get("routing_encrypted") else ""),
             "is_default": bool(pm.get("is_default", False)),
             "is_active_for_autopay": bool(pm.get("is_active_for_autopay", False)),
             "stripe_payment_method_id": pm.get("stripe_payment_method_id", ""),
             "created_at": pm.get("created_at"),
             "source": pm.get("source", "stripe"),
-            "is_legacy": is_legacy,
-            "has_nmi_vault": bool(pm.get("nmi_vault_id")),
+            "is_legacy": False,
+            "has_nmi_vault": False,
         })
 
     return {"success": True, "items": items, "count": len(items)}
@@ -318,13 +288,7 @@ async def vault_list_payment_methods(request: Request):
 
 @router.get("/admin/vault/payment-methods/{method_id}/reveal")
 async def vault_reveal_method(method_id: str, request: Request):
-    """Reveal full routing + account numbers — requires vault session token.
-
-    Supports BOTH data formats:
-      - New format (routing_encrypted / account_encrypted) — Fernet-decrypted
-      - Legacy plain-text format (routing_number / account_number) — passed through
-      - Legacy NMI/loans card format (nmi_vault_id) — only metadata returned
-    """
+    """Reveal only current Ross House encrypted banking fields."""
     admin = await auth_admin(request)
     session = await _require_vault_session(request)
     db = get_db()
@@ -332,6 +296,8 @@ async def vault_reveal_method(method_id: str, request: Request):
     pm = await db.payment_methods.find_one({"_id": ObjectId(method_id)})
     if not pm:
         raise HTTPException(status_code=404, detail="Método de pago no encontrado")
+    if _is_legacy_payment_method(pm):
+        raise HTTPException(status_code=409, detail="legacy_payment_method_blocked_by_business_boundary")
 
     # ── Try multiple field names (new + legacy) ─────────────
     routing_full = ""
@@ -354,22 +320,9 @@ async def vault_reveal_method(method_id: str, request: Request):
         except Exception:
             pass
 
-    # LEGACY plain-text format (older loan flow)
-    if not routing_full and pm.get("routing_number"):
-        routing_full = str(pm.get("routing_number", ""))
-    if not account_full and pm.get("account_number"):
-        account_full = str(pm.get("account_number", ""))
-
-    # LEGACY card-only with no bank info → nothing to reveal
-    is_card_only = bool(pm.get("encrypted_number") or pm.get("nmi_vault_id") or pm.get("card_brand")) and not (routing_full or account_full)
-
-    # ── Reveal legacy card number + CVV ───
     card_full = ""
     cvv_full = ""
-    if pm.get("encrypted_number"):
-        card_full = decrypt_legacy(pm.get("encrypted_number", ""))
-    if pm.get("encrypted_cvv"):
-        cvv_full = decrypt_legacy(pm.get("encrypted_cvv", ""))
+    is_card_only = bool(pm.get("card_brand")) and not (routing_full or account_full)
 
     await _audit(db, admin.get("email", ""), "reveal", target=method_id, meta={
         "user_id": str(pm.get("user_id", "")),
@@ -399,13 +352,10 @@ async def vault_reveal_method(method_id: str, request: Request):
         "account_last4": pm.get("account_last4", ""),
         "user_name": pm.get("user_name") or pm.get("client_name") or pm.get("cardholder_name", ""),
         "user_email": pm.get("user_email", ""),
-        "nmi_vault_id": pm.get("nmi_vault_id", ""),
-        "legacy_format": is_card_only or bool(pm.get("encrypted_number")),
+        "nmi_vault_id": "",
+        "legacy_format": False,
         "decrypt_warning": decrypt_error,
-        "message": None if (card_full or routing_full) else (
-            "⚠️ No se pueden mostrar los datos completos — falta la llave de encriptación legacy o el registro solo tiene un NMI vault_id."
-            if is_card_only else None
-        ),
+        "message": None,
     }
 
 
@@ -420,9 +370,11 @@ async def vault_delete_method(method_id: str, request: Request):
     pm = await db.payment_methods.find_one({"_id": ObjectId(method_id)})
     if not pm:
         raise HTTPException(status_code=404, detail="Método de pago no encontrado")
+    if _is_legacy_payment_method(pm):
+        raise HTTPException(status_code=409, detail="legacy_payment_method_blocked_by_business_boundary")
 
     user_id = str(pm.get("user_id", ""))
-    pm_type = pm.get("type") or ("card" if (pm.get("card_last4") or pm.get("last4") or pm.get("encrypted_number")) else "bank")
+    pm_type = pm.get("type") or ("card" if pm.get("card_last4") else "bank")
     last4 = pm.get("card_last4") or pm.get("last4") or pm.get("account_last4") or pm.get("last_4", "")
 
     # Soft-delete: archive the record so we can recover if needed, then remove

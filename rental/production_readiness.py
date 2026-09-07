@@ -8,6 +8,9 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
+from .background_job_policy import should_disable_background_jobs
+from .runtime_business_boundary import resolve_database_name
+
 _TRUTHY = {"1", "true", "yes", "on"}
 _FALSEY = {"0", "false", "no", "off"}
 _PLACEHOLDER_FRAGMENTS = ("changeme", "replace-me", "example", "password", "secret123")
@@ -40,9 +43,7 @@ def assess_production_readiness(
 
     checks = {
         "environment_is_production": environment == "production",
-        "database_is_explicit_and_isolated": bool(db_name)
-        and db_name != "taxportal"
-        and "staging" not in db_name,
+        "database_is_explicit_and_isolated": db_name == "ross_house_production",
         "tenant_jwt_secret_is_stable_and_strong": _strong_secret(
             environ.get("TENANT_JWT_SECRET", "")
         ),
@@ -83,3 +84,26 @@ def assess_production_readiness(
         "inspection_delivery_checks": delivery_checks,
         "inspection_delivery_blocking_issues": delivery_blocking_issues,
     }
+
+
+def assess_staging_readiness(environ: Mapping[str, str], *, database_name: str) -> dict[str, Any]:
+    """Report staging safety using booleans and codes without exposing values."""
+    environment = str(environ.get("ENVIRONMENT", "")).strip().lower()
+    try:
+        resolved = resolve_database_name({**dict(environ), "DB_NAME": database_name})
+        database_valid = resolved == "ross_house_staging"
+    except RuntimeError:
+        database_valid = False
+    checks = {
+        "environment_is_staging": environment == "staging",
+        "database_is_ross_house_staging": database_valid,
+        "background_jobs_are_disabled": should_disable_background_jobs(environ),
+        "tenant_jwt_secret_is_stable_and_strong": _strong_secret(environ.get("TENANT_JWT_SECRET", "")),
+        "vault_encryption_key_is_present": bool(str(environ.get("VAULT_ENCRYPTION_KEY", "")).strip()),
+        "refresh_tokens_are_enabled": _is_true(environ, "REFRESH_TOKENS_ENABLED"),
+        "legacy_sessions_are_disabled": _is_false(environ, "ALLOW_LEGACY_USER_SESSIONS"),
+        "session_sid_is_required": _is_true(environ, "REQUIRE_SESSION_SID"),
+    }
+    issues = [name for name, passed in checks.items() if not passed]
+    return {"safe_for_staging_validation": not issues, "checks": checks,
+            "blocking_issues": issues, "secrets_exposed": False}

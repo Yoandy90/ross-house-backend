@@ -17,10 +17,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 
 from rental.background_job_policy import should_disable_background_jobs
+from rental.runtime_business_boundary import RENTALS_CORS_ORIGINS, resolve_database_name
 
 # ─── Configuration ────────────────────────────────────────────
 MONGO_URL = os.environ.get("MONGO_URL", "")
-DB_NAME = os.environ.get("DB_NAME", "taxportal")
+DB_NAME = resolve_database_name(os.environ)
 # Security: Generate secure default if not set, log warning
 _default_secret = "ross-house-" + os.urandom(16).hex()
 SECRET_KEY = os.environ.get("JWT_SECRET_KEY", os.environ.get("JWT_SECRET", _default_secret))
@@ -364,30 +365,17 @@ app = FastAPI(
 
 # ─── CORS ─────────────────────────────────────────────────────
 # Security: Only allow specific origins
-ALLOWED_ORIGINS = [
-    "https://rosshouserentals.com",
-    "https://www.rosshouserentals.com",
-    "https://rosslending.com",
-    "https://www.rosslending.com",
-    "http://localhost:3000",  # Local development
-    "http://localhost:8081",  # Expo development
-]
+ALLOWED_ORIGINS = list(RENTALS_CORS_ORIGINS)
 
 # Add preview URLs for development/testing
 import os
 _ENV = os.environ.get("ENVIRONMENT", "").lower()
 _IS_DEV = _ENV in ("development", "dev", "local")
 
-# Safe-by-default: only open CORS wide when ENVIRONMENT is EXPLICITLY a dev value.
-# In production the deployed web app calls the API same-origin (Vercel rewrites /api
-# server-side) and native apps send no Origin, so the strict allowlist is sufficient.
-# The regex keeps the Emergent Expo web preview working without opening "*".
-_PREVIEW_REGEX = r"^https://([a-z0-9-]+\.)?(preview\.emergentagent\.com|emergent\.host)$"
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"] if _IS_DEV else ALLOWED_ORIGINS,
-    allow_origin_regex=None if _IS_DEV else _PREVIEW_REGEX,
+    allow_origin_regex=None,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
