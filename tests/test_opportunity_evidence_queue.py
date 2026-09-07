@@ -66,6 +66,38 @@ def test_admin_router_exposes_authenticated_evidence_queue():
     assert '@router.patch("/admin/deal-finder/evidence/bulk-review")' in source
 
 
+def test_queue_projection_excludes_internal_audit_and_unknown_provider_fields():
+    projection = build_evidence_queue_pipeline()[4]["$facet"]["items"][-1]["$project"]
+    assert "evidence" not in projection
+    for field in ("evidence_id", "source", "confidence", "match_reasons", "source_url"):
+        assert projection[f"evidence.{field}"] == 1
+    for field in ("review_history", "reviewed_by", "review_note", "raw_provider_payload"):
+        assert f"evidence.{field}" not in projection
+    assert "evidence_index" not in projection
+
+
+def test_queue_sort_breaks_ties_between_evidence_rows_from_same_lead():
+    pipeline = build_evidence_queue_pipeline()
+    assert pipeline[1]["$unwind"]["includeArrayIndex"] == "evidence_index"
+    order = pipeline[4]["$facet"]["items"][1]["$sort"]
+    assert list(order.items()) == [
+        ("priority_score", -1), ("evidence.at", -1), ("_id", 1),
+        ("evidence.evidence_id", 1), ("evidence_index", 1),
+    ]
+    rows = [dict(priority_score=98, evidence={"at": "same", "evidence_id": "a"},
+                 _id="lead", evidence_index=index) for index in (2, 0, 1)]
+    def key(row):
+        values = []
+        for field, direction in order.items():
+            value = row
+            for part in field.split("."):
+                value = value[part]
+            values.append(-value if direction == -1 and isinstance(value, int) else value)
+        return tuple(values)
+    assert [row["evidence_index"] for row in sorted(rows, key=key)] == [0, 1, 2]
+    assert [row["evidence_index"] for row in sorted(reversed(rows), key=key)] == [0, 1, 2]
+
+
 @pytest.mark.asyncio
 async def test_bulk_review_dedupes_and_reports_partial_results():
     items = [
