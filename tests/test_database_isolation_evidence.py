@@ -154,7 +154,7 @@ def evidence_entries():
          "evidence": {"field_paths": ["tenant_id"],
                       "ownership_basis": "Exact Rentals tenant relationship",
                       "reviewer": "security-reviewer",
-                      "reviewed_at": "2026-09-06T23:30:00Z"}},
+                      "reviewed_at": "2026-09-06T10:30:00Z"}},
     ]
 
 
@@ -181,6 +181,62 @@ def test_all_four_evidence_formats_validate_without_authorizing_migration():
     assert all(row["filter_status"] == "offline_evidence_approved" for row in data)
     assert package("a" * 64)["migration_authorized"] is False
     assert all("query" not in entry and "filter" not in entry for entry in evidence_entries())
+
+
+@pytest.mark.parametrize("entry_index", [2, 3])
+@pytest.mark.parametrize("path", ["$where", "owner.$ne", "owner[0]", "owner..id", "owner id"])
+def test_direct_planner_rejects_nonliteral_supplemental_paths(entry_index, path):
+    data = rows()
+    apply_filter_contract(data, contract())
+    before = copy.deepcopy(data)
+    entries = evidence_entries()
+    entries[entry_index]["evidence"]["field_paths"] = [path]
+    with pytest.raises(ValueError, match="field_paths_invalid"):
+        approve(data, package("a" * 64, entries), "a" * 64)
+    assert data == before
+
+
+@pytest.mark.parametrize("marker", ["main", "rentals", "another-company", "Ross House Rentals Ltd"])
+def test_direct_planner_rejects_unknown_source_markers(marker):
+    data = rows()
+    apply_filter_contract(data, contract())
+    before = copy.deepcopy(data)
+    entries = evidence_entries()
+    entries[2]["evidence"]["allowed_values"] = ["ross_house_rentals", marker]
+    with pytest.raises(ValueError, match="rentals_source_required"):
+        approve(data, package("a" * 64, entries), "a" * 64)
+    assert data == before
+
+
+@pytest.mark.parametrize("field,value,error", [
+    ("reviewer", " reviewer", "reviewer_invalid"),
+    ("reviewer", "reviewer\u200b", "reviewer_invalid"),
+    ("reviewer", "reviewer:name", "reviewer_invalid"),
+    ("reviewed_at", "not-a-date", "reviewed_at_invalid"),
+    ("reviewed_at", "2026-09-06T11:00:01Z", "manual_review_timeline_invalid"),
+    ("reviewed_at", "2026-08-07T10:59:59Z", "manual_review_timeline_invalid"),
+])
+def test_direct_planner_validates_manual_review_provenance(field, value, error):
+    data = rows()
+    apply_filter_contract(data, contract())
+    before = copy.deepcopy(data)
+    entries = evidence_entries()
+    entries[3]["evidence"][field] = value
+    with pytest.raises(ValueError, match=error) as caught:
+        approve(data, package("a" * 64, entries), "a" * 64)
+    assert value not in str(caught.value)
+    assert data == before
+
+
+@pytest.mark.parametrize("marker", ["ross_house_rentals", "Ross House Rentals", "Ross House Rentals LLC"])
+@pytest.mark.parametrize("reviewed_at", ["2026-08-07T11:00:00Z", "2026-09-06T11:00:00Z"])
+def test_direct_planner_accepts_exact_source_labels_and_review_window_boundaries(marker, reviewed_at):
+    data = rows()
+    apply_filter_contract(data, contract())
+    entries = evidence_entries()
+    entries[2]["evidence"]["allowed_values"] = [marker]
+    entries[3]["evidence"]["reviewed_at"] = reviewed_at
+    assert approve(data, package("a" * 64, entries), "a" * 64)["approved"] == 4
 
 
 def test_partial_evidence_leaves_unsubmitted_collections_blocked():
