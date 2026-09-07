@@ -10,6 +10,14 @@ from rental.opportunity_evidence import review_evidence_atomic
 
 REVIEW_STATUSES = ("needs_review", "confirmed", "dismissed")
 
+# Queue cards do not need internal reviewer identities, notes or audit history.
+# Explicit inclusion also prevents future provider payloads leaking into this view.
+QUEUE_EVIDENCE_FIELDS = (
+    "evidence_id", "source", "signals", "record_name", "record_address",
+    "case_number", "date", "city", "source_url", "confidence", "match_reasons",
+    "review_status", "obit_name", "obit_date", "radar_id", "at",
+)
+
 
 def build_evidence_queue_pipeline(*, status: str = "needs_review", source: str = "",
                                   skip: int = 0, limit: int = 25) -> list[dict[str, Any]]:
@@ -30,7 +38,7 @@ def build_evidence_queue_pipeline(*, status: str = "needs_review", source: str =
         {"$match": {"motivation.details": {"$elemMatch": {
             "evidence_id": {"$type": "string"},
         }}}},
-        {"$unwind": "$motivation.details"},
+        {"$unwind": {"path": "$motivation.details", "includeArrayIndex": "evidence_index"}},
         {"$match": {"motivation.details.evidence_id": {"$type": "string"}}},
         {"$set": {
             "evidence": "$motivation.details",
@@ -51,7 +59,10 @@ def build_evidence_queue_pipeline(*, status: str = "needs_review", source: str =
         {"$facet": {
             "items": [
                 {"$match": item_match},
-                {"$sort": {"priority_score": -1, "evidence.at": -1, "_id": 1}},
+                # _id alone does not distinguish evidence rows from the same lead.
+                # Array index breaks even legacy duplicate-ID ties on unchanged data.
+                {"$sort": {"priority_score": -1, "evidence.at": -1, "_id": 1,
+                           "evidence.evidence_id": 1, "evidence_index": 1}},
                 {"$skip": skip},
                 {"$limit": limit},
                 {"$project": {
@@ -64,7 +75,7 @@ def build_evidence_queue_pipeline(*, status: str = "needs_review", source: str =
                     "ai_score": 1,
                     "lead_status": {"$ifNull": ["$status", "new"]},
                     "priority_score": 1,
-                    "evidence": 1,
+                    **{f"evidence.{field}": 1 for field in QUEUE_EVIDENCE_FIELDS},
                 }},
             ],
             "filtered_total": [
