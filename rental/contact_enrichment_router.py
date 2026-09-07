@@ -27,6 +27,7 @@ from rental.opportunity_evidence import (
     add_evidence_atomic, address_probe, evidence_detail, evidence_id,
     get_evidence_review_history,
     parse_public_records_response,
+    parse_obituary_response,
     match_address, match_person, obituary_source_allowed, person_tokens,
     review_evidence_atomic,
 )
@@ -855,10 +856,9 @@ def _parse_echovita_links(html: str) -> list:
 async def _llm_extract_obituaries(page_text: str, source_url: str) -> list:
     api_key = os.environ.get("EMERGENT_LLM_KEY")
     if not api_key:
-        return []
+        raise RuntimeError("obituary_extraction_not_configured")
     try:
         from emergentintegrations.llm.chat import LlmChat, UserMessage
-        import json as json_lib
         chat = LlmChat(api_key=api_key, session_id=f"obit-{secrets.token_hex(6)}",
                        system_message="Extraes datos estructurados de páginas de obituarios. "
                                       "Respondes SOLO con JSON válido, sin texto extra.")
@@ -868,15 +868,12 @@ async def _llm_extract_obituaries(page_text: str, source_url: str) -> list:
                   f"Si no hay fecha exacta usa null. Si no encuentras obituarios devuelve [].\n\n"
                   f"TEXTO:\n{page_text[:14000]}")
         raw = await chat.send_message(UserMessage(text=prompt))
-        raw = raw if isinstance(raw, str) else str(raw)
-        m = re.search(r"\[.*\]", raw, re.DOTALL)
-        if not m:
-            return []
-        items = json_lib.loads(m.group(0))
-        return [i for i in items if isinstance(i, dict) and i.get("name")][:50]
-    except Exception as e:
-        logger.warning(f"[enrichment] LLM obituary extract failed for {source_url}: {e}")
-        return []
+        return parse_obituary_response(raw)
+    except Exception:
+        # The caller records a partial source run. Do not persist provider errors,
+        # which can include request details or credentials, as diagnostic text.
+        logger.warning("[enrichment] LLM obituary extraction failed")
+        raise RuntimeError("obituary_extraction_failed") from None
 
 
 @router.get("/admin/deal-finder/obituary-results")
