@@ -1082,25 +1082,21 @@ async def run_cron_now(request: Request):
     """Ejecuta un lote del recorrido automático ahora mismo (background)."""
     await auth_admin(request)
     db = get_db()
-    state = await db.app_settings.find_one({"_id": "deal_finder_cron_state"}) or {}
-    if state.get("manual_running"):
-        raise HTTPException(409, "El radar automático ya está corriendo — espera a que termine")
     running_scan = await db.deal_finder_scans.find_one({"status": {"$in": ["searching", "enriching"]}})
     if running_scan:
         raise HTTPException(409, "Hay un escaneo manual en curso — espera a que termine")
 
-    await db.app_settings.update_one(
-        {"_id": "deal_finder_cron_state"}, {"$set": {"manual_running": True}}, upsert=True)
+    from rental.opportunity_scan_lease import acquire_scan_lease
+    lease = await acquire_scan_lease(db, "deal_finder")
+    if lease is None:
+        raise HTTPException(409, "El radar automático ya está corriendo — espera a que termine")
 
     async def _run():
         try:
             from rental.deal_finder_cron import run_auto_scan_batch
-            await run_auto_scan_batch(db)
+            await run_auto_scan_batch(db, lease=lease)
         except Exception as e:
             logger.error(f"[deal_finder] corrida manual del cron falló: {e}")
-        finally:
-            await db.app_settings.update_one(
-                {"_id": "deal_finder_cron_state"}, {"$set": {"manual_running": False}})
 
     asyncio.create_task(_run())
     return {"success": True, "message": "Lote del radar automático iniciado"}
