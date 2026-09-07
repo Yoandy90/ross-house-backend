@@ -26,6 +26,7 @@ from rental.shared import get_db, auth_admin
 from rental.opportunity_evidence import (
     add_evidence_atomic, address_probe, evidence_detail, evidence_id,
     get_evidence_review_history,
+    parse_public_records_response,
     match_address, match_person, obituary_source_allowed, person_tokens,
     review_evidence_atomic,
 )
@@ -530,7 +531,6 @@ async def public_records_import(request: Request, body: PublicRecordsImport):
         raise HTTPException(400, "Falta EMERGENT_LLM_KEY para la extracción con IA")
 
     from emergentintegrations.llm.chat import LlmChat, UserMessage
-    import json as json_lib
     chat = LlmChat(api_key=api_key, session_id=f"pubrec-{secrets.token_hex(6)}",
                    system_message="Extraes datos estructurados de índices de registros públicos de condados de Texas. "
                                   "Respondes SOLO con JSON válido.")
@@ -542,19 +542,16 @@ async def public_records_import(request: Request, body: PublicRecordsImport):
               f"Si es una lista de propiedades (tax sale/vacantes) usa address y deja name null.\n"
               f"Si no hay nada devuelve [].\n\nTEXTO:\n{text[:14000]}")
     raw = await chat.send_message(UserMessage(text=prompt))
-    raw = raw if isinstance(raw, str) else str(raw)
-    m = re.search(r"\[.*\]", raw, re.DOTALL)
-    records = []
-    if m:
-        try:
-            records = [r for r in json_lib.loads(m.group(0)) if isinstance(r, dict)][:200]
-        except Exception:
-            records = []
+    try:
+        records = parse_public_records_response(raw)
+    except ValueError:
+        raise HTTPException(502, "La IA devolvió una respuesta inválida. No se importaron registros.")
+    db = get_db()
     if not records:
+        await record_source_run(db, body.source_type, scanned=0, matched=0)
         return {"success": True, "records_found": 0, "matches": [],
                 "note": "La IA no encontró entradas en el texto pegado"}
 
-    db = get_db()
     signal = PUBLIC_SIGNAL_BY_TYPE[body.source_type]
     matches, new_matches = [], []
     for rec in records:
