@@ -1,4 +1,4 @@
-"""🛰️ Radar de Clientes — Monitoreo de señales sobre clientes de otras empresas.
+"""🛰️ Radar de Oportunidades — señales sobre candidatos de Ross House Rentals.
 
 Señales automáticas (cron semanal, martes):
   💰 tax_debt   — nombre/dirección coincide con leads delincuentes del Deal Finder
@@ -21,9 +21,17 @@ from bson import ObjectId
 from fastapi import APIRouter, HTTPException, Request
 
 from .shared import get_db, auth_admin
+from .radar_integrity import (
+    ROSS_HOUSE_SOURCE,
+    deterministic_lead_id,
+    require_ross_house_source,
+    safe_search_pattern,
+    serialize_radar_client,
+)
 
 logger = logging.getLogger("client_radar")
 router = APIRouter(tags=["client-radar"])
+RADAR_SCOPE = {"source_business": ROSS_HOUSE_SOURCE}
 
 SIGNAL_WEIGHTS = {"ice": 45, "tdcj": 40, "jail": 40, "struckoff": 35,
                   "tax_debt": 30, "deceased": 25, "phone_dead": 15}
@@ -56,31 +64,28 @@ def _score(signals: dict) -> int:
                         if v and v.get("active")))
 
 
-def _serialize(c: dict) -> dict:
-    c["_id"] = str(c["_id"])
-    # enmascarar datos sensibles en listados
-    for k in ("a_number", "passport"):
-        v = c.get(k) or ""
-        c[f"{k}_masked"] = ("••••" + v[-4:]) if len(v) > 4 else ("SET" if v else "")
-    return c
-
-
 # ─────────────────────────── CRUD ───────────────────────────
 
 @router.get("/admin/client-radar/clients")
 async def list_clients(request: Request, signal: str = "", q: str = ""):
     await auth_admin(request)
-    query: dict = {}
+    query: dict = dict(RADAR_SCOPE)
     if signal:
         query[f"signals.{signal}.active"] = True
     if q:
-        query["$or"] = [{"full_name": {"$regex": q, "$options": "i"}},
-                        {"address": {"$regex": q, "$options": "i"}}]
+        try:
+            pattern = safe_search_pattern(q)
+        except ValueError as error:
+            raise HTTPException(400, str(error)) from None
+        query["$or"] = [{"full_name": {"$regex": pattern, "$options": "i"}},
+                        {"address": {"$regex": pattern, "$options": "i"}}]
     items = []
     async for c in get_db().radar_clients.find(query).sort("score", -1).limit(500):
-        items.append(_serialize(c))
-    total = await get_db().radar_clients.count_documents({})
-    with_signals = await get_db().radar_clients.count_documents({"score": {"$gt": 0}})
+        items.append(serialize_radar_client(c))
+    total = await get_db().radar_clients.count_documents(RADAR_SCOPE)
+    with_signals = await get_db().radar_clients.count_documents({
+        **RADAR_SCOPE, "score": {"$gt": 0},
+    })
     return {"success": True, "items": items, "total": total, "with_signals": with_signals}
 
 
@@ -91,6 +96,10 @@ async def create_client(request: Request):
     if not data.get("full_name"):
         raise HTTPException(400, "full_name es requerido")
     doc = {k: (data.get(k) or "").strip() for k in FIELDS}
+    try:
+        doc["source_business"] = require_ross_house_source(doc["source_business"])
+    except ValueError as error:
+        raise HTTPException(400, str(error)) from None
     doc.update({"signals": {}, "score": 0, "created_at": datetime.now(timezone.utc),
                 "last_scan": None})
     r = await get_db().radar_clients.insert_one(doc)
@@ -102,6 +111,11 @@ async def update_client(cid: str, request: Request):
     await auth_admin(request)
     data = await request.json()
     update = {k: (data[k] or "").strip() for k in FIELDS if k in data}
+    if "source_business" in update:
+        try:
+            update["source_business"] = require_ross_house_source(update["source_business"])
+        except ValueError as error:
+            raise HTTPException(400, str(error)) from None
     # señal manual ICE
     if "ice_active" in data:
         update["signals.ice"] = {"active": bool(data["ice_active"]),
@@ -109,9 +123,12 @@ async def update_client(cid: str, request: Request):
                                  "at": datetime.now(timezone.utc).isoformat()}
     if not update:
         raise HTTPException(400, "Nada que actualizar")
-    await get_db().radar_clients.update_one({"_id": ObjectId(cid)}, {"$set": update})
-    c = await get_db().radar_clients.find_one({"_id": ObjectId(cid)})
-    await get_db().radar_clients.update_one({"_id": ObjectId(cid)},
+    scoped_id = {"_id": ObjectId(cid), **RADAR_SCOPE}
+    result = await get_db().radar_clients.update_one(scoped_id, {"$set": update})
+    if result.matched_count != 1:
+        raise HTTPException(404, "Cliente no encontrado")
+    c = await get_db().radar_clients.find_one(scoped_id)
+    await get_db().radar_clients.update_one(scoped_id,
                                             {"$set": {"score": _score(c.get("signals", {}))}})
     return {"success": True}
 
@@ -119,7 +136,9 @@ async def update_client(cid: str, request: Request):
 @router.delete("/admin/client-radar/clients/{cid}")
 async def delete_client(cid: str, request: Request):
     await auth_admin(request)
-    await get_db().radar_clients.delete_one({"_id": ObjectId(cid)})
+    result = await get_db().radar_clients.delete_one({"_id": ObjectId(cid), **RADAR_SCOPE})
+    if result.deleted_count != 1:
+        raise HTTPException(404, "Cliente no encontrado")
     return {"success": True}
 
 
@@ -134,6 +153,7 @@ async def import_csv(request: Request):
     reader = csv.DictReader(io.StringIO(raw))
     db = get_db()
     inserted = skipped = 0
+    documents = []
     for row in reader:
         doc = {}
         for h, v in row.items():
@@ -143,7 +163,17 @@ async def import_csv(request: Request):
         if not doc.get("full_name"):
             skipped += 1
             continue
-        dup = await db.radar_clients.find_one({"full_name": {"$regex": f"^{re.escape(doc['full_name'])}$", "$options": "i"}})
+        try:
+            doc["source_business"] = require_ross_house_source(doc.get("source_business"))
+        except ValueError as error:
+            # Validate the full upload before inserting any row.
+            raise HTTPException(400, str(error)) from None
+        documents.append(doc)
+    for doc in documents:
+        dup = await db.radar_clients.find_one({
+            **RADAR_SCOPE,
+            "full_name": {"$regex": f"^{re.escape(doc['full_name'])}$", "$options": "i"},
+        })
         if dup:
             skipped += 1
             continue
@@ -269,9 +299,12 @@ async def scan_client(db, client: dict) -> dict:
     if manual_ice:
         signals["ice"] = manual_ice
     score = _score(signals)
-    await db.radar_clients.update_one({"_id": client["_id"]}, {"$set": {
+    result = await db.radar_clients.update_one(
+        {"_id": client["_id"], "last_scan": client.get("last_scan"), **RADAR_SCOPE}, {"$set": {
         "signals": signals, "score": score,
         "last_scan": datetime.now(timezone.utc)}})
+    if result.modified_count != 1:
+        raise ValueError("radar_client_changed_during_scan")
     return {"client": client.get("full_name"), "new_signals": list(fresh.keys()), "score": score}
 
 
@@ -281,7 +314,9 @@ async def scan_now(request: Request):
     await auth_admin(request)
     data = await request.json() if (request.headers.get("content-length") or "0") != "0" else {}
     db = get_db()
-    q = {"_id": ObjectId(data["client_id"])} if data.get("client_id") else {}
+    q = dict(RADAR_SCOPE)
+    if data.get("client_id"):
+        q["_id"] = ObjectId(data["client_id"])
     results = []
     async for c in db.radar_clients.find(q).limit(300):
         results.append(await scan_client(db, c))
@@ -308,7 +343,7 @@ async def client_radar_scan_loop():
             db = _gd()
             if db is not None and await _radar_should_run(db):
                 results = []
-                async for c in db.radar_clients.find({}).limit(300):
+                async for c in db.radar_clients.find(RADAR_SCOPE).limit(300):
                     results.append(await scan_client(db, c))
                 news = [r for r in results if r["new_signals"]]
                 await db.app_settings.update_one(
@@ -341,7 +376,7 @@ async def create_lead_from_client(cid: str, request: Request):
     """Crea un lead en Oportunidades a partir de un cliente con señales."""
     await auth_admin(request)
     db = get_db()
-    c = await db.radar_clients.find_one({"_id": ObjectId(cid)})
+    c = await db.radar_clients.find_one({"_id": ObjectId(cid), **RADAR_SCOPE})
     if not c:
         raise HTTPException(404, "Cliente no encontrado")
     active = [k for k, v in (c.get("signals") or {}).items() if v.get("active")]
@@ -358,5 +393,10 @@ async def create_lead_from_client(cid: str, request: Request):
         "status": "new",
         "created_at": datetime.now(timezone.utc),
     }
-    r = await db.leads.insert_one(lead)
-    return {"success": True, "lead_id": str(r.inserted_id)}
+    lead_id = deterministic_lead_id(c["_id"])
+    lead["_id"] = lead_id
+    result = await db.leads.update_one(
+        {"_id": lead_id}, {"$setOnInsert": lead}, upsert=True,
+    )
+    return {"success": True, "lead_id": lead_id,
+            "created": result.upserted_id is not None}
