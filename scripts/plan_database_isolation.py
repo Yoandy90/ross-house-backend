@@ -179,9 +179,14 @@ def _validate_evidence_detail(requirement: str, detail: object) -> None:
     if not isinstance(detail, dict):
         raise ValueError("filter_evidence_detail_invalid")
     if requirement == "explicit_root_id_allowlist":
-        if set(detail) != {"root_ids"}:
+        if set(detail) != {"root_ids", "ownership_basis"}:
             raise ValueError("filter_evidence_allowlist_fields_invalid")
         _strict_strings(detail.get("root_ids"), "root_ids")
+        basis = detail.get("ownership_basis")
+        if not isinstance(basis, str) or not basis.strip() or "*" in basis:
+            raise ValueError("filter_evidence_ownership_basis_invalid")
+        if any(marker in basis.casefold() for marker in FORBIDDEN_SOURCE_MARKERS):
+            raise ValueError("filter_evidence_external_source_prohibited")
     elif requirement == "relationship_closure":
         required = {"root_collection", "relationship_paths", "root_ids"}
         if set(detail) != required:
