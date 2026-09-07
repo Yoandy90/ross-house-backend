@@ -20,7 +20,7 @@ from typing import Literal, Optional
 import httpx
 from bson import ObjectId
 from fastapi import APIRouter, HTTPException, Query, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from rental.shared import get_db, auth_admin
 from rental.opportunity_evidence import (
@@ -29,7 +29,7 @@ from rental.opportunity_evidence import (
     review_evidence_atomic,
 )
 from rental.opportunity_evidence_queue import (
-    build_evidence_queue_pipeline, serialize_evidence_queue,
+    build_evidence_queue_pipeline, bulk_review_evidence, serialize_evidence_queue,
 )
 
 logger = logging.getLogger(__name__)
@@ -581,6 +581,17 @@ class EvidenceReviewBody(BaseModel):
     note: str = ""
 
 
+class BulkEvidenceItem(BaseModel):
+    lead_id: str = Field(min_length=1, max_length=50)
+    evidence_id: str = Field(min_length=1, max_length=50)
+
+
+class BulkEvidenceReviewBody(BaseModel):
+    items: list[BulkEvidenceItem] = Field(min_length=1, max_length=50)
+    status: Literal["needs_review", "confirmed", "dismissed"]
+    note: str = Field(default="", max_length=500)
+
+
 @router.get("/admin/deal-finder/evidence-queue")
 async def opportunity_evidence_queue(
     request: Request,
@@ -595,6 +606,19 @@ async def opportunity_evidence_queue(
         status=status, source=source, skip=skip, limit=limit)
     rows = await get_db().deal_finder_leads.aggregate(pipeline).to_list(length=1)
     return serialize_evidence_queue(rows)
+
+
+@router.patch("/admin/deal-finder/evidence/bulk-review")
+async def bulk_review_opportunity_evidence(
+    request: Request, body: BulkEvidenceReviewBody,
+):
+    """Review up to 50 evidence facts; each mutation remains independently atomic."""
+    admin = await auth_admin(request)
+    reviewer_id = str(admin.get("id") or admin.get("_id") or "")
+    result = await bulk_review_evidence(
+        get_db(), [item.model_dump() for item in body.items], body.status,
+        reviewer_id, note=body.note)
+    return {"success": result["reviewed"] > 0, **result}
 
 
 @router.patch("/admin/deal-finder/leads/{lead_id}/evidence/{evidence_id_value}")

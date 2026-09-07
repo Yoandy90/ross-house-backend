@@ -1,9 +1,10 @@
 from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from rental.opportunity_evidence_queue import (
-    build_evidence_queue_pipeline, serialize_evidence_queue,
+    build_evidence_queue_pipeline, bulk_review_evidence, serialize_evidence_queue,
 )
 
 
@@ -16,6 +17,10 @@ def test_queue_pipeline_is_bounded_and_treats_legacy_evidence_as_pending():
     assert {"$skip": 10} in facets["items"]
     assert {"$limit": 20} in facets["items"]
     assert facets["items"][-1]["$project"]["lead_id"] == {"$toString": "$_id"}
+    assert facets["items"][1]["$sort"]["priority_score"] == -1
+    priority = pipeline[3]["$set"]["priority_score"]["$round"][0]["$add"]
+    assert priority[0]["$multiply"][1] == 0.7
+    assert priority[1]["$multiply"][1] == 0.3
 
 
 def test_queue_source_filter_is_normalized_and_applies_only_to_rows():
@@ -58,3 +63,38 @@ def test_admin_router_exposes_authenticated_evidence_queue():
     assert '@router.get("/admin/deal-finder/evidence-queue")' in source
     assert "await auth_admin(request)" in source
     assert "build_evidence_queue_pipeline(" in source
+    assert '@router.patch("/admin/deal-finder/evidence/bulk-review")' in source
+
+
+@pytest.mark.asyncio
+async def test_bulk_review_dedupes_and_reports_partial_results():
+    items = [
+        {"lead_id": "1" * 24, "evidence_id": "a" * 24},
+        {"lead_id": "1" * 24, "evidence_id": "a" * 24},
+        {"lead_id": "2" * 24, "evidence_id": "b" * 24},
+        {"lead_id": "bad", "evidence_id": "c" * 24},
+    ]
+    reviewer = AsyncMock(side_effect=[{"evidence": {}}, None])
+    with patch("rental.opportunity_evidence_queue.review_evidence_atomic", reviewer):
+        result = await bulk_review_evidence(
+            object(), items, "confirmed", "admin-1", note="County verified")
+    assert result["requested"] == 4
+    assert result["unique"] == 3
+    assert result["reviewed"] == 1
+    assert result["not_found"] == 1
+    assert result["invalid"] == 1
+    assert reviewer.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_bulk_review_rejects_empty_oversized_and_invalid_status():
+    with pytest.raises(ValueError, match="bulk_size_invalid"):
+        await bulk_review_evidence(object(), [], "confirmed", "admin")
+    with pytest.raises(ValueError, match="bulk_size_invalid"):
+        await bulk_review_evidence(
+            object(), [{"lead_id": "1", "evidence_id": "a"}] * 51,
+            "confirmed", "admin")
+    with pytest.raises(ValueError, match="status_invalid"):
+        await bulk_review_evidence(
+            object(), [{"lead_id": "1", "evidence_id": "a"}],
+            "approved", "admin")
