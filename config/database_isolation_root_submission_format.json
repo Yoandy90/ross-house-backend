@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "source_database": "taxportal",
+  "target_database": "ross_house_production",
+  "target_owner": "Ross House Rentals LLC",
+  "migration_authorized": false,
+  "inventory_sha256": "<exact inventory SHA-256>",
+  "contract_sha256": "<exact filter-contract SHA-256>",
+  "provenance": {
+    "prepared_by": "<preparer identity>",
+    "approved_by": "<different approver identity>",
+    "prepared_at": "<UTC timestamp ending in Z>",
+    "approved_at": "<UTC timestamp ending in Z>",
+    "expires_at": "<UTC timestamp no more than 30 days after approval>"
+  },
+  "collections": [
+    {
+      "name": "app_users",
+      "root_ids": ["<exact Ross House Rentals record ID>"],
+      "ownership_basis": "<offline evidence proving Rentals ownership>"
+    },
+    {
+      "name": "tenants",
+      "root_ids": ["<exact Ross House Rentals record ID>"],
+      "ownership_basis": "<offline evidence proving Rentals ownership>"
+    }
+  ]
+}

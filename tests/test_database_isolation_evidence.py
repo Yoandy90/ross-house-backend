@@ -85,7 +85,8 @@ def approve(data, value, inventory_sha256):
 def evidence_entries():
     return [
         {"name": "app_users", "requirement": "explicit_root_id_allowlist",
-         "evidence": {"root_ids": ["rental-user-1"]}},
+         "evidence": {"root_ids": ["rental-user-1"],
+                      "ownership_basis": "Exact Rentals account review"}},
         {"name": "auth_sessions", "requirement": "relationship_closure",
          "evidence": {"root_collection": "app_users",
                       "relationship_paths": ["user_id"],

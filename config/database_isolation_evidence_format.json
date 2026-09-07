@@ -21,7 +21,8 @@
       "name": "<collection name>",
       "requirement": "<explicit_root_id_allowlist|relationship_closure|source_discriminator|manual_schema_review>",
       "evidence": {
-        "root_ids": ["<exact non-empty id>"]
+        "root_ids": ["<exact non-empty id>"],
+        "ownership_basis": "<offline evidence proving Rentals ownership>"
       }
     }
   ]
