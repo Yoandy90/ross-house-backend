@@ -355,7 +355,7 @@ def apply_offline_filter_evidence(
     if not isinstance(evidence, dict) or set(evidence) != allowed_fields:
         raise ValueError("filter_evidence_package_fields_invalid")
     for field, expected in fixed.items():
-        if evidence.get(field) != expected:
+        if type(evidence.get(field)) is not type(expected) or evidence.get(field) != expected:
             raise ValueError(f"filter_evidence_{field}_invalid")
     for field, expected in (
         ("inventory_sha256", inventory_sha256),
