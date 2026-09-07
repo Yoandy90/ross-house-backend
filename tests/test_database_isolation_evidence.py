@@ -85,6 +85,59 @@ def approve(data, value, inventory_sha256):
     )
 
 
+@pytest.mark.parametrize("prepared,approved", [
+    ("Alice Smith", "alice  smith"),
+    ("Alice Smith", "alice\u00a0smith"),
+    ("Alice", "Ａｌｉｃｅ"),
+    ("José", "Jose\u0301"),
+])
+def test_equivalent_reviewer_names_cannot_claim_separation(prepared, approved):
+    data = rows()
+    apply_filter_contract(data, contract())
+    before = copy.deepcopy(data)
+    value = package("a" * 64, evidence_entries())
+    value["provenance"].update(prepared_by=prepared, approved_by=approved)
+    value["provenance"]["evidence_id"] = _expected_evidence_id(
+        "a" * 64, CONTRACT_SHA256, value["collections_sha256"], value["provenance"]
+    )
+    with pytest.raises(ValueError, match="separation_of_duties_required"):
+        approve(data, value, "a" * 64)
+    assert data == before
+
+
+@pytest.mark.parametrize("field", ["prepared_by", "approved_by"])
+@pytest.mark.parametrize("identity", [
+    " reviewer", "reviewer ", "reviewer\u200b", "reviewer\nname",
+    "reviewer\x00", "reviewer:name", "reviewer：name", "reviewer＊",
+])
+def test_ambiguous_reviewer_identifiers_fail_without_echoing_values(field, identity):
+    data = rows()
+    apply_filter_contract(data, contract())
+    before = copy.deepcopy(data)
+    value = package("a" * 64, evidence_entries())
+    value["provenance"][field] = identity
+    value["provenance"]["evidence_id"] = _expected_evidence_id(
+        "a" * 64, CONTRACT_SHA256, value["collections_sha256"], value["provenance"]
+    )
+    with pytest.raises(ValueError, match=f"{field}_invalid") as caught:
+        approve(data, value, "a" * 64)
+    assert identity not in str(caught.value)
+    assert data == before
+
+
+def test_distinct_unicode_reviewers_preserve_original_hash_binding():
+    data = rows()
+    apply_filter_contract(data, contract())
+    value = package("a" * 64, evidence_entries())
+    value["provenance"].update(prepared_by="José", approved_by="María")
+    value["provenance"]["evidence_id"] = _expected_evidence_id(
+        "a" * 64, CONTRACT_SHA256, value["collections_sha256"], value["provenance"]
+    )
+    original = copy.deepcopy(value)
+    assert approve(data, value, "a" * 64)["approved"] == 4
+    assert value == original
+
+
 def evidence_entries():
     return [
         {"name": "app_users", "requirement": "explicit_root_id_allowlist",

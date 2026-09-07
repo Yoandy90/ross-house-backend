@@ -87,6 +87,14 @@ def test_builds_self_validated_non_executable_v2_package():
     assert "filter" not in json.dumps(package).casefold()
 
 
+@pytest.mark.parametrize("approver", ["ＰＲＥＰＡＲＥＲ", "preparer ", "preparer\u200b"])
+def test_builder_rejects_disguised_self_approval(approver):
+    value = submission()
+    value["provenance"]["approved_by"] = approver
+    with pytest.raises(ValueError):
+        build_root_evidence_package(inventory(), contract(), value, now=NOW)
+
+
 @pytest.mark.parametrize("name", ["loans", "users", "admin_tax_returns"])
 def test_external_or_extra_collection_is_rejected(name):
     value = submission()
