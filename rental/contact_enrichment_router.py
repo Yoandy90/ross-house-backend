@@ -35,6 +35,10 @@ from rental.opportunity_evidence_queue import (
 from rental.opportunity_action_queue import (
     build_action_queue_pipeline, serialize_action_queue,
 )
+from rental.opportunity_source_health import (
+    SOURCE_DEFINITIONS, build_source_health_pipeline, record_source_run,
+    serialize_source_health,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["Contact Enrichment"])
@@ -464,6 +468,7 @@ async def motivation_scan(request: Request, body: MotivationScanBody):
         else:
             unmatched.append({"address": prop.get("Address"), "city": prop.get("City"),
                               "signals": prop_signals})
+    await record_source_run(db, "propertyradar", scanned=len(results), matched=len(matched))
     return {"success": True, "scanned": len(results),
             "matched": matched, "unmatched": unmatched[:25],
             "result_count": data.get("resultCount"),
@@ -576,6 +581,8 @@ async def public_records_import(request: Request, body: PublicRecordsImport):
         if created:
             new_matches.append(match_info)
 
+    await record_source_run(
+        db, body.source_type, scanned=len(records), matched=len(matches))
     return {"success": True, "records_found": len(records),
             "matches": matches, "new_matches": new_matches, "signal": signal}
 
@@ -610,6 +617,21 @@ async def opportunity_evidence_queue(
         status=status, source=source, skip=skip, limit=limit)
     rows = await get_db().deal_finder_leads.aggregate(pipeline).to_list(length=1)
     return serialize_evidence_queue(rows)
+
+
+@router.get("/admin/deal-finder/evidence-health")
+async def opportunity_evidence_health(
+    request: Request,
+    stale_days: int = Query(default=30, ge=1, le=365),
+):
+    """Coverage and freshness of all opportunity evidence sources."""
+    await auth_admin(request)
+    db = get_db()
+    rows = await db.deal_finder_leads.aggregate(
+        build_source_health_pipeline()).to_list(length=len(SOURCE_DEFINITIONS) + 5)
+    runs = await db.app_settings.find_one(
+        {"_id": "opportunity_source_health"}, {"_id": 0, "sources": 1})
+    return serialize_source_health(rows, runs, stale_days=stale_days)
 
 
 @router.patch("/admin/deal-finder/evidence/bulk-review")
@@ -967,6 +989,9 @@ async def run_obituary_scan() -> dict:
                           "confidence": m.get("confidence"),
                           "review_status": m.get("review_status")} for m in matches[:100]],
     }}, upsert=True)
+    await record_source_run(
+        db, "obituary", scanned=len(obits), matched=len(matches),
+        errors=len(fetch_errors))
 
     return {"obituaries_found": len(obits), "matches": matches, "new_matches": new_matches,
             "fetch_errors": fetch_errors,
