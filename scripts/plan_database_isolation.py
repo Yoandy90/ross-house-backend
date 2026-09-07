@@ -50,6 +50,9 @@ SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 RELATIONSHIP_PATH_RE = re.compile(
     r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*"
 )
+RENTALS_SOURCE_MARKERS = frozenset({
+    "ross_house_rentals", "Ross House Rentals", "Ross House Rentals LLC",
+})
 
 
 def runtime_files(repository_root: Path) -> list[Path]:
@@ -207,7 +210,9 @@ def _validate_evidence_detail(requirement: str, detail: object) -> None:
     elif requirement == "source_discriminator":
         if set(detail) != {"field_paths", "allowed_values"}:
             raise ValueError("filter_evidence_discriminator_fields_invalid")
-        _strict_strings(detail.get("field_paths"), "field_paths")
+        paths = _strict_strings(detail.get("field_paths"), "field_paths")
+        if any(not RELATIONSHIP_PATH_RE.fullmatch(path) for path in paths):
+            raise ValueError("filter_evidence_field_paths_invalid")
         values = _strict_strings(detail.get("allowed_values"), "allowed_values")
         normalized = {
             re.sub(r"[^a-z0-9]+", " ", value.casefold()).strip()
@@ -215,11 +220,15 @@ def _validate_evidence_detail(requirement: str, detail: object) -> None:
         }
         if normalized & FORBIDDEN_SOURCE_MARKERS:
             raise ValueError("filter_evidence_external_source_prohibited")
+        if not set(values).issubset(RENTALS_SOURCE_MARKERS):
+            raise ValueError("filter_evidence_rentals_source_required")
     elif requirement == "manual_schema_review":
         required = {"field_paths", "ownership_basis", "reviewer", "reviewed_at"}
         if set(detail) != required:
             raise ValueError("filter_evidence_manual_review_fields_invalid")
-        _strict_strings(detail.get("field_paths"), "field_paths")
+        paths = _strict_strings(detail.get("field_paths"), "field_paths")
+        if any(not RELATIONSHIP_PATH_RE.fullmatch(path) for path in paths):
+            raise ValueError("filter_evidence_field_paths_invalid")
         for field in ("ownership_basis", "reviewer", "reviewed_at"):
             value = detail.get(field)
             if not isinstance(value, str) or not value.strip() or "*" in value:
@@ -420,6 +429,12 @@ def apply_offline_filter_evidence(
         if requirement != row["filter_requirement"]:
             raise ValueError(f"filter_evidence_requirement_mismatch:{name}")
         _validate_evidence_detail(requirement, entry["evidence"])
+        if requirement == "manual_schema_review":
+            detail = entry["evidence"]
+            _reviewer_identity_key(detail["reviewer"], "reviewer")
+            reviewed_at = _utc_timestamp(detail["reviewed_at"], "reviewed_at")
+            if not approved_at - timedelta(days=30) <= reviewed_at <= approved_at:
+                raise ValueError("filter_evidence_manual_review_timeline_invalid")
         approved_names.append(name)
     _validate_relationship_bindings(entries)
     for name in approved_names:

@@ -5,19 +5,18 @@ from __future__ import annotations
 import argparse
 import copy
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
 from scripts.build_root_evidence_package import PROVENANCE_FIELDS, write_private_package
 from scripts.plan_database_isolation import (
-    RELATIONSHIP_PATH_RE, _canonical_sha256, _expected_evidence_id,
+    _canonical_sha256, _expected_evidence_id,
     _reviewer_identity_key, _utc_timestamp, apply_offline_filter_evidence,
     load_filter_contract, load_inventory,
 )
 
 DEFAULT_CONTRACT = Path(__file__).resolve().parents[1] / "config/database_isolation_filter_contract.json"
 SUPPLEMENTAL = {"source_discriminator", "manual_schema_review"}
-RENTALS_MARKERS = {"ross_house_rentals", "Ross House Rentals", "Ross House Rentals LLC"}
 
 
 def _context(inventory, contract):
@@ -62,22 +61,8 @@ def _validate(inventory, contract, package, *, now=None):
     entries = {row["name"]: row for row in package["collections"]}
     if not {"app_users", "tenants"}.issubset(entries):
         raise ValueError("complete_evidence_both_roots_required")
-    provenance = package["provenance"]
-    approved = _utc_timestamp(provenance["approved_at"], "approved_at")
-    for row in entries.values():
-        requirement, evidence = row["requirement"], row["evidence"]
-        if requirement not in SUPPLEMENTAL:
-            continue
-        if any(not RELATIONSHIP_PATH_RE.fullmatch(p) for p in evidence["field_paths"]):
-            raise ValueError("complete_evidence_literal_paths_required")
-        if requirement == "source_discriminator":
-            if not set(evidence["allowed_values"]).issubset(RENTALS_MARKERS):
-                raise ValueError("complete_evidence_rentals_source_required")
-        else:
-            _reviewer_identity_key(evidence["reviewer"], "reviewer")
-            reviewed = _utc_timestamp(evidence["reviewed_at"], "reviewed_at")
-            if not approved - timedelta(days=30) <= reviewed <= approved:
-                raise ValueError("complete_evidence_manual_review_binding_invalid")
+    # Supplemental source/path/review checks live in the shared validator so
+    # direct planner inputs receive the same checks as this builder/report.
     return assignments, inventory_names, entries
 
 
