@@ -75,12 +75,15 @@ def load_inventory(path: Path) -> dict:
     payload = parse_offline_json(raw)
     collections = payload.get("collections")
     expected = payload.get("collection_count")
-    if not isinstance(collections, list) or not isinstance(expected, int):
+    if not isinstance(collections, list) or type(expected) is not int or expected < 0:
         raise ValueError("inventory_schema_invalid")
-    names = [str(row.get("name") or "") for row in collections]
+    if any(not isinstance(row, dict) or not isinstance(row.get("name"), str)
+           for row in collections):
+        raise ValueError("inventory_schema_invalid")
+    names = [row["name"] for row in collections]
     if len(collections) != expected:
         raise ValueError("inventory_incomplete")
-    if any(not name for name in names) or len(names) != len(set(names)):
+    if any(not name or name != name.strip() for name in names) or len(names) != len(set(names)):
         raise ValueError("inventory_duplicate_or_empty_collection")
     payload["_inventory_sha256"] = hashlib.sha256(raw).hexdigest()
     return payload
