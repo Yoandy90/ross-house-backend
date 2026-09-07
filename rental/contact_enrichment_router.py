@@ -23,6 +23,10 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
 from rental.shared import get_db, auth_admin
+from rental.opportunity_evidence import (
+    add_evidence_atomic, address_probe, evidence_detail, evidence_id,
+    match_address, match_person, obituary_source_allowed, person_tokens,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["Contact Enrichment"])
@@ -355,6 +359,36 @@ def _norm_street(addr: str) -> str:
     return re.sub(r"\s+", " ", s).strip()
 
 
+async def _find_verified_address_lead(db, address: str):
+    probe = address_probe(address)
+    if not probe:
+        return None, None
+    pattern = f"^{re.escape(probe[0])}\\s+.*\\b{re.escape(probe[1])}\\b"
+    cursor = db.deal_finder_leads.find(
+        {"address": {"$regex": pattern, "$options": "i"}}).limit(10)
+    async for candidate in cursor:
+        verified = match_address(address, candidate.get("address") or "")
+        if verified["matched"]:
+            return candidate, verified
+    return None, None
+
+
+async def _find_verified_person_lead(db, name: str):
+    tokens = person_tokens(name)
+    if len(tokens) < 2:
+        return None, None
+    first, last = tokens[0], tokens[-1]
+    pattern = (f"{re.escape(first)}.*{re.escape(last)}|"
+               f"{re.escape(last)}.*{re.escape(first)}")
+    cursor = db.deal_finder_leads.find(
+        {"owner_name": {"$regex": pattern, "$options": "i"}}).limit(10)
+    async for candidate in cursor:
+        verified = match_person(name, candidate.get("owner_name") or "")
+        if verified["matched"]:
+            return candidate, verified
+    return None, None
+
+
 class MotivationScanBody(BaseModel):
     signals: list[str] = ["probate", "preforeclosure", "divorce", "eviction"]
     limit: int = 100
@@ -398,7 +432,6 @@ async def motivation_scan(request: Request, body: MotivationScanBody):
 
     results = data.get("results") or []
     db = get_db()
-    now = datetime.now(timezone.utc).isoformat()
     matched, unmatched = [], []
     for prop in results:
         street = _norm_street(prop.get("Address") or "")
@@ -407,26 +440,19 @@ async def motivation_scan(request: Request, body: MotivationScanBody):
         prop_signals = [s for s, crit in RADAR_CRITERIA.items() if prop.get(crit)]
         if not prop_signals:
             prop_signals = signals
-        lead = await db.deal_finder_leads.find_one(
-            {"address": {"$regex": f"^{re.escape(street)}", "$options": "i"}})
-        if not lead:
-            # segundo intento: normalizando la dirección del lead en memoria es caro;
-            # usamos búsqueda parcial por número + primera palabra de la calle
-            parts = street.split(" ")
-            if len(parts) >= 2:
-                lead = await db.deal_finder_leads.find_one(
-                    {"address": {"$regex": f"^{re.escape(parts[0])}\\s+{re.escape(parts[1])}", "$options": "i"}})
+        lead, verified = await _find_verified_address_lead(db, street)
         if lead:
-            motivation = lead.get("motivation") or {"signals": [], "details": []}
-            new_signals = sorted(set(motivation.get("signals", []) + prop_signals))
-            motivation["signals"] = new_signals
-            motivation["details"] = (motivation.get("details") or []) + [{
-                "source": "propertyradar", "radar_id": prop.get("RadarID"),
-                "signals": prop_signals, "at": now}]
-            motivation["updated_at"] = now
-            await db.deal_finder_leads.update_one({"_id": lead["_id"]}, {"$set": {"motivation": motivation}})
+            record = {"case_number": str(prop.get("RadarID") or ""),
+                      "address": prop.get("Address") or "", "name": prop.get("Owner") or ""}
+            detail = evidence_detail(
+                "propertyradar", record, verified, now=datetime.now(timezone.utc))
+            detail["radar_id"] = str(prop.get("RadarID") or "")[:100]
+            detail["signals"] = prop_signals
+            created = await add_evidence_atomic(db, lead["_id"], prop_signals, detail)
             matched.append({"lead_id": str(lead["_id"]), "address": lead.get("address"),
-                            "signals": prop_signals})
+                            "signals": prop_signals, "evidence_id": detail["evidence_id"],
+                            "confidence": detail["confidence"], "new_evidence": created,
+                            "review_status": detail["review_status"]})
         else:
             unmatched.append({"address": prop.get("Address"), "city": prop.get("City"),
                               "signals": prop_signals})
@@ -517,46 +543,30 @@ async def public_records_import(request: Request, body: PublicRecordsImport):
 
     db = get_db()
     signal = PUBLIC_SIGNAL_BY_TYPE[body.source_type]
-    now = datetime.now(timezone.utc).isoformat()
     matches, new_matches = [], []
     for rec in records:
         lead = None
+        match_result = None
         # 1) por dirección
         addr = _norm_street(rec.get("address") or "")
         if addr:
-            parts = addr.split(" ")
-            if len(parts) >= 2:
-                lead = await db.deal_finder_leads.find_one(
-                    {"address": {"$regex": f"^{re.escape(parts[0])}\\s+{re.escape(parts[1])}", "$options": "i"}})
+            lead, match_result = await _find_verified_address_lead(db, addr)
         # 2) por nombre del dueño
         if lead is None and rec.get("name"):
-            nparts = [p for p in re.split(r"[\s,]+", rec["name"].strip()) if len(p) > 1]
-            if len(nparts) >= 2:
-                a, b = nparts[0], nparts[-1]
-                lead = await db.deal_finder_leads.find_one(
-                    {"owner_name": {"$regex": f"{re.escape(a)}.*{re.escape(b)}|{re.escape(b)}.*{re.escape(a)}",
-                                    "$options": "i"}})
+            lead, match_result = await _find_verified_person_lead(db, rec["name"])
         if lead is None:
             continue
-        motivation = lead.get("motivation") or {"signals": [], "details": []}
+        detail = evidence_detail(body.source_type, rec, match_result, now=datetime.now(timezone.utc))
         match_info = {"lead_id": str(lead["_id"]), "address": lead.get("address"),
-                      "owner_name": lead.get("owner_name"), "record": rec}
-        dedupe_key = rec.get("case_number") or rec.get("name") or rec.get("address")
-        already = any(d.get("source") == body.source_type and
-                      (d.get("case_number") or d.get("record_name")) == dedupe_key
-                      for d in (motivation.get("details") or []))
-        if already:
-            matches.append(match_info)
-            continue
-        if signal not in motivation.get("signals", []):
-            motivation["signals"] = sorted(set(motivation.get("signals", []) + [signal]))
-        motivation["details"] = (motivation.get("details") or []) + [{
-            "source": body.source_type, "record_name": rec.get("name"),
-            "case_number": rec.get("case_number"), "date": rec.get("date"), "at": now}]
-        motivation["updated_at"] = now
-        await db.deal_finder_leads.update_one({"_id": lead["_id"]}, {"$set": {"motivation": motivation}})
+                      "owner_name": lead.get("owner_name"), "record": rec,
+                      "evidence_id": detail["evidence_id"],
+                      "confidence": detail["confidence"],
+                      "match_reasons": detail["match_reasons"],
+                      "review_status": detail["review_status"]}
+        created = await add_evidence_atomic(db, lead["_id"], signal, detail)
         matches.append(match_info)
-        new_matches.append(match_info)
+        if created:
+            new_matches.append(match_info)
 
     return {"success": True, "records_found": len(records),
             "matches": matches, "new_matches": new_matches, "signal": signal}
@@ -767,10 +777,12 @@ async def run_obituary_scan() -> dict:
     """Núcleo del escaneo de obituarios (usado por el endpoint y por el cron semanal)."""
     db = get_db()
     cfg = await db.admin_config.find_one({"type": "enrichment_config"}) or {}
-    sources = cfg.get("obituary_sources") or DEFAULT_OBITUARY_SOURCES
+    configured_sources = cfg.get("obituary_sources") or DEFAULT_OBITUARY_SOURCES
+    sources = [url for url in configured_sources[:5] if obituary_source_allowed(url)]
 
     all_obits = []
-    fetch_errors = []
+    fetch_errors = [{"url": str(url)[:300], "error": "source_not_allowlisted"}
+                    for url in configured_sources[:5] if not obituary_source_allowed(url)]
     async with httpx.AsyncClient(timeout=25, follow_redirects=True,
                                  headers={"User-Agent": BROWSER_UA}) as client:
         for url in sources[:5]:
@@ -790,10 +802,13 @@ async def run_obituary_scan() -> dict:
             except Exception as e:
                 fetch_errors.append({"url": url, "error": str(e)[:120]})
 
-    # dedupe por nombre
+    # Dedupe determinista por persona/fecha/ciudad (no solo por nombre).
     seen, obits = set(), []
     for o in all_obits:
-        k = re.sub(r"\W", "", o["name"].lower())
+        if not isinstance(o, dict) or not str(o.get("name") or "").strip():
+            continue
+        o["name"] = str(o["name"])[:200].strip()
+        k = evidence_id("obituary", o)
         if k not in seen:
             seen.add(k)
             obits.append(o)
@@ -802,7 +817,7 @@ async def run_obituary_scan() -> dict:
     now = datetime.now(timezone.utc).isoformat()
     matches, new_matches = [], []
     for o in obits:
-        parts = [p for p in re.split(r"[\s,]+", o["name"].strip()) if len(p) > 1]
+        parts = person_tokens(o["name"])
         if len(parts) < 2:
             continue
         first, last = parts[0], parts[-1]
@@ -810,23 +825,24 @@ async def run_obituary_scan() -> dict:
             {"owner_name": {"$regex": f"{re.escape(last)}.*{re.escape(first)}|{re.escape(first)}.*{re.escape(last)}",
                             "$options": "i"}}).limit(3)
         async for lead in cursor:
-            motivation = lead.get("motivation") or {"signals": [], "details": []}
-            match_info = {"lead_id": str(lead["_id"]), "address": lead.get("address"),
-                          "owner_name": lead.get("owner_name"), "obituary": o}
-            already = any(d.get("source") == "obituary" and d.get("obit_name") == o["name"]
-                          for d in (motivation.get("details") or []))
-            if already:
-                matches.append(match_info)
+            verified = match_person(o["name"], lead.get("owner_name") or "")
+            if not verified["matched"]:
                 continue
-            if "possible_deceased" not in motivation.get("signals", []):
-                motivation["signals"] = sorted(set(motivation.get("signals", []) + ["possible_deceased"]))
-            motivation["details"] = (motivation.get("details") or []) + [{
-                "source": "obituary", "obit_name": o["name"], "obit_date": o.get("date"),
-                "obit_city": o.get("city"), "source_url": o.get("source_url"), "at": now}]
-            motivation["updated_at"] = now
-            await db.deal_finder_leads.update_one({"_id": lead["_id"]}, {"$set": {"motivation": motivation}})
+            detail = evidence_detail(
+                "obituary", o, verified, source_url=o.get("source_url") or "",
+                now=datetime.now(timezone.utc),
+            )
+            match_info = {"lead_id": str(lead["_id"]), "address": lead.get("address"),
+                          "owner_name": lead.get("owner_name"), "obituary": o,
+                          "evidence_id": detail["evidence_id"],
+                          "confidence": detail["confidence"],
+                          "match_reasons": detail["match_reasons"],
+                          "review_status": detail["review_status"]}
+            created = await add_evidence_atomic(
+                db, lead["_id"], "possible_deceased", detail)
             matches.append(match_info)
-            new_matches.append(match_info)
+            if created:
+                new_matches.append(match_info)
 
     # guardar historial del escaneo (incluye la lista para verla en la UI)
     await db.admin_config.update_one({"type": "enrichment_config"}, {"$set": {
@@ -836,7 +852,10 @@ async def run_obituary_scan() -> dict:
         "last_matches": [{"lead_id": m["lead_id"], "address": m.get("address"),
                           "owner_name": m.get("owner_name"),
                           "obit_name": (m.get("obituary") or {}).get("name"),
-                          "obit_date": (m.get("obituary") or {}).get("date")} for m in matches[:100]],
+                          "obit_date": (m.get("obituary") or {}).get("date"),
+                          "evidence_id": m.get("evidence_id"),
+                          "confidence": m.get("confidence"),
+                          "review_status": m.get("review_status")} for m in matches[:100]],
     }}, upsert=True)
 
     return {"obituaries_found": len(obits), "matches": matches, "new_matches": new_matches,
