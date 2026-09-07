@@ -17,6 +17,12 @@ class ScanLease:
     ttl_seconds: int
 
 
+def _document_id(name: str) -> str:
+    if not isinstance(name, str) or not name or not name.replace("_", "").isalnum():
+        raise ValueError("opportunity_scan_name_invalid")
+    return f"opportunity_scan_lease:{name}"
+
+
 def _now(value=None):
     current = value or datetime.now(timezone.utc)
     if current.tzinfo is None:
@@ -26,13 +32,11 @@ def _now(value=None):
 
 async def acquire_scan_lease(db, name: str, *, ttl_seconds: int = 14400,
                              now=None, owner: str | None = None) -> ScanLease | None:
-    if not isinstance(name, str) or not name or not name.replace("_", "").isalnum():
-        raise ValueError("opportunity_scan_name_invalid")
+    document_id = _document_id(name)
     if type(ttl_seconds) is not int or not 60 <= ttl_seconds <= 21600:
         raise ValueError("opportunity_scan_ttl_invalid")
     current = _now(now)
     identity = owner or secrets.token_urlsafe(18)
-    document_id = f"opportunity_scan_lease:{name}"
     try:
         document = await db.app_settings.find_one_and_update(
             {"_id": document_id, "$or": [
@@ -53,6 +57,26 @@ async def acquire_scan_lease(db, name: str, *, ttl_seconds: int = 14400,
     if type(generation) is not int or generation < 1:
         raise RuntimeError("opportunity_scan_lease_generation_invalid")
     return ScanLease(document_id, identity, generation, ttl_seconds)
+
+
+async def get_scan_lease_status(db, name: str, *, now=None) -> dict:
+    """Return operational lease state without exposing the owner secret."""
+    current = _now(now)
+    document = await db.app_settings.find_one(
+        {"_id": _document_id(name)},
+        {"lease_owner": 1, "lease_until": 1, "lease_generation": 1},
+    ) or {}
+    lease_until = document.get("lease_until")
+    if isinstance(lease_until, datetime) and lease_until.tzinfo is None:
+        lease_until = lease_until.replace(tzinfo=timezone.utc)
+    active = bool(document.get("lease_owner")) and isinstance(lease_until, datetime) \
+        and lease_until > current
+    generation = document.get("lease_generation")
+    return {
+        "running": active,
+        "lease_expires_at": lease_until.isoformat() if active else "",
+        "lease_generation": generation if type(generation) is int and generation >= 0 else 0,
+    }
 
 
 async def renew_scan_lease(db, lease: ScanLease, *, now=None) -> bool:
