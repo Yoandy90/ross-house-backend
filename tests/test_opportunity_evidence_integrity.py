@@ -10,12 +10,73 @@ from rental.opportunity_evidence import (
     get_evidence_review_history,
     parse_public_records_response,
     parse_obituary_response,
+    validate_radar_results,
     match_address, match_person, obituary_source_allowed, person_tokens,
     review_evidence_atomic, serialize_evidence_review_history,
 )
 
 
 NOW = datetime(2026, 9, 7, 18, tzinfo=timezone.utc)
+
+
+@pytest.mark.parametrize("payload", [None, [], {}, {"results": None},
+    {"results": {}}, {"results": [None]}, {"results": [{"Address": []}]},
+    {"results": [{"Owner": {}}]}, {"results": [{"City": 42}]},
+    {"results": [{"Address": "123 Main"}, None]}, {"results": [{}] * 201}])
+def test_radar_rejects_invalid_batches(payload):
+    with pytest.raises(ValueError, match="radar_response_invalid"):
+        validate_radar_results(payload)
+
+
+def test_radar_accepts_explicit_empty_and_valid_preview_rows():
+    assert validate_radar_results({"results": []}) == []
+    rows = [{"Address": "123 Main", "Owner": None, "RadarID": "123"}]
+    assert validate_radar_results({"results": rows}) == rows
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scenario", ["empty", "invalid", "transport"])
+async def test_radar_handler_only_records_valid_empty_success(scenario):
+    import ast
+    from fastapi import HTTPException
+    source = (Path(__file__).resolve().parents[1] /
+              "rental/contact_enrichment_router.py").read_text()
+    handler = next(node for node in ast.parse(source).body
+                   if isinstance(node, ast.AsyncFunctionDef) and node.name == "motivation_scan")
+    handler.decorator_list = []
+    class Client:
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *args):
+            pass
+        async def post(self, *args, **kwargs):
+            if scenario == "transport":
+                raise RuntimeError("private request details")
+            return SimpleNamespace(status_code=200, raise_for_status=lambda: None,
+                                   json=lambda: {"results": []} if scenario == "empty" else {})
+    receipt = AsyncMock()
+    db = object()
+    env = {
+        "Request": object, "MotivationScanBody": object, "auth_admin": AsyncMock(),
+        "os": SimpleNamespace(environ={"PROPERTYRADAR_API_KEY": "synthetic"}),
+        "RADAR_CRITERIA": {"probate": "inProbateProperty"},
+        "httpx": SimpleNamespace(AsyncClient=lambda **kwargs: Client()),
+        "HTTPException": HTTPException, "get_db": lambda: db,
+        "validate_radar_results": validate_radar_results, "record_source_run": receipt,
+    }
+    module = ast.fix_missing_locations(ast.Module(body=[handler], type_ignores=[]))
+    exec(compile(module, "isolated_radar_handler", "exec"), env)
+    body = SimpleNamespace(signals=["probate"], county_fips=48341, limit=100)
+    if scenario == "empty":
+        result = await env["motivation_scan"](object(), body)
+        assert result["success"] and result["scanned"] == 0
+        receipt.assert_awaited_once_with(db, "propertyradar", scanned=0, matched=0)
+    else:
+        with pytest.raises(HTTPException) as exc:
+            await env["motivation_scan"](object(), body)
+        assert exc.value.status_code == 502
+        assert "private" not in exc.value.detail
+        receipt.assert_not_awaited()
 
 
 @pytest.mark.parametrize("raw", ['[{"address":"123 Main"}]',
