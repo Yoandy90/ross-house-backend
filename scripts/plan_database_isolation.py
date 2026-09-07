@@ -46,6 +46,9 @@ FORBIDDEN_SOURCE_MARKERS = {
     "lending",
 }
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+RELATIONSHIP_PATH_RE = re.compile(
+    r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*"
+)
 
 
 def runtime_files(repository_root: Path) -> list[Path]:
@@ -191,9 +194,14 @@ def _validate_evidence_detail(requirement: str, detail: object) -> None:
         required = {"root_collection", "relationship_paths", "root_ids"}
         if set(detail) != required:
             raise ValueError("filter_evidence_relationship_fields_invalid")
-        if detail.get("root_collection") not in {"app_users", "tenants"}:
+        root = detail.get("root_collection")
+        if not isinstance(root, str) or root not in {"app_users", "tenants"}:
             raise ValueError("filter_evidence_root_collection_invalid")
-        _strict_strings(detail.get("relationship_paths"), "relationship_paths")
+        paths = _strict_strings(
+            detail.get("relationship_paths"), "relationship_paths"
+        )
+        if any(not RELATIONSHIP_PATH_RE.fullmatch(path) for path in paths):
+            raise ValueError("filter_evidence_relationship_paths_invalid")
         _strict_strings(detail.get("root_ids"), "root_ids")
     elif requirement == "source_discriminator":
         if set(detail) != {"field_paths", "allowed_values"}:
@@ -218,6 +226,30 @@ def _validate_evidence_detail(requirement: str, detail: object) -> None:
         basis = detail["ownership_basis"].casefold()
         if any(marker in basis for marker in FORBIDDEN_SOURCE_MARKERS):
             raise ValueError("filter_evidence_external_source_prohibited")
+
+
+def _validate_relationship_bindings(entries: list[dict]) -> None:
+    """Cross-check already validated entries before approving any rows.
+
+    A status label from a previous call is not root evidence. Requiring the
+    root in this package binds both entries to the same hashes and provenance.
+    """
+    roots = {
+        entry["name"]: set(entry["evidence"]["root_ids"])
+        for entry in entries
+        if entry["requirement"] == "explicit_root_id_allowlist"
+        and entry["name"] in {"app_users", "tenants"}
+    }
+    for entry in entries:
+        if entry["requirement"] != "relationship_closure":
+            continue
+        detail = entry["evidence"]
+        allowed_ids = roots.get(detail["root_collection"])
+        if allowed_ids is None:
+            raise ValueError("filter_evidence_relationship_root_evidence_required")
+        if not set(detail["root_ids"]).issubset(allowed_ids):
+            # Do not echo document IDs or values into logs/errors.
+            raise ValueError("filter_evidence_relationship_root_ids_not_allowlisted")
 
 
 def _utc_timestamp(value: object, field: str) -> datetime:
@@ -369,6 +401,7 @@ def apply_offline_filter_evidence(
             raise ValueError(f"filter_evidence_requirement_mismatch:{name}")
         _validate_evidence_detail(requirement, entry["evidence"])
         approved_names.append(name)
+    _validate_relationship_bindings(entries)
     for name in approved_names:
         row_map[name]["filter_status"] = "offline_evidence_approved"
         row_map[name]["evidence_id"] = provenance["evidence_id"]
