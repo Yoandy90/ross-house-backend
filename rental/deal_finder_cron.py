@@ -22,6 +22,10 @@ from datetime import datetime, timezone
 
 import httpx
 
+from rental.opportunity_scan_lease import (
+    ScanLease, acquire_scan_lease, release_scan_lease, renew_scan_lease,
+)
+
 logger = logging.getLogger(__name__)
 
 LETTERS = "abcdefghijklmnopqrstuvwxyz0123456789"
@@ -86,8 +90,10 @@ async def send_alert_email(db, new_opps: list[dict], became_delinquent: list[dic
         return False
 
 
-async def run_auto_scan_batch(db, max_props: int | None = None) -> dict:
-    """Procesa un lote del recorrido a-z del condado. Reanuda donde quedó."""
+async def _run_auto_scan_batch_unlocked(
+    db, max_props: int | None, lease: ScanLease,
+) -> dict:
+    """Process one batch while the caller owns the renewable DB lease."""
     from rental.deal_finder_router import (
         COUNTIES, UA, SKIP_TYPES,
         _open_search_session, _search_page, enrich_and_upsert,
@@ -155,6 +161,8 @@ async def run_auto_scan_batch(db, max_props: int | None = None) -> dict:
                 if letter_idx == 0:
                     cycles += 1  # vuelta completa al condado
 
+            if not await renew_scan_lease(db, lease):
+                raise RuntimeError("deal_finder_scan_lease_lost")
             await db.app_settings.update_one(
                 {"_id": "deal_finder_cron_state"},
                 {"$set": {"letter_idx": letter_idx, "page": page, "cycles": cycles}},
@@ -173,6 +181,8 @@ async def run_auto_scan_batch(db, max_props: int | None = None) -> dict:
         alerted = await send_alert_email(db, new_opps, became)
     result["alerted"] = alerted
 
+    if not await renew_scan_lease(db, lease):
+        raise RuntimeError("deal_finder_scan_lease_lost")
     await db.app_settings.update_one(
         {"_id": "deal_finder_cron_state"},
         {"$set": {"last_run": datetime.now(timezone.utc), "last_result": result}},
@@ -180,6 +190,19 @@ async def run_auto_scan_batch(db, max_props: int | None = None) -> dict:
     )
     logger.info(f"[deal-finder-cron] lote listo: {result}")
     return result
+
+
+async def run_auto_scan_batch(
+    db, max_props: int | None = None, *, lease: ScanLease | None = None,
+) -> dict:
+    """Run at most one county sweep across processes and replicas."""
+    acquired = lease or await acquire_scan_lease(db, "deal_finder")
+    if acquired is None:
+        return {"skipped": True, "reason": "deal_finder_scan_already_running"}
+    try:
+        return await _run_auto_scan_batch_unlocked(db, max_props, acquired)
+    finally:
+        await release_scan_lease(db, acquired)
 
 
 async def deal_finder_scan_loop():
