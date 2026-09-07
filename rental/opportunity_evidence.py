@@ -127,6 +127,22 @@ def parse_public_records_response(raw: str) -> list[dict]:
     return records[:200]
 
 
+def parse_obituary_response(raw: str) -> list[dict]:
+    """Validate obituary extraction before matching any owner names."""
+    try:
+        records = parse_public_records_response(raw)
+    except ValueError:
+        raise ValueError("obituary_response_invalid") from None
+    for record in records:
+        if not str(record.get("name") or "").strip():
+            raise ValueError("obituary_response_invalid")
+        age = record.get("age")
+        if age is not None and (type(age) is not int or not 0 <= age <= 130):
+            raise ValueError("obituary_response_invalid")
+    return [{field: record.get(field) for field in ("name", "age", "city", "date")}
+            for record in records[:50]]
+
+
 def evidence_id(source: str, record: dict) -> str:
     primary = record.get("case_number") or ""
     if not primary:
