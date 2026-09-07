@@ -5,6 +5,8 @@ on:
     paths:
       - 'rental/contact_enrichment_router.py'
       - 'rental/opportunity_evidence_queue.py'
+      - 'rental/opportunity_source_health.py'
+      - 'tests/test_opportunity_source_health.py'
       - 'tests/test_opportunity_evidence_queue.py'
       - '.github/workflows/opportunity-evidence-queue.yml'
 
@@ -23,4 +25,4 @@ jobs:
       - run: python -m py_compile rental/opportunity_evidence_queue.py rental/contact_enrichment_router.py
       - env:
           PYTHONPATH: .
-        run: python -m pytest -q tests/test_opportunity_evidence_integrity.py tests/test_opportunity_evidence_queue.py
+        run: python -m pytest -q tests/test_opportunity_evidence_integrity.py tests/test_opportunity_evidence_queue.py tests/test_opportunity_source_health.py
