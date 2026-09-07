@@ -170,6 +170,50 @@ async def add_evidence_atomic(db, lead_id, signal: str | list[str], detail: dict
     return result.modified_count == 1
 
 
+def serialize_evidence_review_history(evidence: dict) -> dict:
+    """Return a bounded admin-safe timeline without reviewer identifiers."""
+    history = []
+    for index, raw in enumerate(evidence.get("review_history") or []):
+        if not isinstance(raw, dict) or raw.get("status") not in _REVIEW_STATUSES:
+            continue
+        at = str(raw.get("at") or "")[:50]
+        if not at:
+            continue
+        history.append({
+            "status": raw["status"],
+            "at": at,
+            "note": str(raw.get("note") or "").strip()[:500],
+            "_index": index,
+        })
+    history.sort(key=lambda item: (item["at"], item["_index"]), reverse=True)
+    for item in history:
+        item.pop("_index", None)
+    return {
+        "evidence_id": str(evidence.get("evidence_id") or "")[:50],
+        "current_status": evidence.get("review_status")
+        if evidence.get("review_status") in _REVIEW_STATUSES else "needs_review",
+        "reviewed_at": str(evidence.get("reviewed_at") or "")[:50],
+        "review_note": str(evidence.get("review_note") or "").strip()[:500],
+        "history": history[:50],
+    }
+
+
+async def get_evidence_review_history(db, lead_id, evidence_id_value: str) -> dict | None:
+    """Fetch one evidence timeline with a narrow projection and safe serialization."""
+    if not re.fullmatch(r"[a-f0-9]{24}", str(evidence_id_value or "")):
+        raise ValueError("opportunity_evidence_id_invalid")
+    document = await db.deal_finder_leads.find_one(
+        {"_id": lead_id, "motivation.details": {
+            "$elemMatch": {"evidence_id": evidence_id_value}}},
+        {"_id": 0, "motivation.details": {
+            "$elemMatch": {"evidence_id": evidence_id_value}}},
+    )
+    details = ((document or {}).get("motivation") or {}).get("details") or []
+    evidence = next((item for item in details
+                     if item.get("evidence_id") == evidence_id_value), None)
+    return serialize_evidence_review_history(evidence) if evidence else None
+
+
 async def review_evidence_atomic(db, lead_id, evidence_id_value: str, status: str,
                                  reviewer_id: str, *, note: str = "", now=None) -> dict | None:
     """Review one evidence item and safely reconcile its active signals."""
