@@ -690,3 +690,35 @@ async def reconcile_pending_signals_batch(
             "affected": len(items), "removed": removed_total, "items": items,
             "has_more": has_more, "next_after_lead_id": next_after_lead_id,
             "reconciliation_id": reconciliation_id}
+
+
+async def get_signal_reconciliation_history(
+    db, lead_id, *, limit: int = 50,
+) -> dict | None:
+    """Return a bounded, sanitized newest-first reconciliation timeline."""
+    if not 1 <= limit <= 50:
+        raise ValueError("opportunity_signal_reconciliation_history_limit_invalid")
+    document = await db.deal_finder_leads.find_one(
+        {"_id": lead_id}, {"motivation.reconciliation_history": 1})
+    if document is None:
+        return None
+    motivation = document.get("motivation")
+    raw_history = motivation.get("reconciliation_history") if isinstance(
+        motivation, dict) else []
+    if not isinstance(raw_history, list):
+        raw_history = []
+    events = []
+    for item in raw_history:
+        if not isinstance(item, dict):
+            continue
+        event = {
+            "reconciliation_id": item.get("reconciliation_id"),
+            "signal": item.get("signal"),
+            "removed_at": item.get("removed_at"),
+            "removed_by": item.get("removed_by"),
+            "note": item.get("note"),
+        }
+        if all(isinstance(value, str) and value for value in event.values()):
+            events.append(event)
+    return {"lead_id": str(lead_id), "total": len(events),
+            "events": list(reversed(events))[:limit]}
