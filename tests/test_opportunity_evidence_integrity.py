@@ -15,7 +15,8 @@ from rental.opportunity_evidence import (
     match_address, match_person, obituary_source_allowed, person_tokens,
     match_obituary, obituary_owner_identity, resolve_obituary_candidates,
     resolve_obituary_ambiguity_atomic, serialize_obituary_ambiguities,
-    pending_only_active_signals, reconcile_pending_signals_batch,
+    pending_only_active_signals, reconciliation_preview_digest,
+    reconcile_pending_signals_batch,
     review_evidence_atomic, serialize_evidence_review_history,
 )
 
@@ -648,11 +649,21 @@ async def test_pending_signal_reconciliation_previews_without_writes():
     )
     result = await reconcile_pending_signals_batch(
         SimpleNamespace(deal_finder_leads=collection), limit=10)
-    assert result == {"mode": "preview", "scanned": 1, "affected": 1,
-                      "removed": 0, "items": [{"lead_id": "1" * 24,
-                      "candidate_signals": ["possible_deceased"],
-                      "removed_signals": []}], "has_more": False,
-                      "next_after_lead_id": None, "reconciliation_id": None}
+    assert result["mode"] == "preview"
+    assert result["scanned"] == result["affected"] == 1
+    assert result["removed"] == 0
+    assert result["items"] == [{"lead_id": "1" * 24,
+                                "candidate_signals": ["possible_deceased"],
+                                "removed_signals": []}]
+    assert result["has_more"] is False
+    assert result["next_after_lead_id"] is None
+    assert result["reconciliation_id"] is None
+    assert result["preview_digest"] == reconciliation_preview_digest(
+        [{"_id": ObjectId("1" * 24), "motivation": {
+            "signals": ["possible_deceased"],
+            "details": [{"signals": ["possible_deceased"],
+                         "review_status": "needs_review"}]}}],
+        after_lead_id=None, limit=10)
     collection.update_one.assert_not_awaited()
 
 
@@ -669,7 +680,9 @@ async def test_pending_signal_reconciliation_apply_rechecks_confirmation_atomica
     )
     result = await reconcile_pending_signals_batch(
         SimpleNamespace(deal_finder_leads=collection), limit=10, apply=True,
-        actor_id="admin-7", note="remove unsupported legacy signal", now=NOW)
+        actor_id="admin-7", note="remove unsupported legacy signal",
+        expected_preview_digest=reconciliation_preview_digest(
+            [document], after_lead_id=None, limit=10), now=NOW)
     assert result["mode"] == "applied" and result["removed"] == 1
     query, update = collection.update_one.await_args.args
     assert query["$and"][0]["motivation.details"]["$not"]["$elemMatch"] == {
@@ -699,9 +712,38 @@ async def test_pending_signal_reconciliation_reports_concurrent_confirmation_as_
     )
     result = await reconcile_pending_signals_batch(
         SimpleNamespace(deal_finder_leads=collection), limit=10, apply=True,
-        actor_id="admin-7", note="remove unsupported legacy signal", now=NOW)
+        actor_id="admin-7", note="remove unsupported legacy signal",
+        expected_preview_digest=reconciliation_preview_digest(
+            [document], after_lead_id=None, limit=10), now=NOW)
     assert result["removed"] == 0
     assert result["items"][0]["removed_signals"] == []
+
+
+@pytest.mark.asyncio
+async def test_pending_signal_reconciliation_rejects_stale_preview_before_writes():
+    document = {"_id": ObjectId("1" * 24), "motivation": {
+        "signals": ["possible_deceased"],
+        "details": [{"signals": ["possible_deceased"],
+                     "review_status": "needs_review"}],
+    }}
+    collection = SimpleNamespace(
+        find=lambda *args: AsyncDocuments([document]), update_one=AsyncMock())
+    with pytest.raises(ValueError, match="preview_stale"):
+        await reconcile_pending_signals_batch(
+            SimpleNamespace(deal_finder_leads=collection), limit=10, apply=True,
+            actor_id="admin-7", note="approved preview",
+            expected_preview_digest="0" * 64)
+    collection.update_one.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_pending_signal_reconciliation_requires_preview_digest_for_apply():
+    collection = SimpleNamespace(find=Mock())
+    with pytest.raises(ValueError, match="preview_required"):
+        await reconcile_pending_signals_batch(
+            SimpleNamespace(deal_finder_leads=collection), apply=True,
+            actor_id="admin-7", note="approved preview")
+    collection.find.assert_not_called()
 
 
 @pytest.mark.parametrize("actor,note,error", [
