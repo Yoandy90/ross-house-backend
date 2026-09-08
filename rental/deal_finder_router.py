@@ -25,6 +25,7 @@ import hashlib
 import html as html_lib
 import json
 import logging
+import math
 import os
 import re
 import urllib.parse
@@ -1223,7 +1224,7 @@ async def create_offer(request: Request, lead_id: str, body: OfferBody):
     await auth_admin(request)
     if body.mode not in ("amount", "ask"):
         raise HTTPException(422, "mode debe ser amount o ask")
-    if body.mode == "amount" and body.amount <= 0:
+    if not math.isfinite(body.amount) or (body.mode == "amount" and body.amount <= 0):
         raise HTTPException(422, "Indica el monto de la oferta")
     db = get_db()
     doc = await db.deal_finder_leads.find_one({"_id": ObjectId(lead_id)})
@@ -1231,22 +1232,38 @@ async def create_offer(request: Request, lead_id: str, body: OfferBody):
         raise HTTPException(404, "Lead no encontrado")
     existing = (doc.get("offer") or {})
     slug = existing.get("slug")
-    if not slug:
+    is_new = not slug
+    if is_new:
+        available = False
         for _ in range(5):
             slug = _offer_slug(doc.get("owner_name", ""))
             if not await db.deal_finder_leads.find_one({"offer.slug": slug}):
+                available = True
                 break
-    offer = {
-        "slug": slug,
-        "mode": body.mode,
-        "amount": round(body.amount, 2) if body.mode == "amount" else 0,
-        "created_at": existing.get("created_at") or datetime.now(timezone.utc).isoformat(),
-        "expires_at": (datetime.now(timezone.utc) + timedelta(days=30)).isoformat(),
-        "visits": existing.get("visits", 0),
-        "last_visit_at": existing.get("last_visit_at"),
-        "response": existing.get("response"),
+        if not available:
+            raise HTTPException(503, "No se pudo reservar un enlace único; intenta de nuevo")
+    now = datetime.now(timezone.utc)
+    updates = {
+        "offer.slug": slug,
+        "offer.mode": body.mode,
+        "offer.amount": round(body.amount, 2) if body.mode == "amount" else 0,
+        "offer.created_at": existing.get("created_at") or now.isoformat(),
+        "offer.expires_at": (now + timedelta(days=30)).isoformat(),
     }
-    await db.deal_finder_leads.update_one({"_id": doc["_id"]}, {"$set": {"offer": offer}})
+    if is_new:
+        updates.update({
+            "offer.visits": 0, "offer.last_visit_at": None,
+            "offer.response": None, "offer.sent_history": [],
+        })
+    saved = await db.deal_finder_leads.update_one(
+        {"_id": doc["_id"], "offer_send_claim": {"$exists": False}},
+        {"$set": updates})
+    if saved.matched_count != 1:
+        raise HTTPException(409, "No se puede cambiar la oferta mientras hay un envío pendiente")
+    current = await db.deal_finder_leads.find_one({"_id": doc["_id"]})
+    offer = (current or {}).get("offer")
+    if not offer or offer.get("slug") != slug:
+        raise HTTPException(503, "La oferta se guardó, pero no pudo verificarse")
     return {"success": True, "offer": offer, "url": f"{SITE_BASE}/oferta/{slug}"}
 
 
