@@ -49,6 +49,12 @@ def test_mongo_url_must_select_exact_ross_house_database():
     assert any("select exactly ross_house_staging" in item for item in errors)
 
 
+def test_stripe_is_not_required_for_helcim_staging():
+    values = template_values()
+    assert not any(key.startswith("STRIPE_") for key in values)
+    assert validator.validate(values, template=True) == []
+
+
 def test_actual_environment_rejects_placeholders_and_unacknowledged_delivery():
     values = template_values()
     values["SENDGRID_API_KEY"] = "SG.staging-provider-key"
