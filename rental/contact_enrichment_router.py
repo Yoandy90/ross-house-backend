@@ -616,6 +616,8 @@ class ObituaryAmbiguityResolutionBody(BaseModel):
 class EvidenceSignalReconciliationBody(BaseModel):
     apply: bool = False
     limit: int = Field(default=100, ge=1, le=500)
+    after_lead_id: Optional[str] = Field(
+        default=None, min_length=24, max_length=24, pattern=r"^[0-9a-f]{24}$")
 
 
 @router.get("/admin/deal-finder/evidence-queue")
@@ -669,7 +671,8 @@ async def reconcile_opportunity_evidence_signals(
     """Preview by default; applying removes only unsupported active signals."""
     await auth_admin(request)
     result = await reconcile_pending_signals_batch(
-        get_db(), limit=body.limit, apply=body.apply)
+        get_db(), limit=body.limit, apply=body.apply,
+        after_lead_id=body.after_lead_id)
     return {"success": True, **result}
 
 
