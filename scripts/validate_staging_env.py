@@ -16,8 +16,7 @@ REQUIRED = {
     "JWT_SECRET_KEY", "REFRESH_DERIVE_KEY", "VISITOR_IP_SALT",
     "VAULT_ENCRYPTION_KEY",
     "REFRESH_TOKENS_ENABLED", "ALLOW_LEGACY_USER_SESSIONS",
-    "REQUIRE_SESSION_SID", "STRIPE_SECRET_KEY",
-    "STRIPE_PUBLISHABLE_KEY", "STRIPE_WEBHOOK_SECRET",
+    "REQUIRE_SESSION_SID",
     "RENEWAL_TERM_MONTHS", "DISABLE_BACKGROUND_JOBS", "STAGING_FIXTURES_ENABLED",
 }
 SECRET_KEYS = {
@@ -85,11 +84,6 @@ def validate(values: dict[str, str], template: bool) -> list[str]:
         errors.append("ALLOW_LEGACY_USER_SESSIONS must be false")
     if values.get("REQUIRE_SESSION_SID", "").lower() != "true":
         errors.append("REQUIRE_SESSION_SID must be true")
-
-    if not values.get("STRIPE_SECRET_KEY", "").startswith("sk_test_"):
-        errors.append("STRIPE_SECRET_KEY must be a Stripe test key")
-    if not values.get("STRIPE_PUBLISHABLE_KEY", "").startswith("pk_test_"):
-        errors.append("STRIPE_PUBLISHABLE_KEY must be a Stripe test key")
 
     try:
         months = int(values.get("RENEWAL_TERM_MONTHS", ""))
