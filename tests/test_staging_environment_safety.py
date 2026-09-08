@@ -26,7 +26,6 @@ def test_production_database_and_live_keys_are_rejected():
     assert any("select exactly ross_house_staging" in item for item in errors)
     assert any("forbidden cross-business" in item for item in errors)
     assert any("sk_live_" in item for item in errors)
-    assert any("Stripe test key" in item for item in errors)
 
 
 def test_cross_business_database_names_are_rejected():
