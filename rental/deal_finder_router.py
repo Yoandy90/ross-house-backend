@@ -21,6 +21,7 @@ pipeline status/notes/AI fields across re-scans). Scan runs are tracked in
 AI scoring & offer letters use Claude via emergentintegrations (EMERGENT_LLM_KEY).
 """
 import asyncio
+import hashlib
 import html as html_lib
 import json
 import logging
@@ -2689,6 +2690,8 @@ async def mail_letter(request: Request, lead_id: str):
     doc = await db.deal_finder_leads.find_one({"_id": ObjectId(lead_id)})
     if not doc:
         raise HTTPException(404, "Lead no encontrado")
+    if (doc.get("mail") or {}).get("lob_id"):
+        raise HTTPException(409, "Esta oportunidad ya tiene una carta enviada por Lob")
     if not (doc.get("offer_letter") or {}).get("letter_en"):
         raise HTTPException(400, "Genera primero la carta de oferta con AI")
 
@@ -2698,54 +2701,92 @@ async def mail_letter(request: Request, lead_id: str):
 
     sender = await _sender_info()
 
-    async with httpx.AsyncClient(timeout=40) as client:
-        # 1) Verificar dirección (CASS) — evita cartas devueltas
-        ver = await client.post("https://api.lob.com/v1/us_verifications",
-                                auth=(key, ""), data={
-                                    "primary_line": street[0],
-                                    "city": city, "state": state, "zip_code": zipc})
-        if ver.status_code == 200:
-            dpv = ver.json().get("deliverability", "")
-            if dpv not in ("deliverable", "deliverable_unnecessary_unit",
-                           "deliverable_incorrect_unit", "deliverable_missing_unit"):
-                raise HTTPException(422, f"USPS marca la dirección como no entregable ({dpv})")
+    # Claim the lead before contacting Lob. The stable provider idempotency key
+    # also protects the narrow crash window after Lob accepts but before Mongo
+    # persists the result.
+    now = datetime.now(timezone.utc)
+    import secrets as _mail_secrets
+    claim_token = _mail_secrets.token_hex(16)
+    claim_until = now + timedelta(minutes=5)
+    claim = await db.deal_finder_leads.update_one({
+        "_id": doc["_id"],
+        "mail.lob_id": {"$exists": False},
+        "$or": [
+            {"mail_send_claim.expires_at": {"$lte": now}},
+            {"mail_send_claim": {"$exists": False}},
+        ],
+    }, {"$set": {"mail_send_claim": {
+        "token": claim_token, "expires_at": claim_until,
+    }}})
+    if claim.modified_count != 1:
+        current = await db.deal_finder_leads.find_one({"_id": doc["_id"]})
+        if (current or {}).get("mail", {}).get("lob_id"):
+            raise HTTPException(409, "Esta oportunidad ya tiene una carta enviada por Lob")
+        raise HTTPException(409, "Ya hay un envío de carta en curso para esta oportunidad")
 
-        # 2) PDF bilingüe (idéntico a la vista previa) — Lob imprime doble cara.
-        #    for_lob=True deja limpia la zona superior de la pág. 1 para que Lob
-        #    imprima ahí el bloque de remitente/destinatario.
-        photo = await _lead_photo(db, doc)
-        pdf_bytes = _build_letter_pdf(doc, sender, "en", photo=photo, for_lob=True)
+    offer_version = hashlib.sha256(
+        (doc.get("offer_letter") or {}).get("letter_en", "").encode("utf-8")
+    ).hexdigest()[:24]
+    idem = f"ross-house-lead-{lead_id}-offer-{offer_version}"
+    mail_saved = False
 
-        data = {
-            "description": f"Carta oferta — {doc.get('address', doc['property_id'])}",
-            "color": "true", "double_sided": "true",
-            "address_placement": "top_first_page",
-            "mail_type": "usps_first_class", "use_type": "marketing",
+    try:
+        async with httpx.AsyncClient(timeout=40) as client:
+            # 1) Verificar dirección (CASS) — evita cartas devueltas
+            ver = await client.post("https://api.lob.com/v1/us_verifications",
+                                    auth=(key, ""), data={
+                                        "primary_line": street[0],
+                                        "city": city, "state": state, "zip_code": zipc})
+            if ver.status_code == 200:
+                dpv = ver.json().get("deliverability", "")
+                if dpv not in ("deliverable", "deliverable_unnecessary_unit",
+                               "deliverable_incorrect_unit", "deliverable_missing_unit"):
+                    raise HTTPException(422, f"USPS marca la dirección como no entregable ({dpv})")
+
+            # 2) PDF bilingüe (idéntico a la vista previa) — Lob imprime doble cara.
+            photo = await _lead_photo(db, doc)
+            pdf_bytes = _build_letter_pdf(doc, sender, "en", photo=photo, for_lob=True)
+
+            data = {
+                "description": f"Carta oferta — {doc.get('address', doc['property_id'])}",
+                "color": "true", "double_sided": "true",
+                "address_placement": "top_first_page",
+                "mail_type": "usps_first_class", "use_type": "marketing",
+            }
+            data.update(_lob_addr("to", doc.get("owner_name", ""), street, city, state, zipc))
+            data.update(_lob_addr("from", sender.get("name", ""),
+                                  [sender.get("address", "")], sender.get("city", ""),
+                                  sender.get("state", ""), sender.get("zip", "")))
+
+            r = await client.post("https://api.lob.com/v1/letters", auth=(key, ""),
+                                  data=data,
+                                  files={"file": ("carta.pdf", pdf_bytes, "application/pdf")},
+                                  headers={"Idempotency-Key": idem})
+        if r.status_code not in (200, 201):
+            logger.error(f"[deal_finder] Lob falló {r.status_code}: {r.text[:300]}")
+            raise HTTPException(502, "Lob rechazó el envío de la carta")
+
+        letter = r.json()
+        if not isinstance(letter.get("id"), str) or not letter["id"].strip():
+            raise HTTPException(502, "Lob devolvió una confirmación inválida")
+        mail = {
+            "lob_id": letter["id"].strip(),
+            "status": "mailed" if (key.startswith("live_")) else "test",
+            "expected_delivery": letter.get("expected_delivery_date", ""),
+            "tracking_url": letter.get("url", ""),
+            "mode": "live" if key.startswith("live_") else "test",
+            "mailed_at": datetime.now(timezone.utc).isoformat(),
         }
-        data.update(_lob_addr("to", doc.get("owner_name", ""), street, city, state, zipc))
-        data.update(_lob_addr("from", sender.get("name", ""),
-                              [sender.get("address", "")], sender.get("city", ""),
-                              sender.get("state", ""), sender.get("zip", "")))
-
-        idem = f"lead-{lead_id}-{int(datetime.now().timestamp())}"
-        r = await client.post("https://api.lob.com/v1/letters", auth=(key, ""),
-                              data=data,
-                              files={"file": ("carta.pdf", pdf_bytes, "application/pdf")},
-                              headers={"Idempotency-Key": idem})
-    if r.status_code not in (200, 201):
-        logger.error(f"[deal_finder] Lob falló {r.status_code}: {r.text[:300]}")
-        raise HTTPException(502, f"Lob rechazó el envío: {r.text[:200]}")
-
-    letter = r.json()
-    mail = {
-        "lob_id": letter.get("id"),
-        "status": "mailed" if (key.startswith("live_")) else "test",
-        "expected_delivery": letter.get("expected_delivery_date", ""),
-        "tracking_url": letter.get("url", ""),
-        "mode": "live" if key.startswith("live_") else "test",
-        "mailed_at": datetime.now(timezone.utc).isoformat(),
-    }
-    await db.deal_finder_leads.update_one(
-        {"_id": doc["_id"]},
-        {"$set": {"mail": mail, "status": "offer_sent"}})
-    return {"success": True, "mail": mail}
+        saved = await db.deal_finder_leads.update_one(
+            {"_id": doc["_id"], "mail_send_claim.token": claim_token},
+            {"$set": {"mail": mail, "status": "offer_sent"},
+             "$unset": {"mail_send_claim": ""}})
+        if saved.modified_count != 1:
+            raise HTTPException(503, "Lob aceptó la carta, pero no se pudo confirmar el registro local")
+        mail_saved = True
+        return {"success": True, "mail": mail}
+    finally:
+        if not mail_saved:
+            await db.deal_finder_leads.update_one(
+                {"_id": doc["_id"], "mail_send_claim.token": claim_token},
+                {"$unset": {"mail_send_claim": ""}})
