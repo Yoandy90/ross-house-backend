@@ -2800,6 +2800,61 @@ def _mail_delivery_state(mail: dict, today: str) -> str:
     return "pending"
 
 
+def _lob_tracking_snapshot(letter: dict, mail: dict) -> dict:
+    if not isinstance(letter, dict):
+        raise HTTPException(502, "Lob devolvió un rastreo inválido")
+    raw_events = letter.get("tracking_events")
+    if not isinstance(raw_events, list):
+        raw_events = []
+    events = []
+    for raw in raw_events[-50:]:
+        if not isinstance(raw, dict):
+            continue
+        name = str(raw.get("name") or "")[:80]
+        if not name:
+            continue
+        events.append({
+            "name": name,
+            "label": str(TRACK_LABELS.get(name, name))[:120],
+            "time": str(raw.get("time") or "")[:64],
+            "location": str(raw.get("location") or "")[:160],
+        })
+    last = events[-1]["name"] if events else None
+    event_names = {event["name"] for event in events}
+    friendly = ("returned" if "Returned to Sender" in event_names
+                else "delivered" if "Delivered" in event_names
+                else "delivered_soon" if last == "Processed for Delivery"
+                else "in_transit" if last in ("In Transit", "In Local Area", "Re-Routed", "Mailed")
+                else str(mail.get("tracking_status") or mail.get("status") or "mailed")[:40])
+    expected = letter.get("expected_delivery_date")
+    send_date = letter.get("send_date")
+    return {
+        "status": friendly,
+        "expected_delivery": expected[:32] if isinstance(expected, str) else "",
+        "send_date": send_date[:32] if isinstance(send_date, str) else "",
+        "events": events,
+    }
+
+
+async def _fetch_lob_tracking(client: httpx.AsyncClient, key: str, lob_id: str,
+                              mail: dict) -> dict:
+    if not re.fullmatch(r"ltr_[A-Za-z0-9_-]{3,80}", lob_id):
+        raise HTTPException(422, "Identificador de carta Lob inválido")
+    try:
+        result = await client.get(f"https://api.lob.com/v1/letters/{lob_id}", auth=(key, ""))
+    except httpx.HTTPError:
+        raise HTTPException(502, "Lob no está disponible para consultar el rastreo")
+    if result.status_code != 200:
+        raise HTTPException(502, "Lob no pudo confirmar el rastreo de la carta")
+    try:
+        letter = result.json()
+    except Exception:
+        raise HTTPException(502, "Lob devolvió un rastreo inválido")
+    if not isinstance(letter, dict) or letter.get("id") != lob_id:
+        raise HTTPException(502, "Lob devolvió el rastreo de una carta diferente")
+    return _lob_tracking_snapshot(letter, mail)
+
+
 @router.get("/admin/deal-finder/leads/{lead_id}/mail-status")
 async def mail_tracking(request: Request, lead_id: str):
     """Rastreo REAL de la carta física: consulta los tracking events de USPS vía Lob
@@ -2814,39 +2869,107 @@ async def mail_tracking(request: Request, lead_id: str):
         raise HTTPException(404, "Este lead no tiene carta enviada por Lob")
     lob_id = doc["mail"]["lob_id"]
     async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.get(f"https://api.lob.com/v1/letters/{lob_id}", auth=(key, ""))
-    if r.status_code != 200:
-        raise HTTPException(400, "Carta no encontrada en Lob (¿se envió con otra API key test/live?)")
-    letter = r.json()
-    events = [{
-        "name": e.get("name"),
-        "label": TRACK_LABELS.get(e.get("name"), e.get("name")),
-        "time": e.get("time"),
-        "location": e.get("location"),
-    } for e in (letter.get("tracking_events") or [])]
-    last = events[-1]["name"] if events else None
-    event_names = {event.get("name") for event in events}
-    friendly = ("returned" if "Returned to Sender" in event_names
-                else "delivered" if "Delivered" in event_names
-                else "delivered_soon" if last == "Processed for Delivery"
-                else "in_transit" if last in ("In Transit", "In Local Area", "Re-Routed", "Mailed")
-                else doc["mail"].get("tracking_status", doc["mail"].get("status", "mailed")))
-    await db.deal_finder_leads.update_one({"_id": doc["_id"]}, {"$set": {
-        "mail.tracking_events": events,
-        "mail.tracking_status": friendly,
-        "mail.expected_delivery": letter.get("expected_delivery_date"),
-        "mail.send_date": letter.get("send_date"),
-        "mail.last_tracked_at": datetime.utcnow(),
-    }})
+        snapshot = await _fetch_lob_tracking(client, key, lob_id, doc["mail"])
+    tracked_at = datetime.now(timezone.utc)
+    saved = await db.deal_finder_leads.update_one(
+        {"_id": doc["_id"], "mail.lob_id": lob_id}, {"$set": {
+            "mail.tracking_events": snapshot["events"],
+            "mail.tracking_status": snapshot["status"],
+            "mail.expected_delivery": snapshot["expected_delivery"],
+            "mail.send_date": snapshot["send_date"],
+            "mail.last_tracked_at": tracked_at,
+        }})
+    if saved.modified_count != 1:
+        raise HTTPException(409, "La carta cambió mientras se actualizaba el rastreo")
     return {
         "lob_id": lob_id,
-        "status": friendly,
-        "expected_delivery": letter.get("expected_delivery_date"),
-        "send_date": (letter.get("send_date") or "")[:10],
+        "status": snapshot["status"],
+        "expected_delivery": snapshot["expected_delivery"],
+        "send_date": snapshot["send_date"][:10],
         "carrier": "USPS First Class",
-        "events": events,
+        "events": snapshot["events"],
         "note": ("USPS aún no reporta eventos — normal en las primeras 24-72h tras el envío"
-                 if not events else None),
+                 if not snapshot["events"] else None),
+    }
+
+
+class MailTrackingSyncBody(BaseModel):
+    limit: int = 20
+    stale_hours: int = 12
+
+
+@router.post("/admin/deal-finder/mail-tracking/sync")
+async def sync_mail_tracking(request: Request, body: MailTrackingSyncBody):
+    """Refresh a bounded stale batch while preventing concurrent work per letter."""
+    await auth_admin(request)
+    if not 1 <= body.limit <= 50 or not 1 <= body.stale_hours <= 168:
+        raise HTTPException(422, "Límite o antigüedad de rastreo inválidos")
+    key = _lob_key()
+    if not key:
+        raise HTTPException(400, "Lob no está configurado")
+    db = get_db()
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(hours=body.stale_hours)
+    cursor = db.deal_finder_leads.find({
+        "mail.lob_id": {"$exists": True, "$nin": [None, ""]},
+        "$or": [
+            {"mail.last_tracked_at": {"$exists": False}},
+            {"mail.last_tracked_at": {"$lte": cutoff}},
+        ],
+    }, {"mail": 1}).sort("mail.last_tracked_at", 1).limit(body.limit)
+    docs = await cursor.to_list(body.limit)
+    semaphore = asyncio.Semaphore(4)
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        async def sync_one(doc: dict) -> dict:
+            mail = doc.get("mail") or {}
+            lob_id = str(mail.get("lob_id") or "")
+            import secrets as _tracking_secrets
+            token = _tracking_secrets.token_hex(16)
+            claim = await db.deal_finder_leads.update_one({
+                "_id": doc["_id"], "mail.lob_id": lob_id,
+                "$or": [
+                    {"mail_tracking_claim": {"$exists": False}},
+                    {"mail_tracking_claim.expires_at": {"$lte": now}},
+                ],
+            }, {"$set": {"mail_tracking_claim": {
+                "token": token, "expires_at": now + timedelta(minutes=5),
+            }}})
+            if claim.modified_count != 1:
+                return {"lead_id": str(doc["_id"]), "status": "skipped"}
+            try:
+                async with semaphore:
+                    snapshot = await _fetch_lob_tracking(client, key, lob_id, mail)
+                tracked_at = datetime.now(timezone.utc)
+                saved = await db.deal_finder_leads.update_one(
+                    {"_id": doc["_id"], "mail.lob_id": lob_id,
+                     "mail_tracking_claim.token": token},
+                    {"$set": {
+                        "mail.tracking_events": snapshot["events"],
+                        "mail.tracking_status": snapshot["status"],
+                        "mail.expected_delivery": snapshot["expected_delivery"],
+                        "mail.send_date": snapshot["send_date"],
+                        "mail.last_tracked_at": tracked_at,
+                    }, "$unset": {"mail_tracking_claim": ""}})
+                if saved.modified_count != 1:
+                    raise RuntimeError("tracking_claim_lost")
+                return {"lead_id": str(doc["_id"]), "status": "updated",
+                        "tracking_status": snapshot["status"]}
+            except Exception:
+                logger.warning("[deal-finder] batch mail tracking failed for %s", lob_id,
+                               exc_info=True)
+                await db.deal_finder_leads.update_one(
+                    {"_id": doc["_id"], "mail_tracking_claim.token": token},
+                    {"$unset": {"mail_tracking_claim": ""}})
+                return {"lead_id": str(doc["_id"]), "status": "failed"}
+
+        results = await asyncio.gather(*(sync_one(doc) for doc in docs))
+    return {
+        "success": True, "requested": len(docs),
+        "updated": sum(item["status"] == "updated" for item in results),
+        "skipped": sum(item["status"] == "skipped" for item in results),
+        "failed": sum(item["status"] == "failed" for item in results),
+        "results": results,
     }
 
 
