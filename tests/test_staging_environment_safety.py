@@ -26,7 +26,6 @@ def test_production_database_and_live_keys_are_rejected():
     assert any("select exactly ross_house_staging" in item for item in errors)
     assert any("forbidden cross-business" in item for item in errors)
     assert any("sk_live_" in item for item in errors)
-    assert any("Stripe test key" in item for item in errors)
 
 
 def test_cross_business_database_names_are_rejected():
@@ -47,6 +46,12 @@ def test_mongo_url_must_select_exact_ross_house_database():
     )
     errors = validator.validate(values, template=True)
     assert any("select exactly ross_house_staging" in item for item in errors)
+
+
+def test_stripe_is_not_required_for_helcim_staging():
+    values = template_values()
+    assert not any(key.startswith("STRIPE_") for key in values)
+    assert validator.validate(values, template=True) == []
 
 
 def test_actual_environment_rejects_placeholders_and_unacknowledged_delivery():
