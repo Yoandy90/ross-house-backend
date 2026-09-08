@@ -5,6 +5,8 @@ on:
     paths:
       - 'rental/contact_enrichment_router.py'
       - 'rental/opportunity_evidence_queue.py'
+      - 'rental/opportunity_evidence.py'
+      - 'tests/test_opportunity_evidence_integrity.py'
       - 'rental/opportunity_source_health.py'
       - 'tests/test_opportunity_source_health.py'
       - 'tests/test_opportunity_evidence_queue.py'

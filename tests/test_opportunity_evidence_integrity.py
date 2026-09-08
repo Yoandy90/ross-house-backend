@@ -19,6 +19,38 @@ from rental.opportunity_evidence import (
 NOW = datetime(2026, 9, 7, 18, tzinfo=timezone.utc)
 
 
+def test_history_orders_real_instants_and_preserves_invalid_date_events():
+    from copy import deepcopy
+    evidence = {"review_history": [
+        {"status": "confirmed", "at": "2026-09-07T10:00:00-05:00", "note": "latest"},
+        {"status": "dismissed", "at": "2026-09-07T14:00:00Z", "note": "earlier"},
+        {"status": "needs_review", "at": "invalid", "note": "unknown date"},
+        {"status": "confirmed", "at": "2026-09-07T16:00:00", "note": "no timezone"},
+    ]}
+    original = deepcopy(evidence)
+    result = serialize_evidence_review_history(evidence)["history"]
+    assert [item["note"] for item in result] == ["latest", "earlier", "no timezone", "unknown date"]
+    assert result[0]["at"] == "2026-09-07T15:00:00+00:00"
+    assert result[-1]["at"] == "unknown"
+    assert all(set(item) == {"status", "at", "note"} for item in result)
+    assert evidence == original
+
+
+def test_history_equal_instants_use_append_order_and_limit_to_50():
+    evidence = {"review_history": [
+        {"status": "confirmed", "at": "2026-09-07T15:00:00Z", "note": str(i)}
+        for i in range(60)
+    ]}
+    result = serialize_evidence_review_history(evidence)["history"]
+    assert len(result) == 50
+    assert result[0]["note"] == "59" and result[-1]["note"] == "10"
+
+
+@pytest.mark.parametrize("events", [None, {}, "invalid", 42, [{"status": []}]])
+def test_history_handles_malformed_legacy_containers(events):
+    assert serialize_evidence_review_history({"review_history": events})["history"] == []
+
+
 @pytest.mark.parametrize("payload", [None, [], {}, {"results": None},
     {"results": {}}, {"results": [None]}, {"results": [{"Address": []}]},
     {"results": [{"Owner": {}}]}, {"results": [{"City": 42}]},
