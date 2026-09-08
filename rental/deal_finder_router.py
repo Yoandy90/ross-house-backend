@@ -778,7 +778,9 @@ async def campaign_stats(request: Request):
     db = get_db()
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
-    funnel = {"sent": 0, "delivered": 0, "scanned": 0, "responded": 0}
+    funnel = {"sent": 0, "delivered": 0, "delivered_confirmed": 0,
+              "delivered_estimated": 0, "returned": 0,
+              "scanned": 0, "responded": 0}
     by_county: dict = {}
     by_signal: dict = {}
     by_action: dict = {}
@@ -788,22 +790,30 @@ async def campaign_stats(request: Request):
             {"county": 1, "signals": 1, "mail": 1, "offer": 1}):
         mail = doc.get("mail") or {}
         offer = doc.get("offer") or {}
-        delivered = bool(mail.get("expected_delivery") and
-                         mail["expected_delivery"] <= today)
+        delivery_state = _mail_delivery_state(mail, today)
+        delivered = delivery_state in ("confirmed", "estimated")
         scanned = (offer.get("visits") or 0) > 0
         responded = bool(offer.get("response"))
         county = doc.get("county") or "otro"
         signals = doc.get("signals") or ["otro"]
 
         def bump(d, key):
-            row = d.setdefault(key, {"sent": 0, "delivered": 0, "scanned": 0, "responded": 0})
+            row = d.setdefault(key, {"sent": 0, "delivered": 0,
+                                     "delivered_confirmed": 0, "delivered_estimated": 0,
+                                     "returned": 0, "scanned": 0, "responded": 0})
             row["sent"] += 1
             row["delivered"] += 1 if delivered else 0
+            row["delivered_confirmed"] += 1 if delivery_state == "confirmed" else 0
+            row["delivered_estimated"] += 1 if delivery_state == "estimated" else 0
+            row["returned"] += 1 if delivery_state == "returned" else 0
             row["scanned"] += 1 if scanned else 0
             row["responded"] += 1 if responded else 0
 
         funnel["sent"] += 1
         funnel["delivered"] += 1 if delivered else 0
+        funnel["delivered_confirmed"] += 1 if delivery_state == "confirmed" else 0
+        funnel["delivered_estimated"] += 1 if delivery_state == "estimated" else 0
+        funnel["returned"] += 1 if delivery_state == "returned" else 0
         funnel["scanned"] += 1 if scanned else 0
         funnel["responded"] += 1 if responded else 0
         bump(by_county, county)
@@ -817,7 +827,9 @@ async def campaign_stats(request: Request):
         s = row["sent"] or 1
         return {**row,
                 "scan_rate": round(row["scanned"] * 100 / s, 1),
-                "response_rate": round(row["responded"] * 100 / s, 1)}
+                "response_rate": round(row["responded"] * 100 / s, 1),
+                "confirmed_delivery_rate": round(row["delivered_confirmed"] * 100 / s, 1),
+                "return_rate": round(row["returned"] * 100 / s, 1)}
 
     return {"success": True,
             "funnel": rates(funnel),
@@ -826,7 +838,7 @@ async def campaign_stats(request: Request):
             "by_signal": {k: rates(v) for k, v in
                           sorted(by_signal.items(), key=lambda kv: -kv[1]["sent"])},
             "by_action": by_action,
-            "note": "Entregadas = estimado por fecha de entrega esperada de Lob/USPS"}
+            "note": "Entregadas combina confirmación USPS y estimación vencida; las devueltas se excluyen"}
 
 
 @router.get("/admin/deal-finder/responses")
@@ -2767,7 +2779,25 @@ TRACK_LABELS = {
     "Processed for Delivery": "📬 Procesada para entrega (llega hoy/mañana)",
     "Re-Routed": "↩️ Re-enrutada por USPS",
     "Returned to Sender": "⛔ Devuelta al remitente",
+    "Delivered": "✅ Entregada por USPS",
 }
+
+
+def _mail_delivery_state(mail: dict, today: str) -> str:
+    """Classify delivery without treating returned mail as successfully delivered."""
+    tracking_status = str(mail.get("tracking_status") or "").lower()
+    event_names = {str(event.get("name") or "").lower()
+                   for event in (mail.get("tracking_events") or [])
+                   if isinstance(event, dict)}
+    if tracking_status == "returned" or "returned to sender" in event_names:
+        return "returned"
+    if tracking_status == "delivered" or "delivered" in event_names:
+        return "confirmed"
+    expected = mail.get("expected_delivery")
+    if (isinstance(expected, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", expected[:10])
+            and expected[:10] <= today):
+        return "estimated"
+    return "pending"
 
 
 @router.get("/admin/deal-finder/leads/{lead_id}/mail-status")
@@ -2795,10 +2825,12 @@ async def mail_tracking(request: Request, lead_id: str):
         "location": e.get("location"),
     } for e in (letter.get("tracking_events") or [])]
     last = events[-1]["name"] if events else None
-    friendly = ("delivered_soon" if last == "Processed for Delivery"
-                else "returned" if last == "Returned to Sender"
+    event_names = {event.get("name") for event in events}
+    friendly = ("returned" if "Returned to Sender" in event_names
+                else "delivered" if "Delivered" in event_names
+                else "delivered_soon" if last == "Processed for Delivery"
                 else "in_transit" if last in ("In Transit", "In Local Area", "Re-Routed", "Mailed")
-                else doc["mail"].get("status", "mailed"))
+                else doc["mail"].get("tracking_status", doc["mail"].get("status", "mailed")))
     await db.deal_finder_leads.update_one({"_id": doc["_id"]}, {"$set": {
         "mail.tracking_events": events,
         "mail.tracking_status": friendly,
