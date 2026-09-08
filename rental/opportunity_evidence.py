@@ -143,6 +143,22 @@ def parse_obituary_response(raw: str) -> list[dict]:
             for record in records[:50]]
 
 
+def validate_radar_results(data: object) -> list[dict]:
+    """Reject malformed batches before any lead can be updated."""
+    if not isinstance(data, dict) or not isinstance(data.get("results"), list):
+        raise ValueError("radar_response_invalid")
+    results = data["results"]
+    if len(results) > 200:
+        raise ValueError("radar_response_invalid")
+    for record in results:
+        if not isinstance(record, dict):
+            raise ValueError("radar_response_invalid")
+        for field in ("Address", "City", "Owner"):
+            if record.get(field) is not None and not isinstance(record[field], str):
+                raise ValueError("radar_response_invalid")
+    return results
+
+
 def evidence_id(source: str, record: dict) -> str:
     primary = record.get("case_number") or ""
     if not primary:

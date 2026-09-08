@@ -28,6 +28,7 @@ from rental.opportunity_evidence import (
     get_evidence_review_history,
     parse_public_records_response,
     parse_obituary_response,
+    validate_radar_results,
     match_address, match_person, obituary_source_allowed, person_tokens,
     review_evidence_atomic,
 )
@@ -441,10 +442,13 @@ async def motivation_scan(request: Request, body: MotivationScanBody):
         data = r.json()
     except HTTPException:
         raise
-    except Exception as e:
-        raise HTTPException(502, f"PropertyRadar no disponible: {e}")
+    except Exception:
+        raise HTTPException(502, "PropertyRadar no disponible. Intenta nuevamente.") from None
 
-    results = data.get("results") or []
+    try:
+        results = validate_radar_results(data)
+    except ValueError:
+        raise HTTPException(502, "PropertyRadar devolvió una respuesta inválida. No se procesaron propiedades.") from None
     db = get_db()
     matched, unmatched = [], []
     for prop in results:
