@@ -428,7 +428,7 @@ def evidence_detail(source: str, record: dict, match: dict, *, source_url: str =
 
 
 async def add_evidence_atomic(db, lead_id, signal: str | list[str], detail: dict) -> bool:
-    """Add one evidence fact once; concurrent writers cannot lose other facts."""
+    """Add evidence once; only pre-confirmed facts activate motivation signals."""
     eid = detail.get("evidence_id")
     if not eid:
         raise ValueError("opportunity_evidence_id_required")
@@ -436,6 +436,7 @@ async def add_evidence_atomic(db, lead_id, signal: str | list[str], detail: dict
     if not signals:
         raise ValueError("opportunity_evidence_signal_required")
     detail = {**detail, "signals": signals}
+    active_signals = signals if detail.get("review_status") == "confirmed" else []
     result = await db.deal_finder_leads.update_one(
         {"_id": lead_id, "motivation.details.evidence_id": {"$ne": eid}},
         [
@@ -445,7 +446,7 @@ async def add_evidence_atomic(db, lead_id, signal: str | list[str], detail: dict
             {"$set": {
                 "motivation.signals": {"$setUnion": [
                     {"$cond": [{"$isArray": "$motivation.signals"},
-                               "$motivation.signals", []]}, signals,
+                               "$motivation.signals", []]}, active_signals,
                 ]},
                 "motivation.details": {"$concatArrays": [
                     {"$cond": [{"$isArray": "$motivation.details"},
@@ -556,11 +557,11 @@ async def review_evidence_atomic(db, lead_id, evidence_id_value: str, status: st
         return None
     signals = [value for value in (reviewed.get("signals") or [])
                if isinstance(value, str) and value]
-    if status == "dismissed":
+    if status != "confirmed":
         for signal in signals:
             legacy_sources = _LEGACY_SOURCE_BY_SIGNAL.get(signal, [])
             conditions = [{"motivation.details": {"$not": {"$elemMatch": {
-                "signals": signal, "review_status": {"$ne": "dismissed"},
+                "signals": signal, "review_status": "confirmed",
             }}}}]
             if legacy_sources:
                 conditions.append({"motivation.details": {"$not": {"$elemMatch": {
@@ -572,7 +573,9 @@ async def review_evidence_atomic(db, lead_id, evidence_id_value: str, status: st
             )
     elif signals:
         await db.deal_finder_leads.update_one(
-            {"_id": lead_id},
+            {"_id": lead_id, "motivation.details": {"$elemMatch": {
+                "evidence_id": evidence_id_value, "review_status": "confirmed",
+            }}},
             {"$addToSet": {"motivation.signals": {"$each": signals}}},
         )
     final = await db.deal_finder_leads.find_one(

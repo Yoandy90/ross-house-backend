@@ -491,7 +491,7 @@ def test_evidence_detail_rejects_naive_clock():
 
 
 @pytest.mark.asyncio
-async def test_atomic_add_dedupes_by_evidence_id_and_adds_all_signals():
+async def test_atomic_add_dedupes_pending_evidence_without_activating_signals():
     collection = SimpleNamespace(update_one=AsyncMock(
         return_value=SimpleNamespace(modified_count=1)))
     db = SimpleNamespace(deal_finder_leads=collection)
@@ -506,8 +506,7 @@ async def test_atomic_add_dedupes_by_evidence_id_and_adds_all_signals():
         "$ne": detail["evidence_id"]}}
     assert pipeline[0]["$set"]["motivation"]["$cond"][2] == {}
     fields = pipeline[1]["$set"]
-    assert fields["motivation.signals"]["$setUnion"][1] == [
-        "probate", "preforeclosure"]
+    assert fields["motivation.signals"]["$setUnion"][1] == []
     saved_detail = fields["motivation.details"]["$concatArrays"][1][0]
     assert saved_detail == {**detail, "signals": ["probate", "preforeclosure"]}
     assert fields["motivation.updated_at"] == detail["at"]
@@ -520,6 +519,18 @@ async def test_atomic_add_reports_existing_evidence_without_overwrite():
     db = SimpleNamespace(deal_finder_leads=collection)
     assert await add_evidence_atomic(
         db, "lead-1", "possible_deceased", {"evidence_id": "same", "at": "now"}) is False
+
+
+@pytest.mark.asyncio
+async def test_atomic_add_can_activate_explicitly_preconfirmed_evidence():
+    collection = SimpleNamespace(update_one=AsyncMock(
+        return_value=SimpleNamespace(modified_count=1)))
+    db = SimpleNamespace(deal_finder_leads=collection)
+    detail = {"evidence_id": "a" * 24, "at": NOW.isoformat(),
+              "review_status": "confirmed"}
+    assert await add_evidence_atomic(db, "lead-1", "probate_confirmed", detail)
+    fields = collection.update_one.await_args.args[1][1]["$set"]
+    assert fields["motivation.signals"]["$setUnion"][1] == ["probate_confirmed"]
 
 
 def review_database(status="confirmed"):
@@ -554,7 +565,9 @@ async def test_confirm_review_is_audited_bounded_and_restores_signal():
     }
     assert collection.find_one_and_update.await_args.kwargs["array_filters"] == [
         {"evidence.evidence_id": "a" * 24}]
-    restore = collection.update_one.await_args.args[1]
+    restore_query, restore = collection.update_one.await_args.args
+    assert restore_query["motivation.details"]["$elemMatch"] == {
+        "evidence_id": "a" * 24, "review_status": "confirmed"}
     assert restore == {"$addToSet": {"motivation.signals": {
         "$each": ["possible_deceased"]}}}
 
@@ -567,6 +580,19 @@ async def test_dismiss_review_only_pulls_signal_without_active_or_legacy_support
     query, update = collection.update_one.await_args.args
     assert query["_id"] == "lead-1"
     assert len(query["$and"]) == 2
+    assert query["$and"][0]["motivation.details"]["$not"]["$elemMatch"][
+        "review_status"] == "confirmed"
+    assert update == {"$pull": {"motivation.signals": "possible_deceased"}}
+
+
+@pytest.mark.asyncio
+async def test_reopen_review_keeps_signal_inactive_until_confirmed():
+    db, collection = review_database("needs_review")
+    await review_evidence_atomic(
+        db, "lead-1", "a" * 24, "needs_review", "admin-7", now=NOW)
+    query, update = collection.update_one.await_args.args
+    assert query["$and"][0]["motivation.details"]["$not"]["$elemMatch"] == {
+        "signals": "possible_deceased", "review_status": "confirmed"}
     assert update == {"$pull": {"motivation.signals": "possible_deceased"}}
 
 
