@@ -42,7 +42,7 @@ def test_cross_business_database_names_are_rejected():
 def test_mongo_url_must_select_exact_ross_house_database():
     values = template_values()
     values["MONGO_URL"] = (
-        "mongodb+srv://staging-user:staging-pass@staging-cluster/"
+        "mongodb+srv://STAGING_USER:STAGING_PASSWORD@staging-cluster/"
         "unrelated_staging?retryWrites=true"
     )
     errors = validator.validate(values, template=True)
