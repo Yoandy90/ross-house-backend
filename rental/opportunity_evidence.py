@@ -66,6 +66,68 @@ def match_person(record_name: str, owner_name: str) -> dict:
             "reasons": ["exact_name_tokens" if exact else "first_last_tokens"]}
 
 
+def _city_key(value: str) -> str:
+    noise = {"TX", "TEXAS", "USA", "US"}
+    return " ".join(word for word in _ascii_words(value) if word not in noise)
+
+
+def _lead_city_keys(lead: dict) -> set[str]:
+    cities = {_city_key(lead.get("mailing_city") or "")}
+    address = str(lead.get("address") or "")
+    match = re.search(r",\s*([^,]+?)(?:\s+(?:TX|TEXAS)\b|\s+\d{5}(?:-\d{4})?\b|$)",
+                      address, re.IGNORECASE)
+    if match:
+        cities.add(_city_key(match.group(1)))
+    return {city for city in cities if city}
+
+
+def match_obituary(record: dict, lead: dict) -> dict:
+    """Require geographic corroboration when an obituary supplies a city."""
+    matched = match_person(str(record.get("name") or ""),
+                           str(lead.get("owner_name") or ""))
+    if not matched["matched"]:
+        return matched
+    obituary_city = _city_key(record.get("city") or "")
+    lead_cities = _lead_city_keys(lead)
+    if obituary_city and lead_cities and obituary_city not in lead_cities:
+        return {"matched": False, "confidence": 0,
+                "reasons": [*matched["reasons"], "city_mismatch"]}
+    if obituary_city and obituary_city in lead_cities:
+        return {"matched": True, "confidence": min(100, matched["confidence"] + 5),
+                "reasons": [*matched["reasons"], "city_match"]}
+    return {"matched": True, "confidence": max(0, matched["confidence"] - 10),
+            "reasons": [*matched["reasons"], "city_unverified"]}
+
+
+def obituary_owner_identity(lead: dict) -> str:
+    """Group a portfolio by normalized owner and mailing destination."""
+    suffixes = {"JR", "SR", "II", "III", "IV"}
+    owner = " ".join(sorted(set(
+        word for word in _ascii_words(lead.get("owner_name") or "")
+        if len(word) > 1 and (word not in _NAME_NOISE or word in suffixes)
+    )))
+    mailing = " ".join(_ascii_words(" ".join([
+        *[str(line) for line in (lead.get("mailing_lines") or []) if isinstance(line, str)],
+        str(lead.get("mailing_city") or ""), str(lead.get("mailing_state") or ""),
+        str(lead.get("mailing_zip") or ""),
+    ])))
+    return f"{owner}|{mailing}" if mailing else owner
+
+
+def resolve_obituary_candidates(record: dict, candidates: list[dict]) -> dict:
+    """Keep multi-property portfolios while quarantining distinct same-name owners."""
+    verified = []
+    for lead in candidates:
+        match = match_obituary(record, lead)
+        if match["matched"]:
+            verified.append((lead, match))
+    identities = {obituary_owner_identity(lead) for lead, _ in verified}
+    ambiguous = len(identities) > 1
+    return {"matches": [] if ambiguous else verified,
+            "ambiguous": ambiguous, "candidate_count": len(verified),
+            "candidate_leads": [lead for lead, _ in verified] if ambiguous else []}
+
+
 def _normalized_address(value: str) -> list[str]:
     words = _ascii_words(value)
     return [_STREET_SUFFIX.get(word, word) for word in words]
