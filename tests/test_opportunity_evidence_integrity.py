@@ -651,7 +651,8 @@ async def test_pending_signal_reconciliation_previews_without_writes():
     assert result == {"mode": "preview", "scanned": 1, "affected": 1,
                       "removed": 0, "items": [{"lead_id": "1" * 24,
                       "candidate_signals": ["possible_deceased"],
-                      "removed_signals": []}]}
+                      "removed_signals": []}], "has_more": False,
+                      "next_after_lead_id": None}
     collection.update_one.assert_not_awaited()
 
 
@@ -690,6 +691,54 @@ async def test_pending_signal_reconciliation_reports_concurrent_confirmation_as_
         SimpleNamespace(deal_finder_leads=collection), limit=10, apply=True)
     assert result["removed"] == 0
     assert result["items"][0]["removed_signals"] == []
+
+
+@pytest.mark.asyncio
+async def test_pending_signal_reconciliation_returns_stable_next_cursor():
+    documents = [
+        {"_id": ObjectId("1" * 24), "motivation": {
+            "signals": ["possible_deceased"],
+            "details": [{"signals": ["possible_deceased"],
+                         "review_status": "needs_review"}]}},
+        {"_id": ObjectId("2" * 24), "motivation": {
+            "signals": ["probate_confirmed"],
+            "details": [{"signals": ["probate_confirmed"],
+                         "review_status": "needs_review"}]}},
+    ]
+    collection = SimpleNamespace(
+        find=Mock(return_value=AsyncDocuments(documents)),
+        update_one=AsyncMock(),
+    )
+    result = await reconcile_pending_signals_batch(
+        SimpleNamespace(deal_finder_leads=collection), limit=1)
+    assert result["scanned"] == 1
+    assert result["has_more"] is True
+    assert result["next_after_lead_id"] == "1" * 24
+
+
+@pytest.mark.asyncio
+async def test_pending_signal_reconciliation_applies_cursor_to_query():
+    collection = SimpleNamespace(
+        find=Mock(return_value=AsyncDocuments([])),
+        update_one=AsyncMock(),
+    )
+    result = await reconcile_pending_signals_batch(
+        SimpleNamespace(deal_finder_leads=collection),
+        limit=10, after_lead_id="2" * 24)
+    query = collection.find.call_args.args[0]
+    assert query["_id"] == {"$gt": ObjectId("2" * 24)}
+    assert result["has_more"] is False
+    assert result["next_after_lead_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_pending_signal_reconciliation_rejects_invalid_cursor():
+    collection = SimpleNamespace(find=Mock())
+    with pytest.raises(ValueError, match="reconciliation_cursor_invalid"):
+        await reconcile_pending_signals_batch(
+            SimpleNamespace(deal_finder_leads=collection),
+            after_lead_id="not-an-object-id")
+    collection.find.assert_not_called()
 
 
 @pytest.mark.parametrize("limit", [0, 501])
