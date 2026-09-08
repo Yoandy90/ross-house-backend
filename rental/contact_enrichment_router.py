@@ -25,7 +25,7 @@ from pydantic import BaseModel, Field
 from rental.shared import get_db, auth_admin
 from rental.opportunity_evidence import (
     add_evidence_atomic, address_probe, evidence_detail, evidence_id,
-    get_evidence_review_history,
+    get_evidence_review_history, get_signal_reconciliation_history,
     parse_public_records_response,
     parse_obituary_response,
     validate_radar_results,
@@ -697,6 +697,23 @@ async def opportunity_action_queue(
         raise HTTPException(422, str(exc))
     rows = await get_db().deal_finder_leads.aggregate(pipeline).to_list(length=1)
     return serialize_action_queue(rows)
+
+
+@router.get("/admin/deal-finder/leads/{lead_id}/reconciliation-history")
+async def opportunity_signal_reconciliation_history(
+    request: Request, lead_id: str,
+    limit: int = Query(default=50, ge=1, le=50),
+):
+    """Return the sanitized audit trail for automatic signal removals."""
+    await auth_admin(request)
+    try:
+        oid = ObjectId(lead_id)
+    except Exception:
+        raise HTTPException(422, "lead_id inválido")
+    result = await get_signal_reconciliation_history(get_db(), oid, limit=limit)
+    if result is None:
+        raise HTTPException(404, "Oportunidad no encontrada")
+    return result
 
 
 @router.get("/admin/deal-finder/leads/{lead_id}/evidence/{evidence_id_value}/history")

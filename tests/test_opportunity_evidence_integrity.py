@@ -778,6 +778,58 @@ async def test_pending_signal_reconciliation_rejects_unbounded_limits(limit):
     collection.find.assert_not_called()
 
 
+@pytest.mark.asyncio
+async def test_reconciliation_history_is_newest_first_bounded_and_sanitized():
+    lead_id = ObjectId("1" * 24)
+    raw = [
+        {"reconciliation_id": "a" * 32, "signal": "possible_deceased",
+         "removed_at": "2026-09-08T15:00:00+00:00", "removed_by": "admin-1",
+         "note": "first", "private": "must-not-leak"},
+        {"reconciliation_id": "b" * 32, "signal": "probate_confirmed",
+         "removed_at": "2026-09-08T16:00:00+00:00", "removed_by": "admin-2",
+         "note": "second"},
+        {"signal": "malformed"},
+    ]
+    collection = SimpleNamespace(find_one=AsyncMock(return_value={
+        "_id": lead_id, "motivation": {"reconciliation_history": raw}}))
+    result = await get_signal_reconciliation_history(
+        SimpleNamespace(deal_finder_leads=collection), lead_id, limit=1)
+    assert result == {
+        "lead_id": str(lead_id), "total": 2,
+        "events": [{
+            "reconciliation_id": "b" * 32,
+            "signal": "probate_confirmed",
+            "removed_at": "2026-09-08T16:00:00+00:00",
+            "removed_by": "admin-2",
+            "note": "second",
+        }],
+    }
+    assert "private" not in result["events"][0]
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_history_handles_missing_lead_and_invalid_container():
+    lead_id = ObjectId("1" * 24)
+    collection = SimpleNamespace(find_one=AsyncMock(side_effect=[
+        None, {"_id": lead_id, "motivation": {"reconciliation_history": "bad"}},
+    ]))
+    db = SimpleNamespace(deal_finder_leads=collection)
+    assert await get_signal_reconciliation_history(db, lead_id) is None
+    assert await get_signal_reconciliation_history(db, lead_id) == {
+        "lead_id": str(lead_id), "total": 0, "events": []}
+
+
+@pytest.mark.parametrize("limit", [0, 51])
+@pytest.mark.asyncio
+async def test_reconciliation_history_rejects_invalid_limit_before_read(limit):
+    collection = SimpleNamespace(find_one=AsyncMock())
+    with pytest.raises(ValueError, match="history_limit_invalid"):
+        await get_signal_reconciliation_history(
+            SimpleNamespace(deal_finder_leads=collection),
+            ObjectId("1" * 24), limit=limit)
+    collection.find_one.assert_not_awaited()
+
+
 @pytest.mark.parametrize("evidence,status", [
     ("bad", "confirmed"), ("a" * 24, "approved"),
 ])
@@ -865,6 +917,8 @@ def test_all_opportunity_sources_use_verified_atomic_evidence_boundary():
     assert "serialize_obituary_ambiguities(" in source
     assert '@router.post("/admin/deal-finder/evidence/reconcile-signals")' in source
     assert "reconcile_pending_signals_batch(" in source
+    assert '@router.get("/admin/deal-finder/leads/{lead_id}/reconciliation-history")' in source
+    assert "get_signal_reconciliation_history(" in source
     assert "_find_verified_address_lead(db, addr)" in source
     assert ").limit(10)" in source
     assert '{"$set": {"motivation": motivation}}' not in source
