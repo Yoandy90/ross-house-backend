@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from bson import ObjectId
@@ -15,6 +15,7 @@ from rental.opportunity_evidence import (
     match_address, match_person, obituary_source_allowed, person_tokens,
     match_obituary, obituary_owner_identity, resolve_obituary_candidates,
     resolve_obituary_ambiguity_atomic, serialize_obituary_ambiguities,
+    pending_only_active_signals, reconcile_pending_signals_batch,
     review_evidence_atomic, serialize_evidence_review_history,
 )
 
@@ -596,6 +597,111 @@ async def test_reopen_review_keeps_signal_inactive_until_confirmed():
     assert update == {"$pull": {"motivation.signals": "possible_deceased"}}
 
 
+def test_pending_signal_reconciliation_preserves_confirmed_and_legacy_support():
+    document = {"motivation": {
+        "signals": ["possible_deceased", "probate_confirmed", "eviction_filed", "manual"],
+        "details": [
+            {"source": "obituary", "signals": ["possible_deceased"],
+             "review_status": "needs_review"},
+            {"source": "probate"},
+            {"source": "eviction", "signals": ["eviction_filed"],
+             "review_status": "confirmed"},
+        ],
+    }}
+    assert pending_only_active_signals(document) == ["possible_deceased"]
+
+
+@pytest.mark.parametrize("motivation", [None, [], {"signals": "probate"},
+                                          {"signals": ["probate"], "details": {}}])
+def test_pending_signal_reconciliation_ignores_malformed_legacy_containers(motivation):
+    assert pending_only_active_signals({"motivation": motivation}) == []
+
+
+class AsyncDocuments:
+    def __init__(self, documents):
+        self.documents = documents
+    def sort(self, *args):
+        return self
+    def limit(self, limit):
+        self.documents = self.documents[:limit]
+        return self
+    def __aiter__(self):
+        self.iterator = iter(self.documents)
+        return self
+    async def __anext__(self):
+        try:
+            return next(self.iterator)
+        except StopIteration:
+            raise StopAsyncIteration
+
+
+@pytest.mark.asyncio
+async def test_pending_signal_reconciliation_previews_without_writes():
+    collection = SimpleNamespace(
+        find=lambda *args: AsyncDocuments([{
+            "_id": ObjectId("1" * 24), "motivation": {
+                "signals": ["possible_deceased"],
+                "details": [{"signals": ["possible_deceased"],
+                             "review_status": "needs_review"}],
+            }}]),
+        update_one=AsyncMock(),
+    )
+    result = await reconcile_pending_signals_batch(
+        SimpleNamespace(deal_finder_leads=collection), limit=10)
+    assert result == {"mode": "preview", "scanned": 1, "affected": 1,
+                      "removed": 0, "items": [{"lead_id": "1" * 24,
+                      "candidate_signals": ["possible_deceased"],
+                      "removed_signals": []}]}
+    collection.update_one.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_pending_signal_reconciliation_apply_rechecks_confirmation_atomically():
+    document = {"_id": ObjectId("1" * 24), "motivation": {
+        "signals": ["possible_deceased"],
+        "details": [{"signals": ["possible_deceased"],
+                     "review_status": "needs_review"}],
+    }}
+    collection = SimpleNamespace(
+        find=lambda *args: AsyncDocuments([document]),
+        update_one=AsyncMock(return_value=SimpleNamespace(modified_count=1)),
+    )
+    result = await reconcile_pending_signals_batch(
+        SimpleNamespace(deal_finder_leads=collection), limit=10, apply=True)
+    assert result["mode"] == "applied" and result["removed"] == 1
+    query, update = collection.update_one.await_args.args
+    assert query["$and"][0]["motivation.details"]["$not"]["$elemMatch"] == {
+        "signals": "possible_deceased", "review_status": "confirmed"}
+    assert update == {"$pull": {"motivation.signals": "possible_deceased"}}
+
+
+@pytest.mark.asyncio
+async def test_pending_signal_reconciliation_reports_concurrent_confirmation_as_not_removed():
+    document = {"_id": ObjectId("1" * 24), "motivation": {
+        "signals": ["possible_deceased"],
+        "details": [{"signals": ["possible_deceased"],
+                     "review_status": "needs_review"}],
+    }}
+    collection = SimpleNamespace(
+        find=lambda *args: AsyncDocuments([document]),
+        update_one=AsyncMock(return_value=SimpleNamespace(modified_count=0)),
+    )
+    result = await reconcile_pending_signals_batch(
+        SimpleNamespace(deal_finder_leads=collection), limit=10, apply=True)
+    assert result["removed"] == 0
+    assert result["items"][0]["removed_signals"] == []
+
+
+@pytest.mark.parametrize("limit", [0, 501])
+@pytest.mark.asyncio
+async def test_pending_signal_reconciliation_rejects_unbounded_limits(limit):
+    collection = SimpleNamespace(find=Mock())
+    with pytest.raises(ValueError, match="reconciliation_limit_invalid"):
+        await reconcile_pending_signals_batch(
+            SimpleNamespace(deal_finder_leads=collection), limit=limit)
+    collection.find.assert_not_called()
+
+
 @pytest.mark.parametrize("evidence,status", [
     ("bad", "confirmed"), ("a" * 24, "approved"),
 ])
@@ -681,6 +787,8 @@ def test_all_opportunity_sources_use_verified_atomic_evidence_boundary():
     assert '@router.post("/admin/deal-finder/obituary-ambiguities/{ambiguity_id}/resolve")' in source
     assert "resolve_obituary_ambiguity_atomic(" in source
     assert "serialize_obituary_ambiguities(" in source
+    assert '@router.post("/admin/deal-finder/evidence/reconcile-signals")' in source
+    assert "reconcile_pending_signals_batch(" in source
     assert "_find_verified_address_lead(db, addr)" in source
     assert ").limit(10)" in source
     assert '{"$set": {"motivation": motivation}}' not in source

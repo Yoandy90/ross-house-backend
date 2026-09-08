@@ -32,6 +32,7 @@ from rental.opportunity_evidence import (
     match_address, match_person, obituary_source_allowed, person_tokens,
     resolve_obituary_candidates,
     resolve_obituary_ambiguity_atomic, serialize_obituary_ambiguities,
+    reconcile_pending_signals_batch,
     review_evidence_atomic,
 )
 from rental.opportunity_evidence_queue import (
@@ -416,7 +417,8 @@ class MotivationScanBody(BaseModel):
 async def motivation_scan(request: Request, body: MotivationScanBody):
     """NIVEL 3: consulta PropertyRadar (Purchase=0, modo preview — sin cargos por
     registro completo) y cruza los resultados con tus leads por dirección.
-    A los que coinciden les marca las señales de motivación."""
+    Las coincidencias crean evidencia pendiente de revisión; solo una confirmación
+    administrativa activa las señales de motivación."""
     await auth_admin(request)
     key = os.environ.get("PROPERTYRADAR_API_KEY")
     if not key:
@@ -611,6 +613,11 @@ class ObituaryAmbiguityResolutionBody(BaseModel):
     lead_id: str = Field(min_length=24, max_length=24, pattern=r"^[0-9a-f]{24}$")
 
 
+class EvidenceSignalReconciliationBody(BaseModel):
+    apply: bool = False
+    limit: int = Field(default=100, ge=1, le=500)
+
+
 @router.get("/admin/deal-finder/evidence-queue")
 async def opportunity_evidence_queue(
     request: Request,
@@ -653,6 +660,17 @@ async def bulk_review_opportunity_evidence(
         get_db(), [item.model_dump() for item in body.items], body.status,
         reviewer_id, note=body.note)
     return {"success": result["reviewed"] > 0, **result}
+
+
+@router.post("/admin/deal-finder/evidence/reconcile-signals")
+async def reconcile_opportunity_evidence_signals(
+    request: Request, body: EvidenceSignalReconciliationBody,
+):
+    """Preview by default; applying removes only unsupported active signals."""
+    await auth_admin(request)
+    result = await reconcile_pending_signals_batch(
+        get_db(), limit=body.limit, apply=body.apply)
+    return {"success": True, **result}
 
 
 @router.get("/admin/deal-finder/action-queue")
