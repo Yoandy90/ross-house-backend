@@ -1376,6 +1376,18 @@ async def send_offer_link(request: Request, lead_id: str, body: OfferSendBody):
     offer = doc.get("offer") or {}
     if not offer.get("slug"):
         raise HTTPException(400, "Primero genera el link de la oferta")
+    normalized_to = (to.lower() if body.channel == "email"
+                     else re.sub(r"\D", "", to)[-10:])
+    delivery_version = hashlib.sha256(json.dumps({
+        "slug": offer.get("slug"), "mode": offer.get("mode"),
+        "amount": offer.get("amount"), "expires_at": offer.get("expires_at"),
+    }, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()[:24]
+    for previous in offer.get("sent_history") or []:
+        previous_to = (str(previous.get("to") or "").lower() if body.channel == "email"
+                       else re.sub(r"\D", "", str(previous.get("to") or ""))[-10:])
+        if (previous.get("channel") == body.channel and previous_to == normalized_to and
+                previous.get("delivery_version") == delivery_version):
+            raise HTTPException(409, "Esta versión de la oferta ya fue enviada a ese destinatario")
 
     # 🛡️ Bloqueo automático DNC (TCPA): SMS a números en No-Llamar requiere PIN
     if body.channel == "sms":
@@ -1415,14 +1427,54 @@ async def send_offer_link(request: Request, lead_id: str, body: OfferSendBody):
     amount_txt_es = f"${amount:,.0f} en efectivo" if offer.get("mode") == "amount" and amount else "una oferta en efectivo"
     amount_txt_en = f"${amount:,.0f} cash" if offer.get("mode") == "amount" and amount else "a cash offer"
 
+    now = datetime.now(timezone.utc)
+    import secrets as _delivery_secrets
+    claim_token = _delivery_secrets.token_hex(16)
+    duplicate_match = {
+        "channel": body.channel, "normalized_to": normalized_to,
+        "delivery_version": delivery_version,
+    }
+    claim = await db.deal_finder_leads.update_one({
+        "_id": doc["_id"],
+        "offer.sent_history": {"$not": {"$elemMatch": duplicate_match}},
+        "$or": [
+            {"offer_send_claim": {"$exists": False}},
+            {"offer_send_claim.expires_at": {"$lte": now},
+             "offer_send_claim.provider_started_at": {"$exists": False}},
+        ],
+    }, {"$set": {"offer_send_claim": {
+        "token": claim_token, **duplicate_match,
+        "expires_at": now + timedelta(minutes=5),
+    }}})
+    if claim.modified_count != 1:
+        current = await db.deal_finder_leads.find_one({"_id": doc["_id"]}) or {}
+        for previous in (current.get("offer") or {}).get("sent_history") or []:
+            if all(previous.get(k) == v for k, v in duplicate_match.items()):
+                raise HTTPException(409, "Esta versión de la oferta ya fue enviada a ese destinatario")
+        active = current.get("offer_send_claim") or {}
+        if active.get("provider_started_at"):
+            raise HTTPException(409, "Un envío anterior quedó pendiente de verificación; no se enviará otro automáticamente")
+        raise HTTPException(409, "Ya hay un envío de oferta en curso para esta oportunidad")
+
+    async def mark_provider_started():
+        provider_started = await db.deal_finder_leads.update_one(
+            {"_id": doc["_id"], "offer_send_claim.token": claim_token},
+            {"$set": {"offer_send_claim.provider_started_at": datetime.now(timezone.utc)}})
+        if provider_started.modified_count != 1:
+            raise HTTPException(409, "No se pudo reservar el envío de forma segura")
+
     sent_ok = False
     if body.channel == "sms":
         sms_body = (f"Hola {first}, soy Yoandy de Ross House Rentals (Dumas, TX). "
                     f"Le ofrecemos {amount_txt_es} por {addr}. Vea los detalles y responda aqui: {url} "
                     f"/ Hi {first}, we're offering {amount_txt_en} for your property. Details: {url}")
         from rental.service_providers_router import _send_sms
+        await mark_provider_started()
         sent_ok = await _send_sms(to, sms_body)
         if not sent_ok:
+            await db.deal_finder_leads.update_one(
+                {"_id": doc["_id"], "offer_send_claim.token": claim_token},
+                {"$unset": {"offer_send_claim": ""}})
             raise HTTPException(502, "No se pudo enviar el SMS — verifica las llaves de Twilio en Configuración → API Keys")
     else:
         cfg = await db.rental_config.find_one({"type": "company"}) or {}
@@ -1444,18 +1496,28 @@ async def send_offer_link(request: Request, lead_id: str, body: OfferSendBody):
         </div>"""
         plain = f"Ross House Rentals: le ofrecemos {amount_txt_es} por {addr}. Vea y responda: {url}"
         from rental.ai_brain_router import _send_email_branded
+        await mark_provider_started()
         sent_ok = await _send_email_branded(to, f"💰 Oferta en efectivo por {addr} — Ross House Rentals", html, plain)
         if not sent_ok:
+            await db.deal_finder_leads.update_one(
+                {"_id": doc["_id"], "offer_send_claim.token": claim_token},
+                {"$unset": {"offer_send_claim": ""}})
             raise HTTPException(502, "No se pudo enviar el email — verifica SendGrid en Configuración → API Keys")
 
-    entry = {"channel": body.channel, "to": to, "at": datetime.now(timezone.utc).isoformat()}
+    entry = {"channel": body.channel, "to": to, "normalized_to": normalized_to,
+             "delivery_version": delivery_version,
+             "at": datetime.now(timezone.utc).isoformat()}
     if body.channel == "sms" and isinstance(sent_ok, str):
         entry["sid"] = sent_ok
         entry["status"] = "accepted"
-    upd = {"$push": {"offer.sent_history": entry}}
+    upd = {"$push": {"offer.sent_history": entry},
+           "$unset": {"offer_send_claim": ""}}
     if doc.get("status") in (None, "", "new", "contacted"):
         upd["$set"] = {"status": "offer_sent"}
-    await db.deal_finder_leads.update_one({"_id": doc["_id"]}, upd)
+    saved = await db.deal_finder_leads.update_one(
+        {"_id": doc["_id"], "offer_send_claim.token": claim_token}, upd)
+    if saved.modified_count != 1:
+        raise HTTPException(503, "El proveedor aceptó el envío, pero el historial local requiere verificación")
     return {"success": True, "sent": entry}
 
 
