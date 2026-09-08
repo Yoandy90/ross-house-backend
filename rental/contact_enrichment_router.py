@@ -618,6 +618,7 @@ class EvidenceSignalReconciliationBody(BaseModel):
     limit: int = Field(default=100, ge=1, le=500)
     after_lead_id: Optional[str] = Field(
         default=None, min_length=24, max_length=24, pattern=r"^[0-9a-f]{24}$")
+    note: str = Field(default="", max_length=500)
 
 
 @router.get("/admin/deal-finder/evidence-queue")
@@ -669,10 +670,14 @@ async def reconcile_opportunity_evidence_signals(
     request: Request, body: EvidenceSignalReconciliationBody,
 ):
     """Preview by default; applying removes only unsupported active signals."""
-    await auth_admin(request)
-    result = await reconcile_pending_signals_batch(
-        get_db(), limit=body.limit, apply=body.apply,
-        after_lead_id=body.after_lead_id)
+    admin = await auth_admin(request)
+    actor_id = str(admin.get("id") or admin.get("_id") or "")
+    try:
+        result = await reconcile_pending_signals_batch(
+            get_db(), limit=body.limit, apply=body.apply,
+            after_lead_id=body.after_lead_id, actor_id=actor_id, note=body.note)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc))
     return {"success": True, **result}
 
 
