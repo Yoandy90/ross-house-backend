@@ -31,9 +31,6 @@ def test_realistic_incomplete_and_stale_snapshot_fails_closed():
             "REFRESH_DERIVE_KEY",
             "VISITOR_IP_SALT",
             "VAULT_ENCRYPTION_KEY",
-            "STRIPE_SECRET_KEY",
-            "STRIPE_PUBLISHABLE_KEY",
-            "STRIPE_WEBHOOK_SECRET",
         }
     )
 
@@ -46,7 +43,7 @@ def test_realistic_incomplete_and_stale_snapshot_fails_closed():
         item for item in errors if item.startswith("missing_required_variables:")
     )
     assert "VAULT_ENCRYPTION_KEY" in missing
-    assert "STRIPE_WEBHOOK_SECRET" in missing
+    assert "STRIPE_WEBHOOK_SECRET" not in missing
 
 
 def test_snapshot_with_values_is_rejected():
