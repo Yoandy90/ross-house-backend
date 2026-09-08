@@ -479,6 +479,7 @@ try:
     from rental.zelle_router import router as zelle_router
     from rental.client_radar_router import router as client_radar_router
     from rental.helcim_vault_router import router as helcim_vault_router
+    from rental.helcim_reporting_router import router as helcim_reporting_router
     from rental.manual_confirmations_router import router as manual_confirmations_router
 
     app.include_router(auth_router, prefix="/api")
@@ -551,6 +552,7 @@ try:
     app.include_router(zelle_router, prefix="/api")
     app.include_router(client_radar_router, prefix="/api")
     app.include_router(helcim_vault_router, prefix="/api")
+    app.include_router(helcim_reporting_router, prefix="/api")
     app.include_router(manual_confirmations_router, prefix="/api")
     app.include_router(property_taxes_router, prefix="/api")
     app.include_router(admin_nav_router, prefix="/api")
