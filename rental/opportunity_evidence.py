@@ -226,21 +226,34 @@ async def add_evidence_atomic(db, lead_id, signal: str | list[str], detail: dict
 def serialize_evidence_review_history(evidence: dict) -> dict:
     """Return a bounded admin-safe timeline without reviewer identifiers."""
     history = []
-    for index, raw in enumerate(evidence.get("review_history") or []):
-        if not isinstance(raw, dict) or raw.get("status") not in _REVIEW_STATUSES:
+    events = evidence.get("review_history")
+    events = events if isinstance(events, list) else []
+    for index, raw in enumerate(events):
+        if (not isinstance(raw, dict) or not isinstance(raw.get("status"), str)
+                or raw["status"] not in _REVIEW_STATUSES):
             continue
         at = str(raw.get("at") or "")[:50]
-        if not at:
-            continue
+        try:
+            instant = datetime.fromisoformat(at.replace("Z", "+00:00"))
+            if instant.tzinfo is None:
+                raise ValueError("timezone_required")
+            instant = instant.astimezone(timezone.utc)
+        except (ValueError, OverflowError):
+            instant = datetime.min.replace(tzinfo=timezone.utc)
+            at = "unknown"
+        else:
+            at = instant.isoformat()
         history.append({
             "status": raw["status"],
             "at": at,
             "note": str(raw.get("note") or "").strip()[:500],
             "_index": index,
+            "_instant": instant,
         })
-    history.sort(key=lambda item: (item["at"], item["_index"]), reverse=True)
+    history.sort(key=lambda item: (item["_instant"], item["_index"]), reverse=True)
     for item in history:
         item.pop("_index", None)
+        item.pop("_instant", None)
     return {
         "evidence_id": str(evidence.get("evidence_id") or "")[:50],
         "current_status": evidence.get("review_status")
