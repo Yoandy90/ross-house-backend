@@ -618,19 +618,28 @@ def pending_only_active_signals(document: dict) -> list[str]:
     return sorted(current & managed - confirmed)
 
 
-async def reconcile_pending_signals_batch(db, *, limit: int = 100,
-                                          apply: bool = False) -> dict:
-    """Preview or safely remove signals backed only by pending/dismissed evidence."""
+async def reconcile_pending_signals_batch(
+    db, *, limit: int = 100, apply: bool = False,
+    after_lead_id: str | None = None,
+) -> dict:
+    """Preview or safely remove one stable page of unsupported active signals."""
     if not 1 <= limit <= 500:
         raise ValueError("opportunity_signal_reconciliation_limit_invalid")
-    cursor = db.deal_finder_leads.find(
-        {"motivation.signals": {"$type": "array"},
-         "motivation.details": {"$elemMatch": {"signals": {"$type": "array"}}}},
-        {"motivation": 1},
-    ).sort("_id", 1).limit(limit)
+    if after_lead_id is not None and not ObjectId.is_valid(after_lead_id):
+        raise ValueError("opportunity_signal_reconciliation_cursor_invalid")
+    query = {
+        "motivation.signals": {"$type": "array"},
+        "motivation.details": {"$elemMatch": {"signals": {"$type": "array"}}},
+    }
+    if after_lead_id is not None:
+        query["_id"] = {"$gt": ObjectId(after_lead_id)}
+    cursor = db.deal_finder_leads.find(query, {"motivation": 1}).sort(
+        "_id", 1).limit(limit + 1)
     documents = [document async for document in cursor]
+    has_more = len(documents) > limit
+    page = documents[:limit]
     items, removed_total = [], 0
-    for document in documents:
+    for document in page:
         candidates = pending_only_active_signals(document)
         if not candidates:
             continue
@@ -657,5 +666,7 @@ async def reconcile_pending_signals_batch(db, *, limit: int = 100,
         items.append({"lead_id": str(document["_id"]),
                       "candidate_signals": candidates,
                       "removed_signals": removed})
-    return {"mode": "applied" if apply else "preview", "scanned": len(documents),
-            "affected": len(items), "removed": removed_total, "items": items[:500]}
+    next_after_lead_id = str(page[-1]["_id"]) if has_more and page else None
+    return {"mode": "applied" if apply else "preview", "scanned": len(page),
+            "affected": len(items), "removed": removed_total, "items": items,
+            "has_more": has_more, "next_after_lead_id": next_after_lead_id}
