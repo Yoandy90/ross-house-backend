@@ -618,10 +618,26 @@ def pending_only_active_signals(document: dict) -> list[str]:
     return sorted(current & managed - confirmed)
 
 
+def reconciliation_preview_digest(
+    documents: list[dict], *, after_lead_id: str | None, limit: int,
+) -> str:
+    """Bind an apply request to the exact reviewed page and candidates."""
+    candidates = []
+    for document in documents:
+        signals = pending_only_active_signals(document)
+        if signals:
+            candidates.append({"lead_id": str(document["_id"]), "signals": signals})
+    payload = {"after_lead_id": after_lead_id, "limit": limit,
+               "candidates": candidates}
+    canonical = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 async def reconcile_pending_signals_batch(
     db, *, limit: int = 100, apply: bool = False,
     after_lead_id: str | None = None, actor_id: str = "", note: str = "",
-    now: datetime | None = None,
+    expected_preview_digest: str | None = None, now: datetime | None = None,
 ) -> dict:
     """Preview or safely remove one stable, attributable page of signals."""
     if not 1 <= limit <= 500:
@@ -634,6 +650,11 @@ async def reconcile_pending_signals_batch(
         raise ValueError("opportunity_signal_reconciliation_actor_invalid")
     if apply and (not clean_note or len(clean_note) > 500):
         raise ValueError("opportunity_signal_reconciliation_note_invalid")
+    if apply and (
+        not isinstance(expected_preview_digest, str)
+        or re.fullmatch(r"[0-9a-f]{64}", expected_preview_digest) is None
+    ):
+        raise ValueError("opportunity_signal_reconciliation_preview_required")
     reconciliation_id = secrets.token_hex(16) if apply else None
     reconciled_at = (now or datetime.now(timezone.utc)).isoformat()
     query = {
@@ -647,6 +668,10 @@ async def reconcile_pending_signals_batch(
     documents = [document async for document in cursor]
     has_more = len(documents) > limit
     page = documents[:limit]
+    preview_digest = reconciliation_preview_digest(
+        page, after_lead_id=after_lead_id, limit=limit)
+    if apply and expected_preview_digest != preview_digest:
+        raise ValueError("opportunity_signal_reconciliation_preview_stale")
     items, removed_total = [], 0
     for document in page:
         candidates = pending_only_active_signals(document)
@@ -689,7 +714,8 @@ async def reconcile_pending_signals_batch(
     return {"mode": "applied" if apply else "preview", "scanned": len(page),
             "affected": len(items), "removed": removed_total, "items": items,
             "has_more": has_more, "next_after_lead_id": next_after_lead_id,
-            "reconciliation_id": reconciliation_id}
+            "reconciliation_id": reconciliation_id,
+            "preview_digest": preview_digest}
 
 
 async def get_signal_reconciliation_history(
