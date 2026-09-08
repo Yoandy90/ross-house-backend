@@ -607,6 +607,8 @@ class BulkEvidenceReviewBody(BaseModel):
     items: list[BulkEvidenceItem] = Field(min_length=1, max_length=50)
     status: Literal["needs_review", "confirmed", "dismissed"]
     note: str = Field(default="", max_length=500)
+    expected_preview_digest: Optional[str] = Field(
+        default=None, min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
 
 
 class ObituaryAmbiguityResolutionBody(BaseModel):
@@ -675,7 +677,8 @@ async def reconcile_opportunity_evidence_signals(
     try:
         result = await reconcile_pending_signals_batch(
             get_db(), limit=body.limit, apply=body.apply,
-            after_lead_id=body.after_lead_id, actor_id=actor_id, note=body.note)
+            after_lead_id=body.after_lead_id, actor_id=actor_id, note=body.note,
+            expected_preview_digest=body.expected_preview_digest)
     except ValueError as exc:
         raise HTTPException(422, str(exc))
     return {"success": True, **result}
