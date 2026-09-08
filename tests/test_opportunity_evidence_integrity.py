@@ -652,7 +652,7 @@ async def test_pending_signal_reconciliation_previews_without_writes():
                       "removed": 0, "items": [{"lead_id": "1" * 24,
                       "candidate_signals": ["possible_deceased"],
                       "removed_signals": []}], "has_more": False,
-                      "next_after_lead_id": None}
+                      "next_after_lead_id": None, "reconciliation_id": None}
     collection.update_one.assert_not_awaited()
 
 
@@ -668,12 +668,22 @@ async def test_pending_signal_reconciliation_apply_rechecks_confirmation_atomica
         update_one=AsyncMock(return_value=SimpleNamespace(modified_count=1)),
     )
     result = await reconcile_pending_signals_batch(
-        SimpleNamespace(deal_finder_leads=collection), limit=10, apply=True)
+        SimpleNamespace(deal_finder_leads=collection), limit=10, apply=True,
+        actor_id="admin-7", note="remove unsupported legacy signal", now=NOW)
     assert result["mode"] == "applied" and result["removed"] == 1
     query, update = collection.update_one.await_args.args
     assert query["$and"][0]["motivation.details"]["$not"]["$elemMatch"] == {
         "signals": "possible_deceased", "review_status": "confirmed"}
-    assert update == {"$pull": {"motivation.signals": "possible_deceased"}}
+    assert update["$pull"] == {"motivation.signals": "possible_deceased"}
+    event = update["$push"]["motivation.reconciliation_history"]["$each"][0]
+    assert event == {
+        "reconciliation_id": result["reconciliation_id"],
+        "signal": "possible_deceased",
+        "removed_at": NOW.isoformat(),
+        "removed_by": "admin-7",
+        "note": "remove unsupported legacy signal",
+    }
+    assert update["$push"]["motivation.reconciliation_history"]["$slice"] == -50
 
 
 @pytest.mark.asyncio
@@ -688,9 +698,26 @@ async def test_pending_signal_reconciliation_reports_concurrent_confirmation_as_
         update_one=AsyncMock(return_value=SimpleNamespace(modified_count=0)),
     )
     result = await reconcile_pending_signals_batch(
-        SimpleNamespace(deal_finder_leads=collection), limit=10, apply=True)
+        SimpleNamespace(deal_finder_leads=collection), limit=10, apply=True,
+        actor_id="admin-7", note="remove unsupported legacy signal", now=NOW)
     assert result["removed"] == 0
     assert result["items"][0]["removed_signals"] == []
+
+
+@pytest.mark.parametrize("actor,note,error", [
+    ("", "reason", "actor_invalid"),
+    ("admin-7", "", "note_invalid"),
+    ("admin-7", "x" * 501, "note_invalid"),
+])
+@pytest.mark.asyncio
+async def test_pending_signal_reconciliation_requires_auditable_apply(
+        actor, note, error):
+    collection = SimpleNamespace(find=Mock())
+    with pytest.raises(ValueError, match=error):
+        await reconcile_pending_signals_batch(
+            SimpleNamespace(deal_finder_leads=collection), apply=True,
+            actor_id=actor, note=note)
+    collection.find.assert_not_called()
 
 
 @pytest.mark.asyncio
