@@ -9,6 +9,7 @@ import secrets
 import unicodedata
 from urllib.parse import urlsplit
 
+from bson import ObjectId
 from pymongo import ReturnDocument
 
 
