@@ -1808,31 +1808,60 @@ class OfferResponseBody(BaseModel):
 async def public_offer_respond(slug: str, body: OfferResponseBody, request: Request):
     if body.action not in ("accept", "counter", "call", "reject"):
         raise HTTPException(422, "Acción inválida")
+    if not math.isfinite(body.price) or body.price < 0:
+        raise HTTPException(422, "Precio inválido")
     if body.action == "counter" and body.price <= 0:
         raise HTTPException(422, "Indica tu precio")
     db = get_db()
     doc = await db.deal_finder_leads.find_one({"offer.slug": slug})
     if not doc:
         raise HTTPException(404, "Oferta no encontrada")
+    offer = doc.get("offer") or {}
+    expires = offer.get("expires_at") or ""
+    now = datetime.now(timezone.utc)
+    try:
+        expires_at = datetime.fromisoformat(expires)
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        raise HTTPException(410, "La oferta venció o ya no está disponible")
+    if expires_at <= now:
+        raise HTTPException(410, "La oferta venció o ya no está disponible")
     response = {
         "action": body.action,
         "price": round(body.price, 2) if body.price else 0,
         "phone": body.phone.strip()[:25],
         "best_time": body.best_time.strip()[:60],
         "message": body.message.strip()[:500],
-        "at": datetime.now(timezone.utc).isoformat(),
+        "at": now.isoformat(),
     }
     new_status = {"accept": "negotiating", "counter": "interested",
                   "call": "contacted", "reject": "discarded"}[body.action]
-    await db.deal_finder_leads.update_one(
-        {"_id": doc["_id"]},
+    saved = await db.deal_finder_leads.update_one(
+        {
+            "_id": doc["_id"],
+            "offer.slug": slug,
+            "offer.expires_at": expires,
+            "$and": [
+                {"$or": [
+                    {"offer.response": {"$exists": False}},
+                    {"offer.response": None},
+                ]},
+                {"offer.expires_at": {"$gt": now.isoformat()}},
+            ],
+        },
         {"$set": {"offer.response": response, "status": new_status}})
+    if saved.modified_count != 1:
+        current = await db.deal_finder_leads.find_one({"_id": doc["_id"]}) or {}
+        current_offer = current.get("offer") or {}
+        if current_offer.get("response"):
+            raise HTTPException(409, "Esta oferta ya tiene una respuesta registrada")
+        raise HTTPException(409, "La oferta cambió mientras respondías; vuelve a abrir el enlace")
 
     # ✅ ACEPTÓ: generar contrato automáticamente (queda guardado en el lead)
     auto_contract_pdf = None
     contract_price = 0.0
     if body.action == "accept":
-        offer = doc.get("offer") or {}
         contract_price = float(offer.get("amount") or 0) or float(body.price or 0)
         if contract_price > 0:
             try:
