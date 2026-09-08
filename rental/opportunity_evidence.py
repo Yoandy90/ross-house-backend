@@ -620,13 +620,22 @@ def pending_only_active_signals(document: dict) -> list[str]:
 
 async def reconcile_pending_signals_batch(
     db, *, limit: int = 100, apply: bool = False,
-    after_lead_id: str | None = None,
+    after_lead_id: str | None = None, actor_id: str = "", note: str = "",
+    now: datetime | None = None,
 ) -> dict:
-    """Preview or safely remove one stable page of unsupported active signals."""
+    """Preview or safely remove one stable, attributable page of signals."""
     if not 1 <= limit <= 500:
         raise ValueError("opportunity_signal_reconciliation_limit_invalid")
     if after_lead_id is not None and not ObjectId.is_valid(after_lead_id):
         raise ValueError("opportunity_signal_reconciliation_cursor_invalid")
+    clean_actor = actor_id.strip() if isinstance(actor_id, str) else ""
+    clean_note = note.strip() if isinstance(note, str) else ""
+    if apply and (not clean_actor or len(clean_actor) > 100):
+        raise ValueError("opportunity_signal_reconciliation_actor_invalid")
+    if apply and (not clean_note or len(clean_note) > 500):
+        raise ValueError("opportunity_signal_reconciliation_note_invalid")
+    reconciliation_id = secrets.token_hex(16) if apply else None
+    reconciled_at = (now or datetime.now(timezone.utc)).isoformat()
     query = {
         "motivation.signals": {"$type": "array"},
         "motivation.details": {"$elemMatch": {"signals": {"$type": "array"}}},
@@ -658,7 +667,17 @@ async def reconcile_pending_signals_batch(
                     {"_id": document["_id"], "motivation.signals": signal,
                      "motivation.details": {"$elemMatch": {"signals": signal}},
                      "$and": conditions},
-                    {"$pull": {"motivation.signals": signal}},
+                    {"$pull": {"motivation.signals": signal},
+                     "$push": {"motivation.reconciliation_history": {
+                         "$each": [{
+                             "reconciliation_id": reconciliation_id,
+                             "signal": signal,
+                             "removed_at": reconciled_at,
+                             "removed_by": clean_actor,
+                             "note": clean_note,
+                         }],
+                         "$slice": -50,
+                     }}},
                 )
                 if result.modified_count == 1:
                     removed.append(signal)
@@ -669,4 +688,5 @@ async def reconcile_pending_signals_batch(
     next_after_lead_id = str(page[-1]["_id"]) if has_more and page else None
     return {"mode": "applied" if apply else "preview", "scanned": len(page),
             "affected": len(items), "removed": removed_total, "items": items,
-            "has_more": has_more, "next_after_lead_id": next_after_lead_id}
+            "has_more": has_more, "next_after_lead_id": next_after_lead_id,
+            "reconciliation_id": reconciliation_id}
