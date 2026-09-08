@@ -30,6 +30,7 @@ from rental.opportunity_evidence import (
     parse_obituary_response,
     validate_radar_results,
     match_address, match_person, obituary_source_allowed, person_tokens,
+    resolve_obituary_candidates,
     review_evidence_atomic,
 )
 from rental.opportunity_evidence_queue import (
@@ -886,11 +887,15 @@ async def obituary_results(request: Request):
     await auth_admin(request)
     db = get_db()
     cfg = await db.admin_config.find_one({"type": "enrichment_config"}) or {}
+    ambiguities = cfg.get("last_obituary_ambiguities")
+    if not isinstance(ambiguities, list):
+        ambiguities = []
     return {
         "last_scan": cfg.get("last_obituary_scan"),
         "count": cfg.get("last_obituary_count", 0),
         "obituaries": cfg.get("last_obituaries", []),
         "matches": cfg.get("last_matches", []),
+        "ambiguities": [item for item in ambiguities[:100] if isinstance(item, dict)],
     }
 
 
@@ -945,7 +950,7 @@ async def run_obituary_scan() -> dict:
 
     # Cruce contra leads: owner_name en CAD viene como "APELLIDO NOMBRE"
     now = datetime.now(timezone.utc).isoformat()
-    matches, new_matches = [], []
+    matches, new_matches, ambiguities = [], [], []
     for o in obits:
         parts = person_tokens(o["name"])
         if len(parts) < 2:
@@ -953,11 +958,18 @@ async def run_obituary_scan() -> dict:
         first, last = parts[0], parts[-1]
         cursor = db.deal_finder_leads.find(
             {"owner_name": {"$regex": f"{re.escape(last)}.*{re.escape(first)}|{re.escape(first)}.*{re.escape(last)}",
-                            "$options": "i"}}).limit(3)
-        async for lead in cursor:
-            verified = match_person(o["name"], lead.get("owner_name") or "")
-            if not verified["matched"]:
-                continue
+                            "$options": "i"}}).limit(50)
+        candidates = [lead async for lead in cursor]
+        resolution = resolve_obituary_candidates(o, candidates)
+        if resolution["ambiguous"]:
+            ambiguities.append({
+                "obituary": {key: o.get(key) for key in ("name", "age", "city", "date", "source_url")},
+                "candidate_count": resolution["candidate_count"],
+                "candidate_addresses": [str(lead.get("address") or "")[:200]
+                                        for lead in resolution["candidate_leads"][:5]],
+            })
+            continue
+        for lead, verified in resolution["matches"]:
             detail = evidence_detail(
                 "obituary", o, verified, source_url=o.get("source_url") or "",
                 now=datetime.now(timezone.utc),
@@ -978,6 +990,7 @@ async def run_obituary_scan() -> dict:
     await db.admin_config.update_one({"type": "enrichment_config"}, {"$set": {
         "type": "enrichment_config", "last_obituary_scan": now,
         "last_obituary_count": len(obits), "last_obituary_matches": len(matches),
+        "last_obituary_ambiguities": ambiguities[:100],
         "last_obituaries": [{k: o.get(k) for k in ("name", "age", "city", "date", "source_url")} for o in obits[:100]],
         "last_matches": [{"lead_id": m["lead_id"], "address": m.get("address"),
                           "owner_name": m.get("owner_name"),
@@ -992,6 +1005,7 @@ async def run_obituary_scan() -> dict:
         errors=len(fetch_errors))
 
     return {"obituaries_found": len(obits), "matches": matches, "new_matches": new_matches,
+            "ambiguities": ambiguities,
             "fetch_errors": fetch_errors,
             "sources": sources,
             "sample": obits[:10]}

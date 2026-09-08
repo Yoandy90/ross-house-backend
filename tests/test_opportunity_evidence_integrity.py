@@ -12,6 +12,7 @@ from rental.opportunity_evidence import (
     parse_obituary_response,
     validate_radar_results,
     match_address, match_person, obituary_source_allowed, person_tokens,
+    match_obituary, obituary_owner_identity, resolve_obituary_candidates,
     review_evidence_atomic, serialize_evidence_review_history,
 )
 
@@ -251,6 +252,79 @@ def test_person_match_rejects_unsafe_false_positives(record, owner, reason):
     assert result["reasons"] == [reason]
 
 
+def obituary_lead(address="305 Bruce Ave, Dumas TX", mailing="PO Box 1",
+                  mailing_city="Dumas"):
+    return {"owner_name": "DOE JANE", "address": address,
+            "mailing_lines": [mailing], "mailing_city": mailing_city,
+            "mailing_state": "TX", "mailing_zip": "79029"}
+
+
+def test_obituary_match_requires_city_when_both_records_have_location():
+    matched = match_obituary({"name": "Jane Doe", "city": "Dumas, Texas"}, obituary_lead())
+    assert matched["matched"] is True and "city_match" in matched["reasons"]
+    mismatch = match_obituary({"name": "Jane Doe", "city": "Amarillo"}, obituary_lead())
+    assert mismatch == {"matched": False, "confidence": 0,
+                        "reasons": ["exact_name_tokens", "city_mismatch"]}
+
+
+def test_obituary_without_location_stays_reviewable_at_lower_confidence():
+    matched = match_obituary({"name": "Jane Doe", "city": ""}, obituary_lead())
+    assert matched["matched"] is True
+    assert matched["confidence"] == 90
+    assert matched["reasons"][-1] == "city_unverified"
+
+
+def test_obituary_resolution_preserves_one_owner_portfolio():
+    leads = [obituary_lead(address="305 Bruce Ave, Dumas TX"),
+             obituary_lead(address="307 Bruce Ave, Dumas TX")]
+    result = resolve_obituary_candidates({"name": "Jane Doe", "city": "Dumas"}, leads)
+    assert result["ambiguous"] is False
+    assert len(result["matches"]) == 2
+    assert obituary_owner_identity(leads[0]) == obituary_owner_identity(leads[1])
+
+
+def test_obituary_resolution_quarantines_distinct_same_name_owners():
+    leads = [obituary_lead(mailing="PO Box 1"), obituary_lead(mailing="PO Box 999")]
+    result = resolve_obituary_candidates({"name": "Jane Doe", "city": "Dumas"}, leads)
+    assert result["matches"] == []
+    assert result["ambiguous"] is True and result["candidate_count"] == 2
+    assert result["candidate_leads"] == leads
+
+
+def test_obituary_identity_keeps_generational_suffixes_distinct():
+    junior = {**obituary_lead(), "owner_name": "DOE JANE JR"}
+    senior = {**obituary_lead(), "owner_name": "DOE JANE SR"}
+    assert obituary_owner_identity(junior) != obituary_owner_identity(senior)
+    result = resolve_obituary_candidates({"name": "Jane Doe", "city": "Dumas"},
+                                         [junior, senior])
+    assert result["ambiguous"] is True and result["candidate_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_obituary_results_exposes_only_bounded_ambiguity_records():
+    import ast
+    source = (Path(__file__).resolve().parents[1] /
+              "rental/contact_enrichment_router.py").read_text()
+    handler = next(node for node in ast.parse(source).body
+                   if isinstance(node, ast.AsyncFunctionDef)
+                   and node.name == "obituary_results")
+    handler.decorator_list = []
+    records = [{"candidate_count": index} for index in range(105)] + ["invalid"]
+    collection = SimpleNamespace(find_one=AsyncMock(return_value={
+        "last_obituary_ambiguities": records,
+    }))
+    env = {
+        "Request": object, "auth_admin": AsyncMock(),
+        "get_db": lambda: SimpleNamespace(admin_config=collection),
+    }
+    module = ast.fix_missing_locations(ast.Module(body=[handler], type_ignores=[]))
+    exec(compile(module, "isolated_obituary_results", "exec"), env)
+    result = await env["obituary_results"](object())
+    assert len(result["ambiguities"]) == 100
+    assert result["ambiguities"][0]["candidate_count"] == 0
+    assert result["ambiguities"][-1]["candidate_count"] == 99
+
+
 def test_address_match_requires_house_number_and_real_street_token():
     assert address_probe("305 N Bruce Avenue, Dumas TX") == ("305", "BRUCE")
     assert match_address("305 N Bruce Avenue", "305 BRUCE AVE, DUMAS TX")["matched"] is True
@@ -455,7 +529,8 @@ def test_all_opportunity_sources_use_verified_atomic_evidence_boundary():
               "rental/contact_enrichment_router.py").read_text()
     assert source.count("add_evidence_atomic(") == 3
     assert "source_not_allowlisted" in source
-    assert "match_person(o[\"name\"]" in source
+    assert "resolve_obituary_candidates(o, candidates)" in source
+    assert ").limit(50)" in source
     assert "_find_verified_address_lead(db, addr)" in source
     assert ").limit(10)" in source
     assert '{"$set": {"motivation": motivation}}' not in source
