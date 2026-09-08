@@ -34,7 +34,7 @@ from typing import Optional
 
 import httpx
 from bson import ObjectId
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
@@ -1761,19 +1761,50 @@ async def contact_search(request: Request, body: ContactSearchBody):
             "credits_used": data.get("credits_deducted", 0)}
 
 
+_OFFER_VISITOR_COOKIE = "rh_offer_visitor"
+_OFFER_VISITOR_RX = re.compile(r"^[A-Za-z0-9_-]{24,64}$")
+
+
+def _offer_visitor_token(request: Request, response: Response) -> str:
+    """Return a pseudonymous browser token without storing IP or user-agent data."""
+    token = (request.cookies.get(_OFFER_VISITOR_COOKIE) or "").strip()
+    if _OFFER_VISITOR_RX.fullmatch(token):
+        return token
+    import secrets as _visit_secrets
+    token = _visit_secrets.token_urlsafe(24)
+    response.set_cookie(
+        _OFFER_VISITOR_COOKIE, token, max_age=365 * 24 * 60 * 60,
+        httponly=True, secure=request.url.scheme == "https", samesite="lax",
+        path="/api/public/oferta",
+    )
+    return token
+
+
 @router.get("/public/oferta/{slug}")
-async def public_offer(slug: str, request: Request):
-    """Página pública del dueño — registra la visita (¡sabemos que recibió la carta!)."""
+async def public_offer(slug: str, request: Request, response: Response):
+    """Página pública del dueño — cuenta una visita por navegador, no por recarga."""
+    response.headers["Cache-Control"] = "no-store"
     db = get_db()
     doc = await db.deal_finder_leads.find_one({"offer.slug": slug})
     if not doc:
         raise HTTPException(404, "Oferta no encontrada")
     offer = doc.get("offer") or {}
-    upd = {"$inc": {"offer.visits": 1},
-           "$set": {"offer.last_visit_at": datetime.now(timezone.utc).isoformat()}}
-    if not offer.get("first_visit_at"):
-        upd["$set"]["offer.first_visit_at"] = datetime.now(timezone.utc).isoformat()
-    await db.deal_finder_leads.update_one({"_id": doc["_id"]}, upd)
+    now = datetime.now(timezone.utc).isoformat()
+    visitor_token = _offer_visitor_token(request, response)
+    visit_key = hashlib.sha256(f"{slug}:{visitor_token}".encode("utf-8")).hexdigest()[:32]
+    counted = await db.deal_finder_leads.update_one(
+        {"_id": doc["_id"], "offer.visit_keys": {"$ne": visit_key}},
+        {
+            "$inc": {"offer.visits": 1},
+            "$set": {"offer.last_visit_at": now},
+            "$push": {"offer.visit_keys": {"$each": [visit_key], "$slice": -256}},
+        },
+    )
+    if counted.modified_count == 1:
+        await db.deal_finder_leads.update_one(
+            {"_id": doc["_id"], "offer.first_visit_at": {"$exists": False}},
+            {"$set": {"offer.first_visit_at": now}},
+        )
     expires = offer.get("expires_at", "")
     expired = False
     try:
