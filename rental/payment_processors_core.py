@@ -1,15 +1,16 @@
-"""Procesadores de Pago — Stripe / Square / Clover.
+"""Procesadores de Pago — Helcim / Stripe / Square / Clover / BofA.
 
 Sistema multi-procesador: el admin guarda las credenciales de cada procesador
 y activa el que quiera usar en cualquier momento (aplica a la app móvil y a la web).
 
-- Stripe  : procesador actual (sincroniza con rental_config type=company).
-- Square  : Hosted Checkout via Payment Links API (connect.squareup[sandbox].com).
-- Clover  : Hosted Checkout via invoicingcheckoutservice.
+- Helcim : procesador predeterminado para nuevas configuraciones de Ross House.
+- Stripe : compatibilidad con configuraciones existentes.
+- Square : Hosted Checkout via Payment Links API (connect.squareup[sandbox].com).
+- Clover : Hosted Checkout via invoicingcheckoutservice.
 
 Colección: rental_config { type: "payment_processors" }
 {
-  active_processor: "stripe" | "square" | "clover",
+  active_processor: "helcim" | "stripe" | "square" | "clover" | "bofa",
   processors: {
     stripe: { publishable_key, secret_key, webhook_secret },
     square: { environment, application_id, access_token, location_id,
@@ -149,7 +150,7 @@ def _sa_sign(fields: dict, secret_key: str) -> str:
 
 async def _get_doc() -> dict:
     doc = await get_db().rental_config.find_one({"type": "payment_processors"}) or {}
-    doc.setdefault("active_processor", "stripe")
+    doc.setdefault("active_processor", "helcim")
     doc.setdefault("processors", {})
     doc.setdefault("three_ds", dict(DEFAULT_3DS))
     for k, v in DEFAULT_3DS.items():
@@ -189,7 +190,7 @@ def _active_creds(cfg: dict) -> dict:
 async def get_active_processor() -> tuple[str, dict]:
     """Helper para otros routers: (nombre, credenciales del entorno activo + environment)."""
     doc = await _get_doc()
-    name = doc.get("active_processor", "stripe")
+    name = doc.get("active_processor", "helcim")
     cfg = doc["processors"].get(name, {})
     creds = dict(_active_creds(cfg))
     creds["environment"] = cfg.get("environment", "sandbox")
@@ -202,7 +203,7 @@ async def get_three_ds_settings() -> dict:
 
 
 def _masked_view(doc: dict) -> dict:
-    out = {"active_processor": doc.get("active_processor", "stripe"),
+    out = {"active_processor": doc.get("active_processor", "helcim"),
            "three_ds": doc.get("three_ds", dict(DEFAULT_3DS)), "processors": {}}
     base = _public_base_url()
     for p in PROCESSORS:
@@ -587,7 +588,7 @@ async def test_processor(name: str, request: Request):
 async def public_payment_processor():
     """La app móvil / web consultan qué procesador está activo (solo campos públicos)."""
     doc = await _get_doc()
-    name = doc.get("active_processor", "stripe")
+    name = doc.get("active_processor", "helcim")
     pcfg = doc["processors"].get(name, {})
     cfg = _active_creds(pcfg)
     env = pcfg.get("environment", "sandbox")
