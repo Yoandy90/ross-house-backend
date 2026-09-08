@@ -7,10 +7,11 @@ environment. It does not authorize or describe a production deployment.
 
 - Create a new staging service/environment. Never repurpose the production service.
 - Use a dedicated MongoDB user and database whose names identify staging.
-- Never copy production JWT, refresh, Stripe, Twilio, SendGrid, or admin tokens.
+- Never copy production JWT, refresh, payment-provider, Twilio, SendGrid, or admin tokens.
 - Keep Twilio and SendGrid credentials empty unless an owner explicitly authorizes
   external delivery and the acknowledgement in the staging template is set.
-- Use Stripe test keys only.
+- Helcim is the planned payment provider. Keep it disabled for initial verification,
+  then configure its developer credentials through the encrypted admin vault only.
 - The public hostname must contain `staging` and use HTTPS.
 - Do not use `taxportal` as the database name.
 
@@ -19,8 +20,8 @@ environment. It does not authorize or describe a production deployment.
 1. Create a new service/environment from backend `main`.
 2. Provision a dedicated MongoDB staging database and least-privilege user.
 3. Start from `.env.staging.example`; do not upload or commit the completed file.
-4. Generate independent random values for every secret field.
-5. Leave all delivery-provider credentials empty for the first verification.
+4. Generate independent random values for every infrastructure secret field.
+5. Leave payment and delivery providers disabled for the first verification.
 6. Before configuring the service, validate the local export:
 
 ```bash
