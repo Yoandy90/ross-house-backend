@@ -585,3 +585,77 @@ async def review_evidence_atomic(db, lead_id, evidence_id_value: str, status: st
                            if item.get("evidence_id") == evidence_id_value), reviewed)
     return {"evidence": final_evidence,
             "signals": final_motivation.get("signals") or []}
+
+
+def pending_only_active_signals(document: dict) -> list[str]:
+    """Find stored signals backed only by unconfirmed modern evidence."""
+    motivation = document.get("motivation")
+    if not isinstance(motivation, dict):
+        return []
+    stored_signals = motivation.get("signals")
+    if not isinstance(stored_signals, list):
+        return []
+    stored_details = motivation.get("details")
+    if not isinstance(stored_details, list):
+        stored_details = []
+    current = {value for value in stored_signals
+               if isinstance(value, str) and value}
+    details = [item for item in stored_details
+               if isinstance(item, dict)]
+    managed, confirmed = set(), set()
+    for detail in details:
+        signals = detail.get("signals")
+        if not isinstance(signals, list):
+            continue
+        clean = {value for value in signals if isinstance(value, str) and value}
+        managed.update(clean)
+        if detail.get("review_status") == "confirmed":
+            confirmed.update(clean)
+    for signal, sources in _LEGACY_SOURCE_BY_SIGNAL.items():
+        if any("signals" not in detail and detail.get("source") in sources
+               for detail in details):
+            confirmed.add(signal)
+    return sorted(current & managed - confirmed)
+
+
+async def reconcile_pending_signals_batch(db, *, limit: int = 100,
+                                          apply: bool = False) -> dict:
+    """Preview or safely remove signals backed only by pending/dismissed evidence."""
+    if not 1 <= limit <= 500:
+        raise ValueError("opportunity_signal_reconciliation_limit_invalid")
+    cursor = db.deal_finder_leads.find(
+        {"motivation.signals": {"$type": "array"},
+         "motivation.details": {"$elemMatch": {"signals": {"$type": "array"}}}},
+        {"motivation": 1},
+    ).sort("_id", 1).limit(limit)
+    documents = [document async for document in cursor]
+    items, removed_total = [], 0
+    for document in documents:
+        candidates = pending_only_active_signals(document)
+        if not candidates:
+            continue
+        removed = []
+        if apply:
+            for signal in candidates:
+                conditions = [{"motivation.details": {"$not": {"$elemMatch": {
+                    "signals": signal, "review_status": "confirmed",
+                }}}}]
+                legacy_sources = _LEGACY_SOURCE_BY_SIGNAL.get(signal, [])
+                if legacy_sources:
+                    conditions.append({"motivation.details": {"$not": {"$elemMatch": {
+                        "signals": {"$exists": False}, "source": {"$in": legacy_sources},
+                    }}}})
+                result = await db.deal_finder_leads.update_one(
+                    {"_id": document["_id"], "motivation.signals": signal,
+                     "motivation.details": {"$elemMatch": {"signals": signal}},
+                     "$and": conditions},
+                    {"$pull": {"motivation.signals": signal}},
+                )
+                if result.modified_count == 1:
+                    removed.append(signal)
+                    removed_total += 1
+        items.append({"lead_id": str(document["_id"]),
+                      "candidate_signals": candidates,
+                      "removed_signals": removed})
+    return {"mode": "applied" if apply else "preview", "scanned": len(documents),
+            "affected": len(items), "removed": removed_total, "items": items[:500]}
