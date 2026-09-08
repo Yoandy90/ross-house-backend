@@ -14,6 +14,7 @@ import sys
 REQUIRED = {
     "ENVIRONMENT", "MONGO_URL", "DB_NAME", "TENANT_JWT_SECRET",
     "JWT_SECRET_KEY", "REFRESH_DERIVE_KEY", "VISITOR_IP_SALT",
+    "VAULT_ENCRYPTION_KEY",
     "REFRESH_TOKENS_ENABLED", "ALLOW_LEGACY_USER_SESSIONS",
     "REQUIRE_SESSION_SID", "STRIPE_SECRET_KEY",
     "STRIPE_PUBLISHABLE_KEY", "STRIPE_WEBHOOK_SECRET",
@@ -21,7 +22,7 @@ REQUIRED = {
 }
 SECRET_KEYS = {
     "TENANT_JWT_SECRET", "JWT_SECRET_KEY", "REFRESH_DERIVE_KEY",
-    "VISITOR_IP_SALT",
+    "VISITOR_IP_SALT", "VAULT_ENCRYPTION_KEY",
 }
 PLACEHOLDER_MARKERS = ("replace", "your-", "staging_user", "staging_password", "staging_cluster")
 PRODUCTION_MARKERS = (
@@ -58,12 +59,15 @@ def validate(values: dict[str, str], template: bool) -> list[str]:
         errors.append("ENVIRONMENT must be staging")
 
     db_name = values.get("DB_NAME", "").lower()
-    if "staging" not in db_name or db_name == "taxportal":
-        errors.append("DB_NAME must identify a dedicated staging database")
+    if db_name != "ross_house_staging":
+        errors.append("DB_NAME must be exactly ross_house_staging")
 
     mongo = values.get("MONGO_URL", "").lower()
-    if "staging" not in mongo or "taxportal" in mongo:
-        errors.append("MONGO_URL must identify staging and must not select taxportal")
+    if not re.search(r"/ross_house_staging(?:\\?|$)", mongo):
+        errors.append("MONGO_URL must select exactly ross_house_staging")
+    forbidden_database_markers = ("taxportal", "ross_tax", "ross_lending", "loans")
+    if any(marker in db_name for marker in forbidden_database_markers):
+        errors.append("DB_NAME contains a forbidden cross-business database marker")
 
     encoded = "\n".join(values.values()).lower()
     for marker in PRODUCTION_MARKERS:

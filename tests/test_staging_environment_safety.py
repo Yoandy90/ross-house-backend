@@ -22,10 +22,31 @@ def test_production_database_and_live_keys_are_rejected():
     values["MONGO_URL"] = "mongodb+srv://user:pass@production/taxportal"
     values["STRIPE_SECRET_KEY"] = "sk_live_forbidden"
     errors = validator.validate(values, template=True)
-    assert any("dedicated staging database" in item for item in errors)
-    assert any("must identify staging" in item for item in errors)
+    assert any("exactly ross_house_staging" in item for item in errors)
+    assert any("select exactly ross_house_staging" in item for item in errors)
+    assert any("forbidden cross-business" in item for item in errors)
     assert any("sk_live_" in item for item in errors)
     assert any("Stripe test key" in item for item in errors)
+
+
+def test_cross_business_database_names_are_rejected():
+    for name in ("ross_tax_staging", "ross_lending_staging", "loans_staging",
+                 "taxportal_staging"):
+        values = template_values()
+        values["DB_NAME"] = name
+        errors = validator.validate(values, template=True)
+        assert any("exactly ross_house_staging" in item for item in errors)
+        assert any("forbidden cross-business" in item for item in errors)
+
+
+def test_mongo_url_must_select_exact_ross_house_database():
+    values = template_values()
+    values["MONGO_URL"] = (
+        "mongodb+srv://STAGING_USER:STAGING_PASSWORD@staging-cluster/"
+        "unrelated_staging?retryWrites=true"
+    )
+    errors = validator.validate(values, template=True)
+    assert any("select exactly ross_house_staging" in item for item in errors)
 
 
 def test_actual_environment_rejects_placeholders_and_unacknowledged_delivery():
@@ -44,6 +65,7 @@ def test_actual_isolated_environment_can_pass():
         "JWT_SECRET_KEY": "admin-" + "b" * 40,
         "REFRESH_DERIVE_KEY": "refresh-" + "c" * 40,
         "VISITOR_IP_SALT": "visitor-" + "d" * 40,
+        "VAULT_ENCRYPTION_KEY": "vault-" + "e" * 40,
         "SENDGRID_API_KEY": "",
         "TWILIO_ACCOUNT_SID": "",
         "TWILIO_AUTH_TOKEN": "",

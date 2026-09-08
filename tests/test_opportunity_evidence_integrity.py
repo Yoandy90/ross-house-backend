@@ -8,7 +8,7 @@ from bson import ObjectId
 
 from rental.opportunity_evidence import (
     add_evidence_atomic, address_probe, evidence_detail, evidence_id,
-    get_evidence_review_history,
+    get_evidence_review_history, get_signal_reconciliation_history,
     parse_public_records_response,
     parse_obituary_response,
     validate_radar_results,
