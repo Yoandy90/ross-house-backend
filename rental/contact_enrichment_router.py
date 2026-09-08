@@ -31,6 +31,7 @@ from rental.opportunity_evidence import (
     validate_radar_results,
     match_address, match_person, obituary_source_allowed, person_tokens,
     resolve_obituary_candidates,
+    resolve_obituary_ambiguity_atomic, serialize_obituary_ambiguities,
     review_evidence_atomic,
 )
 from rental.opportunity_evidence_queue import (
@@ -606,6 +607,10 @@ class BulkEvidenceReviewBody(BaseModel):
     note: str = Field(default="", max_length=500)
 
 
+class ObituaryAmbiguityResolutionBody(BaseModel):
+    lead_id: str = Field(min_length=24, max_length=24, pattern=r"^[0-9a-f]{24}$")
+
+
 @router.get("/admin/deal-finder/evidence-queue")
 async def opportunity_evidence_queue(
     request: Request,
@@ -887,16 +892,31 @@ async def obituary_results(request: Request):
     await auth_admin(request)
     db = get_db()
     cfg = await db.admin_config.find_one({"type": "enrichment_config"}) or {}
-    ambiguities = cfg.get("last_obituary_ambiguities")
-    if not isinstance(ambiguities, list):
-        ambiguities = []
     return {
         "last_scan": cfg.get("last_obituary_scan"),
         "count": cfg.get("last_obituary_count", 0),
         "obituaries": cfg.get("last_obituaries", []),
         "matches": cfg.get("last_matches", []),
-        "ambiguities": [item for item in ambiguities[:100] if isinstance(item, dict)],
+        "ambiguities": serialize_obituary_ambiguities(
+            cfg.get("last_obituary_ambiguities")),
     }
+
+
+@router.post("/admin/deal-finder/obituary-ambiguities/{ambiguity_id}/resolve")
+async def resolve_obituary_ambiguity(request: Request, ambiguity_id: str,
+                                     body: ObituaryAmbiguityResolutionBody):
+    """Select exactly one owner for a quarantined obituary match."""
+    admin = await auth_admin(request)
+    try:
+        lead_id = ObjectId(body.lead_id)
+        result = await resolve_obituary_ambiguity_atomic(
+            get_db(), ambiguity_id, lead_id,
+            str(admin.get("id") or admin.get("_id") or ""))
+    except ValueError as exc:
+        raise HTTPException(422, str(exc))
+    if result is None:
+        raise HTTPException(409, "La coincidencia ya fue resuelta o la propiedad no es candidata")
+    return {"success": True, **result}
 
 
 @router.post("/admin/deal-finder/obituary-scan")
@@ -913,6 +933,14 @@ async def run_obituary_scan() -> dict:
     db = get_db()
     cfg = await db.admin_config.find_one({"type": "enrichment_config"}) or {}
     configured_sources = cfg.get("obituary_sources") or DEFAULT_OBITUARY_SOURCES
+    prior_items = cfg.get("last_obituary_ambiguities")
+    if not isinstance(prior_items, list):
+        prior_items = []
+    prior_ambiguities = {
+        str(item.get("ambiguity_id")): item
+        for item in prior_items
+        if isinstance(item, dict) and item.get("status") in {"resolved", "resolving"}
+    }
     sources = [url for url in configured_sources[:5] if obituary_source_allowed(url)]
 
     all_obits = []
@@ -962,12 +990,33 @@ async def run_obituary_scan() -> dict:
         candidates = [lead async for lead in cursor]
         resolution = resolve_obituary_candidates(o, candidates)
         if resolution["ambiguous"]:
-            ambiguities.append({
+            ambiguity_id = evidence_id("obituary", o)
+            candidate_leads = resolution["candidate_leads"][:50]
+            candidate_ids = {str(lead.get("_id")) for lead in candidate_leads}
+            prior = prior_ambiguities.get(ambiguity_id) or {}
+            preserve_resolution = str(prior.get("resolved_lead_id") or "") in candidate_ids
+            preserve_claim = (prior.get("status") == "resolving" and
+                              str(prior.get("claimed_lead_id") or "") in candidate_ids)
+            ambiguity = {
+                "ambiguity_id": ambiguity_id,
+                "status": ("resolved" if preserve_resolution else
+                           "resolving" if preserve_claim else "pending"),
                 "obituary": {key: o.get(key) for key in ("name", "age", "city", "date", "source_url")},
                 "candidate_count": resolution["candidate_count"],
                 "candidate_addresses": [str(lead.get("address") or "")[:200]
-                                        for lead in resolution["candidate_leads"][:5]],
-            })
+                                        for lead in candidate_leads[:5]],
+                "candidates": [{"lead_id": str(lead.get("_id")),
+                                "address": str(lead.get("address") or "")[:200],
+                                "owner_name": str(lead.get("owner_name") or "")[:200]}
+                               for lead in candidate_leads],
+            }
+            if preserve_resolution:
+                ambiguity.update({key: prior.get(key) for key in
+                                  ("resolved_lead_id", "resolved_at", "resolved_by")})
+            elif preserve_claim:
+                ambiguity.update({key: prior.get(key) for key in
+                                  ("claim_token", "claimed_at", "claimed_lead_id")})
+            ambiguities.append(ambiguity)
             continue
         for lead, verified in resolution["matches"]:
             detail = evidence_detail(
