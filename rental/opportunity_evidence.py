@@ -1,10 +1,11 @@
 """Deterministic, reviewable evidence matching for acquisition opportunities."""
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import re
+import secrets
 import unicodedata
 from urllib.parse import urlsplit
 
@@ -126,6 +127,178 @@ def resolve_obituary_candidates(record: dict, candidates: list[dict]) -> dict:
     return {"matches": [] if ambiguous else verified,
             "ambiguous": ambiguous, "candidate_count": len(verified),
             "candidate_leads": [lead for lead, _ in verified] if ambiguous else []}
+
+
+def serialize_obituary_ambiguities(items: object) -> list[dict]:
+    """Return a bounded public-admin view without claim or reviewer internals."""
+    if not isinstance(items, list):
+        return []
+    output = []
+    for raw in items[:100]:
+        if not isinstance(raw, dict):
+            continue
+        obituary = raw.get("obituary")
+        if (not isinstance(obituary, dict) or
+                not isinstance(obituary.get("name"), str) or
+                not obituary["name"].strip()):
+            continue
+        ambiguity_id = str(raw.get("ambiguity_id") or "")
+        status = str(raw.get("status") or "pending")
+        candidates = raw.get("candidates")
+        safe_candidates = []
+        if isinstance(candidates, list):
+            for candidate in candidates[:50]:
+                if not isinstance(candidate, dict):
+                    continue
+                lead_id = str(candidate.get("lead_id") or "")
+                if re.fullmatch(r"[0-9a-f]{24}", lead_id):
+                    safe_candidates.append({
+                        "lead_id": lead_id,
+                        "address": str(candidate.get("address") or "")[:200],
+                        "owner_name": str(candidate.get("owner_name") or "")[:200],
+                    })
+        candidate_count = raw.get("candidate_count")
+        age = obituary.get("age")
+        safe_obituary = {
+            "name": obituary["name"].strip()[:200],
+            "age": age if type(age) is int and 0 <= age <= 130 else None,
+            "city": str(obituary.get("city") or "")[:200]
+                    if isinstance(obituary.get("city"), str) else "",
+            "date": str(obituary.get("date") or "")[:50]
+                    if isinstance(obituary.get("date"), str) else "",
+            "source_url": (str(obituary.get("source_url"))[:300]
+                           if obituary_source_allowed(obituary.get("source_url")) else ""),
+        }
+        addresses = raw.get("candidate_addresses")
+        if not isinstance(addresses, list):
+            addresses = []
+        result = {
+            "ambiguity_id": ambiguity_id if re.fullmatch(r"[0-9a-f]{24}", ambiguity_id) else "",
+            "status": status if status in {"pending", "resolving", "resolved"} else "pending",
+            "obituary": safe_obituary,
+            "candidate_count": max(0, candidate_count) if type(candidate_count) is int else 0,
+            "candidates": safe_candidates,
+            "candidate_addresses": [str(value)[:200] for value in addresses[:5]
+                                    if isinstance(value, str)],
+        }
+        if result["status"] == "resolved":
+            resolved_lead_id = str(raw.get("resolved_lead_id") or "")
+            result["resolved_lead_id"] = (resolved_lead_id
+                                           if re.fullmatch(r"[0-9a-f]{24}", resolved_lead_id)
+                                           else "")
+            result["resolved_at"] = str(raw.get("resolved_at") or "")[:50]
+        output.append(result)
+    return output
+
+
+async def resolve_obituary_ambiguity_atomic(db, ambiguity_id: str, lead_id,
+                                             reviewer_id: str, *,
+                                             now: datetime | None = None) -> dict | None:
+    """Claim one ambiguity, revalidate it, add evidence once and finalize it."""
+    if not re.fullmatch(r"[0-9a-f]{24}", str(ambiguity_id or "")):
+        raise ValueError("obituary_ambiguity_id_invalid")
+    lead_id_text = str(lead_id)
+    if not re.fullmatch(r"[0-9a-f]{24}", lead_id_text):
+        raise ValueError("obituary_ambiguity_lead_id_invalid")
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        raise ValueError("obituary_ambiguity_clock_must_be_aware")
+    at = current.astimezone(timezone.utc).isoformat()
+    stale_before = (current.astimezone(timezone.utc) - timedelta(minutes=15)).isoformat()
+    claim_token = secrets.token_hex(12)
+    claimable = [{"status": "pending"},
+                 {"status": "resolving", "claimed_lead_id": lead_id_text,
+                  "claimed_at": {"$lt": stale_before}}]
+    claimed = await db.admin_config.find_one_and_update(
+        {
+            "type": "enrichment_config",
+            "last_obituary_ambiguities": {"$elemMatch": {
+                "ambiguity_id": ambiguity_id,
+                "$or": claimable,
+                "candidates": {"$elemMatch": {"lead_id": lead_id_text}},
+            }},
+        },
+        {"$set": {
+            "last_obituary_ambiguities.$[item].status": "resolving",
+            "last_obituary_ambiguities.$[item].claim_token": claim_token,
+            "last_obituary_ambiguities.$[item].claimed_at": at,
+            "last_obituary_ambiguities.$[item].claimed_lead_id": lead_id_text,
+        }},
+        array_filters=[{"item.ambiguity_id": ambiguity_id, "$or": [
+            {"item.status": "pending"},
+            {"item.status": "resolving", "item.claimed_lead_id": lead_id_text,
+             "item.claimed_at": {"$lt": stale_before}},
+        ]}],
+        return_document=ReturnDocument.AFTER,
+    )
+    if not claimed:
+        return None
+    ambiguity = next((item for item in claimed.get("last_obituary_ambiguities", [])
+                      if isinstance(item, dict) and item.get("claim_token") == claim_token), None)
+    if not ambiguity:
+        await db.admin_config.update_one(
+            {"type": "enrichment_config"},
+            {"$set": {"last_obituary_ambiguities.$[item].status": "pending"},
+             "$unset": {"last_obituary_ambiguities.$[item].claim_token": "",
+                        "last_obituary_ambiguities.$[item].claimed_at": "",
+                        "last_obituary_ambiguities.$[item].claimed_lead_id": ""}},
+            array_filters=[{"item.ambiguity_id": ambiguity_id,
+                            "item.claim_token": claim_token}],
+        )
+        return None
+    evidence_added = False
+    try:
+        obituary = ambiguity.get("obituary")
+        if not isinstance(obituary, dict):
+            raise ValueError("obituary_ambiguity_record_invalid")
+        lead = await db.deal_finder_leads.find_one({"_id": lead_id})
+        if not lead:
+            raise ValueError("obituary_ambiguity_lead_not_found")
+        match = match_obituary(obituary, lead)
+        if not match["matched"]:
+            raise ValueError("obituary_ambiguity_candidate_no_longer_matches")
+        manual_match = {**match,
+                        "reasons": [*match["reasons"], "manual_identity_resolution"]}
+        detail = evidence_detail(
+            "obituary", obituary, manual_match,
+            source_url=str(obituary.get("source_url") or ""), now=current)
+        created = await add_evidence_atomic(
+            db, lead_id, "possible_deceased", detail)
+        evidence_added = True
+        finalized = await db.admin_config.update_one(
+            {"type": "enrichment_config"},
+            {"$set": {
+                "last_obituary_ambiguities.$[item].status": "resolved",
+                "last_obituary_ambiguities.$[item].resolved_lead_id": lead_id_text,
+                "last_obituary_ambiguities.$[item].resolved_at": at,
+                "last_obituary_ambiguities.$[item].resolved_by": str(reviewer_id or "")[:100],
+            }, "$unset": {
+                "last_obituary_ambiguities.$[item].claim_token": "",
+                "last_obituary_ambiguities.$[item].claimed_at": "",
+                "last_obituary_ambiguities.$[item].claimed_lead_id": "",
+            }},
+            array_filters=[{"item.ambiguity_id": ambiguity_id,
+                            "item.claim_token": claim_token}],
+        )
+        if finalized.modified_count != 1:
+            raise RuntimeError("obituary_ambiguity_finalize_failed")
+        return {"created": created, "lead_id": lead_id_text,
+                "ambiguity_id": ambiguity_id, "evidence": detail}
+    finally:
+        # Release only before evidence is written. After that, leaving the claim
+        # closed is safer than allowing a second owner to be selected.
+        if not evidence_added:
+            await db.admin_config.update_one(
+                {"type": "enrichment_config"},
+                {"$set": {"last_obituary_ambiguities.$[item].status": "pending"},
+                 "$unset": {
+                     "last_obituary_ambiguities.$[item].claim_token": "",
+                     "last_obituary_ambiguities.$[item].claimed_at": "",
+                     "last_obituary_ambiguities.$[item].claimed_lead_id": "",
+                 }},
+                array_filters=[{"item.ambiguity_id": ambiguity_id,
+                                "item.claim_token": claim_token}],
+            )
 
 
 def _normalized_address(value: str) -> list[str]:

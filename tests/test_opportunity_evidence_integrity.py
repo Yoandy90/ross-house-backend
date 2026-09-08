@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from bson import ObjectId
 
 from rental.opportunity_evidence import (
     add_evidence_atomic, address_probe, evidence_detail, evidence_id,
@@ -13,6 +14,7 @@ from rental.opportunity_evidence import (
     validate_radar_results,
     match_address, match_person, obituary_source_allowed, person_tokens,
     match_obituary, obituary_owner_identity, resolve_obituary_candidates,
+    resolve_obituary_ambiguity_atomic, serialize_obituary_ambiguities,
     review_evidence_atomic, serialize_evidence_review_history,
 )
 
@@ -300,6 +302,118 @@ def test_obituary_identity_keeps_generational_suffixes_distinct():
     assert result["ambiguous"] is True and result["candidate_count"] == 2
 
 
+def test_obituary_ambiguity_serializer_bounds_and_hides_claim_internals():
+    items = [{
+        "ambiguity_id": "a" * 24, "status": "resolved",
+        "obituary": {"name": "Jane Doe", "city": "Dumas", "age": 150,
+                     "source_url": "https://evil.example/private"},
+        "candidate_count": 2,
+        "candidates": [{"lead_id": f"{i:024x}", "address": "A" * 250,
+                        "owner_name": "DOE JANE"} for i in range(55)],
+        "candidate_addresses": ["B" * 250] * 7,
+        "resolved_lead_id": "1" * 24, "resolved_at": "2026-09-08T14:00:00Z",
+        "resolved_by": "private-admin", "claim_token": "private-claim",
+    }] + ["invalid"] * 101
+    result = serialize_obituary_ambiguities(items)
+    assert len(result) == 1
+    assert len(result[0]["candidates"]) == 50
+    assert len(result[0]["candidate_addresses"]) == 5
+    assert len(result[0]["candidates"][0]["address"]) == 200
+    assert result[0]["obituary"]["age"] is None
+    assert result[0]["obituary"]["source_url"] == ""
+    assert "private" not in str(result)
+
+
+def ambiguity_database(*, claim=True, matching=True):
+    lead_id = ObjectId("1" * 24)
+    admin_config = SimpleNamespace(update_one=AsyncMock(
+        return_value=SimpleNamespace(modified_count=1)))
+
+    async def claim_one(query, update, **kwargs):
+        if not claim:
+            return None
+        token = update["$set"]["last_obituary_ambiguities.$[item].claim_token"]
+        return {"last_obituary_ambiguities": [{
+            "ambiguity_id": "a" * 24, "status": "resolving",
+            "claim_token": token,
+            "obituary": {"name": "Jane Doe", "city": "Dumas",
+                         "source_url": "https://echovita.com/example"},
+        }]}
+
+    admin_config.find_one_and_update = AsyncMock(side_effect=claim_one)
+    leads = SimpleNamespace(
+        find_one=AsyncMock(return_value={
+            "_id": lead_id, "owner_name": "DOE JANE" if matching else "SMITH JOHN",
+            "address": "305 Bruce Ave, Dumas TX", "mailing_city": "Dumas",
+            "mailing_lines": ["PO Box 1"], "mailing_state": "TX", "mailing_zip": "79029",
+        }),
+        update_one=AsyncMock(return_value=SimpleNamespace(modified_count=1)),
+    )
+    return SimpleNamespace(admin_config=admin_config, deal_finder_leads=leads), lead_id
+
+
+@pytest.mark.asyncio
+async def test_manual_obituary_resolution_claims_revalidates_and_finalizes_once():
+    db, lead_id = ambiguity_database()
+    result = await resolve_obituary_ambiguity_atomic(
+        db, "a" * 24, lead_id, "admin-7", now=NOW)
+    assert result["created"] is True and result["lead_id"] == str(lead_id)
+    assert result["evidence"]["match_reasons"][-1] == "manual_identity_resolution"
+    claim_query = db.admin_config.find_one_and_update.await_args.args[0]
+    elem = claim_query["last_obituary_ambiguities"]["$elemMatch"]
+    assert elem["$or"][0] == {"status": "pending"}
+    assert elem["$or"][1]["claimed_lead_id"] == str(lead_id)
+    assert elem["candidates"]["$elemMatch"]["lead_id"] == str(lead_id)
+    assert db.deal_finder_leads.find_one.await_count == 1
+    assert db.deal_finder_leads.update_one.await_count == 1
+    final_update = db.admin_config.update_one.await_args.args[1]
+    assert final_update["$set"]["last_obituary_ambiguities.$[item].status"] == "resolved"
+    assert final_update["$set"]["last_obituary_ambiguities.$[item].resolved_by"] == "admin-7"
+
+
+@pytest.mark.asyncio
+async def test_manual_obituary_resolution_conflict_never_touches_lead():
+    db, lead_id = ambiguity_database(claim=False)
+    assert await resolve_obituary_ambiguity_atomic(
+        db, "a" * 24, lead_id, "admin-7", now=NOW) is None
+    db.deal_finder_leads.find_one.assert_not_awaited()
+    db.deal_finder_leads.update_one.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_manual_obituary_resolution_releases_claim_if_owner_changed():
+    db, lead_id = ambiguity_database(matching=False)
+    with pytest.raises(ValueError, match="candidate_no_longer_matches"):
+        await resolve_obituary_ambiguity_atomic(
+            db, "a" * 24, lead_id, "admin-7", now=NOW)
+    db.deal_finder_leads.update_one.assert_not_awaited()
+    release = db.admin_config.update_one.await_args.args[1]
+    assert release["$set"]["last_obituary_ambiguities.$[item].status"] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_manual_obituary_resolution_keeps_claim_closed_after_evidence_write():
+    db, lead_id = ambiguity_database()
+    db.admin_config.update_one.return_value = SimpleNamespace(modified_count=0)
+    with pytest.raises(RuntimeError, match="finalize_failed"):
+        await resolve_obituary_ambiguity_atomic(
+            db, "a" * 24, lead_id, "admin-7", now=NOW)
+    assert db.deal_finder_leads.update_one.await_count == 1
+    assert db.admin_config.update_one.await_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ambiguity_id,lead_id", [("bad", ObjectId("1" * 24)),
+                                                    ("a" * 24, "bad")])
+async def test_manual_obituary_resolution_rejects_ids_before_database_access(
+        ambiguity_id, lead_id):
+    db, _ = ambiguity_database()
+    with pytest.raises(ValueError, match="_id_invalid"):
+        await resolve_obituary_ambiguity_atomic(
+            db, ambiguity_id, lead_id, "admin-7", now=NOW)
+    db.admin_config.find_one_and_update.assert_not_awaited()
+
+
 @pytest.mark.asyncio
 async def test_obituary_results_exposes_only_bounded_ambiguity_records():
     import ast
@@ -309,20 +423,23 @@ async def test_obituary_results_exposes_only_bounded_ambiguity_records():
                    if isinstance(node, ast.AsyncFunctionDef)
                    and node.name == "obituary_results")
     handler.decorator_list = []
-    records = [{"candidate_count": index} for index in range(105)] + ["invalid"]
+    records = [{"candidate_count": index + 2,
+                "obituary": {"name": f"Person {index}"}}
+               for index in range(105)] + ["invalid"]
     collection = SimpleNamespace(find_one=AsyncMock(return_value={
         "last_obituary_ambiguities": records,
     }))
     env = {
         "Request": object, "auth_admin": AsyncMock(),
         "get_db": lambda: SimpleNamespace(admin_config=collection),
+        "serialize_obituary_ambiguities": serialize_obituary_ambiguities,
     }
     module = ast.fix_missing_locations(ast.Module(body=[handler], type_ignores=[]))
     exec(compile(module, "isolated_obituary_results", "exec"), env)
     result = await env["obituary_results"](object())
     assert len(result["ambiguities"]) == 100
-    assert result["ambiguities"][0]["candidate_count"] == 0
-    assert result["ambiguities"][-1]["candidate_count"] == 99
+    assert result["ambiguities"][0]["candidate_count"] == 2
+    assert result["ambiguities"][-1]["candidate_count"] == 101
 
 
 def test_address_match_requires_house_number_and_real_street_token():
@@ -531,6 +648,13 @@ def test_all_opportunity_sources_use_verified_atomic_evidence_boundary():
     assert "source_not_allowlisted" in source
     assert "resolve_obituary_candidates(o, candidates)" in source
     assert ").limit(50)" in source
+    assert '"ambiguity_id": ambiguity_id' in source
+    assert '"resolving" if preserve_claim else "pending"' in source
+    assert '("claim_token", "claimed_at", "claimed_lead_id")' in source
+    assert '"lead_id": str(lead.get("_id"))' in source
+    assert '@router.post("/admin/deal-finder/obituary-ambiguities/{ambiguity_id}/resolve")' in source
+    assert "resolve_obituary_ambiguity_atomic(" in source
+    assert "serialize_obituary_ambiguities(" in source
     assert "_find_verified_address_lead(db, addr)" in source
     assert ").limit(10)" in source
     assert '{"$set": {"motivation": motivation}}' not in source
