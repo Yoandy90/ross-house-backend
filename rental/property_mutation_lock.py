@@ -99,7 +99,7 @@ async def release_property_mutation_lock(property_id: str, token: str, db=None) 
         return False
     try:
         if db is None:
-        db = get_db()
+            db = get_db()
         result = await db.properties.update_one(
             {"_id": ObjectId(str(property_id)), f"{_LOCK_FIELD}.token": token},
             {"$unset": {_LOCK_FIELD: ""}},
