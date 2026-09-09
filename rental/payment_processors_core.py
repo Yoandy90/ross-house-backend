@@ -41,6 +41,10 @@ router = APIRouter()
 logger = logging.getLogger(__name__)
 
 PROCESSORS = ("stripe", "square", "clover", "bofa", "helcim")
+# Ross House conserva la configuración histórica de Stripe, pero Helcim es el
+# único procesador aprobado actualmente. Este bloqueo evita reactivaciones
+# accidentales desde cualquier cliente administrativo o llamada directa.
+BLOCKED_PROCESSOR_ACTIVATIONS = {"stripe"}
 SQUARE_VERSION = "2025-10-16"
 SQUARE_BASE = {
     "sandbox": "https://connect.squareupsandbox.com/v2",
@@ -462,6 +466,11 @@ async def activate_processor(name: str, request: Request):
     admin = await auth_admin(request)
     if name not in PROCESSORS:
         raise HTTPException(status_code=404, detail="Procesador desconocido")
+    if name in BLOCKED_PROCESSOR_ACTIVATIONS:
+        raise HTTPException(
+            status_code=409,
+            detail="Stripe está deshabilitado para Ross House Rentals; Helcim es el procesador aprobado",
+        )
 
     doc = await _get_doc()
     cfg = doc["processors"].get(name, {})

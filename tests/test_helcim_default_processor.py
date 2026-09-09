@@ -1,5 +1,7 @@
 import asyncio
 
+import pytest
+
 from rental import payment_processors_core as core
 
 
@@ -61,3 +63,20 @@ def test_public_base_url_does_not_duplicate_railway_scheme(monkeypatch):
         "https://rosshousestaging-staging.up.railway.app"
     )
 
+
+
+def test_stripe_activation_is_blocked_without_touching_stored_config(monkeypatch):
+    async def fake_auth_admin(_request):
+        return {"id": "test-admin"}
+
+    def fail_if_database_is_touched():
+        raise AssertionError("Stripe guard must run before reading or writing configuration")
+
+    monkeypatch.setattr(core, "auth_admin", fake_auth_admin)
+    monkeypatch.setattr(core, "get_db", fail_if_database_is_touched)
+
+    with pytest.raises(core.HTTPException) as exc:
+        asyncio.run(core.activate_processor("stripe", object()))
+
+    assert exc.value.status_code == 409
+    assert "Helcim" in exc.value.detail
