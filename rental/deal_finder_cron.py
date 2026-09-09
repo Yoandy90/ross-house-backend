@@ -10,8 +10,8 @@ Al terminar cada lote envía email de alerta si encontró:
     ausente + terreno baldío/mejora baja), o
   - propiedades ya conocidas que SE VOLVIERON morosas desde el último ciclo.
 
-Config:  app_settings {_id:'deal_finder_cron'}  {enabled, max_per_run, alert_email}
-Estado:  app_settings {_id:'deal_finder_cron_state'}  {letter_idx, page, cycles,
+Config:  rental_config {_id:'deal_finder_cron'}  {enabled, max_per_run, alert_email}
+Estado:  rental_config {_id:'deal_finder_cron_state'}  {letter_idx, page, cycles,
          last_run, last_result}
 Intervalo: env DEAL_FINDER_SCAN_INTERVAL_HOURS (default 24h).
 """
@@ -60,7 +60,7 @@ def _fmt_lead(lead: dict) -> str:
 
 
 async def send_alert_email(db, new_opps: list[dict], became_delinquent: list[dict]) -> bool:
-    cfg = await db.app_settings.find_one({"_id": "deal_finder_cron"}) or {}
+    cfg = await db.rental_config.find_one({"_id": "deal_finder_cron"}) or {}
     to = cfg.get("alert_email") or DEFAULT_ALERT_EMAIL
     total = len(new_opps) + len(became_delinquent)
     subject = f"🎯 Radar de Oportunidades: {total} hallazgo(s) en Moore County"
@@ -101,11 +101,11 @@ async def _run_auto_scan_batch_unlocked(
     county = "moore"
     base = COUNTIES[county]["base"]
 
-    cfg = await db.app_settings.find_one({"_id": "deal_finder_cron"}) or {}
+    cfg = await db.rental_config.find_one({"_id": "deal_finder_cron"}) or {}
     if max_props is None:
         max_props = int(cfg.get("max_per_run") or DEFAULT_MAX_PER_RUN)
 
-    state = await db.app_settings.find_one({"_id": "deal_finder_cron_state"}) or {}
+    state = await db.rental_config.find_one({"_id": "deal_finder_cron_state"}) or {}
     letter_idx = int(state.get("letter_idx") or 0) % len(LETTERS)
     page = int(state.get("page") or 1)
     cycles = int(state.get("cycles") or 0)
@@ -163,7 +163,7 @@ async def _run_auto_scan_batch_unlocked(
 
             if not await renew_scan_lease(db, lease):
                 raise RuntimeError("deal_finder_scan_lease_lost")
-            await db.app_settings.update_one(
+            await db.rental_config.update_one(
                 {"_id": "deal_finder_cron_state"},
                 {"$set": {"letter_idx": letter_idx, "page": page, "cycles": cycles}},
                 upsert=True,
@@ -183,7 +183,7 @@ async def _run_auto_scan_batch_unlocked(
 
     if not await renew_scan_lease(db, lease):
         raise RuntimeError("deal_finder_scan_lease_lost")
-    await db.app_settings.update_one(
+    await db.rental_config.update_one(
         {"_id": "deal_finder_cron_state"},
         {"$set": {"last_run": datetime.now(timezone.utc), "last_result": result}},
         upsert=True,
@@ -212,7 +212,7 @@ async def deal_finder_scan_loop():
     while True:
         try:
             db = get_db()
-            cfg = await db.app_settings.find_one({"_id": "deal_finder_cron"}) or {}
+            cfg = await db.rental_config.find_one({"_id": "deal_finder_cron"}) or {}
             if cfg.get("enabled", True) is False:
                 logger.info("[deal-finder-cron] deshabilitado — omitido")
             else:
