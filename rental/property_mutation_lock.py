@@ -37,7 +37,8 @@ async def acquire_property_mutation_lock(property_id: str, operation: str, actor
     handle. Request routers continue using the canonical shared database.
     """
     oid = _property_oid(property_id)
-    db = db or get_db()
+    if db is None:
+        db = get_db()
     now = datetime.utcnow()
     token = uuid4().hex
     expires_at = now + timedelta(seconds=_LOCK_TTL_SECONDS)
@@ -73,7 +74,8 @@ async def acquire_property_mutation_lock(property_id: str, operation: str, actor
 async def assert_property_lifecycle_recovery_clear(property_id: str, db=None) -> None:
     """Fail closed while any contract on this property retains a lifecycle claim."""
     _property_oid(property_id)
-    db = db or get_db()
+    if db is None:
+        db = get_db()
     pending = await db.rental_contracts.find_one(
         {
             "property_id": str(property_id),
@@ -96,7 +98,8 @@ async def release_property_mutation_lock(property_id: str, token: str, db=None) 
     if not token or not ObjectId.is_valid(str(property_id or "")):
         return False
     try:
-        db = db or get_db()
+        if db is None:
+            db = get_db()
         result = await db.properties.update_one(
             {"_id": ObjectId(str(property_id)), f"{_LOCK_FIELD}.token": token},
             {"$unset": {_LOCK_FIELD: ""}},
