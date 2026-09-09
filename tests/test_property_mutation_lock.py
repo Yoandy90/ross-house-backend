@@ -49,6 +49,13 @@ class DB:
         self.rental_contracts = contracts or Contracts()
 
 
+class MongoLikeDB(DB):
+    def __bool__(self):
+        raise NotImplementedError(
+            "Database objects do not implement truth value testing or bool()"
+        )
+
+
 def test_acquire_uses_single_property_cas_and_bounded_expiry(monkeypatch):
     props = Properties(existing=True, matched_count=1)
     monkeypatch.setattr(lock, "get_db", lambda: DB(props))
@@ -119,3 +126,30 @@ def test_release_failure_is_non_throwing_after_committed_write(monkeypatch):
     monkeypatch.setattr(lock, "get_db", lambda: DB(props))
     released = run(lock.release_property_mutation_lock(str(ObjectId()), "owned-token"))
     assert released is False
+
+
+def test_injected_mongo_database_is_never_truth_value_tested(monkeypatch):
+    props = Properties(existing=True, matched_count=1)
+    database = MongoLikeDB(props, Contracts(None))
+    monkeypatch.setattr(
+        lock,
+        "get_db",
+        lambda: pytest.fail("explicit database handle must be used"),
+    )
+    property_id = str(ObjectId())
+
+    token = run(lock.acquire_property_mutation_lock(
+        property_id,
+        "property_projection_sync",
+        db=database,
+    ))
+    assert token
+    assert run(lock.assert_property_lifecycle_recovery_clear(
+        property_id,
+        db=database,
+    )) is None
+    assert run(lock.release_property_mutation_lock(
+        property_id,
+        token,
+        db=database,
+    )) is True
