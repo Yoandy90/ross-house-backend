@@ -107,8 +107,17 @@ def _mask(value: str) -> str:
 
 
 def _public_base_url() -> str:
-    return (os.environ.get("PUBLIC_API_URL")
-            or "https://ross-house-backend-production.up.railway.app").rstrip("/")
+    explicit_url = (os.environ.get("PUBLIC_API_URL") or "").strip()
+    if explicit_url:
+        return explicit_url.rstrip("/")
+
+    railway_domain = (os.environ.get("RAILWAY_PUBLIC_DOMAIN") or "").strip()
+    if railway_domain:
+        if "://" not in railway_domain:
+            railway_domain = f"https://{railway_domain}"
+        return railway_domain.rstrip("/")
+
+    return "https://ross-house-backend-production.up.railway.app"
 
 
 def _bofa_jwt_headers(cfg: dict, env: str, method: str, path: str,
