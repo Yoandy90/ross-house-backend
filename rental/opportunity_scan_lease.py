@@ -38,7 +38,7 @@ async def acquire_scan_lease(db, name: str, *, ttl_seconds: int = 14400,
     current = _now(now)
     identity = owner or secrets.token_urlsafe(18)
     try:
-        document = await db.app_settings.find_one_and_update(
+        document = await db.rental_config.find_one_and_update(
             {"_id": document_id, "$or": [
                 {"lease_until": {"$lte": current}},
                 {"lease_until": {"$exists": False}},
@@ -62,7 +62,7 @@ async def acquire_scan_lease(db, name: str, *, ttl_seconds: int = 14400,
 async def get_scan_lease_status(db, name: str, *, now=None) -> dict:
     """Return operational lease state without exposing the owner secret."""
     current = _now(now)
-    document = await db.app_settings.find_one(
+    document = await db.rental_config.find_one(
         {"_id": _document_id(name)},
         {"lease_owner": 1, "lease_until": 1, "lease_generation": 1},
     ) or {}
@@ -81,7 +81,7 @@ async def get_scan_lease_status(db, name: str, *, now=None) -> dict:
 
 async def renew_scan_lease(db, lease: ScanLease, *, now=None) -> bool:
     current = _now(now)
-    result = await db.app_settings.update_one(
+    result = await db.rental_config.update_one(
         {"_id": lease.document_id, "lease_owner": lease.owner,
          "lease_generation": lease.generation, "lease_until": {"$gt": current}},
         {"$set": {"lease_until": current + timedelta(seconds=lease.ttl_seconds),
@@ -91,7 +91,7 @@ async def renew_scan_lease(db, lease: ScanLease, *, now=None) -> bool:
 
 
 async def release_scan_lease(db, lease: ScanLease) -> bool:
-    result = await db.app_settings.update_one(
+    result = await db.rental_config.update_one(
         {"_id": lease.document_id, "lease_owner": lease.owner,
          "lease_generation": lease.generation},
         {"$unset": {"lease_owner": "", "lease_until": ""},

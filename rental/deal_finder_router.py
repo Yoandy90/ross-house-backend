@@ -1090,8 +1090,8 @@ async def delete_lead(request: Request, lead_id: str):
 async def get_cron_config(request: Request):
     await auth_admin(request)
     db = get_db()
-    cfg = await db.app_settings.find_one({"_id": "deal_finder_cron"}) or {}
-    state = await db.app_settings.find_one({"_id": "deal_finder_cron_state"}) or {}
+    cfg = await db.rental_config.find_one({"_id": "deal_finder_cron"}) or {}
+    state = await db.rental_config.find_one({"_id": "deal_finder_cron_state"}) or {}
     lease_state = await get_scan_lease_status(db, "deal_finder")
     from rental.deal_finder_cron import LETTERS, DEFAULT_MAX_PER_RUN, DEFAULT_ALERT_EMAIL
     letter_idx = int(state.get("letter_idx") or 0) % len(LETTERS)
@@ -1128,7 +1128,7 @@ async def update_cron_config(request: Request, body: CronConfigUpdate):
         updates["alert_email"] = body.alert_email.strip()
     if not updates:
         raise HTTPException(400, "Nada que actualizar")
-    await db.app_settings.update_one({"_id": "deal_finder_cron"}, {"$set": updates}, upsert=True)
+    await db.rental_config.update_one({"_id": "deal_finder_cron"}, {"$set": updates}, upsert=True)
     return {"success": True, "updated": updates}
 
 

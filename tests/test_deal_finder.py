@@ -282,7 +282,7 @@ def test_11_cron_batch_live(ctx):
     async def _run():
         db = ctx["db"]
         # snapshot del estado para restaurar
-        prev_state = await db.app_settings.find_one({"_id": "deal_finder_cron_state"})
+        prev_state = await db.rental_config.find_one({"_id": "deal_finder_cron_state"})
 
         sent = {"called": False}
         orig = dfc.send_alert_email
@@ -297,7 +297,7 @@ def test_11_cron_batch_live(ctx):
             dfc.send_alert_email = orig
             # restaurar estado previo (no interferir con el cron real)
             if prev_state:
-                await db.app_settings.replace_one(
+                await db.rental_config.replace_one(
                     {"_id": "deal_finder_cron_state"}, prev_state, upsert=True)
         return res, sent
 
