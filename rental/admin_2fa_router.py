@@ -162,6 +162,54 @@ async def _send_otp_email(to_email: str, code: str, name: str = "Admin") -> bool
         return False
 
 
+async def _send_test_email(to_email: str, name: str = "Admin") -> bool:
+    """Send a non-OTP delivery probe without accepting an arbitrary recipient."""
+    sendgrid_key = os.getenv("SENDGRID_API_KEY")
+    from_email = os.getenv("SENDGRID_FROM_EMAIL", "info@rosshouserentals.com")
+    from_name = os.getenv("SENDGRID_FROM_NAME", "Ross House Rentals")
+    if not sendgrid_key:
+        cfg = await get_db().api_config.find_one({"_id": "main"})
+        if cfg:
+            sendgrid_key = cfg.get("sendgrid_api_key") or cfg.get("SENDGRID_API_KEY")
+            from_email = cfg.get("sendgrid_from_email", from_email)
+            from_name = cfg.get("sendgrid_from_name", from_name)
+    if not sendgrid_key:
+        logger.warning("SENDGRID_API_KEY missing — admin test email skipped")
+        return False
+
+    try:
+        import sendgrid
+        from sendgrid.helpers.mail import Mail, Email, To, Content
+
+        sg = sendgrid.SendGridAPIClient(api_key=sendgrid_key)
+        html = f"""
+        <div style="font-family:Helvetica,Arial,sans-serif;max-width:520px;margin:auto;background:#0b1220;color:#fff;border-radius:14px;padding:24px;">
+          <div style="background:linear-gradient(135deg,#3b82f6,#0ea5e9);padding:14px;border-radius:10px;text-align:center;">
+            <h2 style="margin:0;color:#fff;">Correo configurado correctamente</h2>
+          </div>
+          <p style="color:#cbd5e1;margin-top:18px;">Hola {name},</p>
+          <p style="color:#cbd5e1;">Esta es una prueba administrativa de Ross House Rentals.</p>
+          <p style="color:#86efac;font-weight:bold;">SendGrid está entregando correos desde este entorno.</p>
+          <p style="color:#64748b;font-size:11px;margin-top:18px;">Este mensaje no contiene códigos ni requiere ninguna acción.</p>
+        </div>
+        """
+        mail = Mail(
+            from_email=Email(from_email, from_name),
+            to_emails=To(to_email),
+            subject="Prueba de correo · Ross House Rentals",
+            plain_text_content=Content(
+                "text/plain",
+                "Prueba administrativa completada. SendGrid está entregando correos desde este entorno.",
+            ),
+        )
+        mail.add_content(Content("text/html", html))
+        sg.client.mail.send.post(request_body=mail.get())
+        return True
+    except Exception:
+        logger.exception("Admin test email send failed")
+        return False
+
+
 async def _send_otp_sms(to_phone: str, code: str) -> bool:
     sid = os.getenv("TWILIO_ACCOUNT_SID")
     tok = os.getenv("TWILIO_AUTH_TOKEN")
@@ -466,6 +514,42 @@ async def admin_login_resend(request: Request):
         raise HTTPException(status_code=502, detail="No se pudo reenviar")
 
     return {"success": True, "channel": channel, "masked": masked, "expires_in_seconds": OTP_TTL_MINUTES * 60}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SENDGRID DELIVERY TEST (authenticated admin, fixed recipient)
+# ═══════════════════════════════════════════════════════════════════════════
+@router.post("/admin/auth/test-email")
+async def admin_test_email(request: Request, admin=Depends(auth_admin)):
+    user_id = str(admin["_id"]) if isinstance(admin.get("_id"), ObjectId) else str(admin["_id"])
+    email = (admin.get("email") or "").strip().lower()
+    if not email:
+        raise HTTPException(status_code=400, detail="La cuenta admin no tiene email")
+
+    from rental.security import audit_log, check_rate_limit_persistent, client_ip_hash
+    await check_rate_limit_persistent(
+        "admin-test-email-user", user_id, max_requests=3, window_seconds=3600
+    )
+    await check_rate_limit_persistent(
+        "admin-test-email-ip", client_ip_hash(request), max_requests=10, window_seconds=3600
+    )
+
+    sent = await _send_test_email(email, admin.get("name") or "Admin")
+    await audit_log(
+        admin_user_id=user_id,
+        action="admin_test_email",
+        resource_type="auth",
+        result="success" if sent else "delivery_failed",
+        request=request,
+    )
+    if not sent:
+        raise HTTPException(status_code=502, detail="No se pudo enviar el correo de prueba")
+
+    return {
+        "success": True,
+        "recipient": _mask_email(email),
+        "provider": "sendgrid",
+    }
 
 
 # ═══════════════════════════════════════════════════════════════════════════
