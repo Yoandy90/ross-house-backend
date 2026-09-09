@@ -525,7 +525,6 @@ try:
     app.include_router(tax_reminder_router, prefix="/api")
     app.include_router(city_utilities_router, prefix="/api")
     app.include_router(service_providers_router, prefix="/api")
-    app.include_router(ai_brain_router, prefix="/api")
     app.include_router(chatbot_router, prefix="/api")
     app.include_router(visitor_analytics_router, prefix="/api")
     app.include_router(admin_2fa_router, prefix="/api")
@@ -591,6 +590,7 @@ except Exception as e:
     # Re-raise to make the error visible in Railway logs
     print(error_msg)
     print(traceback.format_exc())
+    raise RuntimeError(error_msg) from e
 
 
 # ─── Static photo serving ─────────────────────────────────────
