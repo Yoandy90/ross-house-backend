@@ -50,7 +50,8 @@ def test_claim_release_recovery_detects_applied_release_marker():
 
 
 def test_claim_release_recovery_distinguishes_present_and_unknown_claim_state():
-    claim = {"_id": "claim-release-2", "financial_effect": "claim_release_pending"}
+    claim = {"_id": "claim-release-2", "financial_effect": "claim_release_pending",
+             "attempt_snapshot": {"id": "attempt-1"}}
     present, present_guidance = _classify_recovery(
         claim, None, {"status": "partial", "charge_attempt": {"id": "attempt-1"}})
     assert present == "no_financial_write_detected"
@@ -59,6 +60,9 @@ def test_claim_release_recovery_distinguishes_present_and_unknown_claim_state():
         claim, None, {"status": "partial"})
     assert ambiguous == "ambiguous_state"
     assert "cannot be proven" in ambiguous_guidance.lower()
+    replaced, _ = _classify_recovery(
+        claim, None, {"status": "partial", "charge_attempt": {"id": "new-attempt"}})
+    assert replaced == "ambiguous_state"
 
 
 def test_unchanged_invoice_snapshot_classifies_no_write_detected():

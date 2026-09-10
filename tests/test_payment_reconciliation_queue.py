@@ -102,6 +102,8 @@ def test_invoice_charge_mapper_exposes_attempt_evidence_without_credentials():
                            "source": "helcim_saved", "amount": 650,
                            "transaction_id": "tx-1", "card_token": "hidden"},
     })
+    version = item.pop("attempt_version")
+    assert len(version) == 64
     assert item == {
         "source": "invoice_charge", "id": "invoice-1",
         "status": "reconciliation_required", "processor": "helcim_saved",

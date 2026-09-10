@@ -41,6 +41,7 @@ from rental.stripe_pkg.reconciliation_queue_router import (
     STRIPE_RECONCILIATION_STATUSES,
     _find_by_id,
     _invoice_snapshot,
+    _invoice_charge_item,
 )
 from rental.stripe_pkg.reconciliation_resolution_router import (
     ACTIONS_COLLECTION,
@@ -106,6 +107,8 @@ def _invoice_update_guard(invoice: dict) -> dict:
         guard["total_due"] = invoice.get("total_due")
     if invoice.get("updated_at") is not None:
         guard["updated_at"] = invoice.get("updated_at")
+    if "charge_attempt" in invoice:
+        guard["charge_attempt"] = invoice["charge_attempt"]
     return guard
 
 
@@ -149,6 +152,11 @@ async def _load_confirmed_decision(db, confirmation_id: str) -> tuple[dict, dict
     for field in ("source", "item_id", "exception_status", "exception_updated_at"):
         if str(proposal.get(field) or "") != str(confirmation.get(field) or ""):
             raise HTTPException(status_code=409, detail="Confirmed reconciliation version mismatch")
+    if proposal.get("source") == "invoice_charge" and (
+        not proposal.get("attempt_version")
+        or proposal.get("attempt_version") != confirmation.get("attempt_version")
+    ):
+        raise HTTPException(status_code=409, detail="Confirmed payment attempt mismatch")
     return proposal, confirmation, confirmation_oid
 
 
@@ -158,6 +166,10 @@ async def _recheck_exception_version(db, proposal: dict) -> dict:
         exception is None
         or str(exception.get("status") or "") != str(proposal.get("exception_status") or "")
         or str(exception.get("updated_at") or "") != str(proposal.get("exception_updated_at") or "")
+        or (proposal.get("source") == "invoice_charge" and (
+            not proposal.get("attempt_version")
+            or exception.get("attempt_version") != proposal.get("attempt_version")
+        ))
     ):
         raise HTTPException(status_code=409, detail="Reconciliation item changed after approval")
     return exception
@@ -199,6 +211,8 @@ async def _proven_invoice_for_execution(db, proposal: dict) -> dict | None:
             invoice
             and str(invoice.get("status") or "") in set(CHARGEABLE_STATUSES)
             and str(attempt.get("status") or "") in INVOICE_CHARGE_RECONCILIATION_STATUSES
+            and bool(proposal.get("attempt_version"))
+            and _invoice_charge_item(invoice)["attempt_version"] == proposal["attempt_version"]
         ):
             return invoice
         return None
@@ -232,6 +246,24 @@ async def _trusted_source_amount_cents(db, proposal: dict) -> int | None:
         return _money_cents(amount) if amount > 0 else None
 
     return None
+
+
+def _invoice_attempt_outcome_allowed(invoice: dict, outcome: str) -> bool:
+    """Only a terminal saved-card response can authorize an invoice mutation.
+
+    A note or three admin identities do not prove an in-flight request stopped.
+    Unknown/hosted/autopay outcomes stay blocked pending provider reconciliation.
+    """
+    attempt = invoice.get("charge_attempt") or {}
+    if (attempt.get("source") != "helcim_saved"
+            or attempt.get("status") != "reconciliation_required"):
+        return False
+    status = str(attempt.get("provider_status") or "").upper()
+    if outcome == "provider_confirmed_not_paid":
+        return status == "DECLINED"
+    if outcome == "provider_confirmed_paid":
+        return status in {"APPROVED", "APPROVAL"} and bool(attempt.get("transaction_id"))
+    return False
 
 
 def _workflow_record_snapshot(doc: dict | None) -> dict | None:
@@ -296,6 +328,13 @@ async def _readiness(db, proposal: dict, confirmation: dict, confirmation_oid: O
         return result
 
     await _recheck_exception_version(db, proposal)
+    if proposal.get("source") == "invoice_charge" and outcome in {
+        "provider_confirmed_paid", "provider_confirmed_not_paid"
+    }:
+        invoice = await _proven_invoice_for_execution(db, proposal)
+        if not invoice or not _invoice_attempt_outcome_allowed(invoice, outcome):
+            result.update({"can_execute": False, "reason": "terminal_provider_evidence_required"})
+            return result
     if outcome == "provider_confirmed_not_paid" and proposal.get("source") == "invoice_charge":
         invoice = await _proven_invoice_for_execution(db, proposal)
         snapshot = _invoice_financial_snapshot(invoice)
@@ -431,6 +470,8 @@ async def execute_confirmed_reconciliation(confirmation_id: str, request: Reques
             raise HTTPException(status_code=409, detail="Exact invoice unavailable")
         invoice_id = str(invoice.get("_id") or "")
         before = snapshot["invoice"]
+        if proposal.get("source") == "invoice_charge" and not _invoice_attempt_outcome_allowed(invoice, outcome):
+            raise HTTPException(status_code=409, detail="Terminal provider evidence required")
     if outcome == "provider_confirmed_paid":
         trusted_source_amount = await _trusted_source_amount_cents(db, proposal)
         if trusted_source_amount is None:
@@ -463,6 +504,7 @@ async def execute_confirmed_reconciliation(confirmation_id: str, request: Reques
             "trusted_source_amount_cents": trusted_source_amount_cents,
             "confirmed_amount_cents": confirmed_amount_cents,
             "before": before,
+            "attempt_snapshot": invoice.get("charge_attempt") if invoice else None,
             "financial_effect": (
                 "local_accounting_pending" if outcome == "provider_confirmed_paid"
                 else "claim_release_pending" if outcome == "provider_confirmed_not_paid" and proposal.get("source") == "invoice_charge"
@@ -511,10 +553,8 @@ async def execute_confirmed_reconciliation(confirmation_id: str, request: Reques
         attempt = (invoice or {}).get("charge_attempt") or {}
         release = await db.rental_payments.update_one(
             {
-                "_id": invoice["_id"],
-                "status": {"$in": list(CHARGEABLE_STATUSES)},
-                "charge_attempt.id": attempt.get("id"),
-                "charge_attempt.status": attempt.get("status"),
+                **_invoice_update_guard(invoice),
+                "charge_attempt": attempt,
             },
             {"$unset": {"charge_attempt": ""}, "$set": {
                 "reconciliation_last_release": {
@@ -522,6 +562,7 @@ async def execute_confirmed_reconciliation(confirmation_id: str, request: Reques
                     "execution_claim_id": str(claim_id),
                     "evidence_reference": proposal.get("evidence_reference"),
                     "released_at": now,
+                    "attempt_id": attempt.get("id"),
                 },
                 "updated_at": now,
             }},
@@ -532,6 +573,7 @@ async def execute_confirmed_reconciliation(confirmation_id: str, request: Reques
         else:
             financial_effect = "claim_released"
             result_name = "provider_not_paid_claim_released"
+        after = _invoice_snapshot(await _find_by_id(db.rental_payments, invoice_id))
     elif outcome == "provider_confirmed_not_paid":
         result_name = "provider_not_paid_decision_recorded"
     elif outcome == "needs_refund_review":

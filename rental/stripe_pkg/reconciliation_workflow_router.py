@@ -78,6 +78,10 @@ def _execution_capability(outcome: str) -> dict:
 def _workflow_summary(proposal: dict, confirmation: dict | None, claim: dict | None, result: dict | None, *, now: datetime | None = None) -> dict:
     state = _workflow_state(confirmation, claim, result, now=now)
     outcome = str(proposal.get("outcome") or "")
+    capability = _execution_capability(outcome)
+    if proposal.get("source") == "invoice_charge" and outcome == "provider_confirmed_not_paid":
+        capability = {"mode": "reviewed_claim_release", "financial_write": True,
+                      "requires_exact_invoice": True, "provider_call": False}
     return {
         "proposal_id": str(proposal.get("_id") or ""),
         "proposal_digest": str(proposal.get("proposal_digest") or ""),
@@ -86,7 +90,7 @@ def _workflow_summary(proposal: dict, confirmation: dict | None, claim: dict | N
         "exception_status": str(proposal.get("exception_status") or ""),
         "exception_updated_at": str(proposal.get("exception_updated_at") or ""),
         "outcome": outcome,
-        "capability": _execution_capability(outcome),
+        "capability": capability,
         "reason": str(proposal.get("reason") or ""),
         "evidence_reference": str(proposal.get("evidence_reference") or ""),
         "proposer": proposal.get("proposer") or {},

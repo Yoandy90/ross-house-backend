@@ -7,6 +7,8 @@ closed and a human should investigate before changing any balance.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import hashlib
+import json
 from typing import Any
 
 from bson import ObjectId
@@ -154,6 +156,9 @@ def _invoice_charge_item(doc: dict) -> dict:
         "period": str(doc.get("period") or ""),
         "reference_id": str(attempt.get("transaction_id") or attempt.get("id") or ""),
         "attempt_id": str(attempt.get("id") or ""),
+        "attempt_version": hashlib.sha256(json.dumps(
+            attempt, sort_keys=True, separators=(",", ":"), default=str
+        ).encode()).hexdigest(),
         "updated_at": _iso(attempt.get("updated_at") or attempt.get("created_at")),
     }
 

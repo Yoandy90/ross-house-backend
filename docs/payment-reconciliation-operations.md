@@ -21,7 +21,11 @@ Automatic payment flows intentionally fail closed when the backend cannot prove 
 `provider_confirmed_paid` may complete a proven local invoice. For the
 `invoice_charge` source only, `provider_confirmed_not_paid` may remove the exact
 embedded payment-attempt claim after the three-admin workflow confirms evidence
-that no provider payment occurred.
+that no provider payment occurred. For this source, mutation also requires a
+terminal server-recorded Helcim saved-card response: DECLINED for release, or
+APPROVED/APPROVAL with a transaction ID for invoice completion. Processing,
+unknown, hosted-checkout and autopay attempts remain blocked. Admin notes alone
+cannot unlock them. This module does not independently query Helcim.
 
 That write is allowed only when all of the following are true:
 
@@ -45,7 +49,8 @@ the invoice, attempt ID, source, amount, status and provider transaction ID when
 available; payment credentials remain excluded.
 
 When a confirmed `provider_confirmed_not_paid` decision targets this source,
-execution removes only the matching `charge_attempt.id` and status from a still
+execution checks an immutable attempt fingerprint throughout approval and
+execution and atomically matches the full attempt and financial snapshot of a still
 chargeable invoice. It records `reconciliation_last_release` with the
 confirmation, execution claim and evidence reference. Any mismatch leaves the
 claim in place and returns the workflow to review.

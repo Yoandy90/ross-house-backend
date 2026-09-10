@@ -55,7 +55,8 @@ def _classify_recovery(claim: dict, result: dict | None, invoice: dict | None) -
                 "financial_write_applied_result_missing",
                 "The invoice records this reviewed claim release. Do not execute it again; reconstruct the audit result manually.",
             )
-        if invoice and invoice.get("charge_attempt"):
+        if (invoice and claim.get("attempt_snapshot")
+                and invoice.get("charge_attempt") == claim["attempt_snapshot"]):
             return (
                 "no_financial_write_detected",
                 "The payment-attempt claim is still present. Do not retry automatically; review why execution stopped.",
