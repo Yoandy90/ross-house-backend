@@ -96,7 +96,7 @@ For questions about these terms, contact us:
 
 DEFAULT_PRIVACY_ES = """# Política de Privacidad
 
-**Última actualización: Junio 2026**
+**Última actualización: 10 de septiembre de 2026**
 
 ## 1. Información que Recopilamos
 Recopilamos la siguiente información cuando utiliza nuestra Aplicación:
@@ -114,15 +114,14 @@ Utilizamos su información para:
 
 ## 3. Compartir Información
 No vendemos su información personal. Podemos compartirla con:
-- Proveedores de servicios de pago (Stripe) para procesar transacciones.
+- Helcim para los pagos electrónicos habilitados. Conservamos referencias de transacciones y, cuando guarda un método, tokens y datos limitados para identificarlo.
 - Propietarios de las propiedades que usted renta (información limitada).
 - Autoridades legales cuando sea requerido por ley.
 
 ## 4. Seguridad de Datos
 Implementamos medidas de seguridad para proteger su información:
-- Encriptación de datos en tránsito y en reposo.
-- Acceso restringido a información personal.
-- Monitoreo regular de nuestros sistemas.
+- Controles de acceso a la información personal según la cuenta y sus permisos.
+- Medidas técnicas diseñadas para proteger sus datos. Ningún sistema puede garantizar seguridad absoluta.
 
 ## 5. Sus Derechos
 Usted tiene derecho a:
@@ -148,23 +147,20 @@ Para preguntas sobre privacidad:
 
 DEFAULT_COOKIES_ES = """# Política de Cookies
 
-**Última actualización: Junio 2026**
+**Última actualización: 10 de septiembre de 2026**
 
 ## 1. ¿Qué son las cookies?
 Las cookies son pequeños archivos de texto almacenados en su dispositivo cuando visita nuestro sitio web.
 
-## 2. Cookies que utilizamos
-- **Estrictamente necesarias:** Para el funcionamiento del sitio (sesión, autenticación, CSRF).
-- **Funcionales:** Recuerdan sus preferencias (idioma, modo oscuro).
-- **Analíticas:** Estadísticas anónimas de uso para mejorar el servicio.
-- **No usamos** cookies publicitarias ni de marketing de terceros.
+## 2. Cookies y almacenamiento del navegador
+- Utilizamos cookies y almacenamiento local para funciones de sesión, autenticación y preferencias, según el portal utilizado.
+- La preferencia de idioma puede guardarse en el almacenamiento local del navegador; no todo almacenamiento es una cookie.
 
-## 3. Control de cookies
-Puede deshabilitar cookies desde su navegador, pero algunas funciones de la App pueden no funcionar correctamente.
+## 3. Control del almacenamiento
+Puede gestionar cookies y datos del sitio desde su navegador. Eliminarlos o bloquearlos puede cerrar su sesión o impedir algunas funciones.
 
-## 4. Cookies de terceros
-- **Stripe:** Para procesamiento seguro de pagos.
-- **Google Maps (opcional):** Para mostrar ubicaciones de propiedades.
+## 4. Servicios de terceros
+Los flujos de pago habilitados utilizan Helcim. Al abrir servicios externos, pueden aplicarse sus propias tecnologías de almacenamiento y políticas. Esto no significa que Helcim coloque cookies en todas las páginas de nuestro sitio.
 
 ## 5. Cambios a esta política
 Actualizaremos esta política cuando incorporemos nuevas cookies o servicios.
@@ -176,23 +172,20 @@ Actualizaremos esta política cuando incorporemos nuevas cookies o servicios.
 
 DEFAULT_COOKIES_EN = """# Cookie Policy
 
-**Last updated: June 2026**
+**Last updated: September 10, 2026**
 
 ## 1. What are cookies?
 Cookies are small text files stored on your device when you visit our website.
 
-## 2. Cookies we use
-- **Strictly necessary:** For site operation (session, authentication, CSRF).
-- **Functional:** Remember your preferences (language, dark mode).
-- **Analytics:** Anonymous usage statistics to improve the service.
-- **We do NOT use** third-party advertising or marketing cookies.
+## 2. Cookies and browser storage
+- We use cookies and local storage for session, authentication and preference features, depending on the portal used.
+- Your language preference may be saved in browser local storage; not all storage is a cookie.
 
-## 3. Cookie control
-You can disable cookies in your browser, but some App features may not work correctly.
+## 3. Storage controls
+You can manage cookies and site data through your browser. Removing or blocking them may sign you out or prevent some features from working.
 
-## 4. Third-party cookies
-- **Stripe:** For secure payment processing.
-- **Google Maps (optional):** To display property locations.
+## 4. Third-party services
+Enabled payment flows use Helcim. When you open external services, their own storage technologies and policies may apply. This does not mean Helcim places cookies on every page of our site.
 
 ## 5. Changes to this policy
 We will update this policy when we incorporate new cookies or services.
@@ -296,42 +289,53 @@ If you have an active lease agreement, you **must wait** until it ends before de
 
 DEFAULT_PRIVACY_EN = """# Privacy Policy
 
-**Última actualización: Junio 2026**
+**Last updated: September 10, 2026**
 
-En cumplimiento con la **Guideline 5.1.1(v) de App Store**, esta página explica cómo solicitar la eliminación de su cuenta de Ross House Rentals.
+## 1. Information We Collect
+We collect the following information when you use our App:
+- **Personal information:** Name, email address, phone number.
+- **Payment information:** Data necessary to process rent payments.
+- **Device information:** Device type, operating system, notification tokens.
+- **Location information:** Only when you authorize it, to show nearby properties.
 
-## 1. Eliminar desde la App
-1. Inicie sesión en la App.
-2. Vaya a **Perfil → Configuración → Eliminar Cuenta**.
-3. Confirme con su PIN o contraseña.
-4. Su cuenta y datos personales se eliminarán dentro de **30 días**.
+## 2. How We Use Your Information
+We use your information to:
+- Process rent payments and generate receipts.
+- Send notifications about maintenance, payments, and updates.
+- Improve our services and user experience.
+- Communicate with you about your account and properties.
 
-## 2. Eliminar por correo electrónico
-Envíe un correo a **privacy@rosshouserentals.com** con:
-- Asunto: "Solicitud de Eliminación de Cuenta"
-- Nombre completo, correo registrado y motivo (opcional)
+## 3. Sharing Information
+We do not sell your personal information. We may share it with:
+- Helcim for enabled electronic payments. We retain transaction references and, when you save a method, tokens and limited details to identify it.
+- Property owners of the properties you rent (limited information).
+- Legal authorities when required by law.
 
-Procesaremos su solicitud en un máximo de **30 días**.
+## 4. Data Security
+We implement security measures to protect your information:
+- Access controls for personal information based on the account and its permissions.
+- Technical measures designed to protect your data. No system can guarantee absolute security.
 
-## 3. Datos que se eliminan
-- Información personal de su perfil.
-- Métodos de pago (tarjetas / ACH).
-- Solicitudes de mantenimiento, mensajes y notificaciones.
-- Tokens de notificaciones push.
+## 5. Your Rights
+You have the right to:
+- Access your personal information.
+- Request correction of inaccurate data.
+- Request deletion of your account and data.
+- Opt out of non-essential notifications.
 
-## 4. Datos que se conservan (obligación legal)
-- Registros financieros: hasta **7 años** (requerido por el IRS).
-- Contratos de arrendamiento: hasta **3 años después** del fin del contrato (ley de Texas).
-- Verificaciones de antecedentes: destruidas en 30 días.
+## 6. Data Retention
+We maintain your information while your account is active or as needed to comply with legal obligations.
 
-## 5. Antes de eliminar
-- Asegúrese de que **no tiene contratos de arrendamiento activos**.
-- Descargue cualquier recibo o documento que necesite conservar.
+## 7. Minors
+Our App is not intended for persons under 18 years of age.
 
-## 6. Contacto
+## 8. Changes to this Policy
+We will notify any material changes to this policy through the App.
+
+## 9. Contact
+For privacy questions:
 - 📞 (806) 934-2018
-- 📧 privacy@rosshouserentals.com
-- 📍 305 Bruce Ave, Dumas, TX 79029
+- 📧 info@rosshouserentals.com
 """
 
 DEFAULT_ACCOUNT_DELETION_EN = """# Account Deletion
@@ -376,7 +380,7 @@ We will process your request within **30 days**.
 
 DEFAULT_PRIVACY_EN = """# Privacy Policy
 
-**Last updated: June 2026**
+**Last updated: September 10, 2026**
 
 ## 1. Information We Collect
 We collect the following information when you use our App:
@@ -394,15 +398,14 @@ We use your information to:
 
 ## 3. Sharing Information
 We do not sell your personal information. We may share it with:
-- Payment service providers (Stripe) to process transactions.
+- Helcim for enabled electronic payments. We retain transaction references and, when you save a method, tokens and limited details to identify it.
 - Property owners of the properties you rent (limited information).
 - Legal authorities when required by law.
 
 ## 4. Data Security
 We implement security measures to protect your information:
-- Data encryption in transit and at rest.
-- Restricted access to personal information.
-- Regular monitoring of our systems.
+- Access controls for personal information based on the account and its permissions.
+- Technical measures designed to protect your data. No system can guarantee absolute security.
 
 ## 5. Your Rights
 You have the right to:
@@ -449,6 +452,8 @@ async def _ensure_legal_docs():
         })
         logging.info("✅ Legal documents seeded with defaults")
     else:
+        from rental.legal_content_revision import revise_known_seed_documents
+        await revise_known_seed_documents(db.legal_documents, existing)
         # Backfill any missing fields (e.g. cookies / account_deletion in older deployments)
         missing = {k: v for k, v in defaults.items() if k not in existing or not existing.get(k)}
         if missing:
