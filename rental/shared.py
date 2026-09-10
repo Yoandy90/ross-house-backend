@@ -239,6 +239,8 @@ async def auth_marketplace(request: Request):
                     user["role"] = "tenant"
             if not user:
                 raise HTTPException(status_code=401, detail="Usuario no encontrado")
+            if user.get("status") == "deleted":
+                raise HTTPException(status_code=401, detail="account_deleted")
             return serialize(user)
 
         elif ptype == "tenant":
@@ -454,3 +456,4 @@ async def send_rental_push_to_admins(title: str, body: str, data: dict = None):
                 logging.info(f"📱 Push sent to admin {admin.get('email', '')}: {title}")
             except Exception as e:
                 logging.warning(f"⚠️ Push to admin error: {e}")
+

@@ -977,63 +977,7 @@ async def complete_profile(request: Request):
 
 @router.delete('/marketplace/delete-account')
 async def marketplace_delete_account(request: Request):
-    """Delete the current user's account and all associated data.
-    Required by Apple App Store Review Guidelines §5.1.1(v).
-    """
+    """Close the authenticated app account; retained records are disclosed."""
+    from rental.account_deletion import close_app_account
     user = await auth_marketplace(request)
-    db = get_db()
-    user_id = str(user["_id"])
-    now = datetime.utcnow()
-
-    logging.warning(f"⚠️ ACCOUNT DELETION requested by {user.get('email')} (id={user_id})")
-
-    # 1. Archive user data before deletion
-    archive = {
-        "user_id": user_id,
-        "email": user.get("email", ""),
-        "name": user.get("name", ""),
-        "role": user.get("role", ""),
-        "deleted_at": now,
-        "reason": "user_requested",
-    }
-    await db.deleted_accounts.insert_one(archive)
-
-    # 2. Remove autopay config
-    await db.autopay_config.delete_many({"user_id": user_id})
-
-    # 3. Remove push tokens
-    try:
-        oid = ObjectId(user_id)
-        await db.app_users.update_one({"_id": oid}, {"$unset": {"push_token": 1, "push_platform": 1}})
-    except:
-        pass
-
-    # 4. Anonymize the user record (don't fully delete - keep for financial records)
-    try:
-        oid = ObjectId(user_id)
-        await db.app_users.update_one(
-            {"_id": oid},
-            {"$set": {
-                "name": "Cuenta Eliminada",
-                "email": f"deleted_{user_id}@removed.local",
-                "phone": "",
-                "status": "deleted",
-                "deleted_at": now,
-                "push_token": "",
-            }}
-        )
-    except:
-        pass
-
-    # 5. Remove chat messages (anonymize)
-    await db.chat_messages.update_many(
-        {"sender_id": user_id},
-        {"$set": {"sender_name": "Usuario Eliminado"}}
-    )
-
-    logging.info(f"✅ Account deleted/anonymized for user {user_id}")
-
-    return {
-        "success": True,
-        "message": "Tu cuenta ha sido eliminada exitosamente. Todos tus datos personales han sido removidos."
-    }
+    return await close_app_account(get_db(), user)
