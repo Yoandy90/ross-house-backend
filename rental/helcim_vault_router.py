@@ -55,7 +55,11 @@ async def save_method_session(request: Request):
         r = await x.post(f"{HELCIM_BASE}/helcim-pay/initialize",
                          headers={"api-token": cfg["api_token"], "accept": "application/json"},
                          json={"paymentType": "verify", "amount": 0, "currency": "USD",
-                               "paymentMethod": "cc"})
+                               "paymentMethod": "cc",
+                               "customStyling": {"appearance": "system",
+                                                 "brandColor": "B30D2F",
+                                                 "cornerRadius": "rounded"},
+                               "confirmationScreen": True})
     if r.status_code >= 400:
         raise HTTPException(502, f"Helcim: {r.text[:150]}")
     data = r.json()
