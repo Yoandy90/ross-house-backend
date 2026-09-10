@@ -73,6 +73,22 @@ class RevisionTests(unittest.TestCase):
         self.assertEqual(collection.doc['privacy_es'], 'Edited concurrently by administrator')
         self.assertEqual(collection.markers, {})
 
+    def test_terms_and_deletion_revise_independently_of_privacy(self):
+        fields = ['terms_es', 'terms_en', 'account_deletion_es', 'account_deletion_en']
+        digest = revision.hashlib.sha256(b'Known old content').hexdigest()
+        doc = dict(self.doc, **{field: 'Known old content' for field in fields})
+        # A custom translation must survive while other recognized documents migrate.
+        doc['terms_en'] = 'Terms edited by the owner'
+        collection = Collection(doc)
+        with patch.object(revision, 'LEGACY_HASHES', {field: digest for field in fields}):
+            changed = self.run_revision(collection, doc)
+        self.assertEqual(changed, ['terms_es', 'account_deletion_es', 'account_deletion_en'])
+        self.assertEqual(collection.doc['privacy_es'], doc['privacy_es'])
+        self.assertEqual(collection.doc['terms_en'], 'Terms edited by the owner')
+        for field in changed:
+            self.assertEqual(collection.doc[field], getattr(self.router, 'DEFAULT_' + field.upper()).strip())
+        self.assertEqual(len(collection.markers), 3)
+
 
 if __name__ == '__main__':
     unittest.main()

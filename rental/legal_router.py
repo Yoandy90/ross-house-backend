@@ -16,13 +16,15 @@ router = APIRouter()
 
 DEFAULT_TERMS_ES = """# Términos y Condiciones
 
-**Última actualización: Junio 2026**
+**Última actualización: 10 de septiembre de 2026**
 
 ## 1. Aceptación de los Términos
 Al acceder y utilizar la aplicación de Ross House Rentals LLC ("la Aplicación"), usted acepta cumplir con estos Términos y Condiciones.
 
 ## 2. Descripción del Servicio
-Ross House Rentals LLC proporciona una plataforma de gestión de propiedades que permite a inquilinos, propietarios y administradores gestionar rentas, mantenimientos y pagos.
+Ross House Rentals LLC opera sus propias propiedades de alquiler. El sitio público permite consultar viviendas y enviar solicitudes de interés. Los portales ofrecen funciones de cuenta, pagos, contratos y mantenimiento según el acceso de cada usuario. La administración de propiedades de terceros no está disponible actualmente.
+
+Enviar una solicitud o registrarse en una lista de espera no reserva una vivienda ni garantiza aprobación o disponibilidad. El uso de la plataforma no sustituye su contrato de arrendamiento.
 
 ## 3. Cuentas de Usuario
 - Usted es responsable de mantener la confidencialidad de su cuenta.
@@ -30,12 +32,12 @@ Ross House Rentals LLC proporciona una plataforma de gestión de propiedades que
 - Nos reservamos el derecho de suspender cuentas que violen estos términos.
 
 ## 4. Pagos y Facturación
-- Los pagos de renta se procesan a través de proveedores seguros de pago.
+- Los pagos electrónicos habilitados utilizan Helcim. Los métodos disponibles se muestran en el flujo de pago. Guardar un método de pago no equivale a pagar la renta.
 - Las fechas de vencimiento y montos se establecen en su contrato de arrendamiento.
 - Cargos por pago tardío pueden aplicar según lo estipulado en su contrato.
 
 ## 5. Mantenimiento y Reparaciones
-- Las solicitudes de mantenimiento deben reportarse a través de la Aplicación.
+- Puede reportar solicitudes de mantenimiento a través de la Aplicación o comunicarse con nosotros por teléfono.
 - Emergencias deben reportarse inmediatamente por teléfono.
 - El tiempo de respuesta varía según la urgencia de la solicitud.
 
@@ -52,17 +54,22 @@ Nos reservamos el derecho de modificar estos términos en cualquier momento. Los
 Para preguntas sobre estos términos, contáctenos:
 - 📞 (806) 934-2018
 - 📧 info@rosshouserentals.com
+
+## 10. Cuenta y registros
+La función de eliminación de cuenta no cancela contratos, saldos ni obligaciones pendientes. Consulte la página de eliminación de cuenta para conocer su alcance y cómo solicitar una revisión de sus datos.
 """
 
 DEFAULT_TERMS_EN = """# Terms and Conditions
 
-**Last updated: June 2026**
+**Last updated: September 10, 2026**
 
 ## 1. Acceptance of Terms
 By accessing and using the Ross House Rentals LLC application ("the App"), you agree to comply with these Terms and Conditions.
 
 ## 2. Description of Service
-Ross House Rentals LLC provides a property management platform that allows tenants, landlords, and administrators to manage rentals, maintenance, and payments.
+Ross House Rentals LLC operates its own rental properties. The public website lets visitors view homes and submit expressions of interest. Portals provide account, payment, contract and maintenance features according to each user's access. Third-party property management is not currently available.
+
+Submitting a request or joining a waitlist does not reserve a home or guarantee approval or availability. Using the platform does not replace your lease agreement.
 
 ## 3. User Accounts
 - You are responsible for maintaining the confidentiality of your account.
@@ -70,12 +77,12 @@ Ross House Rentals LLC provides a property management platform that allows tenan
 - We reserve the right to suspend accounts that violate these terms.
 
 ## 4. Payments and Billing
-- Rent payments are processed through secure payment providers.
+- Enabled electronic payments use Helcim. Available methods are shown in the payment flow. Saving a payment method does not constitute a rent payment.
 - Due dates and amounts are established in your lease agreement.
 - Late payment fees may apply as stipulated in your contract.
 
 ## 5. Maintenance and Repairs
-- Maintenance requests must be reported through the App.
+- You can report maintenance requests through the App or contact us by phone.
 - Emergencies should be reported immediately by phone.
 - Response time varies depending on the urgency of the request.
 
@@ -92,6 +99,9 @@ We reserve the right to modify these terms at any time. Changes will be notified
 For questions about these terms, contact us:
 - 📞 (806) 934-2018
 - 📧 info@rosshouserentals.com
+
+## 10. Account and records
+The account deletion feature does not cancel leases, balances or outstanding obligations. See the account deletion page for its scope and how to request a review of your data.
 """
 
 DEFAULT_PRIVACY_ES = """# Política de Privacidad
@@ -195,187 +205,66 @@ We will update this policy when we incorporate new cookies or services.
 - 📧 privacy@rosshouserentals.com
 """
 
-DEFAULT_ACCOUNT_DELETION_ES = """# Cómo Eliminar tu Cuenta — Preguntas Frecuentes
+DEFAULT_ACCOUNT_DELETION_ES = """# Eliminación de cuenta y datos
 
-**Última actualización: Junio 2026**
+**Última actualización: 10 de septiembre de 2026**
 
-> ℹ️ La eliminación de cuenta se realiza **directamente dentro de la app**. Para acceder a esta opción debes estar **registrado e iniciado sesión**.
+## 1. Cómo iniciar la eliminación
+En la aplicación móvil, abra **Perfil → Eliminar mi Cuenta**. Escriba la palabra de confirmación que aparece en pantalla y confirme. La opción requiere iniciar sesión.
 
-## ❓ ¿Cómo elimino mi cuenta?
-1. Abre la app **Ross House Rentals** en tu iPhone o Android.
-2. Inicia sesión con tu correo o teléfono.
-3. Ve a **Perfil → Eliminar mi Cuenta**.
-4. Confirma escribiendo la palabra **ELIMINAR** y toca el botón rojo.
-5. Tu cuenta será eliminada inmediatamente.
+Si no puede acceder a su cuenta, escriba a **info@rosshouserentals.com** indicando su nombre y el correo o teléfono de la cuenta para solicitar asistencia y una revisión de sus datos. No envíe contraseñas ni datos completos de tarjetas. Podemos necesitar verificar su identidad antes de atender la solicitud.
 
-## ❓ ¿Qué pasa si no puedo iniciar sesión?
-Si perdiste acceso a tu cuenta y deseas eliminarla, envíanos un correo a **privacy@rosshouserentals.com** con:
-- Asunto: **Solicitud de Eliminación de Cuenta**
-- Tu nombre completo
-- Correo electrónico o teléfono registrado en la app
-- Motivo (opcional)
+## 2. Alcance de la función actual
+La función modifica el nombre, correo y teléfono del perfil de la cuenta, marca ese perfil como eliminado y retira la configuración de autopago vinculada al usuario. También modifica el nombre visible del remitente en los mensajes asociados.
 
-Procesaremos tu solicitud en un máximo de **30 días**.
+**No es un borrado completo de todos los registros.** Se conserva un registro de la solicitud que incluye identificador de usuario, nombre, correo, rol y fecha. Cambiar el nombre visible en mensajes no elimina su contenido.
 
-## ❓ ¿Qué datos se eliminan?
-- Información personal de tu perfil
-- Métodos de pago guardados (tarjetas, ACH)
-- Solicitudes de mantenimiento y mensajes
-- Tokens de notificaciones push
+## 3. Registros que pueden permanecer
+La función actual no elimina automáticamente contratos, historial financiero, solicitudes de mantenimiento, contenido de mensajes ni todos los métodos de pago guardados. Tampoco constituye una confirmación de eliminación de datos en servicios externos. Puede solicitar por correo una revisión específica de los datos que permanecen y del motivo de su conservación.
 
-## ❓ ¿Qué datos se conservan?
-Por obligación legal (IRS, ley de Texas, FCRA):
-- Registros financieros — hasta **7 años**
-- Contratos de arrendamiento — hasta **3 años después** del fin del contrato
-- Verificaciones de antecedentes — destruidas en 30 días
+## 4. Contratos, pagos y plazos
+Eliminar la cuenta no termina un contrato de arrendamiento, cancela una deuda ni revierte un pago. Si tiene un contrato o saldo pendiente, contáctenos para coordinar el acceso a documentos y la comunicación sobre su vivienda.
 
-## ❓ ¿Es reversible?
-No. Una vez eliminada, no podemos restaurar la cuenta. Asegúrate de descargar cualquier recibo o documento que necesites conservar.
+Esta función no establece un plazo automático de borrado para todos los registros. La conservación debe revisarse según el tipo de dato, las obligaciones aplicables y las solicitudes recibidas; esta página no atribuye un plazo universal al IRS o a la ley de Texas.
 
-## ❓ ¿Tengo contratos activos?
-Si tienes un contrato de arrendamiento vigente, **debes esperar** a que termine antes de eliminar tu cuenta.
+## 5. Antes de confirmar
+Descargue los documentos y recibos que necesite. Si no está seguro del alcance de la eliminación, contáctenos antes de confirmar.
 
-## 📞 Contacto
-- 📧 **privacy@rosshouserentals.com**
-- 📞 (806) 934-2018
-- 📍 305 Bruce Ave, Dumas, TX 79029
+## 6. Contacto
+- Correo: **info@rosshouserentals.com**
+- Teléfono: (806) 934-2018
 """
 
-DEFAULT_ACCOUNT_DELETION_EN = """# How to Delete Your Account — Frequently Asked Questions
 
-**Last updated: June 2026**
 
-> ℹ️ Account deletion is performed **directly inside the app**. To access this option you must be **registered and signed in**.
-
-## ❓ How do I delete my account?
-1. Open the **Ross House Rentals** app on your iPhone or Android.
-2. Sign in with your email or phone.
-3. Go to **Profile → Delete My Account**.
-4. Confirm by typing the word **DELETE** and tap the red button.
-5. Your account will be removed immediately.
-
-## ❓ What if I can't sign in?
-If you lost access to your account and wish to delete it, email us at **privacy@rosshouserentals.com** with:
-- Subject: **Account Deletion Request**
-- Your full name
-- Email or phone number registered in the app
-- Reason (optional)
-
-We will process your request within **30 days**.
-
-## ❓ What data is deleted?
-- Personal profile information
-- Saved payment methods (cards, ACH)
-- Maintenance requests and messages
-- Push notification tokens
-
-## ❓ What data is kept?
-For legal obligations (IRS, Texas law, FCRA):
-- Financial records — up to **7 years**
-- Lease agreements — up to **3 years after** the lease ends
-- Background checks — destroyed within 30 days
-
-## ❓ Is this reversible?
-No. Once deleted, we cannot restore the account. Make sure to download any receipts or documents you need to keep.
-
-## ❓ Do I have active leases?
-If you have an active lease agreement, you **must wait** until it ends before deleting your account.
-
-## 📞 Contact
-- 📧 **privacy@rosshouserentals.com**
-- 📞 (806) 934-2018
-- 📍 305 Bruce Ave, Dumas, TX 79029
-"""
-
-DEFAULT_PRIVACY_EN = """# Privacy Policy
+DEFAULT_ACCOUNT_DELETION_EN = """# Account and data deletion
 
 **Last updated: September 10, 2026**
 
-## 1. Information We Collect
-We collect the following information when you use our App:
-- **Personal information:** Name, email address, phone number.
-- **Payment information:** Data necessary to process rent payments.
-- **Device information:** Device type, operating system, notification tokens.
-- **Location information:** Only when you authorize it, to show nearby properties.
+## 1. How to start deletion
+In the mobile app, open **Profile → Delete My Account**. Type the confirmation word displayed on screen and confirm. You must be signed in to use this option.
 
-## 2. How We Use Your Information
-We use your information to:
-- Process rent payments and generate receipts.
-- Send notifications about maintenance, payments, and updates.
-- Improve our services and user experience.
-- Communicate with you about your account and properties.
+If you cannot access your account, email **info@rosshouserentals.com** with your name and account email or phone number to request assistance and a review of your data. Do not send passwords or full card details. We may need to verify your identity before handling your request.
 
-## 3. Sharing Information
-We do not sell your personal information. We may share it with:
-- Helcim for enabled electronic payments. We retain transaction references and, when you save a method, tokens and limited details to identify it.
-- Property owners of the properties you rent (limited information).
-- Legal authorities when required by law.
+## 2. Scope of the current feature
+The feature changes the account profile name, email and phone number, marks that profile as deleted and removes the autopay configuration linked to the user. It also changes the displayed sender name on associated messages.
 
-## 4. Data Security
-We implement security measures to protect your information:
-- Access controls for personal information based on the account and its permissions.
-- Technical measures designed to protect your data. No system can guarantee absolute security.
+**It does not erase every record.** A request record is retained, including user ID, name, email, role and date. Changing the displayed sender name does not delete message content.
 
-## 5. Your Rights
-You have the right to:
-- Access your personal information.
-- Request correction of inaccurate data.
-- Request deletion of your account and data.
-- Opt out of non-essential notifications.
+## 3. Records that may remain
+The current feature does not automatically delete leases, financial history, maintenance requests, message content or all saved payment methods. It also does not confirm deletion by external services. You may request a specific review by email of the data that remains and the reason for retaining it.
 
-## 6. Data Retention
-We maintain your information while your account is active or as needed to comply with legal obligations.
+## 4. Leases, payments and timing
+Deleting an account does not terminate a lease, cancel a debt or reverse a payment. If you have an active lease or outstanding balance, contact us to coordinate access to documents and communication about your home.
 
-## 7. Minors
-Our App is not intended for persons under 18 years of age.
+This feature does not set an automatic deletion deadline for all records. Retention must be reviewed according to the type of data, applicable obligations and requests received; this page does not attribute a universal period to the IRS or Texas law.
 
-## 8. Changes to this Policy
-We will notify any material changes to this policy through the App.
-
-## 9. Contact
-For privacy questions:
-- 📞 (806) 934-2018
-- 📧 info@rosshouserentals.com
-"""
-
-DEFAULT_ACCOUNT_DELETION_EN = """# Account Deletion
-
-**Last updated: June 2026**
-
-In compliance with **App Store Guideline 5.1.1(v)**, this page explains how to request the deletion of your Ross House Rentals account.
-
-## 1. Delete from the App
-1. Log in to the App.
-2. Go to **Profile → Settings → Delete Account**.
-3. Confirm with your PIN or password.
-4. Your account and personal data will be deleted within **30 days**.
-
-## 2. Delete by email
-Send an email to **privacy@rosshouserentals.com** with:
-- Subject: "Account Deletion Request"
-- Your full name, registered email, and reason (optional)
-
-We will process your request within **30 days**.
-
-## 3. Data that will be deleted
-- Personal profile information.
-- Payment methods (cards / ACH).
-- Maintenance requests, messages, and notifications.
-- Push notification tokens.
-
-## 4. Data we are required to retain (legal obligation)
-- Financial records: up to **7 years** (required by IRS).
-- Lease agreements: up to **3 years after** the lease ends (Texas law).
-- Background checks: destroyed within 30 days.
-
-## 5. Before deleting
-- Make sure you have **no active lease agreements**.
-- Download any receipts or documents you need to keep.
+## 5. Before confirming
+Download the documents and receipts you need. If you are unsure about the scope of deletion, contact us before confirming.
 
 ## 6. Contact
-- 📞 (806) 934-2018
-- 📧 privacy@rosshouserentals.com
-- 📍 305 Bruce Ave, Dumas, TX 79029
+- Email: **info@rosshouserentals.com**
+- Phone: (806) 934-2018
 """
 
 DEFAULT_PRIVACY_EN = """# Privacy Policy
@@ -539,3 +428,4 @@ async def admin_update_legal_documents(request: Request):
 
     logging.info(f"✅ Legal documents updated: {list(update.keys())}")
     return {"success": True, "message": "Documentos legales actualizados"}
+
