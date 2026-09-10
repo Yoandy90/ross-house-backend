@@ -41,6 +41,7 @@ _HARDENED_WEBHOOK_PATHS = {
 }
 _OVERRIDDEN_PATHS = _HARDENED_WEBHOOK_PATHS | {
     "/tenant/create-checkout-payment",
+    "/public/helcim-complete",
 }
 
 # Reuse every core route except the small set replaced in this adapter.
@@ -52,6 +53,20 @@ for _route in core.router.routes:
 def __getattr__(name: str):
     """Forward legacy module attributes to the unchanged core implementation."""
     return getattr(core, name)
+
+
+@router.post("/public/helcim-complete")
+async def helcim_complete(request: Request):
+    """Vault responses use a separate no-charge validator; purchases keep their route."""
+    from .helcim_saved_verification import complete_saved_verification
+    body = await request.json()
+    if not isinstance(body, dict) or not isinstance(body.get("checkout_token"), str):
+        raise HTTPException(400, "Checkout inválido")
+    session = await get_db().helcim_checkout_sessions.find_one(
+        {"checkout_token": body["checkout_token"]})
+    if session and session.get("purpose") == "verify":
+        return await complete_saved_verification(get_db(), session, body.get("raw_data_response"))
+    return await core.helcim_complete(request)
 
 
 def _hosted_checkout_claim_id(contract_id, year: int, month: int) -> ObjectId:
