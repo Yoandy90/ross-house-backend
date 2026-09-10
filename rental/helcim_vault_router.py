@@ -18,6 +18,7 @@ from .shared import get_db, auth_tenant_flex
 logger = logging.getLogger("helcim_vault")
 router = APIRouter(tags=["helcim-vault"])
 HELCIM_BASE = "https://api.helcim.com/v2"
+_SAVE_SESSION_PUBLIC_STATUSES = frozenset({"pending", "verified", "failed"})
 
 
 async def _helcim_cfg() -> dict:
@@ -71,8 +72,36 @@ async def save_method_session(request: Request):
         "purpose": "verify", "tenant_id": str(tenant["_id"]),
         "tenant_name": tenant.get("name", ""), "status": "pending",
         "created_at": datetime.now(timezone.utc)})
-    return {"success": True,
+    return {"success": True, "session_id": sid,
             "url": f"{_public_base_url()}/api/public/helcim-checkout/{sid}"}
+
+
+@router.get("/tenant/helcim/save-method-sessions/{session_id}")
+async def save_method_session_status(session_id: str, request: Request):
+    """Return the authenticated tenant's verification state without vault data.
+
+    Mobile clients may poll this endpoint to close the Helcim WebView only after
+    the server has validated Helcim's signed response.  Checkout/secret/card
+    tokens and provider response data are deliberately never returned.
+    """
+    tenant = await auth_tenant_flex(request)
+    session = await get_db().helcim_checkout_sessions.find_one({
+        "_id": session_id,
+        "tenant_id": str(tenant["_id"]),
+        "purpose": "verify",
+    })
+    if not session:
+        raise HTTPException(status_code=404, detail="Sesión de verificación no encontrada")
+
+    status = str(session.get("status") or "pending").lower()
+    if status not in _SAVE_SESSION_PUBLIC_STATUSES:
+        status = "failed"
+    return {
+        "success": True,
+        "session_id": session_id,
+        "status": status,
+        "method_saved": status == "verified",
+    }
 
 
 @router.get("/tenant/helcim/methods")
