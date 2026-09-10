@@ -19,6 +19,15 @@ logger = logging.getLogger("helcim_vault")
 router = APIRouter(tags=["helcim-vault"])
 HELCIM_BASE = "https://api.helcim.com/v2"
 _SAVE_SESSION_PUBLIC_STATUSES = frozenset({"pending", "verified", "failed"})
+AUTOPAY_AUTHORIZATION_VERSION = "helcim-autopay-v1"
+AUTOPAY_AUTHORIZATION_SCOPE = "monthly_canonical_rent_balance"
+
+
+def _authorization_event(config: dict, request_id: str):
+    for event in config.get("authorization_history") or []:
+        if event.get("authorization_request_id") == request_id:
+            return event
+    return None
 
 
 async def _helcim_cfg() -> dict:
@@ -117,7 +126,8 @@ async def list_methods(request: Request):
     return {"success": True, "methods": items,
             "autopay": {"enabled": bool(ap.get("enabled")),
                         "method_id": str(ap.get("helcim_method_id", "")),
-                        "day_of_month": ap.get("day_of_month", 1)}}
+                        "day_of_month": ap.get("day_of_month", 1),
+                        "authorization_version": AUTOPAY_AUTHORIZATION_VERSION}}
 
 
 @router.delete("/tenant/helcim/methods/{mid}")
@@ -201,3 +211,105 @@ async def set_autopay(request: Request):
         {"user_id": str(tenant["_id"]), "processor": "helcim"},
         {"$set": update}, upsert=True)
     return {"success": True, "enabled": enabled}
+
+
+@router.post("/tenant/helcim/autopay/authorization")
+async def authorize_autopay(request: Request):
+    """Enable or revoke autopay with an append-only authorization snapshot.
+
+    This additive v2 contract lets deployed clients migrate without changing
+    the legacy endpoint in place.  The event contains display/audit metadata,
+    never the Helcim card token or customer code used by the charge worker.
+    """
+    from .security import client_ip_hash
+
+    tenant = await auth_tenant_flex(request)
+    data = await request.json()
+    enabled = data.get("enabled")
+    request_id = str(data.get("authorization_request_id") or "").lower()
+    version = str(data.get("authorization_version") or "")
+    if not isinstance(enabled, bool):
+        raise HTTPException(400, "Estado de autopago inválido")
+    if not (len(request_id) == 32 and all(c in "0123456789abcdef" for c in request_id)):
+        raise HTTPException(400, "Identificador de autorización inválido")
+    if version != AUTOPAY_AUTHORIZATION_VERSION:
+        raise HTTPException(409, "Actualiza la aplicación para autorizar el autopago")
+    if enabled and data.get("accepted") is not True:
+        raise HTTPException(400, "Debes aceptar expresamente la autorización de autopago")
+
+    tenant_id = str(tenant["_id"])
+    day = max(1, min(28, int(data.get("day_of_month") or 1)))
+    method_id = str(data.get("method_id") or "")
+    db = get_db()
+    existing = await db.autopay_config.find_one(
+        {"user_id": tenant_id, "processor": "helcim"})
+    prior_event = _authorization_event(existing or {}, request_id)
+    if prior_event:
+        return {"success": True, "enabled": prior_event.get("action") == "authorized",
+                "authorization_id": request_id, "duplicate": True}
+
+    method = None
+    if enabled:
+        try:
+            method = await db.helcim_saved_methods.find_one({
+                "_id": ObjectId(method_id), "tenant_id": tenant_id})
+        except Exception:
+            method = None
+        if not method:
+            raise HTTPException(400, "Selecciona un método de pago guardado")
+
+    now = datetime.now(timezone.utc)
+    event = {
+        "authorization_request_id": request_id,
+        "authorization_version": AUTOPAY_AUTHORIZATION_VERSION,
+        "scope": AUTOPAY_AUTHORIZATION_SCOPE,
+        "action": "authorized" if enabled else "revoked",
+        "accepted": enabled,
+        "method_id": method_id if enabled else "",
+        "method_type": str((method or {}).get("type") or "card") if enabled else "",
+        "method_brand": str((method or {}).get("brand") or "")[:40] if enabled else "",
+        "method_last4": str((method or {}).get("last4") or "")[-4:] if enabled else "",
+        "day_of_month": day,
+        "recorded_at": now,
+        "ip_hash": client_ip_hash(request),
+        "user_agent": str(request.headers.get("user-agent") or "")[:300],
+    }
+    update = {
+        "$set": {"enabled": enabled, "processor": "helcim", "user_id": tenant_id,
+                 "day_of_month": day, "authorization": event, "updated_at": now},
+        "$push": {"authorization_history": event},
+    }
+    if enabled:
+        update["$set"].update({
+            "helcim_method_id": method_id,
+            "helcim_card_token": method["card_token"],
+            "helcim_customer_code": method.get("customer_code", ""),
+        })
+    else:
+        update["$unset"] = {"helcim_method_id": "", "helcim_card_token": "",
+                              "helcim_customer_code": ""}
+
+    config_id = existing.get("_id") if existing else f"helcim:{tenant_id}"
+    try:
+        result = await db.autopay_config.update_one(
+            {"_id": config_id,
+             "authorization_history.authorization_request_id": {"$ne": request_id}},
+            update, upsert=not bool(existing))
+    except Exception:
+        duplicate = await db.autopay_config.find_one({"_id": config_id})
+        duplicate_event = _authorization_event(duplicate or {}, request_id)
+        if duplicate_event:
+            return {"success": True,
+                    "enabled": duplicate_event.get("action") == "authorized",
+                    "authorization_id": request_id, "duplicate": True}
+        raise
+    if not (getattr(result, "modified_count", 0) or getattr(result, "upserted_id", None)):
+        duplicate = await db.autopay_config.find_one({"_id": config_id})
+        duplicate_event = _authorization_event(duplicate or {}, request_id)
+        if duplicate_event:
+            return {"success": True,
+                    "enabled": duplicate_event.get("action") == "authorized",
+                    "authorization_id": request_id, "duplicate": True}
+        raise HTTPException(409, "No se pudo registrar la autorización")
+    return {"success": True, "enabled": enabled,
+            "authorization_id": request_id, "duplicate": False}
