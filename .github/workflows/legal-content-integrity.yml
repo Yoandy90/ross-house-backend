@@ -1,0 +1,23 @@
+name: Legal Content Integrity
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  content-revision:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Compile legal document modules
+        run: python -m py_compile rental/legal_router.py rental/legal_content_revision.py
+      - name: Preserve custom content, history and concurrent edits
+        run: python -m unittest discover -s tests -p test_legal_content_revision.py
