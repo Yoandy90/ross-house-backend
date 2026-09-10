@@ -40,6 +40,27 @@ def test_record_only_missing_result_cannot_be_mistaken_for_financial_write():
     assert "no financial write" in guidance.lower()
 
 
+def test_claim_release_recovery_detects_applied_release_marker():
+    claim = {"_id": "claim-release-1", "financial_effect": "claim_release_pending"}
+    invoice = {"status": "partial", "reconciliation_last_release": {
+        "execution_claim_id": "claim-release-1"}}
+    classification, guidance = _classify_recovery(claim, None, invoice)
+    assert classification == "financial_write_applied_result_missing"
+    assert "do not execute" in guidance.lower()
+
+
+def test_claim_release_recovery_distinguishes_present_and_unknown_claim_state():
+    claim = {"_id": "claim-release-2", "financial_effect": "claim_release_pending"}
+    present, present_guidance = _classify_recovery(
+        claim, None, {"status": "partial", "charge_attempt": {"id": "attempt-1"}})
+    assert present == "no_financial_write_detected"
+    assert "still present" in present_guidance.lower()
+    ambiguous, ambiguous_guidance = _classify_recovery(
+        claim, None, {"status": "partial"})
+    assert ambiguous == "ambiguous_state"
+    assert "cannot be proven" in ambiguous_guidance.lower()
+
+
 def test_unchanged_invoice_snapshot_classifies_no_write_detected():
     before = {
         "id": "inv-1", "status": "partial", "amount": 1000.0, "late_fee": 50.0,

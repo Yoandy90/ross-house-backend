@@ -37,6 +37,7 @@ from rental.shared import auth_admin, get_db
 from rental.stripe_pkg.reconciliation_queue_router import (
     AUTOPAY_RECONCILIATION_STATUSES,
     HOSTED_RECONCILIATION_STATUSES,
+    INVOICE_CHARGE_RECONCILIATION_STATUSES,
     STRIPE_RECONCILIATION_STATUSES,
     _find_by_id,
     _invoice_snapshot,
@@ -191,6 +192,17 @@ async def _proven_invoice_for_execution(db, proposal: dict) -> dict | None:
         pi_id = str(source_doc.get("account_id") or "")
         return await db.rental_payments.find_one(stripe_payment_identity_query(pi_id)) if pi_id else None
 
+    if source == "invoice_charge":
+        invoice = await _find_by_id(db.rental_payments, item_id)
+        attempt = (invoice or {}).get("charge_attempt") or {}
+        if (
+            invoice
+            and str(invoice.get("status") or "") in set(CHARGEABLE_STATUSES)
+            and str(attempt.get("status") or "") in INVOICE_CHARGE_RECONCILIATION_STATUSES
+        ):
+            return invoice
+        return None
+
     return None
 
 
@@ -211,6 +223,12 @@ async def _trusted_source_amount_cents(db, proposal: dict) -> int | None:
         if not source_doc or str(source_doc.get("last_attempt_status") or "") not in AUTOPAY_RECONCILIATION_STATUSES:
             return None
         amount = float(source_doc.get("last_attempt_amount") or 0)
+        return _money_cents(amount) if amount > 0 else None
+
+    if source == "invoice_charge":
+        invoice = await _find_by_id(db.rental_payments, item_id)
+        attempt = (invoice or {}).get("charge_attempt") or {}
+        amount = float(attempt.get("amount") or 0)
         return _money_cents(amount) if amount > 0 else None
 
     return None
@@ -262,7 +280,9 @@ async def _readiness(db, proposal: dict, confirmation: dict, confirmation_oid: O
         "requires_third_admin": True,
         "provider_calls": False,
         "can_execute": True,
-        "financial_write": outcome == "provider_confirmed_paid",
+        "financial_write": outcome == "provider_confirmed_paid" or (
+            outcome == "provider_confirmed_not_paid" and proposal.get("source") == "invoice_charge"
+        ),
         "invoice": None,
         "outstanding_cents": 0,
         "trusted_source_amount_cents": 0,
@@ -276,6 +296,14 @@ async def _readiness(db, proposal: dict, confirmation: dict, confirmation_oid: O
         return result
 
     await _recheck_exception_version(db, proposal)
+    if outcome == "provider_confirmed_not_paid" and proposal.get("source") == "invoice_charge":
+        invoice = await _proven_invoice_for_execution(db, proposal)
+        snapshot = _invoice_financial_snapshot(invoice)
+        if not invoice or not snapshot:
+            result.update({"can_execute": False, "reason": "exact_invoice_link_unavailable"})
+            return result
+        result.update({"invoice": snapshot["invoice"]})
+        return result
     if outcome != "provider_confirmed_paid":
         return result
 
@@ -392,13 +420,21 @@ async def execute_confirmed_reconciliation(confirmation_id: str, request: Reques
     trusted_source_amount_cents = 0
     confirmed_amount_cents = 0
     before = None
-    if outcome == "provider_confirmed_paid":
+    releases_invoice_claim = (
+        outcome == "provider_confirmed_not_paid"
+        and proposal.get("source") == "invoice_charge"
+    )
+    if outcome == "provider_confirmed_paid" or releases_invoice_claim:
         invoice = await _proven_invoice_for_execution(db, proposal)
         snapshot = _invoice_financial_snapshot(invoice)
-        trusted_source_amount = await _trusted_source_amount_cents(db, proposal)
-        if not invoice or not snapshot or trusted_source_amount is None:
-            raise HTTPException(status_code=409, detail="Exact invoice or trusted source amount unavailable")
+        if not invoice or not snapshot:
+            raise HTTPException(status_code=409, detail="Exact invoice unavailable")
         invoice_id = str(invoice.get("_id") or "")
+        before = snapshot["invoice"]
+    if outcome == "provider_confirmed_paid":
+        trusted_source_amount = await _trusted_source_amount_cents(db, proposal)
+        if trusted_source_amount is None:
+            raise HTTPException(status_code=409, detail="Trusted source amount unavailable")
         if str(data.get("expected_invoice_id") or "").strip() != invoice_id:
             raise HTTPException(status_code=409, detail="Invoice confirmation mismatch")
         trusted_source_amount_cents = int(trusted_source_amount)
@@ -409,7 +445,6 @@ async def execute_confirmed_reconciliation(confirmation_id: str, request: Reques
             or confirmed_amount_cents != trusted_source_amount_cents
         ):
             raise HTTPException(status_code=409, detail="Confirmed amount does not match trusted source and current balance")
-        before = snapshot["invoice"]
 
     now = datetime.now(timezone.utc)
     claim_id = _execution_claim_id(confirmation_oid)
@@ -428,7 +463,11 @@ async def execute_confirmed_reconciliation(confirmation_id: str, request: Reques
             "trusted_source_amount_cents": trusted_source_amount_cents,
             "confirmed_amount_cents": confirmed_amount_cents,
             "before": before,
-            "financial_effect": "local_accounting_pending" if outcome == "provider_confirmed_paid" else "none",
+            "financial_effect": (
+                "local_accounting_pending" if outcome == "provider_confirmed_paid"
+                else "claim_release_pending" if outcome == "provider_confirmed_not_paid" and proposal.get("source") == "invoice_charge"
+                else "none"
+            ),
             "execution_status": "started",
             "created_at": now,
         })
@@ -468,6 +507,31 @@ async def execute_confirmed_reconciliation(confirmation_id: str, request: Reques
         else:
             financial_effect = "local_accounting"
             result_name = "local_invoice_completed"
+    elif releases_invoice_claim:
+        attempt = (invoice or {}).get("charge_attempt") or {}
+        release = await db.rental_payments.update_one(
+            {
+                "_id": invoice["_id"],
+                "status": {"$in": list(CHARGEABLE_STATUSES)},
+                "charge_attempt.id": attempt.get("id"),
+                "charge_attempt.status": attempt.get("status"),
+            },
+            {"$unset": {"charge_attempt": ""}, "$set": {
+                "reconciliation_last_release": {
+                    "confirmation_id": str(confirmation_oid),
+                    "execution_claim_id": str(claim_id),
+                    "evidence_reference": proposal.get("evidence_reference"),
+                    "released_at": now,
+                },
+                "updated_at": now,
+            }},
+        )
+        if getattr(release, "modified_count", 0) != 1:
+            execution_status = "requires_review"
+            result_name = "claim_not_released_concurrent_change"
+        else:
+            financial_effect = "claim_released"
+            result_name = "provider_not_paid_claim_released"
     elif outcome == "provider_confirmed_not_paid":
         result_name = "provider_not_paid_decision_recorded"
     elif outcome == "needs_refund_review":

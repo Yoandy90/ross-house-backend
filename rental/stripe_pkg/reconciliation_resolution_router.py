@@ -20,10 +20,12 @@ from rental.shared import auth_admin, get_db
 from rental.stripe_pkg.reconciliation_queue_router import (
     AUTOPAY_RECONCILIATION_STATUSES,
     HOSTED_RECONCILIATION_STATUSES,
+    INVOICE_CHARGE_RECONCILIATION_STATUSES,
     STRIPE_RECONCILIATION_STATUSES,
     _autopay_item,
     _find_by_id,
     _hosted_item,
+    _invoice_charge_item,
     _stripe_item,
 )
 
@@ -77,6 +79,17 @@ async def _active_exception(db, source: str, item_id: str) -> dict | None:
         doc = await _find_by_id(db.autopay_config, item_id)
         if doc and str(doc.get("last_attempt_status") or "") in AUTOPAY_RECONCILIATION_STATUSES:
             return _autopay_item(doc)
+        return None
+
+    if source == "invoice_charge":
+        doc = await _find_by_id(db.rental_payments, item_id)
+        attempt = (doc or {}).get("charge_attempt") or {}
+        if (
+            doc
+            and str(doc.get("status") or "") in {"pending", "late", "partial"}
+            and str(attempt.get("status") or "") in INVOICE_CHARGE_RECONCILIATION_STATUSES
+        ):
+            return _invoice_charge_item(doc)
         return None
 
     return None

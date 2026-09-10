@@ -60,7 +60,14 @@ class FakeRentalPayments:
         statuses = (query.get("status") or {}).get("$in", [])
         if statuses and self.invoice.get("status") not in statuses:
             return SimpleNamespace(modified_count=0)
-        self.invoice.update(update["$set"])
+        attempt = self.invoice.get("charge_attempt") or {}
+        if "charge_attempt.id" in query and attempt.get("id") != query["charge_attempt.id"]:
+            return SimpleNamespace(modified_count=0)
+        if "charge_attempt.status" in query and attempt.get("status") != query["charge_attempt.status"]:
+            return SimpleNamespace(modified_count=0)
+        for key in update.get("$unset", {}):
+            self.invoice.pop(key, None)
+        self.invoice.update(update.get("$set", {}))
         return SimpleNamespace(modified_count=1)
 
 
@@ -353,9 +360,52 @@ def test_execution_module_has_no_provider_or_refund_calls_and_one_financial_writ
         "create_hosted_checkout(", "requests.", "httpx.", "delete_one(", "find_one_and_update(",
     ):
         assert forbidden not in source
-    assert source.count("db.rental_payments.update_one(") == 1
+    assert source.count("db.rental_payments.update_one(") == 2
     assert source.count("db[ACTIONS_COLLECTION].insert_one(") == 2
     assert "trusted_source_amount_cents" in source
+
+
+@pytest.mark.asyncio
+async def test_confirmed_not_paid_releases_exact_invoice_attempt_with_audit(monkeypatch):
+    created = "2026-09-10T22:00:00+00:00"
+    invoice = _partial_invoice()
+    invoice["charge_attempt"] = {
+        "id": "attempt-1", "status": "reconciliation_required",
+        "source": "helcim_saved", "amount": 650.0,
+        "transaction_id": "tx-declined", "created_at": created,
+    }
+    proposal = _proposal("provider_confirmed_not_paid")
+    proposal.update({
+        "source": "invoice_charge", "item_id": str(invoice["_id"]),
+        "exception_status": "reconciliation_required",
+        "exception_updated_at": created,
+        "reference_id": "tx-declined",
+    })
+    confirmation = _confirmation(proposal)
+    db = FakeDB(invoice)
+
+    async def fake_auth(_request):
+        return {"_id": "admin-c", "email": "c@example.com"}
+    async def fake_load(_db, _confirmation_id):
+        return proposal, confirmation, confirmation["_id"]
+
+    monkeypatch.setattr(rer, "auth_admin", fake_auth)
+    monkeypatch.setattr(rer, "get_db", lambda: db)
+    monkeypatch.setattr(rer, "_load_confirmed_decision", fake_load)
+
+    response = await rer.execute_confirmed_reconciliation(
+        str(confirmation["_id"]),
+        FakeRequest({"execute": True, "proposal_digest": proposal["proposal_digest"],
+                     "expected_outcome": proposal["outcome"]}),
+    )
+    assert response["result"] == "provider_not_paid_claim_released"
+    assert response["financial_effect"] == "claim_released"
+    assert "charge_attempt" not in db.rental_payments.invoice
+    release = db.rental_payments.invoice["reconciliation_last_release"]
+    assert release["confirmation_id"] == str(confirmation["_id"])
+    assert release["evidence_reference"] == proposal["evidence_reference"]
+    assert [a["action"] for a in db.payment_reconciliation_actions.docs.values()] == [
+        "execution_claim", "execution_result"]
 
 
 def test_public_router_includes_execution_workflow_once():

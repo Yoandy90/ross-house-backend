@@ -31,6 +31,10 @@ HOSTED_RECONCILIATION_STATUSES = (
     "creating_checkout",
     "checkout_creation_unknown",
 )
+INVOICE_CHARGE_RECONCILIATION_STATUSES = (
+    "processing",
+    "reconciliation_required",
+)
 
 _BASE_SEVERITY = {
     "reconciliation_required": 4,
@@ -135,6 +139,25 @@ def _autopay_item(doc: dict) -> dict:
     }
 
 
+def _invoice_charge_item(doc: dict) -> dict:
+    """Return the embedded attempt without exposing any saved credential."""
+    attempt = doc.get("charge_attempt") or {}
+    return {
+        "source": "invoice_charge",
+        "id": str(doc.get("_id", "")),
+        "status": str(attempt.get("status") or ""),
+        "processor": str(attempt.get("source") or ""),
+        "contract_id": str(doc.get("contract_id") or ""),
+        "tenant_id": str(doc.get("tenant_id") or ""),
+        "invoice_id": str(doc.get("_id") or ""),
+        "amount": float(attempt.get("amount") or 0),
+        "period": str(doc.get("period") or ""),
+        "reference_id": str(attempt.get("transaction_id") or attempt.get("id") or ""),
+        "attempt_id": str(attempt.get("id") or ""),
+        "updated_at": _iso(attempt.get("updated_at") or attempt.get("created_at")),
+    }
+
+
 def _invoice_snapshot(doc: dict | None) -> dict | None:
     if not doc:
         return None
@@ -199,6 +222,8 @@ def _investigation_hint(source: str, status: str) -> str:
         ("stripe_webhook", "invalid_metadata"): "Review the PaymentIntent origin and canonical invoice linkage before any reconciliation action.",
         ("autopay", "failed_unknown"): "Confirm provider outcome before any manual retry because the remote charge may have succeeded.",
         ("autopay", "reconciliation_required"): "Provider charge was observed; reconcile the canonical invoice before any new charge attempt.",
+        ("invoice_charge", "processing"): "Confirm the provider outcome before allowing any new payment attempt.",
+        ("invoice_charge", "reconciliation_required"): "Compare the provider transaction with this exact invoice attempt before changing the balance or releasing it.",
     }
     return hints.get((source, status), "Investigate source records before changing any financial state.")
 
@@ -241,8 +266,16 @@ async def admin_payment_reconciliation(request: Request, limit: int = 100):
         _autopay_item,
         safe_limit,
     )
+    invoice_charges = await _collect(
+        db.rental_payments.find({
+            "status": {"$in": ["pending", "late", "partial"]},
+            "charge_attempt.status": {"$in": list(INVOICE_CHARGE_RECONCILIATION_STATUSES)},
+        }).sort("charge_attempt.created_at", -1).limit(safe_limit),
+        _invoice_charge_item,
+        safe_limit,
+    )
 
-    items = [_priority(item, now) for item in hosted + stripe + autopay]
+    items = [_priority(item, now) for item in hosted + stripe + autopay + invoice_charges]
     items.sort(
         key=lambda item: (
             item.get("severity_score") or 0,
@@ -321,6 +354,24 @@ async def admin_payment_reconciliation_detail(request: Request, source: str, ite
             "item": item,
             "invoice": None,
             "autopay": _autopay_snapshot(doc),
+            "investigation_hint": _investigation_hint(normalized_source, item["status"]),
+            "read_only": True,
+        }
+
+    if normalized_source == "invoice_charge":
+        doc = await _find_by_id(db.rental_payments, item_id)
+        attempt = (doc or {}).get("charge_attempt") or {}
+        if (
+            not doc
+            or str(doc.get("status") or "") not in {"pending", "late", "partial"}
+            or str(attempt.get("status") or "") not in INVOICE_CHARGE_RECONCILIATION_STATUSES
+        ):
+            raise HTTPException(status_code=404, detail="Reconciliation item not found")
+        item = _priority(_invoice_charge_item(doc), now)
+        return {
+            "item": item,
+            "invoice": _invoice_snapshot(doc),
+            "autopay": None,
             "investigation_hint": _investigation_hint(normalized_source, item["status"]),
             "read_only": True,
         }
