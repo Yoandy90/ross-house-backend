@@ -128,3 +128,44 @@ def test_revocation_records_event_and_removes_charge_credentials(monkeypatch):
     assert update["$push"]["authorization_history"]["action"] == "revoked"
     assert set(update["$unset"]) == {
         "helcim_method_id", "helcim_card_token", "helcim_customer_code"}
+
+
+@pytest.mark.parametrize("enabled,status", [
+    (True, 409), ("false", 400), ("true", 400), (1, 400), (0, 400), (None, 400),
+])
+def test_legacy_endpoint_cannot_enable_without_authorization(monkeypatch, enabled, status):
+    db = _DB()
+    _install(monkeypatch, db)
+    with pytest.raises(vault.HTTPException) as exc:
+        _run(vault.set_autopay(_Request({"enabled": enabled, "method_id": METHOD_ID})))
+    assert exc.value.status_code == status
+    assert db.autopay_config.update is None
+    assert db.helcim_saved_methods.find_queries == []
+
+
+def test_legacy_revocation_clears_credentials_and_preserves_schedule(monkeypatch):
+    db = _DB()
+    _install(monkeypatch, db)
+    writes = []
+
+    async def update_many(query, update):
+        writes.append((query, update))
+        return SimpleNamespace(modified_count=1)
+
+    db.autopay_config.update_many = update_many
+    response = _run(vault.set_autopay(_Request({
+        "enabled": False, "day_of_month": "invalid", "method_id": "invalid"})))
+    assert response == {"success": True, "enabled": False}
+    query, update = writes[0]
+    assert query == {"user_id": "tenant-123", "processor": "helcim"}
+    assert update["$set"]["enabled"] is False
+    assert "day_of_month" not in update["$set"]
+    assert set(update["$unset"]) == {
+        "helcim_method_id", "helcim_card_token", "helcim_customer_code"}
+    event = update["$push"]["authorization_history"]
+    assert event == update["$set"]["authorization"]
+    assert event["action"] == "revoked"
+    assert event["accepted"] is False
+    assert event["source"] == "legacy_endpoint"
+    assert "token" not in repr(event)
+    assert db.helcim_saved_methods.find_queries == []

@@ -192,25 +192,33 @@ async def pay_with_method(request: Request):
 async def set_autopay(request: Request):
     tenant = await auth_tenant_flex(request)
     data = await request.json()
-    db = get_db()
-    enabled = bool(data.get("enabled"))
-    update = {"enabled": enabled, "processor": "helcim",
-              "user_id": str(tenant["_id"]),
-              "day_of_month": max(1, min(28, int(data.get("day_of_month") or 1))),
-              "updated_at": datetime.now(timezone.utc)}
+    enabled = data.get("enabled")
+    if not isinstance(enabled, bool):
+        raise HTTPException(400, "Estado de autopago inválido")
     if enabled:
-        mid = data.get("method_id", "")
-        m = await db.helcim_saved_methods.find_one(
-            {"_id": ObjectId(mid), "tenant_id": str(tenant["_id"])})
-        if not m:
-            raise HTTPException(400, "Selecciona un método de pago guardado")
-        update["helcim_method_id"] = mid
-        update["helcim_card_token"] = m["card_token"]
-        update["helcim_customer_code"] = m.get("customer_code", "")
-    await db.autopay_config.update_one(
+        raise HTTPException(
+            409, "Actualiza la aplicación para registrar la autorización de autopago")
+
+    # Older clients must still be able to revoke, but cannot bypass the
+    # explicit authorization contract when enabling or changing a method.
+    now = datetime.now(timezone.utc)
+    event = {
+        "authorization_request_id": uuid.uuid4().hex,
+        "authorization_version": AUTOPAY_AUTHORIZATION_VERSION,
+        "scope": AUTOPAY_AUTHORIZATION_SCOPE,
+        "action": "revoked",
+        "accepted": False,
+        "source": "legacy_endpoint",
+        "recorded_at": now,
+    }
+    await get_db().autopay_config.update_many(
         {"user_id": str(tenant["_id"]), "processor": "helcim"},
-        {"$set": update}, upsert=True)
-    return {"success": True, "enabled": enabled}
+        {"$set": {"enabled": False, "authorization": event, "updated_at": now},
+         "$unset": {"helcim_method_id": "", "helcim_card_token": "",
+                    "helcim_customer_code": ""},
+         "$push": {"authorization_history": event}},
+    )
+    return {"success": True, "enabled": False}
 
 
 @router.post("/tenant/helcim/autopay/authorization")
