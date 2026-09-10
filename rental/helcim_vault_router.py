@@ -147,8 +147,11 @@ async def pay_with_method(request: Request):
     tenant = await auth_tenant_flex(request)
     data = await request.json()
     db = get_db()
+    method_id = data.get("method_id")
+    if not isinstance(method_id, str) or not ObjectId.is_valid(method_id):
+        raise HTTPException(400, "Método de pago inválido")
     m = await db.helcim_saved_methods.find_one(
-        {"_id": ObjectId(data.get("method_id", "0" * 24)), "tenant_id": str(tenant["_id"])})
+        {"_id": ObjectId(method_id), "tenant_id": str(tenant["_id"])})
     if not m:
         raise HTTPException(404, "Método de pago no encontrado")
 
@@ -157,35 +160,60 @@ async def pay_with_method(request: Request):
         {"tenant_id": {"$in": list(ids)}, "status": {"$in": ["active", "activo"]}})
     if not contract:
         raise HTTPException(404, "Sin contrato activo")
-    pending = await db.rental_payments.find_one(
-        {"contract_id": str(contract["_id"]),
-         "status": {"$in": ["pending", "late", "partial"]}}, sort=[("due_date", 1)])
-    if not pending:
-        raise HTTPException(400, "No tienes pagos pendientes este mes 🎉")
-    total_cents = int(round((float(pending.get("amount") or 0)
-                             + float(pending.get("late_fee") or 0)) * 100))
-    if total_cents <= 0:
-        raise HTTPException(400, "Monto inválido")
-
+    from .rent_charge_policy import resolve_current_rent_charge
+    from .rent_charge_claim import claim_rent_charge
+    try:
+        charge = await resolve_current_rent_charge(db, contract)
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(409, "La renta actual requiere revisión") from exc
+    total = charge["outstanding"]
+    if total <= 0:
+        raise HTTPException(400, "No tienes saldo pendiente este mes")
+    if m.get("type", "card") != "card" or not m.get("card_token"):
+        raise HTTPException(400, "Selecciona una tarjeta guardada válida")
     cfg = await _helcim_cfg()
-    tx = await helcim_purchase_with_token(
-        cfg["api_token"], total_cents, m["card_token"], m.get("customer_code", ""),
-        (request.client.host if request.client else "127.0.0.1"))
-    status = str(tx.get("status", "")).upper()
-    if status not in ("APPROVED", "APPROVAL"):
-        raise HTTPException(402, f"Pago no aprobado ({status or 'DECLINED'})")
-
-    now = datetime.now(timezone.utc)
-    receipt = f"HLC-{now.strftime('%Y%m%d')}-{str(tenant['_id'])[-4:]}"
-    await db.rental_payments.update_one({"_id": pending["_id"]}, {"$set": {
-        "status": "completed", "payment_method": "helcim_saved",
-        "receipt_number": receipt, "reference_number": str(tx.get("transactionId", "")),
-        "total_paid": total_cents / 100, "payment_date": now.isoformat(),
-        "updated_at": now}})
-    logger.info("💳 1-tap Helcim: %s pagó $%.2f (%s)", tenant.get("name"),
-                total_cents / 100, receipt)
-    return {"success": True, "receipt_number": receipt,
-            "transaction_id": str(tx.get("transactionId", ""))}
+    if not cfg.get("api_token"):
+        raise HTTPException(400, "Helcim no configurado")
+    attempt = await claim_rent_charge(
+        db, charge["invoice_id"], source="helcim_saved", amount=total,
+        contract_id=contract["_id"])
+    if not attempt:
+        raise HTTPException(409, "Ya existe un intento de pago o el saldo cambió; requiere revisión")
+    query = {"_id": charge["invoice"]["_id"], "charge_attempt.id": attempt["id"]}
+    try:
+        tx = await helcim_purchase_with_token(
+            cfg["api_token"], int(round(total * 100)), m["card_token"],
+            m.get("customer_code", ""),
+            request.client.host if request.client else "127.0.0.1")
+        status = str(tx.get("status", "")).upper()
+        transaction_id = str(tx.get("transactionId") or "")
+        await db.rental_payments.update_one(query, {"$set": {
+            "charge_attempt.status": "reconciliation_required",
+            "charge_attempt.provider_status": status,
+            "charge_attempt.transaction_id": transaction_id}})
+        if status not in ("APPROVED", "APPROVAL") or not transaction_id:
+            raise HTTPException(409, "El pago requiere confirmación; no vuelvas a intentarlo")
+        now = datetime.now(timezone.utc)
+        receipt = f"HLC-{attempt['id']}"
+        # Do not overwrite partial payments or a concurrent accounting change.
+        completion_query = {**query, "status": charge["invoice"]["status"]}
+        for field in ("amount", "late_fee", "total_due", "total_paid"):
+            completion_query[field] = (charge["invoice"][field] if field in charge["invoice"]
+                                       else {"$exists": False})
+        result = await db.rental_payments.update_one(completion_query, {"$set": {
+            "status": "completed", "paid": True, "payment_method": "helcim_saved",
+            "receipt_number": receipt, "reference_number": transaction_id,
+            "total_paid": charge["total_due"], "payment_date": now,
+            "updated_at": now, "charge_attempt.status": "completed"}})
+        if result.modified_count != 1:
+            raise HTTPException(409, "Pago recibido; conciliación pendiente")
+        return {"success": True, "receipt_number": receipt, "transaction_id": transaction_id}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        # Keep the durable claim even if the provider response or local write is lost.
+        logger.warning("Saved-card charge requires reconciliation: %s", attempt["id"])
+        raise HTTPException(503, "Estado del pago pendiente de verificación; no repitas el cobro") from exc
 
 
 @router.post("/tenant/helcim/autopay")

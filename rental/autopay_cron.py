@@ -146,6 +146,13 @@ async def _process_autopay_for_config(db, autopay):
             ):
                 return {"skipped": True, "reason": "already_attempted_this_month"}
 
+            from .rent_charge_claim import claim_rent_charge
+            if not await claim_rent_charge(
+                db, invoice_id, source="helcim_autopay", amount=total,
+                contract_id=contract["_id"], autopay_id=autopay_id
+            ):
+                return {"skipped": True, "reason": "invoice_charge_already_started"}
+
             tx = await helcim_purchase_with_token(
                 api_token,
                 int(round(total * 100)),
@@ -234,6 +241,13 @@ async def _process_autopay_for_config(db, autopay):
     try:
         import stripe
         stripe.api_key = sk
+        from .rent_charge_claim import claim_rent_charge
+        if not await claim_rent_charge(
+            db, invoice_id, source="stripe_autopay", amount=total,
+            contract_id=contract["_id"], autopay_id=autopay_id
+        ):
+            return {"skipped": True, "reason": "invoice_charge_already_started"}
+
         intent = stripe.PaymentIntent.create(
             amount=int(round(total * 100)),
             currency="usd",

@@ -181,6 +181,13 @@ async def tenant_create_checkout_payment(request: Request):
             return _existing_checkout_response(existing)
         raise HTTPException(status_code=409, detail="Checkout ya iniciado")
 
+    from .rent_charge_claim import claim_rent_charge
+    if not await claim_rent_charge(
+        db, charge["invoice_id"], source=f"{name}_checkout", amount=total,
+        contract_id=contract_id, checkout_id=claim_id
+    ):
+        raise HTTPException(409, "Ya existe un intento de pago o el saldo cambió; requiere revisión")
+
     reference = f"Renta {current_month.title()} {now.year} - {tenant.get('name', '')}"
     try:
         if name == "stripe":
