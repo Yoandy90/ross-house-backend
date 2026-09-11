@@ -4,10 +4,11 @@ admin audit log. Central module — do NOT duplicate this logic in routers.
 """
 import hashlib
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import HTTPException, Request
+from pymongo import ReturnDocument
 
 from .shared import get_db
 
@@ -33,19 +34,39 @@ def client_ip_hash(request: Request) -> str:
 async def check_rate_limit_persistent(endpoint: str, key: str,
                                       max_requests: int = 5,
                                       window_seconds: int = 300) -> None:
-    """DB-backed rate limiter — survives restarts/redeploys and works across
-    replicas. Key should already be hashed/normalized (ip_hash, email, phone).
-    Raises a consistent 429 (no enumeration hints)."""
-    db = get_db()
+    """Atomically reserve one request in a DB-backed fixed window.
+
+    A single find-and-update removes the count-then-insert race across workers
+    and replicas. Identifiers are hashed before storage. Blocked requests still
+    increment the bounded-time counter, which prevents retry storms from
+    reopening the window.
+    """
+    if max_requests < 1 or window_seconds < 1:
+        raise ValueError("rate limit values must be positive")
+
     now = datetime.now(timezone.utc)
-    from datetime import timedelta
-    window_start = now - timedelta(seconds=window_seconds)
-    coll = db.rate_limit_events
-    count = await coll.count_documents({
-        "endpoint": endpoint, "key": key, "created_at": {"$gte": window_start}})
-    if count >= max_requests:
+    bucket_start_epoch = int(now.timestamp()) // window_seconds * window_seconds
+    bucket_id = hashlib.sha256(
+        f"{endpoint}\0{key}\0{bucket_start_epoch}".encode()
+    ).hexdigest()
+    bucket_start = datetime.fromtimestamp(bucket_start_epoch, tz=timezone.utc)
+    expires_at = bucket_start + timedelta(seconds=window_seconds * 2)
+
+    doc = await get_db().rate_limit_windows.find_one_and_update(
+        {"_id": bucket_id},
+        {
+            "$inc": {"count": 1},
+            "$setOnInsert": {
+                "endpoint": endpoint,
+                "created_at": bucket_start,
+                "expires_at": expires_at,
+            },
+        },
+        upsert=True,
+        return_document=ReturnDocument.AFTER,
+    )
+    if not doc or int(doc.get("count", max_requests + 1)) > max_requests:
         raise HTTPException(status_code=429, detail=RATE_LIMIT_429)
-    await coll.insert_one({"endpoint": endpoint, "key": key, "created_at": now})
 
 
 # ══════════════════════════ ADMIN AUDIT LOG ══════════════════════════
