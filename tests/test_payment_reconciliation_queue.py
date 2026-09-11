@@ -4,10 +4,12 @@ from pathlib import Path
 from rental.stripe_pkg.reconciliation_queue_router import (
     AUTOPAY_RECONCILIATION_STATUSES,
     HOSTED_RECONCILIATION_STATUSES,
+    INVOICE_CHARGE_RECONCILIATION_STATUSES,
     STRIPE_RECONCILIATION_STATUSES,
     _autopay_item,
     _autopay_snapshot,
     _hosted_item,
+    _invoice_charge_item,
     _investigation_hint,
     _invoice_snapshot,
     _priority,
@@ -28,6 +30,10 @@ def test_reconciliation_status_sets_are_fail_closed_and_specific():
     }
     assert set(AUTOPAY_RECONCILIATION_STATUSES) == {
         "failed_unknown",
+        "reconciliation_required",
+    }
+    assert set(INVOICE_CHARGE_RECONCILIATION_STATUSES) == {
+        "processing",
         "reconciliation_required",
     }
 
@@ -86,6 +92,26 @@ def test_autopay_mapper_never_exposes_saved_payment_credentials():
     assert "payment_method_id" not in item
     assert "helcim_card_token" not in item
     assert "helcim_customer_code" not in item
+
+
+def test_invoice_charge_mapper_exposes_attempt_evidence_without_credentials():
+    item = _invoice_charge_item({
+        "_id": "invoice-1", "status": "partial", "contract_id": "c1",
+        "tenant_id": "t1", "period": "2026-09",
+        "charge_attempt": {"id": "attempt-1", "status": "reconciliation_required",
+                           "source": "helcim_saved", "amount": 650,
+                           "transaction_id": "tx-1", "card_token": "hidden"},
+    })
+    version = item.pop("attempt_version")
+    assert len(version) == 64
+    assert item == {
+        "source": "invoice_charge", "id": "invoice-1",
+        "status": "reconciliation_required", "processor": "helcim_saved",
+        "contract_id": "c1", "tenant_id": "t1", "invoice_id": "invoice-1",
+        "amount": 650.0, "period": "2026-09", "reference_id": "tx-1",
+        "attempt_id": "attempt-1", "updated_at": None,
+    }
+    assert "card_token" not in item
 
 
 def test_priority_keeps_fresh_creating_checkout_low_then_escalates_with_age():
@@ -214,7 +240,7 @@ def test_detail_reuses_audited_stripe_pi_identity_query_and_has_no_mutation_acti
 
 def test_queue_applies_db_limits_and_returns_severity_summary():
     source = Path("rental/stripe_pkg/reconciliation_queue_router.py").read_text(encoding="utf-8")
-    assert source.count(".limit(safe_limit)") == 3
+    assert source.count(".limit(safe_limit)") == 4
     assert '"by_severity": by_severity' in source
     assert '"age_seconds": age_seconds' in source
     assert '"severity": _SEVERITY_LABELS[score]' in source

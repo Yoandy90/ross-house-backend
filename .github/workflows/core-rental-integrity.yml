@@ -30,5 +30,9 @@ jobs:
         env:
           PYTHONPATH: .
         run: python -m pytest -q tests/test_helcim_autopay_authorization.py tests/test_autopay_canonical_idempotency.py tests/test_autopay_reconciliation_trace.py tests/test_helcim_save_session_status.py tests/test_helcim_saved_charge.py tests/test_hosted_checkout_idempotency.py tests/test_hosted_rent_charge.py tests/test_hosted_rent_charge_wiring.py tests/test_rent_charge_policy.py
+      - name: Run payment reconciliation integrity tests
+        env:
+          PYTHONPATH: .
+        run: python -m pytest -q tests/test_payment_reconciliation_queue.py tests/test_reconciliation_dual_control.py tests/test_reconciliation_execution.py tests/test_reconciliation_review_outcomes.py tests/test_reconciliation_recovery.py tests/test_reconciliation_workflows.py
       - name: Rehearse synthetic offline evidence workflow
         run: python -m scripts.rehearse_database_evidence

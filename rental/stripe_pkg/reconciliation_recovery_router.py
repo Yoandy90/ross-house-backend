@@ -46,7 +46,27 @@ def _classify_recovery(claim: dict, result: dict | None, invoice: dict | None) -
     if result:
         return "result_recorded", "Execution result already exists; no recovery action is needed."
 
-    financial_pending = str(claim.get("financial_effect") or "") == "local_accounting_pending"
+    effect = str(claim.get("financial_effect") or "")
+    if effect == "claim_release_pending":
+        claim_id = str(claim.get("_id") or "")
+        release = (invoice or {}).get("reconciliation_last_release") or {}
+        if str(release.get("execution_claim_id") or "") == claim_id:
+            return (
+                "financial_write_applied_result_missing",
+                "The invoice records this reviewed claim release. Do not execute it again; reconstruct the audit result manually.",
+            )
+        if (invoice and claim.get("attempt_snapshot")
+                and invoice.get("charge_attempt") == claim["attempt_snapshot"]):
+            return (
+                "no_financial_write_detected",
+                "The payment-attempt claim is still present. Do not retry automatically; review why execution stopped.",
+            )
+        return (
+            "ambiguous_state",
+            "The release result is missing and the claim state cannot be proven. Investigate before allowing payment.",
+        )
+
+    financial_pending = effect == "local_accounting_pending"
     if not financial_pending:
         return "record_only_result_missing", "No financial write was authorized; investigate the missing result record only."
 

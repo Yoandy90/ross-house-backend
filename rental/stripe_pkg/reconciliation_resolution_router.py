@@ -20,10 +20,12 @@ from rental.shared import auth_admin, get_db
 from rental.stripe_pkg.reconciliation_queue_router import (
     AUTOPAY_RECONCILIATION_STATUSES,
     HOSTED_RECONCILIATION_STATUSES,
+    INVOICE_CHARGE_RECONCILIATION_STATUSES,
     STRIPE_RECONCILIATION_STATUSES,
     _autopay_item,
     _find_by_id,
     _hosted_item,
+    _invoice_charge_item,
     _stripe_item,
 )
 
@@ -79,6 +81,17 @@ async def _active_exception(db, source: str, item_id: str) -> dict | None:
             return _autopay_item(doc)
         return None
 
+    if source == "invoice_charge":
+        doc = await _find_by_id(db.rental_payments, item_id)
+        attempt = (doc or {}).get("charge_attempt") or {}
+        if (
+            doc
+            and str(doc.get("status") or "") in {"pending", "late", "partial"}
+            and str(attempt.get("status") or "") in INVOICE_CHARGE_RECONCILIATION_STATUSES
+        ):
+            return _invoice_charge_item(doc)
+        return None
+
     return None
 
 
@@ -92,7 +105,7 @@ def _immutable_proposal_payload(
     evidence_reference: str,
     proposer: dict,
 ) -> dict:
-    return {
+    payload = {
         "source": source,
         "item_id": item_id,
         "exception_status": str(exception.get("status") or ""),
@@ -105,6 +118,9 @@ def _immutable_proposal_payload(
         "financial_effect": "none",
         "execution_status": "not_executed",
     }
+    if source == "invoice_charge":
+        payload["attempt_version"] = exception.get("attempt_version", "")
+    return payload
 
 
 @router.post("/admin/payment-reconciliation/{source}/{item_id}/resolution-proposals")
@@ -214,6 +230,10 @@ async def confirm_reconciliation_resolution(proposal_id: str, request: Request):
         exception is None
         or str(exception.get("status") or "") != str(proposal.get("exception_status") or "")
         or str(exception.get("updated_at") or "") != str(proposal.get("exception_updated_at") or "")
+        or (proposal.get("source") == "invoice_charge" and (
+            not proposal.get("attempt_version")
+            or exception.get("attempt_version") != proposal.get("attempt_version")
+        ))
     ):
         raise HTTPException(status_code=409, detail="Reconciliation item changed; create a new proposal")
 
@@ -237,6 +257,7 @@ async def confirm_reconciliation_resolution(proposal_id: str, request: Request):
             "exception_status": proposal.get("exception_status"),
             "exception_updated_at": proposal.get("exception_updated_at"),
             "outcome": proposal.get("outcome"),
+            "attempt_version": proposal.get("attempt_version"),
             "proposer": proposer,
             "confirmer": confirmer,
             "financial_effect": "none",

@@ -54,13 +54,20 @@ class FakeRentalPayments:
         self.update_calls.append((query, update))
         if self.invoice is None or query.get("_id") != self.invoice.get("_id"):
             return SimpleNamespace(modified_count=0)
-        for key in ("amount", "late_fee", "total_paid", "total_due", "updated_at"):
+        for key in ("amount", "late_fee", "total_paid", "total_due", "updated_at", "charge_attempt"):
             if key in query and self.invoice.get(key) != query[key]:
                 return SimpleNamespace(modified_count=0)
         statuses = (query.get("status") or {}).get("$in", [])
         if statuses and self.invoice.get("status") not in statuses:
             return SimpleNamespace(modified_count=0)
-        self.invoice.update(update["$set"])
+        attempt = self.invoice.get("charge_attempt") or {}
+        if "charge_attempt.id" in query and attempt.get("id") != query["charge_attempt.id"]:
+            return SimpleNamespace(modified_count=0)
+        if "charge_attempt.status" in query and attempt.get("status") != query["charge_attempt.status"]:
+            return SimpleNamespace(modified_count=0)
+        for key in update.get("$unset", {}):
+            self.invoice.pop(key, None)
+        self.invoice.update(update.get("$set", {}))
         return SimpleNamespace(modified_count=1)
 
 
@@ -353,9 +360,105 @@ def test_execution_module_has_no_provider_or_refund_calls_and_one_financial_writ
         "create_hosted_checkout(", "requests.", "httpx.", "delete_one(", "find_one_and_update(",
     ):
         assert forbidden not in source
-    assert source.count("db.rental_payments.update_one(") == 1
+    assert source.count("db.rental_payments.update_one(") == 2
     assert source.count("db[ACTIONS_COLLECTION].insert_one(") == 2
     assert "trusted_source_amount_cents" in source
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("race", [False, True])
+async def test_confirmed_not_paid_releases_exact_invoice_attempt_with_audit(monkeypatch, race):
+    created = "2026-09-10T22:00:00+00:00"
+    invoice = _partial_invoice()
+    invoice["charge_attempt"] = {
+        "id": "attempt-1", "status": "reconciliation_required",
+        "source": "helcim_saved", "amount": 650.0,
+        "transaction_id": "tx-declined", "created_at": created,
+        "provider_status": "DECLINED",
+    }
+    proposal = _proposal("provider_confirmed_not_paid")
+    proposal.update({
+        "source": "invoice_charge", "item_id": str(invoice["_id"]),
+        "exception_status": "reconciliation_required",
+        "exception_updated_at": created,
+        "reference_id": "tx-declined",
+        "attempt_version": rer._invoice_charge_item(invoice)["attempt_version"],
+    })
+    confirmation = _confirmation(proposal)
+    db = FakeDB(invoice)
+
+    async def fake_auth(_request):
+        return {"_id": "admin-c", "email": "c@example.com"}
+    async def fake_load(_db, _confirmation_id):
+        return proposal, confirmation, confirmation["_id"]
+
+    monkeypatch.setattr(rer, "auth_admin", fake_auth)
+    monkeypatch.setattr(rer, "get_db", lambda: db)
+    monkeypatch.setattr(rer, "_load_confirmed_decision", fake_load)
+
+    if race:
+        original_write = db.rental_payments.update_one
+        async def concurrent_write(query, update):
+            # Provider evidence changes after all preflight reads but before CAS.
+            db.rental_payments.invoice["charge_attempt"] = {
+                **db.rental_payments.invoice["charge_attempt"],
+                "provider_status": "APPROVED", "transaction_id": "tx-paid",
+            }
+            return await original_write(query, update)
+        db.rental_payments.update_one = concurrent_write
+
+    response = await rer.execute_confirmed_reconciliation(
+        str(confirmation["_id"]),
+        FakeRequest({"execute": True, "proposal_digest": proposal["proposal_digest"],
+                     "expected_outcome": proposal["outcome"]}),
+    )
+    if race:
+        assert response["review_required"] is True
+        assert response["result"] == "claim_not_released_concurrent_change"
+        assert db.rental_payments.invoice["charge_attempt"]["transaction_id"] == "tx-paid"
+        assert "reconciliation_last_release" not in db.rental_payments.invoice
+        return
+    assert response["result"] == "provider_not_paid_claim_released"
+    assert response["financial_effect"] == "claim_released"
+    assert "charge_attempt" not in db.rental_payments.invoice
+    release = db.rental_payments.invoice["reconciliation_last_release"]
+    assert release["confirmation_id"] == str(confirmation["_id"])
+    assert release["evidence_reference"] == proposal["evidence_reference"]
+    assert [a["action"] for a in db.payment_reconciliation_actions.docs.values()] == [
+        "execution_claim", "execution_result"]
+
+
+@pytest.mark.parametrize("source,status,provider_status", [
+    ("helcim_saved", "processing", "DECLINED"),
+    ("helcim_saved", "reconciliation_required", "APPROVED"),
+    ("helcim_saved", "reconciliation_required", "PENDING"),
+    ("helcim_saved", "reconciliation_required", ""),
+    ("helcim_checkout", "reconciliation_required", "DECLINED"),
+    ("helcim_autopay", "reconciliation_required", "DECLINED"),
+])
+def test_release_requires_terminal_saved_card_decline(source, status, provider_status):
+    invoice = {"charge_attempt": {"source": source, "status": status,
+                                 "provider_status": provider_status}}
+    assert not rer._invoice_attempt_outcome_allowed(invoice, "provider_confirmed_not_paid")
+
+
+@pytest.mark.asyncio
+async def test_attempt_change_with_same_status_and_date_invalidates_decision():
+    invoice = _partial_invoice()
+    invoice["charge_attempt"] = {"id": "first", "status": "reconciliation_required",
+        "source": "helcim_saved", "created_at": "same-date", "amount": 650,
+        "provider_status": "DECLINED", "transaction_id": "old-tx"}
+    proposal = {"source": "invoice_charge", "item_id": str(invoice["_id"]),
+        "exception_status": "reconciliation_required", "exception_updated_at": "same-date",
+        "attempt_version": rer._invoice_charge_item(invoice)["attempt_version"]}
+    db = FakeDB(invoice)
+    db.rental_payments.invoice["charge_attempt"] = {
+        **invoice["charge_attempt"], "transaction_id": "different-tx"}
+    with pytest.raises(HTTPException) as exc:
+        await rer._recheck_exception_version(db, proposal)
+    assert exc.value.status_code == 409
+    assert await rer._proven_invoice_for_execution(db, proposal) is None
+    assert not db.rental_payments.update_calls
 
 
 def test_public_router_includes_execution_workflow_once():

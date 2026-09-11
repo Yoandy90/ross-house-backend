@@ -18,7 +18,14 @@ Automatic payment flows intentionally fail closed when the backend cannot prove 
 
 ## What this phase can do
 
-Only `provider_confirmed_paid` may produce a local accounting write.
+`provider_confirmed_paid` may complete a proven local invoice. For the
+`invoice_charge` source only, `provider_confirmed_not_paid` may remove the exact
+embedded payment-attempt claim after the three-admin workflow confirms evidence
+that no provider payment occurred. For this source, mutation also requires a
+terminal server-recorded Helcim saved-card response: DECLINED for release, or
+APPROVED/APPROVAL with a transaction ID for invoice completion. Processing,
+unknown, hosted-checkout and autopay attempts remain blocked. Admin notes alone
+cannot unlock them. This module does not independently query Helcim.
 
 That write is allowed only when all of the following are true:
 
@@ -34,6 +41,24 @@ That write is allowed only when all of the following are true:
 
 The resulting payment method is `manual_reconciliation_verified`, making the accounting origin explicit.
 
+## Saved-card invoice attempts
+
+The queue includes `invoice_charge` exceptions created by the shared invoice
+claim used by saved cards, autopay and hosted checkout. Its sanitized view shows
+the invoice, attempt ID, source, amount, status and provider transaction ID when
+available; payment credentials remain excluded.
+
+When a confirmed `provider_confirmed_not_paid` decision targets this source,
+execution checks an immutable attempt fingerprint throughout approval and
+execution and atomically matches the full attempt and financial snapshot of a still
+chargeable invoice. It records `reconciliation_last_release` with the
+confirmation, execution claim and evidence reference. Any mismatch leaves the
+claim in place and returns the workflow to review.
+
+This action does not clear autopay's separate monthly attempt record and does not
+release a hosted checkout document. Those sources still require their own
+reconciliation path.
+
 ## What this phase cannot do
 
 The reconciliation execution code does **not**:
@@ -41,7 +66,7 @@ The reconciliation execution code does **not**:
 - call Stripe, Square, Clover, Bank of America, or Helcim;
 - create a PaymentIntent or hosted checkout;
 - retry a payment;
-- release a checkout/autopay claim;
+- release a hosted-checkout or autopay monthly claim;
 - issue a refund;
 - create a new charge;
 - automatically apply a manual credit review;
@@ -116,7 +141,11 @@ All proposals, confirmations, execution claims, and execution results use:
 
 `payment_reconciliation_actions`
 
-The workflow is append-oriented. Payment source records are never edited by proposal/confirmation endpoints. The execution endpoint has exactly one allowed financial writer: a guarded update to the already-proven canonical `rental_payments` invoice for `provider_confirmed_paid`.
+The workflow is append-oriented. Payment source records are never edited by
+proposal/confirmation endpoints. Execution has two narrow guarded writes to the
+already-proven canonical `rental_payments` invoice: complete it for
+`provider_confirmed_paid`, or remove the exact embedded attempt for an
+`invoice_charge` decision confirmed as not paid.
 
 ## Administrative identity rules
 
