@@ -45,7 +45,7 @@ VERIFIED_DEFAULT_CONTACTS = [
         "_id": "default-dumas-fire",
         "name_es": "Bomberos de Dumas",
         "name_en": "Dumas Fire Department",
-        "phone": "8069356435",
+        "phone": "8069356434",
         "icon": "flame",
         "color": "#f97316",
         "available": "No-emergencia",
