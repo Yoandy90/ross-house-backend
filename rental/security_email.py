@@ -65,6 +65,71 @@ def build_password_changed_message(name: str, changed_at: datetime) -> dict:
     return {"subject": subject, "text": text, "html": html}
 
 
+def build_maintenance_received_message(
+    *,
+    name: str,
+    request_id: str,
+    title: str,
+    property_address: str,
+    category: str,
+    priority: str,
+    photo_count: int,
+    submitted_at: datetime,
+) -> dict:
+    """Build a bilingual receipt without embedding maintenance evidence."""
+    display_name = escape(" ".join(str(name or "").split()) or "cliente")
+    safe_id = escape(" ".join(str(request_id or "").split()))
+    safe_title = escape(" ".join(str(title or "").split()))
+    safe_address = escape(" ".join(str(property_address or "").split()) or "No indicada")
+    safe_category = escape(" ".join(str(category or "").split()) or "general")
+    safe_priority = escape(" ".join(str(priority or "").split()) or "normal")
+    safe_photo_count = max(0, min(int(photo_count or 0), 5))
+    timestamp = _format_changed_at(submitted_at)
+    subject = f"Recibimos tu solicitud de mantenimiento #{safe_id}"
+    text = (
+        f"Hola {' '.join(str(name or '').split()) or 'cliente'},\n\n"
+        "Recibimos tu solicitud de mantenimiento.\n"
+        f"Número de solicitud: {request_id}\n"
+        f"Título: {' '.join(str(title or '').split())}\n"
+        f"Propiedad: {' '.join(str(property_address or '').split()) or 'No indicada'}\n"
+        f"Categoría: {' '.join(str(category or '').split()) or 'general'}\n"
+        f"Prioridad: {' '.join(str(priority or '').split()) or 'normal'}\n"
+        f"Fotos recibidas: {safe_photo_count}\n"
+        f"Fecha: {timestamp}\n\n"
+        "Conserva este número para dar seguimiento. Te avisaremos cuando cambie el estado.\n\n"
+        "We received your maintenance request and will notify you when its status changes.\n\n"
+        f"¿Necesitas ayuda? {SUPPORT_EMAIL} · {SUPPORT_PHONE}\n"
+        "Ross House Rentals"
+    )
+    html = f"""
+    <div style="font-family:Arial,sans-serif;max-width:620px;margin:auto;color:#202124">
+      <div style="background:#202124;color:white;padding:22px;border-bottom:4px solid #c8102e">
+        <h2 style="margin:0">Solicitud de mantenimiento recibida</h2>
+        <p style="margin:6px 0 0">Maintenance request received</p>
+      </div>
+      <div style="padding:24px">
+        <p>Hola {display_name},</p>
+        <p>Recibimos tu solicitud y la registramos correctamente.</p>
+        <div style="background:#f7f7f8;border-radius:10px;padding:16px;line-height:1.7">
+          <strong>Número:</strong> {safe_id}<br>
+          <strong>Título:</strong> {safe_title}<br>
+          <strong>Propiedad:</strong> {safe_address}<br>
+          <strong>Categoría:</strong> {safe_category}<br>
+          <strong>Prioridad:</strong> {safe_priority}<br>
+          <strong>Fotos recibidas:</strong> {safe_photo_count}<br>
+          <strong>Fecha:</strong> {timestamp}
+        </div>
+        <p>Conserva este número para dar seguimiento. Te avisaremos cuando cambie el estado.</p>
+        <p style="color:#687080">We received your maintenance request and will notify you when its status changes.</p>
+        <p>Ayuda: <a href="mailto:{SUPPORT_EMAIL}">{SUPPORT_EMAIL}</a> ·
+        <a href="tel:+18069342018">{SUPPORT_PHONE}</a></p>
+        <p>Ross House Rentals</p>
+      </div>
+    </div>
+    """.strip()
+    return {"subject": subject, "text": text, "html": html}
+
+
 async def _sendgrid_config(db) -> tuple[str, str]:
     api_key = os.getenv("SENDGRID_API_KEY", "").strip()
     from_email = (
@@ -125,3 +190,60 @@ async def send_password_changed_email(
     except Exception:
         logger.exception("Password-change security email failed")
         return False
+
+
+async def send_maintenance_received_email(
+    db,
+    *,
+    to_email: str,
+    name: str,
+    request_id: str,
+    title: str,
+    property_address: str,
+    category: str,
+    priority: str,
+    photo_count: int,
+    submitted_at: datetime,
+) -> bool:
+    """Send a best-effort tenant receipt; failures never undo the ticket."""
+    recipient = (to_email or "").strip()
+    if not recipient:
+        logger.warning("Maintenance receipt skipped: tenant has no email")
+        return False
+
+    api_key, from_email = await _sendgrid_config(db)
+    if not api_key:
+        logger.warning("Maintenance receipt skipped: SendGrid is not configured")
+        return False
+
+    content = build_maintenance_received_message(
+        name=name,
+        request_id=request_id,
+        title=title,
+        property_address=property_address,
+        category=category,
+        priority=priority,
+        photo_count=photo_count,
+        submitted_at=submitted_at,
+    )
+
+    def _send() -> bool:
+        from sendgrid import SendGridAPIClient
+        from sendgrid.helpers.mail import Mail
+
+        message = Mail(
+            from_email=(from_email, "Ross House Rentals"),
+            to_emails=recipient,
+            subject=content["subject"],
+            plain_text_content=content["text"],
+            html_content=content["html"],
+        )
+        response = SendGridAPIClient(api_key).send(message)
+        return 200 <= int(response.status_code) < 300
+
+    try:
+        return await asyncio.to_thread(_send)
+    except Exception:
+        logger.exception("Maintenance receipt email failed")
+        return False
+
