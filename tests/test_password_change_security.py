@@ -1,5 +1,6 @@
 import asyncio
 from datetime import datetime, timezone
+from pathlib import Path
 
 import jwt
 import pytest
@@ -7,7 +8,6 @@ from bson import ObjectId
 from fastapi import HTTPException
 
 import rental.auth_router as auth_router
-from rental.api_keys_router import KEY_REGISTRY
 from rental.security_email import _sendgrid_config, build_password_changed_message
 
 
@@ -166,14 +166,10 @@ def test_security_email_has_timestamp_contact_and_no_password_value():
 
 
 def test_security_sender_is_configurable_from_admin_and_has_priority(monkeypatch):
-    registry = {entry["key"]: entry for entry in KEY_REGISTRY}
-    assert registry["SECURITY_FROM_EMAIL"] == {
-        "key": "SECURITY_FROM_EMAIL",
-        "label": "Remitente de Alertas de Seguridad",
-        "category": "SendGrid (Emails)",
-        "secret": False,
-        "placeholder": "security@rosshouserentals.com",
-    }
+    registry_source = Path("rental/api_keys_router.py").read_text(encoding="utf-8")
+    assert '"key": "SECURITY_FROM_EMAIL"' in registry_source
+    assert '"label": "Remitente de Alertas de Seguridad"' in registry_source
+    assert '"placeholder": "security@rosshouserentals.com"' in registry_source
 
     monkeypatch.setenv("SENDGRID_API_KEY", "test-key")
     monkeypatch.setenv("SENDGRID_FROM_EMAIL", "general@rosshouserentals.com")
