@@ -43,7 +43,11 @@ def test_endpoint_falls_back_when_database_is_unavailable(monkeypatch):
 
 
 def test_public_route_contract():
-    route = next(route for route in emergency.router.routes if route.path == "")
+    route = next(
+        route
+        for route in emergency.router.routes
+        if route.path == "/public/emergency-contacts"
+    )
 
     assert "GET" in route.methods
     assert emergency.router.prefix == "/public/emergency-contacts"
