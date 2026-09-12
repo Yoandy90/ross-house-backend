@@ -6,7 +6,6 @@ Shared across all rental sub-routers.
 """
 import logging
 import os
-import secrets as _secrets
 import jwt
 import hashlib
 import io
@@ -19,19 +18,13 @@ from fastapi import HTTPException, Request
 _db = None
 
 # ── JWT signing secret ────────────────────────────────────────────────────
-# MUST be provided via environment (TENANT_JWT_SECRET) in production.
-# If missing, we generate a random per-process secret (invalidates all
-# existing tokens on restart — safer than shipping a hardcoded one).
-TENANT_JWT_SECRET = os.environ.get("TENANT_JWT_SECRET")
-if not TENANT_JWT_SECRET:
-    if os.environ.get("ENVIRONMENT", "").lower() == "production":
-        logging.critical(
-            "[SECURITY] TENANT_JWT_SECRET env var is not set in production. "
-            "Falling back to a random per-process secret — all existing "
-            "tokens will be invalidated on every restart. "
-            "Set TENANT_JWT_SECRET to a long random string ASAP."
-        )
-    TENANT_JWT_SECRET = _secrets.token_urlsafe(64)
+# MUST be provided via environment in production. Development and tests get
+# an ephemeral per-process value so local imports remain convenient.
+from .runtime_secrets import resolve_runtime_secret
+TENANT_JWT_SECRET = resolve_runtime_secret(
+    "TENANT_JWT_SECRET",
+    purpose="tenant JWT signing",
+)
 
 
 def get_db():

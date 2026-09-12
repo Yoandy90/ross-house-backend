@@ -22,12 +22,13 @@ from rental.runtime_business_boundary import RENTALS_CORS_ORIGINS, resolve_datab
 # ─── Configuration ────────────────────────────────────────────
 MONGO_URL = os.environ.get("MONGO_URL", "")
 DB_NAME = resolve_database_name(os.environ)
-# Security: Generate secure default if not set, log warning
-_default_secret = "ross-house-" + os.urandom(16).hex()
-SECRET_KEY = os.environ.get("JWT_SECRET_KEY", os.environ.get("JWT_SECRET", _default_secret))
-if "ross-house-" in SECRET_KEY and len(SECRET_KEY) < 40:
-    import warnings
-    warnings.warn("⚠️ Using default JWT secret! Set JWT_SECRET_KEY in environment for production.")
+# JWT configuration fails closed when a deployed production environment is misconfigured.
+from rental.runtime_secrets import resolve_runtime_secret
+SECRET_KEY = resolve_runtime_secret(
+    "JWT_SECRET_KEY",
+    "JWT_SECRET",
+    purpose="server JWT signing",
+)
 PORT = int(os.environ.get("PORT", 8001))
 
 # ─── Logging ──────────────────────────────────────────────────
@@ -73,6 +74,7 @@ async def lifespan(app: FastAPI):
         await db.auth_sessions.create_index("revoked_at")
         await db.rate_limit_events.create_index("created_at", expireAfterSeconds=3600)
         await db.rate_limit_events.create_index([("endpoint", 1), ("key", 1), ("created_at", -1)])
+        await db.rate_limit_windows.create_index("expires_at", expireAfterSeconds=0)
         await db.admin_audit_logs.create_index([("timestamp", -1)])
         await db.admin_audit_logs.create_index([("admin_user_id", 1), ("timestamp", -1)])
         await db.admin_audit_logs.create_index([("action", 1), ("timestamp", -1)])
