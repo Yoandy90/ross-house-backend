@@ -21,6 +21,7 @@ from rental.tenant_integrity import (
     find_active_contract_for_tenant,
     resolve_authenticated_tenant,
 )
+from rental.maintenance_email import send_maintenance_created_emails
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -163,7 +164,35 @@ async def secure_create_maintenance_request(request: Request):
     except Exception as exc:
         logger.warning("maintenance notification failed: %s", exc)
 
-    return {"success": True, "message": "Solicitud de mantenimiento creada", "request_id": request_id}
+    email_delivery = {"tenant_sent": False, "admin_sent": 0, "photo_count": len(photos)}
+    try:
+        email_delivery = await send_maintenance_created_emails(
+            get_db(),
+            {**maintenance, "property": location["property"]},
+            request_id,
+        )
+    except Exception as exc:
+        logger.warning("maintenance email delivery failed: %s", exc)
+
+    # Keep a delivery audit on the durable ticket without exposing recipients.
+    try:
+        await get_db().maintenance_requests.update_one(
+            {"_id": result.inserted_id},
+            {"$set": {
+                "notifications.email": email_delivery,
+                "notifications.updated_at": datetime.utcnow(),
+            }},
+        )
+    except Exception as exc:
+        logger.warning("maintenance email audit update failed: %s", exc)
+
+    return {
+        "success": True,
+        "message": "Solicitud de mantenimiento creada",
+        "request_id": request_id,
+        "email_confirmation_sent": bool(email_delivery.get("tenant_sent")),
+        "photo_count": len(photos),
+    }
 
 
 @router.get('/tenant/maintenance-requests')
@@ -193,6 +222,7 @@ async def secure_list_tenant_maintenance_requests(request: Request):
             "property_id": row.get("property_id", ""),
             "unit_id": row.get("unit_id"),
             "property_address": row.get("property_address", ""),
+            "photo_count": len(row.get("photos") or []),
             "created_at": row.get("created_at", "").isoformat() if row.get("created_at") else "",
             "updated_at": row.get("updated_at", "").isoformat() if row.get("updated_at") else "",
         })
