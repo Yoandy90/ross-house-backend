@@ -429,6 +429,7 @@ try:
     from rental.mashvisor_routes import public_router as mashvisor_public_router
     from rental.faq_router import router as faq_router
     from rental.faq_router import public_router as faq_public_router
+    from rental.emergency_contacts_router import router as emergency_contacts_router
     from rental.utility_payments_router import router as utility_payments_router
     from rental.tenant_utilities_router import router as tenant_utilities_router
     from rental.credit_builder_router import router as credit_builder_router
@@ -504,6 +505,7 @@ try:
     app.include_router(mashvisor_public_router, prefix="/api")
     app.include_router(faq_router, prefix="/api")
     app.include_router(faq_public_router, prefix="/api")
+    app.include_router(emergency_contacts_router, prefix="/api")
     app.include_router(utility_payments_router, prefix="/api")
     app.include_router(tenant_utilities_router, prefix="/api")
     app.include_router(credit_builder_router, prefix="/api")
