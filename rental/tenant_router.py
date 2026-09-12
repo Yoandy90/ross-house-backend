@@ -1822,6 +1822,7 @@ async def admin_list_maintenance_requests(
         requests_list.append({
             "id": str(r["_id"]),
             "_id": str(r["_id"]),  # backward compatibility for legacy frontend
+            "request_number": r.get("request_number", ""),
             "tenant_id": r.get("tenant_id", ""),
             "tenant_name": r.get("tenant_name", ""),
             "tenant_email": r.get("tenant_email", ""),
@@ -1840,10 +1841,33 @@ async def admin_list_maintenance_requests(
             "updated_at": r.get("updated_at", "").isoformat() if r.get("updated_at") else "",
             "completed_at": r.get("completed_at", "").isoformat() if r.get("completed_at") else "",
             "admin_notes": r.get("admin_notes", ""),
+            "assigned_to": r.get("assigned_to", ""),
+            "assigned_provider_id": r.get("assigned_provider_id", ""),
+            "assigned_provider_name": r.get("assigned_provider_name", ""),
+            "assigned_at": r.get("assigned_at", "").isoformat() if r.get("assigned_at") else "",
+            "scheduled_start": r.get("scheduled_start", "").isoformat() if r.get("scheduled_start") else "",
+            "scheduled_end": r.get("scheduled_end", "").isoformat() if r.get("scheduled_end") else "",
+            "tenant_presence_required": bool(r.get("tenant_presence_required", False)),
+            "tenant_visible_note": r.get("tenant_visible_note", ""),
+            "notification_language": r.get("notification_language", "es"),
+            "timeline": [
+                {
+                    "status": event.get("status", ""),
+                    "at": event.get("at", "").isoformat() if event.get("at") else "",
+                    "note": event.get("note", ""),
+                }
+                for event in (r.get("timeline", []) or [])
+                if isinstance(event, dict)
+            ],
         })
 
     # Aggregate counts (status breakdown across full filtered set — useful for UI badges)
-    stats = {"open": 0, "pending": 0, "in_progress": 0, "completed": 0, "cancelled": 0, "urgent": 0}
+    stats = {
+        "open": 0, "pending": 0, "reviewing": 0, "assigned": 0,
+        "scheduled": 0, "in_progress": 0, "waiting_parts": 0,
+        "completed": 0, "resolved": 0, "cancelled": 0, "closed": 0,
+        "urgent": 0,
+    }
     try:
         async for d in db.maintenance_requests.aggregate([
             {"$match": query},
@@ -2178,5 +2202,4 @@ async def tenant_payment_history(request: Request):
         })
     
     return {"success": True, "payments": payments, "total_paid": total_paid}
-
 

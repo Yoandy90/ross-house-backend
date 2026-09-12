@@ -19,10 +19,16 @@ SPANISH_MONTHS = (
 )
 
 
-def _format_changed_at(changed_at: datetime) -> str:
+def _normalize_locale(locale: str) -> str:
+    return "en" if str(locale or "").strip().lower().startswith("en") else "es"
+
+
+def _format_changed_at(changed_at: datetime, locale: str = "es") -> str:
     if changed_at.tzinfo is None:
         changed_at = changed_at.replace(tzinfo=timezone.utc)
     local = changed_at.astimezone(CENTRAL_TIME)
+    if _normalize_locale(locale) == "en":
+        return local.strftime("%B %-d, %Y, %-I:%M %p %Z")
     hour = local.strftime("%I").lstrip("0") or "12"
     minute = local.strftime("%M")
     period = "a. m." if local.hour < 12 else "p. m."
@@ -75,29 +81,70 @@ def build_maintenance_received_message(
     priority: str,
     photo_count: int,
     submitted_at: datetime,
+    locale: str = "es",
 ) -> dict:
-    """Build a bilingual receipt without embedding maintenance evidence."""
-    display_name = escape(" ".join(str(name or "").split()) or "cliente")
+    """Build a localized receipt without embedding maintenance evidence."""
+    locale = _normalize_locale(locale)
+    fallback_name = "customer" if locale == "en" else "cliente"
+    display_name = escape(" ".join(str(name or "").split()) or fallback_name)
     safe_id = escape(" ".join(str(request_id or "").split()))
     safe_title = escape(" ".join(str(title or "").split()))
-    safe_address = escape(" ".join(str(property_address or "").split()) or "No indicada")
+    missing_address = "Not provided" if locale == "en" else "No indicada"
+    safe_address = escape(" ".join(str(property_address or "").split()) or missing_address)
     safe_category = escape(" ".join(str(category or "").split()) or "general")
     safe_priority = escape(" ".join(str(priority or "").split()) or "normal")
     safe_photo_count = max(0, min(int(photo_count or 0), 5))
-    timestamp = _format_changed_at(submitted_at)
+    timestamp = _format_changed_at(submitted_at, locale)
+    raw_name = " ".join(str(name or "").split()) or fallback_name
+    raw_title = " ".join(str(title or "").split())
+    raw_address = " ".join(str(property_address or "").split()) or missing_address
+    if locale == "en":
+        subject = f"We received your maintenance request #{safe_id}"
+        text = (
+            f"Hello {raw_name},\n\n"
+            "We received and recorded your maintenance request.\n"
+            f"Request number: {request_id}\n"
+            f"Title: {raw_title}\n"
+            f"Property: {raw_address}\n"
+            f"Category: {' '.join(str(category or '').split()) or 'general'}\n"
+            f"Priority: {' '.join(str(priority or '').split()) or 'normal'}\n"
+            f"Photos received: {safe_photo_count}\n"
+            f"Date: {timestamp}\n\n"
+            "Keep this number for tracking. We will notify you when the status changes.\n\n"
+            f"Need help? {SUPPORT_EMAIL} · {SUPPORT_PHONE}\nRoss House Rentals"
+        )
+        html = f"""
+        <div style="font-family:Arial,sans-serif;max-width:620px;margin:auto;color:#202124">
+          <div style="background:#202124;color:white;padding:22px;border-bottom:4px solid #c8102e">
+            <h2 style="margin:0">Maintenance request received</h2>
+          </div>
+          <div style="padding:24px"><p>Hello {display_name},</p>
+            <p>We received and recorded your maintenance request.</p>
+            <div style="background:#f7f7f8;border-radius:10px;padding:16px;line-height:1.7">
+              <strong>Number:</strong> {safe_id}<br><strong>Title:</strong> {safe_title}<br>
+              <strong>Property:</strong> {safe_address}<br><strong>Category:</strong> {safe_category}<br>
+              <strong>Priority:</strong> {safe_priority}<br><strong>Photos received:</strong> {safe_photo_count}<br>
+              <strong>Date:</strong> {timestamp}
+            </div>
+            <p>Keep this number for tracking. We will notify you when the status changes.</p>
+            <p>Help: <a href="mailto:{SUPPORT_EMAIL}">{SUPPORT_EMAIL}</a> · <a href="tel:+18069342018">{SUPPORT_PHONE}</a></p>
+            <p>Ross House Rentals</p>
+          </div>
+        </div>""".strip()
+        return {"subject": subject, "text": text, "html": html}
+
     subject = f"Recibimos tu solicitud de mantenimiento #{safe_id}"
     text = (
-        f"Hola {' '.join(str(name or '').split()) or 'cliente'},\n\n"
+        f"Hola {raw_name},\n\n"
         "Recibimos tu solicitud de mantenimiento.\n"
         f"Número de solicitud: {request_id}\n"
         f"Título: {' '.join(str(title or '').split())}\n"
-        f"Propiedad: {' '.join(str(property_address or '').split()) or 'No indicada'}\n"
+        f"Propiedad: {raw_address}\n"
         f"Categoría: {' '.join(str(category or '').split()) or 'general'}\n"
         f"Prioridad: {' '.join(str(priority or '').split()) or 'normal'}\n"
         f"Fotos recibidas: {safe_photo_count}\n"
         f"Fecha: {timestamp}\n\n"
         "Conserva este número para dar seguimiento. Te avisaremos cuando cambie el estado.\n\n"
-        "We received your maintenance request and will notify you when its status changes.\n\n"
         f"¿Necesitas ayuda? {SUPPORT_EMAIL} · {SUPPORT_PHONE}\n"
         "Ross House Rentals"
     )
@@ -105,7 +152,6 @@ def build_maintenance_received_message(
     <div style="font-family:Arial,sans-serif;max-width:620px;margin:auto;color:#202124">
       <div style="background:#202124;color:white;padding:22px;border-bottom:4px solid #c8102e">
         <h2 style="margin:0">Solicitud de mantenimiento recibida</h2>
-        <p style="margin:6px 0 0">Maintenance request received</p>
       </div>
       <div style="padding:24px">
         <p>Hola {display_name},</p>
@@ -120,7 +166,6 @@ def build_maintenance_received_message(
           <strong>Fecha:</strong> {timestamp}
         </div>
         <p>Conserva este número para dar seguimiento. Te avisaremos cuando cambie el estado.</p>
-        <p style="color:#687080">We received your maintenance request and will notify you when its status changes.</p>
         <p>Ayuda: <a href="mailto:{SUPPORT_EMAIL}">{SUPPORT_EMAIL}</a> ·
         <a href="tel:+18069342018">{SUPPORT_PHONE}</a></p>
         <p>Ross House Rentals</p>
@@ -128,6 +173,63 @@ def build_maintenance_received_message(
     </div>
     """.strip()
     return {"subject": subject, "text": text, "html": html}
+
+
+_STATUS_LABELS = {
+    "es": {"pending": "Pendiente", "reviewing": "En revisión", "assigned": "Asignada", "scheduled": "Programada", "in_progress": "En progreso", "waiting_parts": "Esperando piezas", "completed": "Completada", "resolved": "Resuelta", "cancelled": "Cancelada", "closed": "Cerrada"},
+    "en": {"pending": "Pending", "reviewing": "Under review", "assigned": "Assigned", "scheduled": "Scheduled", "in_progress": "In progress", "waiting_parts": "Waiting for parts", "completed": "Completed", "resolved": "Resolved", "cancelled": "Cancelled", "closed": "Closed"},
+}
+
+
+def build_maintenance_updated_message(
+    *, name: str, request_number: str, title: str, status: str,
+    changed_at: datetime, locale: str = "es", assigned_to: str = "",
+    scheduled_start: datetime | None = None, scheduled_end: datetime | None = None,
+    tenant_visible_note: str = "",
+) -> dict:
+    locale = _normalize_locale(locale)
+    fallback_name = "customer" if locale == "en" else "cliente"
+    raw_name = " ".join(str(name or "").split()) or fallback_name
+    safe_name = escape(raw_name)
+    safe_number = escape(str(request_number or "").strip())
+    safe_title = escape(" ".join(str(title or "").split()))
+    safe_status = escape(_STATUS_LABELS[locale].get(status, status.replace("_", " ").title()))
+    raw_assigned = " ".join(str(assigned_to or "").split())
+    raw_note = " ".join(str(tenant_visible_note or "").split())
+    safe_assigned = escape(raw_assigned)
+    safe_note = escape(raw_note)
+    schedule = _format_changed_at(scheduled_start, locale) if scheduled_start else ""
+    if scheduled_end:
+        schedule += (" – " if schedule else "") + _format_changed_at(scheduled_end, locale)
+    changed = _format_changed_at(changed_at, locale)
+    if locale == "en":
+        subject = f"Maintenance request #{safe_number}: {safe_status}"
+        lines = [f"Hello {raw_name},", "", f"Your maintenance request #{request_number} ({title}) was updated.", f"Status: {_STATUS_LABELS[locale].get(status, status)}"]
+        details = f"<strong>Status:</strong> {safe_status}<br>"
+        if safe_assigned:
+            lines.append(f"Assigned to: {raw_assigned}"); details += f"<strong>Assigned to:</strong> {safe_assigned}<br>"
+        if schedule:
+            lines.append(f"Scheduled for: {schedule}"); details += f"<strong>Scheduled for:</strong> {schedule}<br>"
+        if safe_note:
+            lines.append(f"Note: {raw_note}"); details += f"<strong>Note:</strong> {safe_note}<br>"
+        lines += [f"Updated: {changed}", "", f"Need help? {SUPPORT_EMAIL} · {SUPPORT_PHONE}", "Ross House Rentals"]
+        heading, intro = "Maintenance request updated", f"Your request <strong>#{safe_number}</strong> ({safe_title}) was updated."
+    else:
+        subject = f"Solicitud de mantenimiento #{safe_number}: {safe_status}"
+        lines = [f"Hola {raw_name},", "", f"Tu solicitud de mantenimiento #{request_number} ({title}) fue actualizada.", f"Estado: {_STATUS_LABELS[locale].get(status, status)}"]
+        details = f"<strong>Estado:</strong> {safe_status}<br>"
+        if safe_assigned:
+            lines.append(f"Asignada a: {raw_assigned}"); details += f"<strong>Asignada a:</strong> {safe_assigned}<br>"
+        if schedule:
+            lines.append(f"Programada para: {schedule}"); details += f"<strong>Programada para:</strong> {schedule}<br>"
+        if safe_note:
+            lines.append(f"Nota: {raw_note}"); details += f"<strong>Nota:</strong> {safe_note}<br>"
+        lines += [f"Actualizada: {changed}", "", f"¿Necesitas ayuda? {SUPPORT_EMAIL} · {SUPPORT_PHONE}", "Ross House Rentals"]
+        heading, intro = "Solicitud de mantenimiento actualizada", f"Tu solicitud <strong>#{safe_number}</strong> ({safe_title}) fue actualizada."
+    greeting = "Hello" if locale == "en" else "Hola"
+    updated_label = "Updated" if locale == "en" else "Actualizada"
+    html = f"""<div style="font-family:Arial,sans-serif;max-width:620px;margin:auto;color:#202124"><div style="background:#202124;color:white;padding:22px;border-bottom:4px solid #c8102e"><h2 style="margin:0">{heading}</h2></div><div style="padding:24px"><p>{greeting} {safe_name},</p><p>{intro}</p><div style="background:#f7f7f8;border-radius:10px;padding:16px;line-height:1.7">{details}</div><p>{updated_label}: {changed}</p><p>Ross House Rentals</p></div></div>"""
+    return {"subject": subject, "text": "\n".join(lines), "html": html}
 
 
 async def _sendgrid_config(db) -> tuple[str, str]:
@@ -204,6 +306,7 @@ async def send_maintenance_received_email(
     priority: str,
     photo_count: int,
     submitted_at: datetime,
+    locale: str = "es",
 ) -> bool:
     """Send a best-effort tenant receipt; failures never undo the ticket."""
     recipient = (to_email or "").strip()
@@ -225,6 +328,7 @@ async def send_maintenance_received_email(
         priority=priority,
         photo_count=photo_count,
         submitted_at=submitted_at,
+        locale=locale,
     )
 
     def _send() -> bool:
@@ -247,3 +351,29 @@ async def send_maintenance_received_email(
         logger.exception("Maintenance receipt email failed")
         return False
 
+
+async def send_maintenance_updated_email(db, *, to_email: str, **kwargs) -> bool:
+    """Send a best-effort localized workflow update."""
+    recipient = (to_email or "").strip()
+    if not recipient:
+        return False
+    api_key, from_email = await _sendgrid_config(db)
+    if not api_key:
+        logger.warning("Maintenance update email skipped: SendGrid is not configured")
+        return False
+    content = build_maintenance_updated_message(**kwargs)
+
+    def _send() -> bool:
+        from sendgrid import SendGridAPIClient
+        from sendgrid.helpers.mail import Mail
+        response = SendGridAPIClient(api_key).send(Mail(
+            from_email=(from_email, "Ross House Rentals"), to_emails=recipient,
+            subject=content["subject"], plain_text_content=content["text"], html_content=content["html"],
+        ))
+        return 200 <= int(response.status_code) < 300
+
+    try:
+        return await asyncio.to_thread(_send)
+    except Exception:
+        logger.exception("Maintenance update email failed")
+        return False

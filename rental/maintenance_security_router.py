@@ -10,6 +10,7 @@ from datetime import datetime
 
 from bson import ObjectId
 from fastapi import APIRouter, HTTPException, Request
+from pymongo import ReturnDocument
 
 from rental.shared import (
     auth_marketplace,
@@ -33,6 +34,71 @@ _ALLOWED_CATEGORIES = {
 _ALLOWED_PRIORITIES = {"low", "normal", "medium", "high", "urgent"}
 _MAX_PHOTOS = 5
 _MAX_PHOTO_CHARS = 1_500_000
+
+
+def _normalize_locale(value) -> str:
+    raw = str(value or "").strip().lower().replace("_", "-")
+    return "en" if raw == "en" or raw.startswith("en-") else "es"
+
+
+async def _next_maintenance_number(db) -> tuple[int, str]:
+    """Allocate a monotonic public number without count-then-insert races."""
+    counter = await db.counters.find_one_and_update(
+        {"_id": "maintenance_requests"},
+        {
+            "$inc": {"sequence": 1},
+            "$setOnInsert": {"created_at": datetime.utcnow()},
+        },
+        upsert=True,
+        return_document=ReturnDocument.AFTER,
+    )
+    sequence = int((counter or {}).get("sequence") or 0)
+    if sequence < 1:
+        raise RuntimeError("maintenance_number_allocation_failed")
+    return sequence, f"{sequence:04d}"
+
+
+def _iso(value) -> str:
+    return value.isoformat() if isinstance(value, datetime) else ""
+
+
+def _public_maintenance(row: dict, *, include_detail: bool = False) -> dict:
+    status = "pending" if row.get("status") == "open" else row.get("status", "")
+    item = {
+        "id": str(row["_id"]),
+        "request_number": row.get("request_number", ""),
+        "title": row.get("title", ""),
+        "description": row.get("description", ""),
+        "category": row.get("category", ""),
+        "priority": row.get("priority", ""),
+        "status": status,
+        "property_id": row.get("property_id", ""),
+        "unit_id": row.get("unit_id"),
+        "property_address": row.get("property_address", ""),
+        "assigned_to": row.get("assigned_to", ""),
+        "assigned_provider_name": row.get("assigned_provider_name", ""),
+        "assigned_provider_phone": row.get("assigned_provider_phone", ""),
+        "scheduled_start": _iso(row.get("scheduled_start")),
+        "scheduled_end": _iso(row.get("scheduled_end")),
+        "tenant_presence_required": bool(row.get("tenant_presence_required", False)),
+        "tenant_visible_note": row.get("tenant_visible_note", ""),
+        "created_at": _iso(row.get("created_at")),
+        "updated_at": _iso(row.get("updated_at")),
+        "completed_at": _iso(row.get("completed_at")),
+    }
+    if include_detail:
+        item["photos"] = row.get("photos", []) or []
+        item["photo_count"] = len(item["photos"])
+        item["timeline"] = [
+            {
+                "status": event.get("status", ""),
+                "at": _iso(event.get("at")),
+                "note": event.get("note", ""),
+            }
+            for event in (row.get("timeline", []) or [])
+            if isinstance(event, dict)
+        ]
+    return item
 
 
 async def _canonical_lease_location(contract: dict) -> dict:
@@ -120,11 +186,20 @@ async def secure_create_maintenance_request(request: Request):
     if priority not in _ALLOWED_PRIORITIES:
         raise HTTPException(status_code=400, detail="maintenance_priority_invalid")
     photos = _validated_photos(data.get("photos", []))
+    locale = _normalize_locale(
+        data.get("locale")
+        or tenant.get("preferred_language")
+        or tenant.get("language")
+    )
 
     now = datetime.utcnow()
     tenant_id = str(tenant["_id"])
     contract_id = str(contract["_id"])
+    db = get_db()
+    sequence, request_number = await _next_maintenance_number(db)
     maintenance = {
+        "request_sequence": sequence,
+        "request_number": request_number,
         "tenant_id": tenant_id,
         "tenant_name": tenant.get("name", ""),
         "tenant_email": tenant.get("email", ""),
@@ -139,11 +214,12 @@ async def secure_create_maintenance_request(request: Request):
         "priority": priority,
         "status": "pending",
         "photos": photos,
+        "notification_language": locale,
+        "timeline": [{"status": "pending", "at": now, "note": ""}],
         "relationship_source": "active_contract",
         "created_at": now,
         "updated_at": now,
     }
-    db = get_db()
     result = await db.maintenance_requests.insert_one(maintenance)
     request_id = str(result.inserted_id)
 
@@ -155,13 +231,14 @@ async def secure_create_maintenance_request(request: Request):
             db,
             to_email=tenant_email,
             name=str(tenant.get("name") or tenant.get("full_name") or ""),
-            request_id=request_id,
+            request_id=request_number,
             title=title,
             property_address=location["property_address"],
             category=category,
             priority=priority,
             photo_count=len(photos),
             submitted_at=now,
+            locale=locale,
         )
         receipt_status = (
             "sent" if email_confirmation_sent
@@ -202,6 +279,7 @@ async def secure_create_maintenance_request(request: Request):
         "success": True,
         "message": "Solicitud de mantenimiento creada",
         "request_id": request_id,
+        "request_number": request_number,
         "email_confirmation_sent": email_confirmation_sent,
         "photo_count": len(photos),
     }
@@ -224,17 +302,27 @@ async def secure_list_tenant_maintenance_requests(request: Request):
     ).sort("created_at", -1).limit(50)
     items = []
     async for row in cursor:
-        items.append({
-            "id": str(row["_id"]),
-            "title": row.get("title", ""),
-            "description": row.get("description", ""),
-            "category": row.get("category", ""),
-            "priority": row.get("priority", ""),
-            "status": "pending" if row.get("status") == "open" else row.get("status", ""),
-            "property_id": row.get("property_id", ""),
-            "unit_id": row.get("unit_id"),
-            "property_address": row.get("property_address", ""),
-            "created_at": row.get("created_at", "").isoformat() if row.get("created_at") else "",
-            "updated_at": row.get("updated_at", "").isoformat() if row.get("updated_at") else "",
-        })
+        items.append(_public_maintenance(row))
     return {"success": True, "requests": items}
+
+
+@router.get('/tenant/maintenance-requests/{request_id}')
+async def secure_get_tenant_maintenance_request(request_id: str, request: Request):
+    user = await auth_marketplace(request)
+    tenant = await resolve_authenticated_tenant(user)
+    if not tenant:
+        raise HTTPException(status_code=403, detail="maintenance_tenant_not_linked")
+    if not ObjectId.is_valid(request_id):
+        raise HTTPException(status_code=400, detail="maintenance_request_id_invalid")
+
+    tenant_id = str(tenant["_id"])
+    tenant_ids = [tenant_id]
+    if ObjectId.is_valid(tenant_id):
+        tenant_ids.append(ObjectId(tenant_id))
+    row = await get_db().maintenance_requests.find_one({
+        "_id": ObjectId(request_id),
+        "tenant_id": {"$in": tenant_ids},
+    })
+    if not row:
+        raise HTTPException(status_code=404, detail="maintenance_request_not_found")
+    return {"success": True, "request": _public_maintenance(row, include_detail=True)}
