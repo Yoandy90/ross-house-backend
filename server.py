@@ -17,7 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 
 from rental.background_job_policy import should_disable_background_jobs
-from rental.runtime_business_boundary import RENTALS_CORS_ORIGINS, resolve_database_name
+from rental.runtime_business_boundary import deployed_cors_origins, resolve_database_name
 
 # ─── Configuration ────────────────────────────────────────────
 MONGO_URL = os.environ.get("MONGO_URL", "")
@@ -364,11 +364,9 @@ app = FastAPI(
 )
 
 # ─── CORS ─────────────────────────────────────────────────────
-# Security: Only allow specific origins
-ALLOWED_ORIGINS = list(RENTALS_CORS_ORIGINS)
+# Security: production and staging use explicit, environment-bound origins.
+ALLOWED_ORIGINS = list(deployed_cors_origins(os.environ))
 
-# Add preview URLs for development/testing
-import os
 _ENV = os.environ.get("ENVIRONMENT", "").lower()
 _IS_DEV = _ENV in ("development", "dev", "local")
 
