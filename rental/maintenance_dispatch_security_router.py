@@ -10,13 +10,14 @@ from datetime import datetime
 from bson import ObjectId
 from fastapi import APIRouter, HTTPException, Request
 
-from rental.shared import auth_admin, get_db
+from rental.shared import auth_admin, get_db, send_rental_push_to_user
 from rental.maintenance_ownership_security_router import _canonical_status, _load_bound_maintenance_request
+from rental.security_email import send_maintenance_updated_email
 from rental.service_providers_router import _get_settings, _send_email, _send_sms
 from rental._provider_email_templates import dispatch_job_html
 
 router = APIRouter()
-_DISPATCHABLE_STATUSES = {"pending", "in_progress"}
+_DISPATCHABLE_STATUSES = {"pending", "reviewing", "assigned", "in_progress", "waiting_parts"}
 
 
 def _provider_query(provider_id: str) -> dict:
@@ -80,11 +81,17 @@ async def secure_admin_dispatch_maintenance(request: Request):
         {"$set": {
             "assigned_provider_id": provider_id,
             "assigned_provider_name": provider.get("name") or provider.get("company_name") or "",
+            "assigned_to": provider.get("name") or provider.get("company_name") or "",
             "assigned_provider_phone": provider.get("phone") or "",
             "assigned_at": now,
+            "status": "assigned" if status != "in_progress" else "in_progress",
             "dispatch_notification_state": "pending",
             "updated_at": now,
-        }},
+        }, "$push": {"timeline": {
+            "status": "assigned" if status != "in_progress" else "in_progress",
+            "at": now,
+            "note": "",
+        }}},
     )
     if claim.matched_count != 1:
         raise HTTPException(status_code=409, detail="maintenance_dispatch_concurrent_change")
@@ -146,6 +153,40 @@ async def secure_admin_dispatch_maintenance(request: Request):
             "sms": bool(sms_sent),
         }}, "$inc": {"total_jobs": 1}, "$set": {"updated_at": datetime.utcnow()}},
     )
+
+    tenant_locale = "en" if str(ticket.get("notification_language") or "es").startswith("en") else "es"
+    tenant_status = "assigned" if status != "in_progress" else "in_progress"
+    provider_name = provider.get("name") or provider.get("company_name") or ""
+    try:
+        await send_rental_push_to_user(
+            user_id=str(ticket.get("tenant_id") or ""),
+            title="📋 Maintenance Update" if tenant_locale == "en" else "📋 Actualización de Mantenimiento",
+            body=(
+                f"Request #{ticket.get('request_number') or request_id} was assigned."
+                if tenant_locale == "en"
+                else f"La solicitud #{ticket.get('request_number') or request_id} fue asignada."
+            ),
+            data={"type": "maintenance_update", "request_id": request_id, "status": tenant_status},
+        )
+    except Exception:
+        pass
+    try:
+        await send_maintenance_updated_email(
+            db,
+            to_email=ticket.get("tenant_email") or "",
+            name=ticket.get("tenant_name") or "",
+            request_number=ticket.get("request_number") or request_id,
+            title=ticket.get("title") or "",
+            status=tenant_status,
+            changed_at=now,
+            locale=tenant_locale,
+            assigned_to=provider_name,
+            scheduled_start=ticket.get("scheduled_start"),
+            scheduled_end=ticket.get("scheduled_end"),
+            tenant_visible_note=ticket.get("tenant_visible_note") or "",
+        )
+    except Exception:
+        pass
 
     return {
         "success": True,
