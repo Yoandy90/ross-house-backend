@@ -42,6 +42,9 @@ def test_secure_maintenance_routes_are_first_runtime_match():
     get_matches = [r for r in app.routes
                    if getattr(r, "path", None) == "/api/tenant/maintenance-requests"
                    and "GET" in getattr(r, "methods", set())]
+    detail_matches = [r for r in app.routes
+                      if getattr(r, "path", None) == "/api/tenant/maintenance-requests/{request_id}"
+                      and "GET" in getattr(r, "methods", set())]
 
     assert len(post_matches) == 2
     assert post_matches[0].name == "secure_create_maintenance_request"
@@ -49,6 +52,8 @@ def test_secure_maintenance_routes_are_first_runtime_match():
     assert len(get_matches) == 2
     assert get_matches[0].name == "secure_list_tenant_maintenance_requests"
     assert get_matches[1].name == "list_tenant_maintenance_requests"
+    assert len(detail_matches) == 1
+    assert detail_matches[0].name == "secure_get_tenant_maintenance_request"
 
 
 def test_secure_provider_help_route_is_first_runtime_match():
@@ -134,6 +139,37 @@ def test_admin_maintenance_update_keeps_ownership_immutable_and_uses_cas():
     assert '{"_id": ticket["_id"], "status": ticket.get("status")}' in source
     assert 'maintenance_concurrent_update' in source
     assert 'maintenance_status_transition_invalid' in source
+    assert '"tenant_visible_note"' in source
+    assert '"scheduled_start"' in source
+
+
+def test_public_maintenance_detail_never_exposes_admin_notes():
+    row = {
+        "_id": ObjectId(),
+        "title": "Sink",
+        "status": "scheduled",
+        "admin_notes": "Internal vendor cost",
+        "tenant_visible_note": "We will arrive at 3 PM",
+        "timeline": [{"status": "scheduled", "at": None, "note": "At 3 PM", "actor": "admin@example.com"}],
+    }
+    public = secure._public_maintenance(row, include_detail=True)
+    assert public["tenant_visible_note"] == "We will arrive at 3 PM"
+    assert "admin_notes" not in public
+    assert "actor" not in public["timeline"][0]
+
+
+def test_maintenance_numbers_are_zero_padded_and_monotonic():
+    class Counters:
+        def __init__(self):
+            self.value = 0
+
+        async def find_one_and_update(self, *_args, **_kwargs):
+            self.value += 1
+            return {"sequence": self.value}
+
+    db = SimpleNamespace(counters=Counters())
+    assert run(secure._next_maintenance_number(db)) == (1, "0001")
+    assert run(secure._next_maintenance_number(db)) == (2, "0002")
 
 
 def test_photo_policy_rejects_non_image_and_unbounded_lists():
