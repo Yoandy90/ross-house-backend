@@ -5,7 +5,7 @@ from types import SimpleNamespace
 from bson import ObjectId
 
 import rental.maintenance_security_router as maintenance
-from rental.security_email import build_maintenance_received_message
+from rental.security_email import build_maintenance_received_message, build_maintenance_updated_message
 
 
 def run(coro):
@@ -20,6 +20,7 @@ class Request:
             "category": "plumbing",
             "priority": "urgent",
             "photos": ["data:image/jpeg;base64,AA"],
+            "locale": "en-US",
         }
 
 
@@ -37,9 +38,19 @@ class MaintenanceCollection:
         return SimpleNamespace(matched_count=1)
 
 
+class CounterCollection:
+    def __init__(self):
+        self.sequence = 0
+
+    async def find_one_and_update(self, *_args, **_kwargs):
+        self.sequence += 1
+        return {"_id": "maintenance_requests", "sequence": self.sequence}
+
+
 class DB:
     def __init__(self):
         self.maintenance_requests = MaintenanceCollection()
+        self.counters = CounterCollection()
 
 
 def install_route_fakes(monkeypatch, *, email_sent):
@@ -97,9 +108,12 @@ def test_creation_sends_receipt_and_records_delivery(monkeypatch):
     assert response["success"] is True
     assert response["email_confirmation_sent"] is True
     assert response["photo_count"] == 1
+    assert response["request_number"] == "0001"
     assert email_call["to_email"] == "tenant@example.com"
     assert email_call["photo_count"] == 1
     assert email_call["property_address"] == "121 Oak"
+    assert email_call["request_id"] == "0001"
+    assert email_call["locale"] == "en"
     receipt = db.maintenance_requests.updates[0][1]["$set"]["tenant_receipt_email"]
     assert receipt["status"] == "sent"
     assert receipt["sent_at"] == receipt["attempted_at"]
@@ -119,7 +133,7 @@ def test_email_failure_never_rolls_back_ticket(monkeypatch):
     assert "sent_at" not in receipt
 
 
-def test_receipt_is_bilingual_escaped_and_contains_tracking_details():
+def test_spanish_receipt_is_localized_escaped_and_contains_tracking_details():
     content = build_maintenance_received_message(
         name="Tenant <One>",
         request_id="REQ-123",
@@ -129,13 +143,51 @@ def test_receipt_is_bilingual_escaped_and_contains_tracking_details():
         priority="urgent",
         photo_count=1,
         submitted_at=datetime(2026, 9, 12, 18, 30, tzinfo=timezone.utc),
+        locale="es",
     )
 
     combined = " ".join(content.values())
     assert "REQ-123" in combined
     assert "Fotos recibidas: 1" in combined
-    assert "Maintenance request received" in combined
+    assert "Maintenance request received" not in combined
     assert "info@rosshouserentals.com" in combined
     assert "Tenant &lt;One&gt;" in content["html"]
     assert "Fuga &lt;baño&gt;" in content["html"]
     assert "<One>" not in content["html"]
+
+
+def test_english_receipt_contains_only_english_copy():
+    content = build_maintenance_received_message(
+        name="Tenant One",
+        request_id="0007",
+        title="Leaking sink",
+        property_address="121 Oak",
+        category="plumbing",
+        priority="urgent",
+        photo_count=2,
+        submitted_at=datetime(2026, 9, 12, 18, 30, tzinfo=timezone.utc),
+        locale="en-US",
+    )
+    combined = " ".join(content.values())
+    assert "Maintenance request received" in combined
+    assert "Photos received: 2" in combined
+    assert "Solicitud de mantenimiento recibida" not in combined
+    assert "Fotos recibidas" not in combined
+
+
+def test_status_update_email_includes_schedule_and_assignment_in_locale():
+    content = build_maintenance_updated_message(
+        name="Tenant One",
+        request_number="0012",
+        title="Leaking sink",
+        status="scheduled",
+        assigned_to="ACME Repairs",
+        scheduled_start=datetime(2026, 9, 14, 15, 0, tzinfo=timezone.utc),
+        tenant_visible_note="Please secure pets",
+        changed_at=datetime(2026, 9, 12, 18, 30, tzinfo=timezone.utc),
+        locale="en",
+    )
+    assert "#0012" in content["subject"]
+    assert "Scheduled for:" in content["text"]
+    assert "Assigned to: ACME Repairs" in content["text"]
+    assert "Programada para" not in content["text"]
