@@ -4,7 +4,7 @@ Rental Auth Router
 """
 import logging
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional, List
 from collections import defaultdict
 import time
@@ -21,6 +21,7 @@ from rental.shared import (
     send_rental_push_to_user, send_rental_push_to_admins,
     TENANT_JWT_SECRET,
 )
+from rental.security_email import send_password_changed_email
 
 router = APIRouter()
 
@@ -448,7 +449,7 @@ async def reset_password(request: Request):
 
 @router.put('/auth/change-password')
 async def change_password(request: Request):
-    """Change password for authenticated user."""
+    """Change a password, notify the user and revoke every other session."""
     user = await auth_marketplace(request)
     data = await request.json()
     current_password = data.get("current_password", "").strip()
@@ -464,15 +465,62 @@ async def change_password(request: Request):
             raise HTTPException(status_code=401, detail="Contraseña actual incorrecta")
 
     hashed = hash_password(new_password)
+    changed_at = datetime.now(timezone.utc)
     try:
         oid = ObjectId(user["_id"]) if not isinstance(user["_id"], ObjectId) else user["_id"]
     except:
         oid = user["_id"]
 
-    await get_db().app_users.update_one({"_id": oid}, {"$set": {"password_hash": hashed, "updated_at": datetime.utcnow()}})
+    db = get_db()
+    await db.app_users.update_one(
+        {"_id": oid},
+        {"$set": {
+            "password_hash": hashed,
+            "password_changed_at": changed_at,
+            "updated_at": changed_at,
+        }},
+    )
+
+    current_sid = ""
+    authorization = request.headers.get("Authorization", "")
+    if authorization.startswith("Bearer "):
+        try:
+            payload = jwt.decode(
+                authorization.split(" ", 1)[1],
+                TENANT_JWT_SECRET,
+                algorithms=["HS256"],
+            )
+            current_sid = str(payload.get("sid") or "")
+        except Exception:
+            # auth_marketplace already validated the caller. If a legacy token has
+            # no usable sid, revoke all tracked sessions as the safer fallback.
+            current_sid = ""
+
+    session_query = {"user_id": str(user["_id"]), "revoked_at": None}
+    if current_sid:
+        session_query["sid"] = {"$ne": current_sid}
+    revoked = await db.auth_sessions.update_many(
+        session_query,
+        {"$set": {
+            "revoked_at": changed_at,
+            "revoked_reason": "password_changed",
+        }},
+    )
+
+    notification_sent = await send_password_changed_email(
+        db,
+        to_email=str(user.get("email") or ""),
+        name=str(user.get("name") or ""),
+        changed_at=changed_at,
+    )
 
     msg = "Contraseña actualizada" if user.get("password_hash") else "Contraseña establecida exitosamente"
-    return {"success": True, "message": msg}
+    return {
+        "success": True,
+        "message": msg,
+        "other_sessions_revoked": int(revoked.modified_count),
+        "notification_sent": notification_sent,
+    }
 
 
 

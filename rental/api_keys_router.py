@@ -35,6 +35,7 @@ KEY_REGISTRY = [
     # SendGrid (Emails)
     {"key": "SENDGRID_API_KEY", "label": "SendGrid API Key", "category": "SendGrid (Emails)", "secret": True, "placeholder": "SG.xxxxx..."},
     {"key": "SENDGRID_FROM_EMAIL", "label": "Email Remitente", "category": "SendGrid (Emails)", "secret": False, "placeholder": "info@rosshouserentals.com"},
+    {"key": "SECURITY_FROM_EMAIL", "label": "Remitente de Alertas de Seguridad", "category": "SendGrid (Emails)", "secret": False, "placeholder": "security@rosshouserentals.com"},
     # Twilio (SMS)
     {"key": "TWILIO_ACCOUNT_SID", "label": "Account SID", "category": "Twilio (SMS)", "secret": False, "placeholder": "ACxxxxxxxx..."},
     {"key": "TWILIO_AUTH_TOKEN", "label": "Auth Token", "category": "Twilio (SMS)", "secret": True, "placeholder": "xxxxxxxx..."},
