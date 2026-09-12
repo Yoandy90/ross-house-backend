@@ -8,6 +8,9 @@ RENTALS_CORS_ORIGINS = (
     "https://rosshouserentals.com",
     "https://www.rosshouserentals.com",
 )
+RENTALS_STAGING_CORS_ORIGINS = (
+    "https://ross-house-rentals-git-staging-yoandyross-2350s-projects.vercel.app",
+)
 _DATABASE_BY_ENVIRONMENT = {
     "production": "ross_house_production",
     "staging": "ross_house_staging",
@@ -35,6 +38,10 @@ def resolve_database_name(environ: Mapping[str, str]) -> str:
 
 
 def deployed_cors_origins(environ: Mapping[str, str]) -> tuple[str, ...]:
-    """Only explicit local development receives wildcard CORS."""
+    """Return the exact frontend origins allowed for each environment."""
     environment = str(environ.get("ENVIRONMENT", "")).strip().lower()
-    return ("*",) if environment in {"development", "dev", "local"} else RENTALS_CORS_ORIGINS
+    if environment in {"development", "dev", "local"}:
+        return ("*",)
+    if environment == "staging":
+        return RENTALS_CORS_ORIGINS + RENTALS_STAGING_CORS_ORIGINS
+    return RENTALS_CORS_ORIGINS
