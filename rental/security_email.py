@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo
 logger = logging.getLogger("security_email")
 SUPPORT_EMAIL = "info@rosshouserentals.com"
 SUPPORT_PHONE = "(806) 934-2018"
+SECURITY_FROM_NAME = "Ross House Security"
 CENTRAL_TIME = ZoneInfo("America/Chicago")
 SPANISH_MONTHS = (
     "enero", "febrero", "marzo", "abril", "mayo", "junio",
@@ -110,7 +111,7 @@ async def send_password_changed_email(
         from sendgrid.helpers.mail import Mail
 
         message = Mail(
-            from_email=from_email,
+            from_email=(from_email, SECURITY_FROM_NAME),
             to_emails=recipient,
             subject=content["subject"],
             plain_text_content=content["text"],

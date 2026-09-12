@@ -8,7 +8,11 @@ from bson import ObjectId
 from fastapi import HTTPException
 
 import rental.auth_router as auth_router
-from rental.security_email import _sendgrid_config, build_password_changed_message
+from rental.security_email import (
+    SECURITY_FROM_NAME,
+    _sendgrid_config,
+    build_password_changed_message,
+)
 
 
 class Result:
@@ -178,3 +182,4 @@ def test_security_sender_is_configurable_from_admin_and_has_priority(monkeypatch
 
     assert api_key == "test-key"
     assert sender == "security@rosshouserentals.com"
+    assert SECURITY_FROM_NAME == "Ross House Security"
