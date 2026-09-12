@@ -21,6 +21,7 @@ from rental.tenant_integrity import (
     find_active_contract_for_tenant,
     resolve_authenticated_tenant,
 )
+from rental.security_email import send_maintenance_received_email
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -142,8 +143,42 @@ async def secure_create_maintenance_request(request: Request):
         "created_at": now,
         "updated_at": now,
     }
-    result = await get_db().maintenance_requests.insert_one(maintenance)
+    db = get_db()
+    result = await db.maintenance_requests.insert_one(maintenance)
     request_id = str(result.inserted_id)
+
+    # Delivery is advisory: the ticket remains authoritative even when email is unavailable.
+    tenant_email = str(tenant.get("email") or "").strip()
+    email_confirmation_sent = False
+    try:
+        email_confirmation_sent = await send_maintenance_received_email(
+            db,
+            to_email=tenant_email,
+            name=str(tenant.get("name") or tenant.get("full_name") or ""),
+            request_id=request_id,
+            title=title,
+            property_address=location["property_address"],
+            category=category,
+            priority=priority,
+            photo_count=len(photos),
+            submitted_at=now,
+        )
+        receipt_status = (
+            "sent" if email_confirmation_sent
+            else ("failed" if tenant_email else "skipped_no_email")
+        )
+        receipt_record = {
+            "status": receipt_status,
+            "attempted_at": now,
+        }
+        if email_confirmation_sent:
+            receipt_record["sent_at"] = now
+        await db.maintenance_requests.update_one(
+            {"_id": result.inserted_id},
+            {"$set": {"tenant_receipt_email": receipt_record}},
+        )
+    except Exception as exc:
+        logger.warning("maintenance receipt tracking failed: %s", exc)
 
     # Notifications are advisory only and may never roll back a valid ticket.
     try:
@@ -163,7 +198,13 @@ async def secure_create_maintenance_request(request: Request):
     except Exception as exc:
         logger.warning("maintenance notification failed: %s", exc)
 
-    return {"success": True, "message": "Solicitud de mantenimiento creada", "request_id": request_id}
+    return {
+        "success": True,
+        "message": "Solicitud de mantenimiento creada",
+        "request_id": request_id,
+        "email_confirmation_sent": email_confirmation_sent,
+        "photo_count": len(photos),
+    }
 
 
 @router.get('/tenant/maintenance-requests')
