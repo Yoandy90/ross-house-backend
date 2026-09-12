@@ -3,7 +3,10 @@ from pathlib import Path
 import pytest
 
 from rental.runtime_business_boundary import (
-    RENTALS_CORS_ORIGINS, deployed_cors_origins, resolve_database_name,
+    RENTALS_CORS_ORIGINS,
+    RENTALS_STAGING_CORS_ORIGINS,
+    deployed_cors_origins,
+    resolve_database_name,
 )
 
 
@@ -33,11 +36,23 @@ def test_rejects_missing_wrong_or_foreign_database(environment, name):
 
 def test_deployed_cors_is_exclusively_ross_house():
     assert deployed_cors_origins({"ENVIRONMENT": "production"}) == RENTALS_CORS_ORIGINS
-    assert deployed_cors_origins({"ENVIRONMENT": "staging"}) == RENTALS_CORS_ORIGINS
+    assert deployed_cors_origins({"ENVIRONMENT": "staging"}) == (
+        RENTALS_CORS_ORIGINS + RENTALS_STAGING_CORS_ORIGINS
+    )
     assert set(RENTALS_CORS_ORIGINS) == {
         "https://rosshouserentals.com", "https://www.rosshouserentals.com",
     }
     assert deployed_cors_origins({"ENVIRONMENT": "local"}) == ("*",)
+
+
+def test_staging_cors_is_exact_and_never_leaks_to_production():
+    staging_origin = (
+        "https://ross-house-rentals-git-staging-yoandyross-2350s-projects.vercel.app"
+    )
+    assert RENTALS_STAGING_CORS_ORIGINS == (staging_origin,)
+    assert staging_origin in deployed_cors_origins({"ENVIRONMENT": "staging"})
+    assert staging_origin not in deployed_cors_origins({"ENVIRONMENT": "production"})
+    assert "*" not in deployed_cors_origins({"ENVIRONMENT": "staging"})
 
 
 def test_server_wires_boundary_and_preserves_opportunity_workers():
