@@ -5,6 +5,37 @@ from rental import helcim_vault_router as vault
 from rental import payment_processors_core
 
 
+def test_helcim_callback_accepts_current_direct_signed_envelope():
+    tx = {
+        "statusAuth": "PENDING",
+        "statusClearing": "OPENED",
+        "bankToken": "opaque-bank-token",
+    }
+    parsed, supplied_hash = payment_processors_core._parse_helcim_response(
+        {"data": tx, "hash": "signed-response-hash"}
+    )
+    assert parsed == tx
+    assert supplied_hash == "signed-response-hash"
+
+
+def test_helcim_callback_keeps_legacy_nested_envelope_compatibility():
+    tx = {"status": "APPROVED", "cardToken": "opaque-card-token"}
+    parsed, supplied_hash = payment_processors_core._parse_helcim_response(
+        {"data": {"data": tx, "hash": "signed-response-hash"}}
+    )
+    assert parsed == tx
+    assert supplied_hash == "signed-response-hash"
+
+
+def test_helcim_callback_rejects_unsigned_or_malformed_envelopes():
+    for payload in ({"data": {}}, {"hash": "missing-data"}, [], "not-json"):
+        try:
+            payment_processors_core._parse_helcim_response(payload)
+        except (TypeError, ValueError):
+            continue
+        raise AssertionError(f"malformed payload accepted: {payload!r}")
+
+
 def test_payload_items_accepts_current_helcim_response_envelopes():
     rows = [{"id": 7}]
     assert vault._payload_items(rows, "customers") == rows

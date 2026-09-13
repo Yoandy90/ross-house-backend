@@ -1277,6 +1277,28 @@ async def helcim_checkout_page(session_id: str):
     return HTMLResponse(page)
 
 
+def _parse_helcim_response(raw):
+    """Return the signed transaction from current and legacy HelcimPay envelopes."""
+    outer = json.loads(raw) if isinstance(raw, str) else raw
+    if not isinstance(outer, dict):
+        raise ValueError("Helcim response is not an object")
+
+    # Helcim currently emits {"data": transaction, "hash": "..."}. Older
+    # bridge responses wrapped that object once more under "data". Accept both
+    # signed shapes without weakening the hash validation performed below.
+    envelope = outer
+    if not (isinstance(envelope.get("data"), dict) and envelope.get("hash")):
+        nested = outer.get("data")
+        if isinstance(nested, dict):
+            envelope = nested
+
+    tx = envelope.get("data")
+    supplied_hash = envelope.get("hash")
+    if not isinstance(tx, dict) or not isinstance(supplied_hash, str) or not supplied_hash:
+        raise ValueError("Helcim response is missing signed data")
+    return tx, supplied_hash
+
+
 @router.post("/public/helcim-complete")
 async def helcim_complete(request: Request):
     """Valida la respuesta de HelcimPay con el hash (secretToken) y completa el pago."""
@@ -1292,11 +1314,8 @@ async def helcim_complete(request: Request):
 
     raw = body.get("raw_data_response") or ""
     try:
-        outer = json.loads(raw) if isinstance(raw, str) else raw
-        envelope = outer.get("data", outer)
-        tx = envelope["data"]
-        supplied_hash = envelope["hash"]
-    except (TypeError, ValueError, KeyError):
+        tx, supplied_hash = _parse_helcim_response(raw)
+    except (TypeError, ValueError, json.JSONDecodeError):
         raise HTTPException(status_code=400, detail="Respuesta de Helcim malformada")
 
     canonical = json.dumps(tx, separators=(",", ":"), ensure_ascii=True)
