@@ -127,3 +127,53 @@ def test_helcim_bridge_is_branded_and_never_claims_to_store_raw_data():
     assert "Nunca almacenamos el número completo" in page
     assert "secure.helcim.app/helcim-pay/services/start.js" in page
     assert "appendHelcimPayIframe(checkoutToken, true)" in page
+
+
+def test_customer_request_uses_profile_and_hides_no_payment_data():
+    customer = vault._helcim_customer_request({
+        "name": "Prueba Inquilino",
+        "email": "tenant@example.com",
+        "phone": "(806) 555-0199",
+        "address": "999 Staging Test Ave, Dumas, TX 79029",
+    })
+
+    assert customer == {
+        "contactName": "Prueba Inquilino",
+        "cellPhone": "8065550199",
+        "billingAddress": {
+            "name": "Prueba Inquilino",
+            "street1": "999 Staging Test Ave, Dumas, TX 79029",
+            "postalCode": "79029",
+            "email": "tenant@example.com",
+            "phone": "8065550199",
+        },
+    }
+    assert "card" not in repr(customer).lower()
+    assert "cvv" not in repr(customer).lower()
+
+
+def test_customer_request_omits_incomplete_billing_address():
+    customer = vault._helcim_customer_request({
+        "name": "Tenant",
+        "email": "tenant@example.com",
+        "phone": "806-555-0199",
+        "address": "Address without postal code",
+    })
+
+    assert customer == {"contactName": "Tenant", "cellPhone": "8065550199"}
+
+
+def test_existing_helcim_customer_is_reused_instead_of_duplicated():
+    class _Methods:
+        async def find_one(self, query, sort=None):
+            assert query["tenant_id"] == "tenant-123"
+            assert sort == [("created_at", -1)]
+            return {"customer_code": "CST1001"}
+
+    class _Db:
+        helcim_saved_methods = _Methods()
+
+    context = _run(vault._helcim_customer_context(
+        _Db(), {"_id": "tenant-123", "name": "Tenant"}))
+
+    assert context == {"customerCode": "CST1001"}
