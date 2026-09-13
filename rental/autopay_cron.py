@@ -89,7 +89,9 @@ async def _process_autopay_for_config(db, autopay):
     user_id = str(autopay.get("user_id", ""))
     payment_method_id = autopay.get("payment_method_id", "")
     if not payment_method_id and not (
-        autopay.get("processor") == "helcim" and autopay.get("helcim_card_token")
+        autopay.get("processor") == "helcim" and (
+            autopay.get("helcim_card_token") or
+            (autopay.get("helcim_customer_id") and autopay.get("helcim_bank_account_id")))
     ):
         return {"skipped": True, "reason": "no_payment_method"}
 
@@ -130,10 +132,14 @@ async def _process_autopay_for_config(db, autopay):
         logger.error("Autopay config without _id cannot be safely claimed")
         return {"skipped": True, "reason": "missing_autopay_id"}
 
-    # HELCIM: authoritative saved-card token charge.
-    if autopay.get("processor") == "helcim" and autopay.get("helcim_card_token"):
+    # HELCIM: authoritative saved card or authorized bank-account charge.
+    if autopay.get("processor") == "helcim" and (
+        autopay.get("helcim_card_token") or
+        (autopay.get("helcim_customer_id") and autopay.get("helcim_bank_account_id"))
+    ):
         try:
-            from .helcim_vault_router import helcim_purchase_with_token
+            from .helcim_vault_router import (
+                decrypt_provider_token, helcim_ach_with_account, helcim_purchase_with_token)
             from .payment_processors_router import _get_doc, _active_creds
 
             cfg = _active_creds((await _get_doc())["processors"].get("helcim", {}))
@@ -153,12 +159,27 @@ async def _process_autopay_for_config(db, autopay):
             ):
                 return {"skipped": True, "reason": "invoice_charge_already_started"}
 
+            if autopay.get("helcim_method_type") == "ach":
+                tx = await helcim_ach_with_account(
+                    api_token, int(round(total * 100)),
+                    int(autopay["helcim_customer_id"]),
+                    int(autopay["helcim_bank_account_id"]))
+                ach_tx = tx.get("transaction") if isinstance(tx.get("transaction"), dict) else tx
+                transaction_id = str(ach_tx.get("id") or ach_tx.get("transactionId") or "")
+                await db.autopay_config.update_one(
+                    {"_id": autopay_id}, {"$set": {
+                        "last_attempt_status": "ACH_PENDING",
+                        "last_result": "ACH_PENDING",
+                        "last_attempt_transaction_id": transaction_id,
+                        "last_attempt_amount": total,
+                        "last_attempt_invoice_id": str(invoice_id)}})
+                return {"charged": True, "success": True, "pending": True,
+                        "processor": "helcim", "transaction_id": transaction_id}
+
             tx = await helcim_purchase_with_token(
-                api_token,
-                int(round(total * 100)),
-                autopay["helcim_card_token"],
-                autopay.get("helcim_customer_code", ""),
-            )
+                api_token, int(round(total * 100)),
+                decrypt_provider_token(autopay["helcim_card_token"]),
+                autopay.get("helcim_customer_code", ""))
             status_tx = str(tx.get("status", "")).upper()
             await db.autopay_config.update_one(
                 {"_id": autopay_id},

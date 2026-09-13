@@ -1285,21 +1285,60 @@ async def helcim_complete(request: Request):
 
     # Sesión de VERIFICACIÓN (guardar método de pago, sin cobro)
     if ses.get("purpose") == "verify":
-        card_token = tx.get("cardToken") or (tx.get("cardData") or {}).get("cardToken", "")
-        if str(tx.get("status", "")).upper() not in ("APPROVED", "APPROVAL") or not card_token:
-            return {"status": "failed"}
-        masked = str(tx.get("cardNumber") or "")
-        await get_db().helcim_saved_methods.insert_one({
-            "tenant_id": ses.get("tenant_id", ""),
-            "card_token": card_token,
-            "customer_code": str(tx.get("customerCode") or ""),
-            "brand": tx.get("cardType") or "Tarjeta",
-            "last4": masked[-4:] if masked else "",
-            "type": "card",
-            "created_at": datetime.now(timezone.utc)})
+        from .helcim_vault_router import (
+            encrypt_provider_token, provider_token_fingerprint, resolve_ach_vault_ids)
+        method_type = str(ses.get("method_type") or "card")
+        now = datetime.now(timezone.utc)
+        customer_code = str(tx.get("customerCode") or "")
+        if method_type == "ach":
+            bank_token = tx.get("bankToken") or (tx.get("bankData") or {}).get("bankToken", "")
+            masked = str(tx.get("bankAccountNumber") or "")
+            accepted = bool(bank_token) and (
+                str(tx.get("status", "")).upper() in ("APPROVED", "APPROVAL") or
+                str(tx.get("statusAuth", "")).upper() == "PENDING" or
+                str(tx.get("statusClearing", "")).upper() == "OPENED")
+            if not accepted:
+                await get_db().helcim_checkout_sessions.update_one(
+                    {"_id": ses["_id"]}, {"$set": {"status": "failed", "updated_at": now}})
+                return {"status": "failed"}
+            cfg = _active_creds((await _get_doc())["processors"].get("helcim", {}))
+            customer_id, bank_account_id = await resolve_ach_vault_ids(
+                cfg.get("api_token", ""), customer_code, bank_token, masked[-4:])
+            method = {
+                "tenant_id": ses.get("tenant_id", ""),
+                "bank_token": encrypt_provider_token(bank_token),
+                "token_fingerprint": provider_token_fingerprint(bank_token),
+                "customer_code": customer_code,
+                "customer_id": customer_id,
+                "bank_account_id": bank_account_id,
+                "brand": tx.get("bankName") or "Cuenta bancaria",
+                "last4": masked[-4:] if masked else "",
+                "type": "ach",
+                "ready_for_payments": bool(customer_id and bank_account_id),
+                "created_at": now,
+            }
+        else:
+            card_token = tx.get("cardToken") or (tx.get("cardData") or {}).get("cardToken", "")
+            if str(tx.get("status", "")).upper() not in ("APPROVED", "APPROVAL") or not card_token:
+                await get_db().helcim_checkout_sessions.update_one(
+                    {"_id": ses["_id"]}, {"$set": {"status": "failed", "updated_at": now}})
+                return {"status": "failed"}
+            masked = str(tx.get("cardNumber") or "")
+            method = {
+                "tenant_id": ses.get("tenant_id", ""),
+                "card_token": encrypt_provider_token(card_token),
+                "token_fingerprint": provider_token_fingerprint(card_token),
+                "customer_code": customer_code,
+                "brand": tx.get("cardType") or "Tarjeta",
+                "last4": masked[-4:] if masked else "",
+                "type": "card",
+                "ready_for_payments": True,
+                "created_at": now,
+            }
+        await get_db().helcim_saved_methods.insert_one(method)
         await get_db().helcim_checkout_sessions.update_one(
             {"_id": ses["_id"]}, {"$set": {"status": "verified",
-                                           "updated_at": datetime.now(timezone.utc)}})
+                                           "updated_at": now}})
         logger.info("💾 Método Helcim guardado para tenant %s (••••%s)",
                     ses.get("tenant_id"), masked[-4:] if masked else "?")
         return {"status": "verified"}

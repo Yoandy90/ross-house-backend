@@ -127,7 +127,8 @@ def test_revocation_records_event_and_removes_charge_credentials(monkeypatch):
     _, update, _ = db.autopay_config.update
     assert update["$push"]["authorization_history"]["action"] == "revoked"
     assert set(update["$unset"]) == {
-        "helcim_method_id", "helcim_card_token", "helcim_customer_code"}
+        "helcim_method_id", "helcim_card_token", "helcim_customer_code",
+        "helcim_method_type", "helcim_customer_id", "helcim_bank_account_id"}
 
 
 @pytest.mark.parametrize("enabled,status", [
@@ -161,7 +162,8 @@ def test_legacy_revocation_clears_credentials_and_preserves_schedule(monkeypatch
     assert update["$set"]["enabled"] is False
     assert "day_of_month" not in update["$set"]
     assert set(update["$unset"]) == {
-        "helcim_method_id", "helcim_card_token", "helcim_customer_code"}
+        "helcim_method_id", "helcim_card_token", "helcim_customer_code",
+        "helcim_method_type", "helcim_customer_id", "helcim_bank_account_id"}
     event = update["$push"]["authorization_history"]
     assert event == update["$set"]["authorization"]
     assert event["action"] == "revoked"

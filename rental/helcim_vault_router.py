@@ -4,6 +4,7 @@ Flujo: el inquilino verifica su tarjeta UNA vez en el modal seguro (paymentType
 'verify') → Helcim devuelve cardToken → guardamos solo el token. Después todo
 es nativo: cobro server-side con /v2/payment/purchase usando el token.
 """
+import hashlib
 import json
 import logging
 import uuid
@@ -13,7 +14,7 @@ import httpx
 from bson import ObjectId
 from fastapi import APIRouter, HTTPException, Request
 
-from .shared import get_db, auth_tenant_flex
+from .shared import get_db, auth_admin, auth_tenant_flex
 
 logger = logging.getLogger("helcim_vault")
 router = APIRouter(tags=["helcim-vault"])
@@ -54,10 +55,98 @@ async def helcim_purchase_with_token(api_token: str, amount_cents: int,
     return r.json()
 
 
+def encrypt_provider_token(token: str) -> str:
+    """Encrypt new Helcim tokens at rest; raw account data is never accepted."""
+    from .vault_router import encrypt
+    return f"enc:{encrypt(token)}" if token else ""
+
+
+def decrypt_provider_token(token: str) -> str:
+    """Read encrypted tokens while retaining compatibility with legacy rows."""
+    if not token:
+        return ""
+    if not token.startswith("enc:"):
+        return token
+    from .vault_router import decrypt
+    return decrypt(token[4:])
+
+
+def provider_token_fingerprint(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest() if token else ""
+
+
+async def helcim_ach_with_account(api_token: str, amount_cents: int,
+                                  customer_id: int, bank_account_id: int) -> dict:
+    """Start an ACH debit against a Helcim-vaulted, authorized bank account."""
+    body = {"customerId": int(customer_id), "bankAccountId": int(bank_account_id),
+            "amount": round(amount_cents / 100, 2), "currencyId": 2}
+    async with httpx.AsyncClient(timeout=30) as x:
+        r = await x.put(f"{HELCIM_BASE}/ach/withdraw",
+                        headers={"api-token": api_token, "accept": "application/json",
+                                 "idempotency-key": str(uuid.uuid4())}, json=body)
+    if r.status_code >= 400:
+        raise HTTPException(status_code=402, detail=f"Helcim rechazó el débito ACH: {r.text[:180]}")
+    return r.json()
+
+
+def _payload_items(payload, *keys):
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        for key in keys:
+            if isinstance(payload.get(key), list):
+                return payload[key]
+        if isinstance(payload.get("data"), (list, dict)):
+            return _payload_items(payload["data"], *keys)
+    return []
+
+
+async def resolve_ach_vault_ids(api_token: str, customer_code: str,
+                                bank_token: str, last4: str) -> tuple[int | None, int | None]:
+    """Resolve opaque Helcim customer/bank IDs after hosted tokenization."""
+    if not customer_code:
+        return None, None
+    headers = {"api-token": api_token, "accept": "application/json"}
+    async with httpx.AsyncClient(timeout=20) as x:
+        response = await x.get(f"{HELCIM_BASE}/customers", headers=headers,
+                               params={"customerCode": customer_code, "limit": 10})
+        if response.status_code >= 400:
+            return None, None
+        customers = _payload_items(response.json(), "customers")
+        customer = next((item for item in customers
+                         if str(item.get("customerCode") or "") == customer_code), None)
+        if not customer:
+            return None, None
+        customer_id = customer.get("id") or customer.get("customerId")
+        if not customer_id:
+            return None, None
+        response = await x.get(
+            f"{HELCIM_BASE}/customers/{customer_id}/bank-accounts", headers=headers)
+        if response.status_code >= 400:
+            return int(customer_id), None
+        banks = _payload_items(response.json(), "bankAccounts", "banks")
+        def matches(item):
+            token = str(item.get("bankToken") or "")
+            number = str(item.get("bankAccountNumber") or item.get("accountNumber") or
+                         item.get("bankAccountL4") or "")
+            return bool((bank_token and token == bank_token) or
+                        (last4 and number.endswith(last4)))
+        bank = next((item for item in banks if matches(item)), None)
+        if not bank and len(banks) == 1:
+            bank = banks[0]
+        bank_id = (bank or {}).get("id") or (bank or {}).get("bankAccountId")
+        return int(customer_id), int(bank_id) if bank_id else None
+
+
 @router.post("/tenant/helcim/save-method-session")
 async def save_method_session(request: Request):
-    """Crea sesión 'verify' de HelcimPay para guardar tarjeta (sin cobrar)."""
+    """Create a hosted Helcim vault session for a card or ACH account."""
     tenant = await auth_tenant_flex(request)
+    data_in = await request.json()
+    method_type = str(data_in.get("method_type") or "card").lower()
+    if method_type not in {"card", "ach"}:
+        raise HTTPException(400, "Tipo de método de pago inválido")
+    helcim_method = "cc" if method_type == "card" else "ach"
     cfg = await _helcim_cfg()
     if not cfg.get("api_token"):
         raise HTTPException(400, "Helcim no configurado")
@@ -65,7 +154,9 @@ async def save_method_session(request: Request):
         r = await x.post(f"{HELCIM_BASE}/helcim-pay/initialize",
                          headers={"api-token": cfg["api_token"], "accept": "application/json"},
                          json={"paymentType": "verify", "amount": 0, "currency": "USD",
-                               "paymentMethod": "cc",
+                               "paymentMethod": helcim_method,
+                               "setAsDefaultPaymentMethod": 1,
+                               "displayContactFields": 1,
                                "customStyling": {"appearance": "system",
                                                  "brandColor": "B30D2F",
                                                  "cornerRadius": "rounded"},
@@ -75,10 +166,12 @@ async def save_method_session(request: Request):
     data = r.json()
     sid = uuid.uuid4().hex
     from .payment_processors_router import _public_base_url
+    redirect_url = f"rossrentals://pay/methods?helcim_session={sid}"
     await get_db().helcim_checkout_sessions.insert_one({
         "_id": sid, "checkout_token": data["checkoutToken"],
         "secret_token": data["secretToken"], "amount_cents": 0,
-        "purpose": "verify", "tenant_id": str(tenant["_id"]),
+        "purpose": "verify", "method_type": method_type,
+        "redirect_url": redirect_url, "tenant_id": str(tenant["_id"]),
         "tenant_name": tenant.get("name", ""), "status": "pending",
         "created_at": datetime.now(timezone.utc)})
     return {"success": True, "session_id": sid,
@@ -120,6 +213,7 @@ async def list_methods(request: Request):
     async for m in get_db().helcim_saved_methods.find({"tenant_id": str(tenant["_id"])}):
         items.append({"id": str(m["_id"]), "brand": m.get("brand", "Tarjeta"),
                       "last4": m.get("last4", ""), "type": m.get("type", "card"),
+                      "ready_for_payments": bool(m.get("ready_for_payments", True)),
                       "created_at": m["created_at"].isoformat()})
     ap = await get_db().autopay_config.find_one({"user_id": str(tenant["_id"]),
                                                  "processor": "helcim"}) or {}
@@ -128,6 +222,36 @@ async def list_methods(request: Request):
                         "method_id": str(ap.get("helcim_method_id", "")),
                         "day_of_month": ap.get("day_of_month", 1),
                         "authorization_version": AUTOPAY_AUTHORIZATION_VERSION}}
+
+
+@router.get("/admin/helcim/vault-methods")
+async def admin_list_tokenized_methods(request: Request):
+    """Masked admin inventory. Provider tokens and raw payment data never leave the API."""
+    await auth_admin(request)
+    db = get_db()
+    items = []
+    async for method in db.helcim_saved_methods.find({}).sort("created_at", -1):
+        tenant_id = str(method.get("tenant_id") or "")
+        tenant = None
+        for value in (tenant_id, ObjectId(tenant_id) if ObjectId.is_valid(tenant_id) else None):
+            if value is not None:
+                tenant = await db.app_users.find_one({"_id": value})
+                if tenant:
+                    break
+        items.append({
+            "id": str(method["_id"]),
+            "tenant_id": tenant_id,
+            "tenant_name": str((tenant or {}).get("name") or ""),
+            "tenant_email": str((tenant or {}).get("email") or ""),
+            "type": str(method.get("type") or "card"),
+            "brand": str(method.get("brand") or "Método Helcim"),
+            "last4": str(method.get("last4") or "")[-4:],
+            "ready_for_payments": bool(method.get("ready_for_payments", True)),
+            "created_at": method.get("created_at").isoformat()
+                if isinstance(method.get("created_at"), datetime) else "",
+        })
+    return {"success": True, "methods": items,
+            "security": "helcim_tokenized_masked_only"}
 
 
 @router.delete("/tenant/helcim/methods/{mid}")
@@ -169,8 +293,11 @@ async def pay_with_method(request: Request):
     total = charge["outstanding"]
     if total <= 0:
         raise HTTPException(400, "No tienes saldo pendiente este mes")
-    if m.get("type", "card") != "card" or not m.get("card_token"):
+    method_type = str(m.get("type") or "card")
+    if method_type == "card" and not m.get("card_token"):
         raise HTTPException(400, "Selecciona una tarjeta guardada válida")
+    if method_type == "ach" and not (m.get("customer_id") and m.get("bank_account_id")):
+        raise HTTPException(409, "La cuenta bancaria todavía está siendo verificada por Helcim")
     cfg = await _helcim_cfg()
     if not cfg.get("api_token"):
         raise HTTPException(400, "Helcim no configurado")
@@ -181,9 +308,22 @@ async def pay_with_method(request: Request):
         raise HTTPException(409, "Ya existe un intento de pago o el saldo cambió; requiere revisión")
     query = {"_id": charge["invoice"]["_id"], "charge_attempt.id": attempt["id"]}
     try:
+        if method_type == "ach":
+            tx = await helcim_ach_with_account(
+                cfg["api_token"], int(round(total * 100)),
+                int(m["customer_id"]), int(m["bank_account_id"]))
+            ach_tx = tx.get("transaction") if isinstance(tx.get("transaction"), dict) else tx
+            transaction_id = str(ach_tx.get("id") or ach_tx.get("transactionId") or "")
+            await db.rental_payments.update_one(query, {"$set": {
+                "charge_attempt.status": "reconciliation_required",
+                "charge_attempt.provider_status": "ACH_PENDING",
+                "charge_attempt.transaction_id": transaction_id}})
+            return {"success": True, "status": "ach_pending",
+                    "transaction_id": transaction_id}
+
         tx = await helcim_purchase_with_token(
-            cfg["api_token"], int(round(total * 100)), m["card_token"],
-            m.get("customer_code", ""),
+            cfg["api_token"], int(round(total * 100)),
+            decrypt_provider_token(m["card_token"]), m.get("customer_code", ""),
             request.client.host if request.client else "127.0.0.1")
         status = str(tx.get("status", "")).upper()
         transaction_id = str(tx.get("transactionId") or "")
@@ -243,7 +383,8 @@ async def set_autopay(request: Request):
         {"user_id": str(tenant["_id"]), "processor": "helcim"},
         {"$set": {"enabled": False, "authorization": event, "updated_at": now},
          "$unset": {"helcim_method_id": "", "helcim_card_token": "",
-                    "helcim_customer_code": ""},
+                    "helcim_customer_code": "", "helcim_method_type": "",
+                    "helcim_customer_id": "", "helcim_bank_account_id": ""},
          "$push": {"authorization_history": event}},
     )
     return {"success": True, "enabled": False}
@@ -293,6 +434,8 @@ async def authorize_autopay(request: Request):
             method = None
         if not method:
             raise HTTPException(400, "Selecciona un método de pago guardado")
+        if not method.get("ready_for_payments", True):
+            raise HTTPException(409, "El método todavía está siendo verificado por Helcim")
 
     now = datetime.now(timezone.utc)
     event = {
@@ -318,12 +461,16 @@ async def authorize_autopay(request: Request):
     if enabled:
         update["$set"].update({
             "helcim_method_id": method_id,
-            "helcim_card_token": method["card_token"],
+            "helcim_method_type": str(method.get("type") or "card"),
+            "helcim_card_token": method.get("card_token", ""),
+            "helcim_customer_id": method.get("customer_id"),
+            "helcim_bank_account_id": method.get("bank_account_id"),
             "helcim_customer_code": method.get("customer_code", ""),
         })
     else:
         update["$unset"] = {"helcim_method_id": "", "helcim_card_token": "",
-                              "helcim_customer_code": ""}
+                              "helcim_customer_code": "", "helcim_method_type": "",
+                              "helcim_customer_id": "", "helcim_bank_account_id": ""}
 
     config_id = existing.get("_id") if existing else f"helcim:{tenant_id}"
     try:
