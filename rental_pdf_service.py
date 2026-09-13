@@ -545,9 +545,12 @@ def generate_rental_contract_pdf(contract: dict, config: dict = None, tenant_pho
     due_day = contract.get('payment_due_day')
     if due_day is None:
         due_day = contract.get('payment_day', 1)
+    # The lease term uses the canonical configured amount. Historical
+    # `late_fee` values came from an obsolete admin UI fallback and must not
+    # override the official $50 default.
     late_fee = contract.get('late_fee_amount')
     if late_fee is None:
-        late_fee = contract.get('late_fee', 50)
+        late_fee = 50
     grace_days = contract.get('late_fee_grace_days')
     if grace_days is None:
         grace_days = contract.get('grace_period_days', 5)
