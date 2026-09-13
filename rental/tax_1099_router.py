@@ -19,6 +19,8 @@ import logging
 import hashlib
 import json
 import re
+import base64
+import uuid
 from datetime import datetime, timezone, timedelta
 
 from fastapi import APIRouter, HTTPException, Request, Response
@@ -40,6 +42,7 @@ NEC_METHODS = ("cash", "check", "zelle", "wire", "stripe_ach", "other")
 EXCLUDED_METHODS = ("stripe_card", "paypal", "venmo", "cashapp")
 NEC_BASE_THRESHOLDS = {2025: 600.0, 2026: 2000.0}
 W9_REVISION = "March 2024"
+W9_FORM_VERSION = "Form W-9 (Rev. 3-2024)"
 VALID_TAX_CLASSIFICATIONS = {
     "individual", "sole_proprietor", "c_corporation", "s_corporation",
     "partnership", "trust_estate", "llc_c", "llc_s", "llc_p", "other",
@@ -59,6 +62,150 @@ DEFAULT_PAYER = {
     "city": "Dumas", "state": "TX", "zip": "79029",
     "phone": "(806) 934-2018",
 }
+
+IRS_W9_TEMPLATE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                               "assets", "fw9.pdf")
+
+
+def _w9_classification_fields(classification: str) -> dict:
+    """Map our canonical classification to the official W-9 line 3a fields."""
+    prefix = "topmostSubform[0].Page1[0].Boxes3a-b_ReadOrder[0]."
+    choices = {
+        "individual": (prefix + "c1_1[0]", "/1"),
+        "sole_proprietor": (prefix + "c1_1[0]", "/1"),
+        "c_corporation": (prefix + "c1_1[1]", "/2"),
+        "s_corporation": (prefix + "c1_1[2]", "/3"),
+        "partnership": (prefix + "c1_1[3]", "/4"),
+        "trust_estate": (prefix + "c1_1[4]", "/5"),
+        "llc_c": (prefix + "c1_1[5]", "/6"),
+        "llc_s": (prefix + "c1_1[5]", "/6"),
+        "llc_p": (prefix + "c1_1[5]", "/6"),
+        "other": (prefix + "c1_1[6]", "/7"),
+    }
+    field, value = choices[classification]
+    result = {field: value}
+    if classification.startswith("llc_"):
+        result[prefix + "f1_03[0]"] = classification[-1].upper()
+    elif classification == "other":
+        result[prefix + "f1_04[0]"] = "Other"
+    return result
+
+
+def build_official_w9_pdf(provider: dict, w9: dict, payer: dict) -> bytes:
+    """Fill the official IRS W-9 and retain all six original pages."""
+    from pypdf import PdfReader, PdfWriter
+    from reportlab.pdfgen import canvas
+
+    tin = _w9_tin(w9)
+    root = "topmostSubform[0].Page1[0]."
+    fields = {
+        root + "f1_01[0]": w9.get("legal_name") or "",
+        root + "f1_02[0]": w9.get("business_name") or "",
+        root + "f1_05[0]": w9.get("exempt_payee_code") or "",
+        root + "f1_06[0]": w9.get("fatca_code") or "",
+        root + "Address_ReadOrder[0].f1_07[0]": w9.get("address") or "",
+        root + "Address_ReadOrder[0].f1_08[0]": ", ".join(filter(None, [
+            w9.get("city") or "", w9.get("state") or "", w9.get("zip") or "",
+        ])),
+        # The official requester field is narrow; the address is optional and
+        # the complete payer address remains in the protected company record.
+        root + "f1_09[0]": payer.get("name") or "",
+    }
+    fields.update(_w9_classification_fields(w9.get("tax_classification") or "individual"))
+    if w9.get("foreign_partners"):
+        fields[root + "Boxes3a-b_ReadOrder[0].c1_2[0]"] = "/1"
+    if w9.get("tin_type") == "ein":
+        fields[root + "f1_14[0]"], fields[root + "f1_15[0]"] = tin[:2], tin[2:]
+    else:
+        fields[root + "f1_11[0]"] = tin[:3]
+        fields[root + "f1_12[0]"] = tin[3:5]
+        fields[root + "f1_13[0]"] = tin[5:]
+
+    reader = PdfReader(IRS_W9_TEMPLATE)
+    writer = PdfWriter()
+    writer.append(reader)
+    writer.update_page_form_field_values(writer.pages[0], fields, auto_regenerate=False)
+
+    # The IRS file has no AcroForm signature/date controls; overlay those two
+    # fields while preserving the official form and all of its instructions.
+    overlay_buffer = io.BytesIO()
+    overlay = canvas.Canvas(overlay_buffer, pagesize=(612, 792))
+    overlay.setFont("Helvetica", 8)
+    overlay.drawString(120, 194, str(w9.get("signature") or w9.get("legal_name") or "")[:70])
+    signed_at = w9.get("signed_at")
+    if isinstance(signed_at, str):
+        signed_at = datetime.fromisoformat(signed_at.replace("Z", "+00:00"))
+    overlay.drawString(410, 194, signed_at.strftime("%m/%d/%Y") if signed_at else "")
+    if w9.get("backup_withholding_status") == "subject":
+        overlay.setStrokeColorRGB(0.75, 0, 0)
+        overlay.setLineWidth(1.5)
+        overlay.line(54, 278, 558, 290)
+        overlay.line(54, 290, 558, 278)
+    overlay.save()
+    overlay_buffer.seek(0)
+    writer.pages[0].merge_page(PdfReader(overlay_buffer).pages[0])
+
+    output = io.BytesIO()
+    writer.write(output)
+    return output.getvalue()
+
+
+async def archive_w9_document(db, provider_id: str, provider: dict, w9: dict) -> dict:
+    """Generate and encrypt a new immutable official W-9 document revision."""
+    payer = await _get_payer()
+    pdf = build_official_w9_pdf(provider, w9, payer)
+    now = datetime.now(timezone.utc)
+    document_id = str(uuid.uuid4())
+    document = {
+        "_id": document_id,
+        "provider_id": str(provider_id),
+        "document_type": "w9",
+        "title": "Form W-9",
+        "form_version": W9_FORM_VERSION,
+        "filename": f"W9-{str(provider_id)[-8:]}.pdf",
+        "mime_type": "application/pdf",
+        "content_ciphertext": vault_encrypt(base64.b64encode(pdf).decode("ascii")),
+        "sha256": hashlib.sha256(pdf).hexdigest(),
+        "signed_at": w9.get("signed_at"),
+        "created_at": now,
+        "is_current": True,
+    }
+    await db.contractor_tax_documents.insert_one(document)
+    await db.contractor_tax_documents.update_many(
+        {
+            "_id": {"$ne": document_id},
+            "provider_id": str(provider_id),
+            "document_type": "w9",
+            "is_current": True,
+        },
+        {"$set": {"is_current": False, "superseded_at": now}},
+    )
+    return document
+
+
+def _safe_tax_document(document: dict) -> dict:
+    return {
+        "id": str(document.get("_id") or ""),
+        "provider_id": str(document.get("provider_id") or ""),
+        "document_type": document.get("document_type") or "",
+        "title": document.get("title") or "",
+        "form_version": document.get("form_version") or "",
+        "filename": document.get("filename") or "",
+        "signed_at": document.get("signed_at").isoformat() if isinstance(document.get("signed_at"), datetime) else document.get("signed_at"),
+        "created_at": document.get("created_at").isoformat() if isinstance(document.get("created_at"), datetime) else document.get("created_at"),
+        "is_current": bool(document.get("is_current", False)),
+    }
+
+
+def _tax_document_pdf(document: dict) -> bytes:
+    try:
+        pdf = base64.b64decode(vault_decrypt(document["content_ciphertext"]), validate=True)
+        if not pdf.startswith(b"%PDF-") or hashlib.sha256(pdf).hexdigest() != document.get("sha256"):
+            raise ValueError("tax document integrity check failed")
+        return pdf
+    except Exception as exc:
+        logger.error("Tax document could not be decrypted: %s", document.get("_id"))
+        raise HTTPException(status_code=500, detail="tax_document_unavailable") from exc
 
 
 async def _get_payer() -> dict:
@@ -322,9 +469,41 @@ async def save_w9(provider_id: str, request: Request):
         if exc.detail == "w9_tin_invalid":
             raise HTTPException(status_code=400, detail="TIN debe tener 9 dígitos") from exc
         raise
+    await archive_w9_document(db, provider_id, p, w9)
     await db.service_providers.update_one({"_id": provider_id}, {"$set": {"w9": w9}})
     await record_w9_audit(db, provider_id, "admin_w9_saved", w9, request)
     return {"success": True}
+
+
+@router.get('/admin/contractor-tax-documents')
+async def admin_contractor_tax_documents(request: Request, provider_id: str = ""):
+    await auth_admin(request)
+    query = {"provider_id": provider_id} if provider_id else {}
+    cursor = get_db().contractor_tax_documents.find(query).sort("created_at", -1).limit(500)
+    return {"success": True, "documents": [_safe_tax_document(row) async for row in cursor]}
+
+
+@router.get('/admin/contractor-tax-documents/{document_id}/download')
+async def admin_contractor_tax_document_download(document_id: str, request: Request):
+    admin = await auth_admin(request)
+    document = await get_db().contractor_tax_documents.find_one({"_id": document_id})
+    if not document:
+        raise HTTPException(status_code=404, detail="tax_document_not_found")
+    try:
+        await get_db().w9_audit_log.insert_one({
+            "provider_id": document.get("provider_id") or "",
+            "document_id": document_id,
+            "event": "admin_w9_downloaded",
+            "actor": str(admin.get("email") or admin.get("_id") or "admin"),
+            "created_at": datetime.now(timezone.utc),
+        })
+    except Exception as exc:
+        logger.warning("W-9 download audit could not be stored: %s", exc)
+    filename = re.sub(r"[^A-Za-z0-9_.-]", "-", document.get("filename") or "W9.pdf")
+    return Response(
+        content=_tax_document_pdf(document), media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"', "Cache-Control": "no-store"},
+    )
 
 
 IRS_1099NEC_TEMPLATE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -1055,6 +1234,7 @@ async def public_w9_submit(token: str, request: Request):
         raise HTTPException(status_code=404, detail="Enlace no válido")
     data = await request.json()
     w9 = build_w9_submission(data, request, source="digital_link")
+    await archive_w9_document(db, str(p["_id"]), p, w9)
     await db.service_providers.update_one(
         {"_id": p["_id"]},
         {"$set": {"w9": w9, "w9_request.completed_at": datetime.utcnow(),
