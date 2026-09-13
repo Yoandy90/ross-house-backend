@@ -317,6 +317,7 @@ async def marketplace_register(request: Request):
             "name": name,
             "email": email,
             "role": role,
+            "maintenance_worker_type": "contractor" if requested_role == "contractor" else None,
         },
         "registration_status": "pending_review" if requested_role == "contractor" else "active",
     }
@@ -404,6 +405,7 @@ async def marketplace_login(request: Request):
             "name": user.get("name", ""),
             "email": user.get("email", email),
             "role": role,
+            "maintenance_worker_type": user.get("maintenance_worker_type"),
             "tenant_number": user.get("tenant_number", ""),
             "has_password": True,
         },
@@ -897,6 +899,7 @@ async def get_marketplace_profile(request: Request):
             "email": user.get("email", ""),
             "phone": user.get("phone", ""),
             "role": user.get("role", "tenant"),
+            "maintenance_worker_type": user.get("maintenance_worker_type"),
             "profile_photo_url": user.get("profile_photo_url", ""),
             "company_name": user.get("company_name", ""),
             "created_at": str(user.get("created_at", "")),

@@ -79,6 +79,9 @@ class Collection:
     async def delete_one(self, query):
         return SimpleNamespace(deleted_count=1)
 
+    async def count_documents(self, query):
+        return 0
+
 
 def test_non_maintenance_role_is_rejected(monkeypatch):
     async def auth(_request):
@@ -116,7 +119,11 @@ def test_dashboard_returns_only_assigned_provider_jobs(monkeypatch):
         {"_id": ObjectId(), "assigned_provider_id": provider_id, "status": "assigned", "title": "Sink"},
         {"_id": ObjectId(), "assigned_provider_id": "provider-2", "status": "assigned", "title": "Roof"},
     ])
-    db = SimpleNamespace(maintenance_requests=jobs)
+    db = SimpleNamespace(
+        maintenance_requests=jobs,
+        provider_payments=Collection(),
+        contractor_tax_documents=Collection(),
+    )
 
     async def actor(_request):
         return ({"_id": ObjectId()}, {"name": "Tech One", "worker_type": "contractor"}, provider_id)
@@ -253,8 +260,12 @@ def test_pending_contractor_can_submit_w9_but_cannot_open_jobs(monkeypatch):
     })
     monkeypatch.setattr("rental.tax_1099_router._send_admin_email", email)
     monkeypatch.setattr("rental.tax_1099_router._w9_masked", lambda _w9: "***-**-6789")
+    async def archive(*_args, **_kwargs):
+        return {"_id": "w9-document-1"}
+    monkeypatch.setattr("rental.tax_1099_router.archive_w9_document", archive)
     result = run(technician.submit_maintenance_w9(Request({"legal_name": "Pat Contractor"})))
     assert result["success"] is True
     saved = providers.last_update[1]["$set"]
     assert saved["onboarding.w9_complete"] is True
     assert "tin" not in saved["w9"]
+    assert result["tax_document_id"] == "w9-document-1"

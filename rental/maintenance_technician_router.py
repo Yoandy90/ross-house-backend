@@ -9,7 +9,7 @@ import re
 
 import bcrypt
 from bson import ObjectId
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request, Response
 
 from rental.maintenance_security_router import _iso, _validated_photos
 from rental.security_email import send_maintenance_updated_email
@@ -270,11 +270,14 @@ async def submit_maintenance_w9(request: Request):
     if str(provider.get("worker_type") or "contractor") != "contractor":
         raise HTTPException(status_code=403, detail="contractor_onboarding_not_applicable")
     from rental.tax_1099_router import (
-        build_w9_submission, record_w9_audit, _send_admin_email, _w9_masked,
+        archive_w9_document, build_w9_submission, record_w9_audit,
+        _send_admin_email, _w9_masked,
     )
 
     w9 = build_w9_submission(await request.json(), request, source="authenticated_mobile_wizard")
     now = datetime.utcnow()
+    # Never mark onboarding complete unless its immutable official W-9 exists.
+    tax_document = await archive_w9_document(get_db(), provider_id, provider, w9)
     await get_db().service_providers.update_one(
         _id_query(provider_id),
         {"$set": {
@@ -296,7 +299,42 @@ async def submit_maintenance_w9(request: Request):
         )
     except Exception:
         pass
-    return {"success": True, "w9_complete": True, "status": provider.get("status") or "pending_review"}
+    return {
+        "success": True,
+        "w9_complete": True,
+        "status": provider.get("status") or "pending_review",
+        "tax_document_id": str(tax_document["_id"]),
+    }
+
+
+@router.get('/maintenance/tax-documents')
+async def maintenance_tax_documents(request: Request):
+    """List only the authenticated contractor's fiscal documents."""
+    _actor, provider, provider_id = await _maintenance_identity(request)
+    if str(provider.get("worker_type") or "contractor") != "contractor":
+        raise HTTPException(status_code=403, detail="contractor_tax_documents_not_applicable")
+    from rental.tax_1099_router import _safe_tax_document
+    cursor = get_db().contractor_tax_documents.find({"provider_id": provider_id}).sort("created_at", -1)
+    return {"success": True, "documents": [_safe_tax_document(row) async for row in cursor]}
+
+
+@router.get('/maintenance/tax-documents/{document_id}/download')
+async def maintenance_tax_document_download(document_id: str, request: Request):
+    """Download a contractor-owned document; cross-provider IDs never work."""
+    _actor, provider, provider_id = await _maintenance_identity(request)
+    if str(provider.get("worker_type") or "contractor") != "contractor":
+        raise HTTPException(status_code=403, detail="contractor_tax_documents_not_applicable")
+    document = await get_db().contractor_tax_documents.find_one({
+        "_id": document_id, "provider_id": provider_id,
+    })
+    if not document:
+        raise HTTPException(status_code=404, detail="tax_document_not_found")
+    from rental.tax_1099_router import _tax_document_pdf
+    filename = re.sub(r"[^A-Za-z0-9_.-]", "-", document.get("filename") or "tax-document.pdf")
+    return Response(
+        content=_tax_document_pdf(document), media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"', "Cache-Control": "no-store"},
+    )
 
 
 @router.get('/maintenance/dashboard')
@@ -306,7 +344,7 @@ async def maintenance_dashboard(request: Request):
     cursor = get_db().maintenance_requests.find(query).sort("updated_at", -1).limit(100)
     jobs = [_technician_job(row) async for row in cursor]
     active = [j for j in jobs if j["status"] not in {"completed", "resolved", "cancelled", "closed"}]
-    return {
+    response = {
         "success": True,
         "provider": {
             "id": provider_id,
@@ -323,6 +361,30 @@ async def maintenance_dashboard(request: Request):
         },
         "jobs": jobs,
     }
+    if str(provider.get("worker_type") or "contractor") == "contractor":
+        year = datetime.utcnow().year
+        start, end = datetime(year, 1, 1), datetime(year + 1, 1, 1)
+        paid = 0.0
+        pending = 0.0
+        async for payment in get_db().provider_payments.find({
+            "provider_id": {"$in": _provider_values(provider_id)},
+            "$or": [
+                {"paid_at": {"$gte": start, "$lt": end}},
+                {"paid_at": {"$exists": False}, "created_at": {"$gte": start, "$lt": end}},
+            ],
+        }):
+            amount = float(payment.get("amount") or 0)
+            if payment.get("status") == "paid":
+                paid += amount
+            else:
+                pending += amount
+        response["contractor"] = {
+            "tax_year": year,
+            "paid_ytd": round(paid, 2),
+            "pending_payments": round(pending, 2),
+            "tax_documents_count": await get_db().contractor_tax_documents.count_documents({"provider_id": provider_id}),
+        }
+    return response
 
 
 @router.get('/maintenance/jobs/{job_id}')
