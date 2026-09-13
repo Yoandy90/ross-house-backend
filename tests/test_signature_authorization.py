@@ -180,7 +180,15 @@ async def test_legacy_admin_cannot_sign_terminal_or_duplicate_contract(monkeypat
         def __init__(self, lease): self.rental_contracts = Contracts(lease)
 
     for lease, detail in (
-        ({"_id": "lease", "status": "active"}, "contract_not_in_signable_state"),
+        (
+            {
+                "_id": "lease",
+                "status": "active",
+                "tenant_signature": "tenant",
+                "admin_signature": "admin",
+            },
+            "contract_not_in_signable_state",
+        ),
         ({
             "_id": "lease",
             "status": "pending_signatures",
@@ -202,9 +210,12 @@ async def test_modern_signature_rejects_terminal_or_activation_states(monkeypatc
     async def canonical(_actor): return {"_id": "tenant-1"}
     monkeypatch.setattr(signatures_router, "resolve_authenticated_tenant", canonical)
     for status in ("active", "terminated", "cancelled", "pending_activation"):
+        contract = {"tenant_id": "tenant-1", "status": status}
+        if status == "active":
+            contract.update({"tenant_signature": "tenant", "admin_signature": "admin"})
         with pytest.raises(HTTPException) as exc:
             await signatures_router._authorize_contract_signer(
-                actor, {"tenant_id": "tenant-1", "status": status}, _DB())
+                actor, contract, _DB())
         assert exc.value.status_code == 409
         assert exc.value.detail == "contract_not_in_signable_state"
 
@@ -228,6 +239,44 @@ def test_signatures_never_directly_activate_occupancy():
     assert "update_field_absent = {update_field: {'$in': [None, '']}}" in modern
     assert "contract_role_already_signed" in legacy
     assert "contract_role_already_signed" in modern
+
+
+@pytest.mark.asyncio
+async def test_legacy_unsigned_active_contract_can_resume_actor_bound_signing(monkeypatch):
+    lease = {
+        "_id": ObjectId("507f1f77bcf86cd799439011"),
+        "tenant_id": "tenant-1",
+        "status": "active",
+        "tenant_signature": None,
+        "admin_signature": None,
+    }
+    written = {}
+
+    class Contracts:
+        async def find_one(self, _query): return lease
+        async def update_one(self, query, update):
+            written.update({"query": query, "update": update})
+            return type("Result", (), {"matched_count": 1})()
+
+    class Request:
+        client = None
+        async def json(self):
+            return {"signature": "data:image/png;base64,synthetic", "role": "tenant"}
+
+    async def fake_auth(_request): return {"_id": "app-user", "role": "tenant"}
+    async def fake_tenant(_actor): return {"_id": "tenant-1"}
+    monkeypatch.setattr(
+        legacy_guard,
+        "get_db",
+        lambda: type("DB", (), {"rental_contracts": Contracts()})(),
+    )
+    monkeypatch.setattr(legacy_guard, "auth_marketplace", fake_auth)
+    monkeypatch.setattr(legacy_guard, "resolve_authenticated_tenant", fake_tenant)
+
+    result = await legacy_guard.secure_legacy_lease_sign(str(lease["_id"]), Request())
+    assert result["new_status"] == "pending_signatures"
+    assert written["query"]["status"] == "active"
+    assert written["update"]["$set"]["tenant_signature"].startswith("data:image/")
 
 
 def test_secure_legacy_route_is_registered_before_historical_handler():
