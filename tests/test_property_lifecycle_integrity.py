@@ -225,6 +225,45 @@ def test_whole_property_activation_rejects_legacy_manual_lock(monkeypatch):
     assert exc.value.detail == "lease_property_manual_status_conflict"
 
 
+def test_whole_property_activation_repairs_stale_rented_projection(monkeypatch):
+    prop = _property(status="rented")
+    contract = {
+        "_id": ObjectId(),
+        "property_id": str(prop["_id"]),
+        "tenant_id": str(ObjectId()),
+        "unit_id": None,
+    }
+    db = DB(prop)
+    monkeypatch.setattr(lifecycle, "get_db", lambda: db)
+
+    run(lifecycle._preflight_whole_property_activation(contract, str(contract["_id"])))
+
+    query, update = db.properties.updates[0]
+    assert query["status"] == "rented"
+    assert query["status_manually_set"] == {"$ne": True}
+    assert update["$set"]["status"] == "available"
+    assert update["$set"]["current_contract_id"] is None
+    assert update["$set"]["current_tenant_id"] is None
+
+
+def test_whole_property_activation_does_not_repair_other_tenant(monkeypatch):
+    prop = _property(status="rented", current_tenant_id=str(ObjectId()))
+    contract = {
+        "_id": ObjectId(),
+        "property_id": str(prop["_id"]),
+        "tenant_id": str(ObjectId()),
+        "unit_id": None,
+    }
+    db = DB(prop)
+    monkeypatch.setattr(lifecycle, "get_db", lambda: db)
+
+    with pytest.raises(HTTPException) as exc:
+        run(lifecycle._preflight_whole_property_activation(contract, str(contract["_id"])))
+
+    assert exc.value.detail == "lease_property_owned_by_other_tenant"
+    assert db.properties.updates == []
+
+
 def test_lifecycle_whole_property_claim_requires_available_status():
     source = open(lifecycle.__file__, encoding="utf-8").read()
     assert '"_id": prop_oid, "status": "available", "status_manually_set": {"$ne": True}' in source
