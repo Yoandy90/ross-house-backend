@@ -200,7 +200,12 @@ async def _claim_tenant_occupancy(contract: dict, contract_id: str, now: datetim
 
 
 async def _preflight_whole_property_activation(contract: dict, contract_id: str) -> None:
-    """Reject stale or multi-unit whole-property projections before claiming tenant."""
+    """Validate and safely repair whole-property occupancy before activation.
+
+    Older property records can retain ``status=rented`` after their active lease
+    projection was removed.  Activation may repair only that known stale state,
+    and only when no contract, tenant, manual status, or unit topology conflicts.
+    """
     db = get_db()
     property_id = str(contract.get("property_id") or "")
     prop_oid = _oid(property_id, "lease_property_invalid")
@@ -212,11 +217,61 @@ async def _preflight_whole_property_activation(contract: dict, contract_id: str)
         raise HTTPException(status_code=409, detail="lease_property_owned_by_other_contract")
     if prop.get("status_manually_set"):
         raise HTTPException(status_code=409, detail="lease_property_manual_status_conflict")
-    if str(prop.get("status") or "available").strip().lower() != "available":
-        raise HTTPException(status_code=409, detail="lease_property_not_available")
     existing_unit = await db.property_units.find_one({"property_id": property_id})
     if prop.get("is_multi_unit") or existing_unit:
         raise HTTPException(status_code=409, detail="lease_unit_required_for_multi_unit_property")
+
+    status = str(prop.get("status") or "available").strip().lower()
+    if status == "available":
+        return
+    if status != "rented":
+        raise HTTPException(status_code=409, detail="lease_property_not_available")
+
+    # ``rented`` with no other active lease can be a stale denormalized
+    # projection.  The property mutation lock held by the state guard plus this
+    # CAS makes the repair race-safe; every real conflict remains fail-closed.
+    other_property_lease = await db.rental_contracts.find_one({
+        "property_id": property_id,
+        "status": "active",
+        "_id": {"$ne": ObjectId(contract_id)},
+    })
+    if other_property_lease:
+        raise HTTPException(status_code=409, detail="lease_property_owned_by_other_contract")
+
+    tenant_id = str(contract.get("tenant_id") or "")
+    current_tenant = str(prop.get("current_tenant_id") or "")
+    if current_tenant and current_tenant != tenant_id:
+        raise HTTPException(status_code=409, detail="lease_property_owned_by_other_tenant")
+
+    repaired = await db.properties.update_one(
+        {
+            "_id": prop_oid,
+            "status": prop.get("status"),
+            "status_manually_set": {"$ne": True},
+            "$and": [
+                {"$or": [
+                    {"current_contract_id": contract_id},
+                    {"current_contract_id": None},
+                    {"current_contract_id": ""},
+                    {"current_contract_id": {"$exists": False}},
+                ]},
+                {"$or": [
+                    {"current_tenant_id": tenant_id},
+                    {"current_tenant_id": None},
+                    {"current_tenant_id": ""},
+                    {"current_tenant_id": {"$exists": False}},
+                ]},
+            ],
+        },
+        {"$set": {
+            "status": "available",
+            "current_contract_id": None,
+            "current_tenant_id": None,
+            "updated_at": datetime.utcnow(),
+        }},
+    )
+    if repaired.matched_count != 1:
+        raise HTTPException(status_code=409, detail="lease_property_stale_state_changed")
 
 
 @router.patch('/admin/rental-contracts/{contract_id}/status')
