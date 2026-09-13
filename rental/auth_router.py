@@ -12,6 +12,7 @@ from bson import ObjectId
 from fastapi import APIRouter, HTTPException, Request
 import os
 import random
+import uuid
 import jwt
 import bcrypt
 from rental.shared import (
@@ -164,7 +165,12 @@ async def marketplace_mark_notification_read(notif_id: str, request: Request):
 
 @router.post('/public/marketplace-register')
 async def marketplace_register(request: Request):
-    """Register a new marketplace user (tenant, landlord, or buyer)"""
+    """Register a public marketplace user or independent contractor.
+
+    Public users may register as contractors, but never as company employees.
+    Contractor accounts remain pending until an administrator approves their
+    service-provider profile.
+    """
     # Rate limiting to prevent spam registrations
     client_ip = request.client.host if request.client else "unknown"
     check_rate_limit(client_ip, "register")
@@ -179,19 +185,36 @@ async def marketplace_register(request: Request):
     email = data.get("email", "").strip().lower()
     phone = data.get("phone", "").strip()
     password = data.get("password", "").strip()
-    role = data.get("role", "guest")  # guest, landlord, buyer (tenant is admin-only)
+    requested_role = data.get("role", "guest")
+    role = requested_role  # tenant and maintenance employee are admin-only
 
     if not name or not email or not phone:
         raise HTTPException(status_code=400, detail="Nombre, email y teléfono son requeridos")
     if not password or len(password) < 6:
         raise HTTPException(status_code=400, detail="La contraseña debe tener al menos 6 caracteres")
-    if role not in ("guest", "tenant", "landlord", "buyer"):
+    if role not in ("guest", "tenant", "landlord", "buyer", "contractor"):
         raise HTTPException(status_code=400, detail="Rol inválido")
 
     # Self-registration: if someone picks 'tenant', downgrade to 'guest'
     # Real tenant role is only assigned by admin when creating an actual tenant
     if role == "tenant":
         role = "guest"
+
+    contractor_services = []
+    if requested_role == "contractor":
+        from rental.service_providers_router import VALID_SERVICES
+
+        raw_services = data.get("services")
+        if not isinstance(raw_services, list) or not 1 <= len(raw_services) <= 10:
+            raise HTTPException(status_code=400, detail="Selecciona al menos un oficio")
+        contractor_services = list(dict.fromkeys(
+            str(service).strip().lower() for service in raw_services
+        ))
+        if any(service not in VALID_SERVICES for service in contractor_services):
+            raise HTTPException(status_code=400, detail="Oficio de contratista inválido")
+        # Internally both approved contractors and employees use the capability
+        # role `maintenance`; worker_type preserves their employment category.
+        role = "maintenance"
 
     # Check if email already exists
     existing = await get_db().app_users.find_one({"email": email})
@@ -209,6 +232,37 @@ async def marketplace_register(request: Request):
         "created_at": datetime.utcnow(),
     }
 
+    provider = None
+    if requested_role == "contractor":
+        provider_id = str(uuid.uuid4())
+        user["service_provider_id"] = provider_id
+        user["maintenance_worker_type"] = "contractor"
+        provider = {
+            "_id": provider_id,
+            "app_user_id": None,
+            "name": name,
+            "company_name": str(data.get("company_name") or "").strip(),
+            "email": email,
+            "phone": phone,
+            "services": contractor_services,
+            "service_areas": data.get("service_areas") if isinstance(data.get("service_areas"), list) else [],
+            "billing_type": "per_hour",
+            "languages": [data.get("language_pref", "es")],
+            "language_pref": data.get("language_pref", "es") if data.get("language_pref") in ("es", "en") else "es",
+            "worker_type": "contractor",
+            "status": "pending_review",
+            "rating": 0.0,
+            "total_jobs": 0,
+            "completed_jobs": 0,
+            "ratings_history": [],
+            "dispatch_history": [],
+            "admin_notes": "",
+            "is_featured": False,
+            "source": "mobile_app",
+            "created_at": datetime.utcnow(),
+            "updated_at": datetime.utcnow(),
+        }
+
     # For landlords, also save company info if provided
     if role == "landlord":
         user["company_name"] = data.get("company_name", "")
@@ -217,6 +271,16 @@ async def marketplace_register(request: Request):
 
     result = await get_db().app_users.insert_one(user)
     user_id = str(result.inserted_id)
+
+    if provider is not None:
+        provider["app_user_id"] = user_id
+        try:
+            await get_db().service_providers.insert_one(provider)
+        except Exception:
+            # Do not leave a maintenance-capable account without its scoped
+            # provider record if the second write fails.
+            await get_db().app_users.delete_one({"_id": result.inserted_id})
+            raise
 
     # Also create in tenants collection if tenant role (admin-created tenants only, not guest self-reg)
     if role == "tenant":
@@ -252,7 +316,8 @@ async def marketplace_register(request: Request):
             "name": name,
             "email": email,
             "role": role,
-        }
+        },
+        "registration_status": "pending_review" if requested_role == "contractor" else "active",
     }
 
 
