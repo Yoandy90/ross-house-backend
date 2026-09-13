@@ -1,4 +1,5 @@
 import pytest
+from bson import ObjectId
 from fastapi import FastAPI, HTTPException
 
 from rental import lease_signature_security_router as legacy_guard
