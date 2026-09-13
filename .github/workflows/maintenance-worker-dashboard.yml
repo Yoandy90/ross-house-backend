@@ -31,5 +31,5 @@ jobs:
         with:
           python-version: '3.11'
           cache: pip
-      - run: pip install -r requirements.txt
+      - run: pip install -r requirements.txt pytest
       - run: pytest -q tests/test_maintenance_technician_dashboard.py tests/test_maintenance_tenant_integrity.py tests/test_maintenance_receipt_email.py
