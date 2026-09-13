@@ -21,6 +21,13 @@ from rental.lease_signature_state import effective_lease_status
 
 router = APIRouter()
 
+
+def _signature_has_image(value) -> bool:
+    """Accept both legacy data-URL signatures and current signature records."""
+    if isinstance(value, dict):
+        return bool(value.get("image_data"))
+    return bool(isinstance(value, str) and value.strip())
+
 @router.post('/admin/leases')
 async def admin_create_lease(request: Request):
     """Admin: Create a new lease contract for a property"""
@@ -219,7 +226,7 @@ async def _email_signed_lease_pdf(contract: dict):
 
     # ── 2) Generate the PDF ──
     config = await db.rental_config.find_one({"type": "company"}) or {}
-    if not contract.get("admin_signature") or not contract.get("admin_signature", {}).get("image_data"):
+    if not _signature_has_image(contract.get("admin_signature")):
         try:
             saved_admin_sig = await db.admin_signatures.find_one({"type": "landlord_default"})
             if saved_admin_sig and saved_admin_sig.get("image_data"):
@@ -1195,7 +1202,7 @@ async def generate_contract_pdf(contract_id: str, request: Request):
         config = {}
 
     # Fetch saved admin signature if not already in contract
-    if not contract.get('admin_signature') or not contract.get('admin_signature', {}).get('image_data'):
+    if not _signature_has_image(contract.get('admin_signature')):
         try:
             saved_admin_sig = await get_db().admin_signatures.find_one({"type": "landlord_default"})
             if saved_admin_sig and saved_admin_sig.get('image_data'):
@@ -1299,7 +1306,7 @@ async def tenant_download_lease_pdf(lease_id: str, request: Request):
 
     # Load company config + landlord signature so the PDF is identical to admin export
     config = await db.rental_config.find_one({"type": "company"}) or {}
-    if not contract.get("admin_signature") or not contract.get("admin_signature", {}).get("image_data"):
+    if not _signature_has_image(contract.get("admin_signature")):
         try:
             saved_admin_sig = await db.admin_signatures.find_one({"type": "landlord_default"})
             if saved_admin_sig and saved_admin_sig.get("image_data"):
