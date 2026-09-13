@@ -141,10 +141,25 @@ def test_legacy_identity_scan_fails_closed_if_unbounded(monkeypatch):
 def test_multiple_active_contracts_fail_closed(monkeypatch):
     tid = ObjectId()
     set_db(monkeypatch, [], [
-        {"_id": ObjectId(), "tenant_id": str(tid), "status": "active"},
-        {"_id": ObjectId(), "tenant_id": tid, "status": "active"},
+        {
+            "_id": ObjectId(), "tenant_id": str(tid), "status": "active",
+            "tenant_signature": "tenant", "admin_signature": "admin",
+        },
+        {
+            "_id": ObjectId(), "tenant_id": tid, "status": "active",
+            "tenant_signature": "tenant", "landlord_signature": "landlord",
+        },
     ])
     with pytest.raises(HTTPException) as exc:
         run(integrity.find_active_contract_for_tenant({"_id": tid}))
     assert exc.value.status_code == 409
     assert exc.value.detail == "tenant_multiple_active_contracts"
+
+
+def test_unsigned_active_contract_never_grants_active_tenant_authority(monkeypatch):
+    tid = ObjectId()
+    set_db(monkeypatch, [], [{
+        "_id": ObjectId(), "tenant_id": str(tid), "status": "active",
+        "tenant_signature": None, "admin_signature": None,
+    }])
+    assert run(integrity.find_active_contract_for_tenant({"_id": tid})) is None

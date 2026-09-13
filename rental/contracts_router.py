@@ -17,6 +17,7 @@ from rental.shared import (
     send_rental_push_to_user, send_rental_push_to_admins,
     TENANT_JWT_SECRET,
 )
+from rental.lease_signature_state import effective_lease_status
 
 router = APIRouter()
 
@@ -87,7 +88,7 @@ async def admin_list_leases(request: Request):
             "start_date": doc.get("start_date", ""),
             "end_date": doc.get("end_date", ""),
             "rent_amount": doc.get("rent_amount", doc.get("monthly_rent", 0)),
-            "status": doc.get("status", "draft"),
+            "status": effective_lease_status(doc),
             "has_tenant_signature": bool(doc.get("tenant_signature")),
             "has_landlord_signature": bool(doc.get("landlord_signature") or doc.get("admin_signature")),
             "has_admin_signature": bool(doc.get("admin_signature")),
@@ -110,6 +111,7 @@ async def admin_get_lease(lease_id: str, request: Request):
         raise HTTPException(status_code=404, detail="Contrato no encontrado")
 
     doc = serialize(lease)
+    doc["status"] = effective_lease_status(doc)
     return {"success": True, "lease": doc}
 
 
@@ -399,7 +401,7 @@ async def get_my_leases(request: Request):
             "deposit_amount": doc.get("deposit_amount", 0) or doc.get("security_deposit", 0),
             "terms": doc.get("terms", ""),
             "clauses": doc.get("clauses", []),
-            "status": doc.get("status", "draft"),
+            "status": effective_lease_status(doc),
             "has_tenant_signature": bool(doc.get("tenant_signature")),
             "has_landlord_signature": bool(doc.get("landlord_signature") or doc.get("admin_signature")),
             "has_admin_signature": bool(doc.get("admin_signature")),
@@ -434,6 +436,7 @@ async def get_lease_detail(lease_id: str, request: Request):
 
     doc = serialize(lease)
     doc["source"] = source
+    doc["status"] = effective_lease_status(doc)
 
     # Resolve tenant_ids the user might match against (direct + via tenants doc)
     tenant_ids = {user_id}
@@ -486,7 +489,9 @@ async def list_contracts(request: Request):
     cursor = get_db().rental_contracts.find(query).sort("created_at", -1)
     contracts = []
     async for c in cursor:
-        contracts.append(serialize(c))
+        doc = serialize(c)
+        doc["status"] = effective_lease_status(doc)
+        contracts.append(doc)
 
     return {"success": True, "contracts": contracts, "count": len(contracts)}
 
@@ -3448,6 +3453,4 @@ async def update_property_location(property_id: str, request: Request):
     )
 
     return {"success": True, "message": "Ubicación actualizada"}
-
-
 

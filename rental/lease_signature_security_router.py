@@ -12,6 +12,7 @@ from fastapi import APIRouter, HTTPException, Request
 
 from rental.shared import auth_admin, auth_marketplace, get_db
 from rental.tenant_integrity import resolve_authenticated_tenant
+from rental.lease_signature_state import effective_lease_status, lease_has_required_signatures
 
 router = APIRouter(tags=["lease-signature-security"])
 _ALLOWED_ROLES = {"tenant", "landlord", "admin"}
@@ -112,7 +113,12 @@ async def secure_legacy_lease_sign(lease_id: str, request: Request):
         raise HTTPException(status_code=404, detail="Contrato no encontrado")
     actor = await _authorize_actor(request, lease, signer_role)
     expected_status = _norm(lease.get("status")).lower()
-    if expected_status not in _SIGNABLE_STATES[signer_role]:
+    signing_status = effective_lease_status(lease)
+    # Recover historical rows marked active before signature guards existed;
+    # genuinely active, fully signed leases remain terminal for signing.
+    if expected_status == "active" and lease_has_required_signatures(lease):
+        raise HTTPException(status_code=409, detail="contract_not_in_signable_state")
+    if signing_status not in _SIGNABLE_STATES[signer_role]:
         raise HTTPException(status_code=409, detail="contract_not_in_signable_state")
     signature_field = f"{signer_role}_signature"
     if lease.get(signature_field):
@@ -122,7 +128,7 @@ async def secure_legacy_lease_sign(lease_id: str, request: Request):
     update = {"updated_at": now}
 
     if signer_role == "tenant":
-        if expected_status not in ["pending_tenant", "pending_signatures"]:
+        if signing_status not in ["pending_tenant", "pending_signatures"]:
             raise HTTPException(status_code=400, detail="Este contrato no está pendiente de firma del inquilino")
         update.update({"tenant_signature": signature, "tenant_signed_at": now,
                        "tenant_signer_name": _actor_name(actor, signer_role)})
@@ -133,7 +139,7 @@ async def secure_legacy_lease_sign(lease_id: str, request: Request):
         else:
             update["status"] = "pending_activation"
     elif signer_role == "landlord":
-        if expected_status not in ["pending_landlord", "pending_signatures"]:
+        if signing_status not in ["pending_landlord", "pending_signatures"]:
             raise HTTPException(status_code=400, detail="Este contrato no está pendiente de firma del propietario")
         update.update({"landlord_signature": signature, "landlord_signed_at": now,
                        "landlord_signer_name": _actor_name(actor, signer_role)})
