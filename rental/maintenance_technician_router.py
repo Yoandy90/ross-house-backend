@@ -54,7 +54,7 @@ def _job_query(job_id: str, provider_id: str) -> dict:
     }
 
 
-async def _maintenance_actor(request: Request) -> tuple[dict, dict, str]:
+async def _maintenance_identity(request: Request) -> tuple[dict, dict, str]:
     actor = await auth_marketplace(request)
     if str(actor.get("role") or "").strip().lower() != "maintenance":
         raise HTTPException(status_code=403, detail="maintenance_role_required")
@@ -64,13 +64,24 @@ async def _maintenance_actor(request: Request) -> tuple[dict, dict, str]:
         raise HTTPException(status_code=403, detail="maintenance_provider_link_required")
 
     provider = await get_db().service_providers.find_one(_id_query(provider_id))
-    if not provider or str(provider.get("status") or "").strip().lower() != "active":
-        raise HTTPException(status_code=403, detail="maintenance_provider_inactive")
+    if not provider:
+        raise HTTPException(status_code=403, detail="maintenance_provider_link_required")
 
     linked_user_id = str(provider.get("app_user_id") or "").strip()
     actor_id = str(actor.get("_id") or actor.get("id") or "").strip()
     if linked_user_id and linked_user_id != actor_id:
         raise HTTPException(status_code=403, detail="maintenance_provider_link_mismatch")
+    return actor, provider, provider_id
+
+
+async def _maintenance_actor(request: Request) -> tuple[dict, dict, str]:
+    actor, provider, provider_id = await _maintenance_identity(request)
+    if str(provider.get("status") or "").strip().lower() != "active":
+        raise HTTPException(status_code=403, detail="maintenance_provider_inactive")
+    if str(provider.get("worker_type") or "contractor") == "contractor":
+        from rental.tax_1099_router import _w9_complete
+        if not _w9_complete(provider.get("w9") or {}):
+            raise HTTPException(status_code=403, detail="maintenance_w9_required")
     return actor, provider, provider_id
 
 
@@ -213,6 +224,79 @@ async def create_maintenance_user(request: Request):
         "user": {"id": user_id, "name": name, "email": email, "role": "maintenance"},
         "provider_id": provider_id,
     }
+
+
+@router.get('/maintenance/onboarding')
+async def maintenance_onboarding(request: Request):
+    """Return a contractor's safe onboarding state without exposing the TIN."""
+    _actor, provider, _provider_id = await _maintenance_identity(request)
+    if str(provider.get("worker_type") or "contractor") != "contractor":
+        raise HTTPException(status_code=403, detail="contractor_onboarding_not_applicable")
+    from rental.tax_1099_router import _w9_complete, _w9_masked, W9_REVISION
+
+    w9 = provider.get("w9") or {}
+    return {
+        "success": True,
+        "provider": {
+            "name": provider.get("name") or "",
+            "company_name": provider.get("company_name") or "",
+            "email": provider.get("email") or "",
+            "phone": provider.get("phone") or "",
+            "services": provider.get("services") or [],
+            "status": provider.get("status") or "pending_review",
+        },
+        "w9": {
+            "legal_name": w9.get("legal_name") or "",
+            "business_name": w9.get("business_name") or "",
+            "tax_classification": w9.get("tax_classification") or "individual",
+            "tin_type": w9.get("tin_type") or "ssn",
+            "tin_masked": _w9_masked(w9),
+            "address": w9.get("address") or "",
+            "city": w9.get("city") or "",
+            "state": w9.get("state") or "",
+            "zip": w9.get("zip") or "",
+            "signed_at": _iso(w9.get("signed_at")),
+        },
+        "w9_revision": W9_REVISION,
+        "w9_complete": _w9_complete(w9),
+        "can_receive_jobs": provider.get("status") == "active" and _w9_complete(w9),
+    }
+
+
+@router.post('/maintenance/onboarding/w9')
+async def submit_maintenance_w9(request: Request):
+    """Accept an authenticated, signed W-9 and retain only encrypted TIN data."""
+    _actor, provider, provider_id = await _maintenance_identity(request)
+    if str(provider.get("worker_type") or "contractor") != "contractor":
+        raise HTTPException(status_code=403, detail="contractor_onboarding_not_applicable")
+    from rental.tax_1099_router import (
+        build_w9_submission, record_w9_audit, _send_admin_email, _w9_masked,
+    )
+
+    w9 = build_w9_submission(await request.json(), request, source="authenticated_mobile_wizard")
+    now = datetime.utcnow()
+    await get_db().service_providers.update_one(
+        _id_query(provider_id),
+        {"$set": {
+            "w9": w9,
+            "w9_request.completed_at": now,
+            "onboarding.w9_complete": True,
+            "onboarding.submitted_at": now,
+            "onboarding.updated_at": now,
+            "updated_at": now,
+        }},
+    )
+    await record_w9_audit(get_db(), provider_id, "authenticated_w9_submitted", w9, request)
+    try:
+        await _send_admin_email(
+            get_db(),
+            f"W-9 listo para revisar: {provider.get('name', '')}",
+            f"<p><b>{provider.get('name', '')}</b> completó su incorporación fiscal.</p>"
+            f"<p>TIN: {_w9_masked(w9)} · Estado: pendiente de aprobación.</p>",
+        )
+    except Exception:
+        pass
+    return {"success": True, "w9_complete": True, "status": provider.get("status") or "pending_review"}
 
 
 @router.get('/maintenance/dashboard')
