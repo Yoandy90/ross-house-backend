@@ -15,6 +15,8 @@ def run(coro):
 class Request:
     def __init__(self, body=None):
         self.body = body or {}
+        self.headers = {"user-agent": "pytest"}
+        self.client = SimpleNamespace(host="127.0.0.1")
 
     async def json(self):
         return self.body
@@ -219,3 +221,40 @@ def test_public_provider_registration_is_always_contractor():
     source = open("rental/service_providers_router.py", encoding="utf-8").read()
     assert "data['worker_type'] = 'contractor'" in source
     assert "pattern='^(contractor|employee)$'" in source
+
+
+def test_pending_contractor_can_submit_w9_but_cannot_open_jobs(monkeypatch):
+    provider_id = "provider-1"
+    user_id = ObjectId()
+    providers = Collection([{
+        "_id": provider_id,
+        "status": "pending_review",
+        "worker_type": "contractor",
+        "app_user_id": str(user_id),
+        "name": "Pat Contractor",
+    }])
+    db = SimpleNamespace(service_providers=providers)
+
+    async def auth(_request):
+        return {"_id": user_id, "role": "maintenance", "service_provider_id": provider_id}
+
+    monkeypatch.setattr(technician, "auth_marketplace", auth)
+    monkeypatch.setattr(technician, "get_db", lambda: db)
+    with pytest.raises(HTTPException) as exc:
+        run(technician._maintenance_actor(Request()))
+    assert exc.value.detail == "maintenance_provider_inactive"
+
+    async def email(*_args, **_kwargs):
+        return True
+
+    monkeypatch.setattr("rental.tax_1099_router.build_w9_submission", lambda *_args, **_kwargs: {
+        "legal_name": "Pat Contractor", "tin_ciphertext": "encrypted", "tin_last4": "6789",
+        "address": "1 Main", "signed_at": "2026-09-13T00:00:00Z", "tin_type": "ein",
+    })
+    monkeypatch.setattr("rental.tax_1099_router._send_admin_email", email)
+    monkeypatch.setattr("rental.tax_1099_router._w9_masked", lambda _w9: "***-**-6789")
+    result = run(technician.submit_maintenance_w9(Request({"legal_name": "Pat Contractor"})))
+    assert result["success"] is True
+    saved = providers.last_update[1]["$set"]
+    assert saved["onboarding.w9_complete"] is True
+    assert "tin" not in saved["w9"]

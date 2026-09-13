@@ -55,6 +55,31 @@ VALID_SERVICES = [
 VALID_STATUSES = ['active', 'paused', 'blacklisted', 'pending_review']
 
 
+def _provider_ready_for_jobs(provider: dict) -> bool:
+    if provider.get('status') != 'active':
+        return False
+    if provider.get('worker_type') == 'contractor' and provider.get('source') == 'mobile_app':
+        from rental.tax_1099_router import _w9_complete
+        return _w9_complete(provider.get('w9') or {})
+    return True
+
+
+def _safe_provider(provider: dict) -> dict:
+    """Serialize provider records without returning stored tax secrets."""
+    item = serialize(provider)
+    w9 = item.get('w9')
+    if isinstance(w9, dict):
+        from rental.tax_1099_router import _w9_complete, _w9_masked
+        item['w9'] = {
+            key: value for key, value in w9.items()
+            if key not in {'tin', 'tin_ciphertext', 'signature', 'submission_ip',
+                           'submission_user_agent', 'submission_hash'}
+        }
+        item['w9']['tin_masked'] = _w9_masked(provider.get('w9') or {})
+        item['w9']['complete'] = _w9_complete(provider.get('w9') or {})
+    return item
+
+
 # ============================================================
 # Models
 # ============================================================
@@ -630,7 +655,7 @@ async def admin_list_providers(
         ]
     total = await db.service_providers.count_documents(q)
     cursor = db.service_providers.find(q).sort([("is_featured", -1), ("rating", -1), ("created_at", -1)]).skip(skip).limit(limit)
-    items = [serialize(d) async for d in cursor]
+    items = [_safe_provider(d) async for d in cursor]
     return {"success": True, "total": total, "providers": items}
 
 
@@ -670,13 +695,16 @@ async def admin_get_provider(request: Request, provider_id: str):
     doc = await db.service_providers.find_one({"_id": provider_id})
     if not doc:
         raise HTTPException(404, "Provider not found")
-    return {"success": True, "provider": serialize(doc)}
+    return {"success": True, "provider": _safe_provider(doc)}
 
 
 @router.patch('/admin/service-providers/{provider_id}')
 async def admin_update_provider(request: Request, provider_id: str, payload: ServiceProviderUpdate):
     await auth_admin(request)
     db = get_db()
+    existing = await db.service_providers.find_one({"_id": provider_id})
+    if not existing:
+        raise HTTPException(404, "Provider not found")
     update = {"updated_at": datetime.utcnow()}
     if payload.status:
         if payload.status not in VALID_STATUSES:
@@ -686,10 +714,15 @@ async def admin_update_provider(request: Request, provider_id: str, payload: Ser
         v = getattr(payload, f)
         if v is not None:
             update[f] = v
+    next_status = update.get('status', existing.get('status'))
+    next_worker_type = update.get('worker_type', existing.get('worker_type'))
+    if (next_status == 'active' and next_worker_type == 'contractor'
+            and existing.get('source') == 'mobile_app'):
+        from rental.tax_1099_router import _w9_complete
+        if not _w9_complete(existing.get('w9') or {}):
+            raise HTTPException(409, "contractor_w9_required_before_approval")
     res = await db.service_providers.update_one({"_id": provider_id}, {"$set": update})
-    if res.matched_count == 0:
-        raise HTTPException(404, "Provider not found")
-    return {"success": True, "provider": serialize(await db.service_providers.find_one({"_id": provider_id}))}
+    return {"success": True, "provider": _safe_provider(await db.service_providers.find_one({"_id": provider_id}))}
 
 
 @router.delete('/admin/service-providers/{provider_id}')
@@ -710,6 +743,8 @@ async def admin_dispatch_job(request: Request, payload: DispatchRequest):
     p = await db.service_providers.find_one({"_id": payload.provider_id})
     if not p:
         raise HTTPException(404, "Provider not found")
+    if not _provider_ready_for_jobs(p):
+        raise HTTPException(409, "contractor_not_ready_for_jobs")
     settings = await _get_settings(db)
     subj = payload.subject or "Ross House Rentals — Solicitud de trabajo"
     email_sent = sms_sent = False
@@ -850,7 +885,9 @@ async def admin_match_for_maintenance(request: Request, request_id: str):
     q = {"status": "active", "services": {"$in": matching_services}}
     providers = []
     async for p in db.service_providers.find(q).sort([("is_featured", -1), ("rating", -1)]).limit(80):
-        provider_obj = serialize(p)
+        if not _provider_ready_for_jobs(p):
+            continue
+        provider_obj = _safe_provider(p)
         # ZIP-based score: 1 if provider lists this zip OR has no area filter (serves everywhere); 0 if has areas but doesn't include it
         areas = p.get('service_areas') or []
         if prop_zip and areas:
@@ -904,6 +941,8 @@ async def admin_dispatch_maintenance(request: Request):
     p = await db.service_providers.find_one({"_id": provider_id})
     if not p:
         raise HTTPException(404, "Provider not found")
+    if not _provider_ready_for_jobs(p):
+        raise HTTPException(409, "contractor_not_ready_for_jobs")
 
     # Look up maintenance request (try ObjectId then string)
     from bson import ObjectId
@@ -975,7 +1014,7 @@ async def admin_dispatch_maintenance(request: Request):
         }}
     )
 
-    return {"success": True, "email_sent": email_sent, "sms_sent": sms_sent, "provider": serialize(p)}
+    return {"success": True, "email_sent": email_sent, "sms_sent": sms_sent, "provider": _safe_provider(p)}
 
 
 # ============================================================

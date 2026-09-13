@@ -9,8 +9,11 @@ on:
       - 'rental/maintenance_ownership_security_router.py'
       - 'rental/service_providers_router.py'
       - 'rental/auth_router.py'
+      - 'rental/tax_1099_router.py'
+      - 'rental/reports_router.py'
       - 'tests/test_maintenance_technician_dashboard.py'
       - 'tests/test_public_contractor_registration.py'
+      - 'tests/test_w9_secure_onboarding.py'
       - 'server.py'
       - '.github/workflows/maintenance-worker-dashboard.yml'
   push:
@@ -21,8 +24,11 @@ on:
       - 'rental/maintenance_ownership_security_router.py'
       - 'rental/service_providers_router.py'
       - 'rental/auth_router.py'
+      - 'rental/tax_1099_router.py'
+      - 'rental/reports_router.py'
       - 'tests/test_maintenance_technician_dashboard.py'
       - 'tests/test_public_contractor_registration.py'
+      - 'tests/test_w9_secure_onboarding.py'
       - 'server.py'
       - '.github/workflows/maintenance-worker-dashboard.yml'
 
@@ -36,4 +42,4 @@ jobs:
           python-version: '3.11'
           cache: pip
       - run: pip install -r requirements.txt pytest
-      - run: PYTHONPATH=. python -m pytest -q tests/test_maintenance_technician_dashboard.py tests/test_public_contractor_registration.py tests/test_maintenance_tenant_integrity.py tests/test_maintenance_receipt_email.py
+      - run: PYTHONPATH=. python -m pytest -q tests/test_maintenance_technician_dashboard.py tests/test_public_contractor_registration.py tests/test_w9_secure_onboarding.py tests/test_maintenance_tenant_integrity.py tests/test_maintenance_receipt_email.py

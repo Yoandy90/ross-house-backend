@@ -259,6 +259,7 @@ async def marketplace_register(request: Request):
             "admin_notes": "",
             "is_featured": False,
             "source": "mobile_app",
+            "onboarding": {"w9_complete": False, "profile_complete": True},
             "created_at": datetime.utcnow(),
             "updated_at": datetime.utcnow(),
         }
