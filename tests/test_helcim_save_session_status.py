@@ -4,6 +4,7 @@ import asyncio
 import pytest
 
 from rental import helcim_vault_router as vault
+from rental import payment_processors_core as processors
 
 
 class _Sessions:
@@ -109,3 +110,20 @@ def test_unknown_internal_state_fails_closed(monkeypatch):
 
     assert result["status"] == "failed"
     assert result["method_saved"] is False
+
+
+def test_payment_public_base_url_prefers_branded_domain(monkeypatch):
+    monkeypatch.setenv("PAYMENTS_PUBLIC_BASE_URL", "https://payments.rosshouserentals.com/")
+    monkeypatch.setenv("PUBLIC_API_URL", "https://rosshousestaging-staging.up.railway.app")
+
+    assert processors._public_base_url() == "https://payments.rosshouserentals.com"
+
+
+def test_helcim_bridge_is_branded_and_never_claims_to_store_raw_data():
+    page = processors._HELCIM_BRIDGE_TEMPLATE
+
+    assert "Ross House Rentals" in page
+    assert "Pago seguro protegido por Helcim" in page
+    assert "Nunca almacenamos el número completo" in page
+    assert "secure.helcim.app/helcim-pay/services/start.js" in page
+    assert "appendHelcimPayIframe(checkoutToken, true)" in page
