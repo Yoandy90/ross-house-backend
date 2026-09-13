@@ -10,6 +10,7 @@ from bson import ObjectId
 from fastapi import HTTPException
 
 from rental.shared import get_db
+from rental.lease_signature_state import lease_has_required_signatures
 
 
 def _norm_email(value) -> str:
@@ -128,15 +129,18 @@ async def resolve_authenticated_tenant(user: dict):
 
 
 async def find_active_contract_for_tenant(tenant: dict):
-    """Return the tenant's single active contract; ambiguity is an integrity error."""
+    """Return one fully signed active contract; unsigned legacy rows fail closed."""
     tenant_id = str(tenant["_id"])
     ids = [tenant_id]
     if ObjectId.is_valid(tenant_id):
         ids.append(ObjectId(tenant_id))
-    matches = await get_db().rental_contracts.find({
+    candidates = await get_db().rental_contracts.find({
         "tenant_id": {"$in": ids},
         "status": "active",
-    }).limit(2).to_list(2)
+    }).limit(1001).to_list(1001)
+    if len(candidates) > 1000:
+        raise HTTPException(status_code=409, detail="tenant_active_contract_scan_unbounded")
+    matches = [contract for contract in candidates if lease_has_required_signatures(contract)]
     if len(matches) > 1:
         raise HTTPException(status_code=409, detail="tenant_multiple_active_contracts")
     return matches[0] if matches else None
