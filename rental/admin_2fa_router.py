@@ -396,15 +396,12 @@ async def admin_login_step1(request: Request):
 @router.post("/admin/staging-access/temporary-admin")
 async def create_temporary_staging_admin(request: Request, admin=Depends(auth_admin)):
     """Create or rotate a short-lived, staging-only admin account."""
-    from rental.staging_fixture_policy import (
-        StagingFixturePolicyError,
-        assert_staging_fixture_allowed,
-    )
-
-    try:
-        assert_staging_fixture_allowed(os.environ, database_name=os.getenv("DB_NAME", ""))
-    except StagingFixturePolicyError as exc:
-        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    environment = os.getenv("ENVIRONMENT", "").strip().lower()
+    database_name = os.getenv("DB_NAME", "").strip().lower()
+    if environment != "staging":
+        raise HTTPException(status_code=403, detail="temporary_admin_environment_not_staging")
+    if "staging" not in database_name or database_name == "taxportal":
+        raise HTTPException(status_code=403, detail="temporary_admin_database_not_staging")
 
     body = await request.json()
     email = (body.get("email") or "").strip().lower()
