@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from bson import ObjectId
 from .shared import get_db, auth_admin, auth_marketplace, serialize
 from .tenant_integrity import resolve_authenticated_tenant
+from .lease_signature_state import effective_lease_status, lease_has_required_signatures
 
 router = APIRouter()
 _ALLOWED_CONTRACT_SIGNER_ROLES = {"tenant", "landlord", "admin"}
@@ -52,7 +53,12 @@ def _actor_name(user: dict, role: str) -> str:
 
 
 def _assert_contract_signing_state(contract: dict, role: str) -> None:
-    status = str(contract.get('status') or '').strip().lower()
+    status = effective_lease_status(contract)
+    if (
+        str(contract.get('status') or '').strip().lower() == 'active'
+        and lease_has_required_signatures(contract)
+    ):
+        raise HTTPException(409, "contract_not_in_signable_state")
     if status not in _ALLOWED_SIGNING_STATES.get(role, set()):
         raise HTTPException(409, "contract_not_in_signable_state")
 
@@ -110,13 +116,13 @@ async def get_pending_signatures(request: Request):
         signed_by_me = False
         if role == 'tenant' and c.get('tenant_id') in my_ids:
             signed_by_me = bool(c.get('tenant_signature'))
-            needs_sig = not signed_by_me and c.get('status') in _ALLOWED_SIGNING_STATES['tenant']
+            needs_sig = not signed_by_me and effective_lease_status(c) in _ALLOWED_SIGNING_STATES['tenant']
         elif role == 'landlord' and c.get('landlord_id') == user_id:
             signed_by_me = bool(c.get('landlord_signature'))
-            needs_sig = not signed_by_me and c.get('status') in _ALLOWED_SIGNING_STATES['landlord']
+            needs_sig = not signed_by_me and effective_lease_status(c) in _ALLOWED_SIGNING_STATES['landlord']
         elif role == 'admin':
             signed_by_me = bool(c.get('admin_signature'))
-            needs_sig = not signed_by_me and c.get('status') in _ALLOWED_SIGNING_STATES['admin']
+            needs_sig = not signed_by_me and effective_lease_status(c) in _ALLOWED_SIGNING_STATES['admin']
         pending.append({
             'id': c['id'], 'type': 'contract',
             'title': f"Contrato - {c.get('property_address', 'Propiedad')}",
