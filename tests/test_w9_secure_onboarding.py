@@ -1,4 +1,5 @@
 import asyncio
+from io import BytesIO
 from types import SimpleNamespace
 
 import pytest
@@ -6,6 +7,7 @@ from cryptography.fernet import Fernet
 from fastapi import HTTPException
 
 import rental.tax_1099_router as tax
+from pypdf import PdfReader
 
 
 class Request:
@@ -100,3 +102,28 @@ def test_legacy_w9_remains_reportable_but_new_ciphertext_must_decrypt(monkeypatc
         "legal_name": "Bad Cipher", "tin_ciphertext": "not-valid",
         "address": "1 Main St", "signed_at": "2026-01-01",
     }) is False
+
+
+def test_official_w9_pdf_keeps_irs_form_and_fills_expected_fields(monkeypatch):
+    monkeypatch.setenv("VAULT_ENCRYPTION_KEY", Fernet.generate_key().decode())
+    w9 = tax.build_w9_submission(payload(), Request(), source="test")
+    pdf = tax.build_official_w9_pdf({}, w9, {"name": "Ross House Rentals LLC"})
+    reader = PdfReader(BytesIO(pdf))
+    fields = reader.get_fields()
+
+    assert len(reader.pages) == 6
+    assert fields["topmostSubform[0].Page1[0].f1_01[0]"]["/V"] == "Pat Contractor"
+    assert fields["topmostSubform[0].Page1[0].f1_14[0]"]["/V"] == "12"
+    assert fields["topmostSubform[0].Page1[0].f1_15[0]"]["/V"] == "3456789"
+    assert b"123456789" not in pdf
+
+
+def test_safe_tax_document_never_exposes_pdf_or_tin():
+    safe = tax._safe_tax_document({
+        "_id": "doc-1", "provider_id": "provider-1", "document_type": "w9",
+        "title": "Form W-9", "filename": "W9.pdf", "is_current": True,
+        "content_ciphertext": "secret-pdf", "tin": "123456789",
+    })
+    assert safe["id"] == "doc-1"
+    assert "content_ciphertext" not in safe
+    assert "tin" not in safe
