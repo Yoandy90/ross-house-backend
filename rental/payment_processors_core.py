@@ -111,6 +111,10 @@ def _mask(value: str) -> str:
 
 
 def _public_base_url() -> str:
+    payment_url = (os.environ.get("PAYMENTS_PUBLIC_BASE_URL") or "").strip()
+    if payment_url:
+        return payment_url.rstrip("/")
+
     explicit_url = (os.environ.get("PUBLIC_API_URL") or "").strip()
     if explicit_url:
         return explicit_url.rstrip("/")
@@ -1201,15 +1205,34 @@ async def bofa_webhook(request: Request):
 
 _HELCIM_BRIDGE_TEMPLATE = """<!DOCTYPE html>
 <html lang="es"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Pago seguro</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#09090b">
+<title>Pago seguro | Ross House Rentals</title>
 <script src="https://secure.helcim.app/helcim-pay/services/start.js"></script>
-<style>body{font-family:-apple-system,Segoe UI,Roboto,sans-serif;display:flex;align-items:center;
-justify-content:center;height:100vh;margin:0;background:#f6f7f9;color:#1f2937}
-.box{text-align:center;padding:20px}.spin{width:42px;height:42px;border:4px solid #e5e7eb;
-border-top-color:#0ea5e9;border-radius:50%;margin:0 auto 16px;animation:s 1s linear infinite}
-@keyframes s{to{transform:rotate(360deg)}}</style></head>
-<body><div class="box"><div class="spin" id="spin"></div><p id="state">Abriendo pago seguro…</p></div>
+<style>
+:root{color-scheme:dark}
+*{box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;min-height:100vh;
+margin:0;background:radial-gradient(circle at 50% -10%,#3b101b 0,#160a0e 38%,#09090b 72%);
+color:#f8fafc;display:flex;align-items:flex-start;justify-content:center}
+.brand{width:min(100%,560px);padding:calc(env(safe-area-inset-top) + 38px) 24px 40px;text-align:center}
+.mark{width:62px;height:62px;margin:0 auto 16px;border-radius:19px;display:grid;place-items:center;
+background:linear-gradient(145deg,#ef1643,#9f0b2d);box-shadow:0 16px 45px rgba(225,15,58,.32);
+font-size:29px;font-weight:900;letter-spacing:-2px}
+.name{font-size:15px;font-weight:800;letter-spacing:.18em;text-transform:uppercase}
+.secure{margin-top:12px;color:#a7adb9;font-size:14px;line-height:1.5}
+.state{display:inline-flex;align-items:center;gap:9px;margin-top:22px;padding:10px 15px;border:1px solid rgba(255,255,255,.1);
+border-radius:999px;background:rgba(255,255,255,.05);color:#d6dae2;font-size:13px}
+.dot{width:8px;height:8px;border-radius:50%;background:#18c891;box-shadow:0 0 15px rgba(24,200,145,.8)}
+.note{margin-top:18px;color:#777f8f;font-size:11px;letter-spacing:.04em}
+</style></head>
+<body><main class="brand" aria-live="polite">
+  <div class="mark" aria-hidden="true">R</div>
+  <div class="name">Ross House Rentals</div>
+  <div class="secure">Pago seguro protegido por Helcim<br><span lang="en">Secure payment protected by Helcim</span></div>
+  <div class="state"><span class="dot"></span><span id="state">Abriendo formulario seguro…</span></div>
+  <div class="note">Nunca almacenamos el número completo de tu tarjeta o cuenta bancaria.</div>
+</main>
 <script>
 var checkoutToken = __TOKEN__;
 var redirectUrl = __REDIRECT__;
@@ -1217,7 +1240,7 @@ var state = document.getElementById('state');
 window.addEventListener('message', function(ev) {
   if (!ev.data || ev.data.eventName !== 'helcim-pay-js-' + checkoutToken) return;
   if (ev.data.eventStatus === 'SUCCESS') {
-    state.textContent = 'Confirmando pago…';
+    state.textContent = 'Confirmando de forma segura…';
     var raw = typeof ev.data.eventMessage === 'string'
       ? ev.data.eventMessage : JSON.stringify(ev.data.eventMessage);
     fetch('/api/public/helcim-complete', {
@@ -1225,18 +1248,16 @@ window.addEventListener('message', function(ev) {
       body: JSON.stringify({checkout_token: checkoutToken, raw_data_response: raw})
     }).then(function(r){return r.json();}).then(function(res){
       state.textContent = res.status === 'paid'
-        ? '✅ ¡Pago exitoso! Puedes volver a la app.'
+        ? '✅ ¡Pago exitoso! Regresando a la app…'
         : (res.status === 'verified'
-           ? '💾 ¡Método de pago guardado! Vuelve a la app.'
+           ? '✅ Método guardado. Regresando a la app…'
            : (res.status === 'ach_pending'
-           ? '🏦 Pago bancario iniciado — se confirmará en 1-3 días hábiles.'
+           ? '🏦 Pago bancario iniciado; se confirmará al liquidarse.'
            : '⚠️ No se pudo confirmar el pago.'));
-      document.getElementById('spin').style.display = 'none';
-      if (redirectUrl) setTimeout(function(){ window.location.replace(redirectUrl); }, 2500);
+      if (redirectUrl) setTimeout(function(){ window.location.replace(redirectUrl); }, 1800);
     }).catch(function(){ state.textContent = '⚠️ Error confirmando el pago.'; });
   } else if (ev.data.eventStatus === 'ABORTED') {
-    state.textContent = 'Pago cancelado o rechazado. Puedes volver a la app e intentar de nuevo.';
-    document.getElementById('spin').style.display = 'none';
+    state.textContent = 'Pago cancelado o rechazado. Puedes volver a la app.';
   }
 });
 appendHelcimPayIframe(checkoutToken, true);
