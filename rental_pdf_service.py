@@ -32,6 +32,19 @@ def _normalize_signature_record(value):
         return {"image_data": value}
     return {}
 
+
+def _signature_with_date(value, *date_candidates):
+    """Normalize a signature and attach its persisted signing date when needed."""
+    record = dict(_normalize_signature_record(value))
+    if record.get("image_data") and not (
+        record.get("signed_at") or record.get("updated_at")
+    ):
+        record["signed_at"] = next(
+            (date for date in date_candidates if date),
+            None,
+        )
+    return record
+
 # ─── Default Company Configuration ───────────────────────────────
 DEFAULT_COMPANY = {
     "name": "Ross House Rentals LLC",
@@ -330,14 +343,27 @@ def generate_rental_contract_pdf(contract: dict, config: dict = None, tenant_pho
 
     # ─── EXTRACT SIGNATURE DATA FOR INITIALS ─────────────────────────
     tenant_name = contract.get('tenant_name', '')
-    tenant_sig = _normalize_signature_record(
-        contract.get('signature') or contract.get('tenant_signature')
+    tenant_sig = _signature_with_date(
+        contract.get('signature') or contract.get('tenant_signature'),
+        contract.get('tenant_signed_at'),
+        contract.get('tenant_signature_date'),
+        contract.get('signed_at'),
     )
     
-    # Get admin signature from contract or from saved signature in config
-    admin_sig = _normalize_signature_record(contract.get('admin_signature'))
+    # Get admin/landlord signature from contract or from saved signature in config
+    admin_sig = _normalize_signature_record(
+        contract.get('admin_signature') or contract.get('landlord_signature')
+    )
     if not admin_sig.get('image_data') and config:
         admin_sig = _normalize_signature_record(config.get('saved_admin_signature'))
+    admin_sig = _signature_with_date(
+        admin_sig,
+        contract.get('admin_signed_at'),
+        contract.get('admin_signature_date'),
+        contract.get('landlord_signed_at'),
+        contract.get('landlord_signature_date'),
+        contract.get('signed_at'),
+    )
     
     # Get landlord/company name for initials
     landlord_name = co.get('name', 'Ross House Rentals LLC')
@@ -516,9 +542,15 @@ def generate_rental_contract_pdf(contract: dict, config: dict = None, tenant_pho
     section += 1
     rent = contract.get('rent_amount', 0)
     deposit = contract.get('deposit_amount', 0)
-    due_day = contract.get('payment_due_day', 1)
-    late_fee = contract.get('late_fee_amount', 50)
-    grace_days = contract.get('late_fee_grace_days', 5)
+    due_day = contract.get('payment_due_day')
+    if due_day is None:
+        due_day = contract.get('payment_day', 1)
+    late_fee = contract.get('late_fee_amount')
+    if late_fee is None:
+        late_fee = contract.get('late_fee', 50)
+    grace_days = contract.get('late_fee_grace_days')
+    if grace_days is None:
+        grace_days = contract.get('grace_period_days', 5)
 
     elements.append(Paragraph(
         f"{section}. RENT AND PAYMENTS / RENTA Y PAGOS", styles['SectionNum']
@@ -1152,10 +1184,9 @@ def generate_rental_contract_pdf(contract: dict, config: dict = None, tenant_pho
     elements.append(Spacer(1, 20))
 
     # Handle digital signature
-    sig = _normalize_signature_record(
-        contract.get('signature') or contract.get('tenant_signature')
-    )
-    admin_sig = _normalize_signature_record(contract.get('admin_signature'))
+    # Reuse the normalized records above so root-level signing dates and
+    # legacy field aliases remain available on the final signature page.
+    sig = tenant_sig
     tenant_sig_cell = '_' * 40
     landlord_sig_cell = '_' * 40
     tenant_signed_date_str = '_______________'
@@ -1171,11 +1202,9 @@ def generate_rental_contract_pdf(contract: dict, config: dict = None, tenant_pho
             sig_buffer = io.BytesIO(sig_bytes)
             tenant_sig_cell = RLImage(sig_buffer, width=180, height=55)
 
-            signed_at = sig.get('signed_at', '')
-            if isinstance(signed_at, str) and signed_at:
-                tenant_signed_date_str = signed_at[:10]
-            elif hasattr(signed_at, 'strftime'):
-                tenant_signed_date_str = signed_at.strftime('%m/%d/%Y')
+            signed_at = sig.get('signed_at') or sig.get('updated_at')
+            if signed_at:
+                tenant_signed_date_str = _format_signature_date(signed_at)
         except Exception as e:
             logger.warning(f"Could not process tenant signature: {e}")
             tenant_sig_cell = '_' * 40
@@ -1200,11 +1229,9 @@ def generate_rental_contract_pdf(contract: dict, config: dict = None, tenant_pho
             admin_buffer = io.BytesIO(admin_bytes)
             landlord_sig_cell = RLImage(admin_buffer, width=180, height=55)
 
-            admin_signed_at = admin_sig.get('signed_at') or admin_sig.get('updated_at', '')
-            if isinstance(admin_signed_at, str) and admin_signed_at:
-                landlord_signed_date_str = admin_signed_at[:10]
-            elif hasattr(admin_signed_at, 'strftime'):
-                landlord_signed_date_str = admin_signed_at.strftime('%m/%d/%Y')
+            admin_signed_at = admin_sig.get('signed_at') or admin_sig.get('updated_at')
+            if admin_signed_at:
+                landlord_signed_date_str = _format_signature_date(admin_signed_at)
             else:
                 landlord_signed_date_str = tenant_signed_date_str  # Use tenant date if admin date not available
         except Exception as e:
