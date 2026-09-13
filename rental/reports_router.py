@@ -814,14 +814,15 @@ async def _build_annual_tax(db, year: int) -> Dict[str, Any]:
     prop_expense_total = sum(sum(cats.values()) for cats in expenses.values())
 
     # ── Mano de obra de contratistas (provider_payments) + resumen 1099 ──
-    from rental.tax_1099_router import _provider_totals
+    from rental.tax_1099_router import _provider_totals, _nec_threshold, _w9_complete
     totals_1099 = await _provider_totals(year)
+    nec_threshold = await _nec_threshold(year)
     contractors = []
     contractor_total = 0.0
     for pid, t in sorted(totals_1099.items(), key=lambda kv: -(kv[1]["reportable"] + kv[1]["excluded"])):
         p = await db.service_providers.find_one({"_id": pid}) or {}
         w9 = p.get("w9") or {}
-        w9_ok = bool(w9.get("legal_name") and w9.get("tin") and w9.get("address"))
+        w9_ok = _w9_complete(w9)
         paid = t["reportable"] + t["excluded"]
         contractor_total += paid
         contractors.append({
@@ -830,7 +831,7 @@ async def _build_annual_tax(db, year: int) -> Dict[str, Any]:
             "paid": round(paid, 2),
             "reportable": round(t["reportable"], 2),
             "excluded": round(t["excluded"], 2),
-            "needs_1099": t["reportable"] >= 600,
+            "needs_1099": t["reportable"] >= nec_threshold,
             "w9_complete": w9_ok,
             "form_sent": bool((p.get("form_1099_sent") or {}).get(str(year))),
         })
