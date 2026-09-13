@@ -23,6 +23,15 @@ from reportlab.platypus import (
 
 logger = logging.getLogger(__name__)
 
+
+def _normalize_signature_record(value):
+    """Return a consistent signature mapping for legacy and current records."""
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str) and value.strip():
+        return {"image_data": value}
+    return {}
+
 # ─── Default Company Configuration ───────────────────────────────
 DEFAULT_COMPANY = {
     "name": "Ross House Rentals LLC",
@@ -210,6 +219,7 @@ def _build_initials_line(tenant_name: str, signature_data: dict, styles) -> str:
     Build the initials line with real data if signature exists.
     Returns a formatted Paragraph-compatible string.
     """
+    signature_data = _normalize_signature_record(signature_data)
     initials = _get_initials(tenant_name)
     
     # Get signature date from various possible fields
@@ -240,6 +250,8 @@ def _build_dual_initials_block(tenant_name: str, tenant_sig: dict, admin_sig: di
     
     For unsigned contract, shows blank lines: ________
     """
+    tenant_sig = _normalize_signature_record(tenant_sig)
+    admin_sig = _normalize_signature_record(admin_sig)
     tenant_initials = _get_initials(tenant_name)
     landlord_initials = _get_initials(landlord_name)
     
@@ -318,12 +330,14 @@ def generate_rental_contract_pdf(contract: dict, config: dict = None, tenant_pho
 
     # ─── EXTRACT SIGNATURE DATA FOR INITIALS ─────────────────────────
     tenant_name = contract.get('tenant_name', '')
-    tenant_sig = contract.get('signature') or contract.get('tenant_signature') or {}
+    tenant_sig = _normalize_signature_record(
+        contract.get('signature') or contract.get('tenant_signature')
+    )
     
     # Get admin signature from contract or from saved signature in config
-    admin_sig = contract.get('admin_signature') or {}
+    admin_sig = _normalize_signature_record(contract.get('admin_signature'))
     if not admin_sig.get('image_data') and config:
-        admin_sig = config.get('saved_admin_signature') or {}
+        admin_sig = _normalize_signature_record(config.get('saved_admin_signature'))
     
     # Get landlord/company name for initials
     landlord_name = co.get('name', 'Ross House Rentals LLC')
@@ -1138,8 +1152,10 @@ def generate_rental_contract_pdf(contract: dict, config: dict = None, tenant_pho
     elements.append(Spacer(1, 20))
 
     # Handle digital signature
-    sig = contract.get('signature') or contract.get('tenant_signature')
-    admin_sig = contract.get('admin_signature')
+    sig = _normalize_signature_record(
+        contract.get('signature') or contract.get('tenant_signature')
+    )
+    admin_sig = _normalize_signature_record(contract.get('admin_signature'))
     tenant_sig_cell = '_' * 40
     landlord_sig_cell = '_' * 40
     tenant_signed_date_str = '_______________'
@@ -1168,8 +1184,10 @@ def generate_rental_contract_pdf(contract: dict, config: dict = None, tenant_pho
     # First try to get from contract, if not found, use the saved_admin_signature from config
     if not admin_sig or not admin_sig.get('image_data'):
         # Check if saved admin signature was passed via config
-        saved_admin_sig = config.get('saved_admin_signature') if config else None
-        if saved_admin_sig and saved_admin_sig.get('image_data'):
+        saved_admin_sig = _normalize_signature_record(
+            config.get('saved_admin_signature') if config else None
+        )
+        if saved_admin_sig.get('image_data'):
             admin_sig = saved_admin_sig
             logger.info("Using saved admin signature from config for contract PDF")
     
