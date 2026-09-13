@@ -3,9 +3,10 @@
 - Suma pagos 'paid' del año por proveedor (colección provider_payments).
 - REGLA IRS: pagos con tarjeta o redes de terceros (PayPal/Venmo/CashApp/Stripe card)
   NO van en 1099-NEC (los reporta el procesador en 1099-K). Cash/check/Zelle/ACH/wire SÍ.
-- Umbral: $600+/año → requiere 1099-NEC.
-- W-9 del proveedor se guarda en service_providers.w9 {legal_name, business_name,
-  tax_classification, tin_type, tin, address, city, state, zip}.
+- Umbral por año fiscal: $600 hasta 2025; $2,000 en 2026. Los años posteriores
+  se pueden ajustar en app_settings.tax_1099.reporting_thresholds.
+- El TIN del W-9 se cifra con VAULT_ENCRYPTION_KEY. Las respuestas normales
+  exponen solo los últimos cuatro dígitos.
 - Payer (tu LLC) en app_settings {_id:'tax_1099'}.
 - PDF: formulario sustituto Copy B (para el proveedor) con reportlab.
   NOTA: la Copy A al IRS se presenta electrónicamente (IRIS/Tax1099) — el CSV
@@ -15,11 +16,15 @@ import io
 import os
 import asyncio
 import logging
+import hashlib
+import json
+import re
 from datetime import datetime, timezone, timedelta
 
 from fastapi import APIRouter, HTTPException, Request, Response
 
 from rental.shared import get_db, auth_admin
+from rental.vault_router import encrypt as vault_encrypt, decrypt as vault_decrypt
 
 try:
     from zoneinfo import ZoneInfo
@@ -33,6 +38,19 @@ logger = logging.getLogger(__name__)
 # Métodos reportables en 1099-NEC (el resto los cubre 1099-K del procesador)
 NEC_METHODS = ("cash", "check", "zelle", "wire", "stripe_ach", "other")
 EXCLUDED_METHODS = ("stripe_card", "paypal", "venmo", "cashapp")
+NEC_BASE_THRESHOLDS = {2025: 600.0, 2026: 2000.0}
+W9_REVISION = "March 2024"
+VALID_TAX_CLASSIFICATIONS = {
+    "individual", "sole_proprietor", "c_corporation", "s_corporation",
+    "partnership", "trust_estate", "llc_c", "llc_s", "llc_p", "other",
+}
+US_STATE_CODES = {
+    "AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DE", "FL", "GA", "HI", "ID",
+    "IL", "IN", "IA", "KS", "KY", "LA", "ME", "MD", "MA", "MI", "MN", "MS",
+    "MO", "MT", "NE", "NV", "NH", "NJ", "NM", "NY", "NC", "ND", "OH", "OK",
+    "OR", "PA", "RI", "SC", "SD", "TN", "TX", "UT", "VT", "VA", "WA", "WV",
+    "WI", "WY", "DC", "AS", "GU", "MP", "PR", "VI",
+}
 
 DEFAULT_PAYER = {
     "name": "Ross House Rentals LLC",
@@ -51,6 +69,146 @@ async def _get_payer() -> dict:
 def _mask_tin(tin: str) -> str:
     t = (tin or "").replace("-", "").strip()
     return f"***-**-{t[-4:]}" if len(t) >= 4 else ""
+
+
+def _w9_tin(w9: dict) -> str:
+    """Return a TIN only for an internal tax operation.
+
+    Plaintext support is intentionally read-only for legacy records. Every new
+    or edited W-9 is written as ciphertext.
+    """
+    ciphertext = str((w9 or {}).get("tin_ciphertext") or "")
+    if ciphertext:
+        return vault_decrypt(ciphertext)
+    return str((w9 or {}).get("tin") or "")
+
+
+def _w9_complete(w9: dict) -> bool:
+    w9 = w9 or {}
+    has_attestation = bool(w9.get("signed_at"))
+    # Legacy admin-entered/paper W-9s predate the electronic signature fields.
+    # Keep them usable for tax reporting while every new submission is signed.
+    if w9.get("tin") and not w9.get("tin_ciphertext"):
+        has_attestation = has_attestation or bool(w9.get("updated_at"))
+    return bool(
+        w9.get("legal_name")
+        and _w9_tin(w9)
+        and w9.get("address")
+        and has_attestation
+    )
+
+
+def _w9_masked(w9: dict) -> str:
+    last4 = str((w9 or {}).get("tin_last4") or "")
+    return f"***-**-{last4}" if len(last4) == 4 else _mask_tin(_w9_tin(w9))
+
+
+async def _nec_threshold(year: int) -> float:
+    cfg = await get_db().app_settings.find_one({"_id": "tax_1099"}) or {}
+    override = (cfg.get("reporting_thresholds") or {}).get(str(year))
+    if override is not None:
+        try:
+            value = float(override)
+            if value > 0:
+                return value
+        except (TypeError, ValueError):
+            pass
+    if year <= 2025:
+        return NEC_BASE_THRESHOLDS[2025]
+    # 2026 starts at $2,000 and is inflation-adjusted later. Administrators can
+    # set the published amount per tax year without a code deployment.
+    return NEC_BASE_THRESHOLDS[2026]
+
+
+async def record_w9_audit(db, provider_id: str, event: str, w9: dict, request: Request) -> None:
+    """Append a non-sensitive W-9 event for electronic-submission traceability."""
+    try:
+        await db.w9_audit_log.insert_one({
+            "provider_id": str(provider_id),
+            "event": event,
+            "source": w9.get("source") or "",
+            "tin_last4": w9.get("tin_last4") or "",
+            "submission_hash": w9.get("submission_hash") or "",
+            "certification_revision": w9.get("certification_revision") or W9_REVISION,
+            "ip": request.client.host if request.client else "",
+            "user_agent": request.headers.get("user-agent", "")[:500],
+            "created_at": datetime.now(timezone.utc),
+        })
+    except Exception as exc:
+        logger.warning("W-9 audit event could not be stored: %s", exc)
+
+
+def build_w9_submission(data: dict, request: Request, *, source: str) -> dict:
+    """Validate and encrypt an electronically signed substitute Form W-9."""
+    legal_name = str(data.get("legal_name") or "").strip()
+    business_name = str(data.get("business_name") or "").strip()
+    tin = "".join(ch for ch in str(data.get("tin") or "") if ch.isdigit())
+    tin_type = str(data.get("tin_type") or "ssn").lower()
+    tax_classification = str(data.get("tax_classification") or "individual").lower()
+    address = str(data.get("address") or "").strip()
+    city = str(data.get("city") or "").strip()
+    state = str(data.get("state") or "").strip().upper()[:2]
+    zip_code = str(data.get("zip") or "").strip()
+    signature = str(data.get("signature") or "").strip()
+    certifications = data.get("certifications") or {}
+    backup_status = str(data.get("backup_withholding_status") or "").strip().lower()
+    if not backup_status:
+        backup_status = "not_subject" if certifications.get("not_backup_withholding") is True else "subject"
+
+    if data.get("us_person") is not True:
+        raise HTTPException(status_code=422, detail="w9_us_person_required")
+    if not legal_name:
+        raise HTTPException(status_code=422, detail="w9_legal_name_required")
+    if tax_classification not in VALID_TAX_CLASSIFICATIONS:
+        raise HTTPException(status_code=422, detail="w9_tax_classification_invalid")
+    if tin_type not in ("ssn", "ein") or len(tin) != 9:
+        raise HTTPException(status_code=422, detail="w9_tin_invalid")
+    if not (address and city and state in US_STATE_CODES and
+            re.fullmatch(r"\d{5}(?:-\d{4})?", zip_code)):
+        raise HTTPException(status_code=422, detail="w9_address_required")
+    required_certifications = ("tin_correct", "us_person", "fatca_correct")
+    if (not data.get("certified") or backup_status not in {"not_subject", "subject"}
+            or any(certifications.get(key) is not True for key in required_certifications)):
+        raise HTTPException(status_code=422, detail="w9_certification_required")
+    if len(signature) < 2:
+        raise HTTPException(status_code=422, detail="w9_signature_required")
+
+    signed_at = datetime.now(timezone.utc)
+    ciphertext = vault_encrypt(tin)
+    audit_payload = {
+        "legal_name": legal_name,
+        "business_name": business_name,
+        "tax_classification": tax_classification,
+        "tin_type": tin_type,
+        "tin_last4": tin[-4:],
+        "address": address,
+        "city": city,
+        "state": state,
+        "zip": zip_code,
+        "signature": signature,
+        "signed_at": signed_at.isoformat(),
+        "revision": W9_REVISION,
+    }
+    return {
+        **audit_payload,
+        "signed_at": signed_at,
+        "tin_ciphertext": ciphertext,
+        "exempt_payee_code": str(data.get("exempt_payee_code") or "").strip(),
+        "fatca_code": str(data.get("fatca_code") or "").strip(),
+        "foreign_partners": bool(data.get("foreign_partners", False)),
+        "certifications": {
+            **{key: True for key in required_certifications},
+            "not_backup_withholding": backup_status == "not_subject",
+        },
+        "backup_withholding_status": backup_status,
+        "certified": True,
+        "certification_revision": W9_REVISION,
+        "source": source,
+        "submission_ip": request.client.host if request.client else "",
+        "submission_user_agent": request.headers.get("user-agent", "")[:500],
+        "submission_hash": hashlib.sha256(json.dumps(audit_payload, sort_keys=True).encode()).hexdigest(),
+        "updated_at": signed_at,
+    }
 
 
 def _year_range(year: int):
@@ -82,13 +240,14 @@ async def summary_1099(request: Request, year: int = 0):
     await auth_admin(request)
     db = get_db()
     year = year or datetime.utcnow().year
+    threshold = await _nec_threshold(year)
     totals = await _provider_totals(year)
     providers = {p["_id"]: p async for p in db.service_providers.find({})}
     rows = []
     for pid, t in totals.items():
         p = providers.get(pid, {})
         w9 = p.get("w9") or {}
-        w9_complete = bool(w9.get("legal_name") and w9.get("tin") and w9.get("address"))
+        w9_complete = _w9_complete(w9)
         rows.append({
             "provider_id": pid,
             "name": p.get("name", "(eliminado)"),
@@ -96,16 +255,16 @@ async def summary_1099(request: Request, year: int = 0):
             "reportable": round(t["reportable"], 2),
             "excluded": round(t["excluded"], 2),
             "payments_count": t["count"],
-            "needs_1099": t["reportable"] >= 600,
+            "needs_1099": t["reportable"] >= threshold,
             "w9_complete": w9_complete,
             "w9": {**{k: w9.get(k, "") for k in
                       ("legal_name", "business_name", "tax_classification",
                        "tin_type", "address", "city", "state", "zip")},
-                   "tin_masked": _mask_tin(w9.get("tin", ""))},
+                   "tin_masked": _w9_masked(w9)},
         })
     rows.sort(key=lambda r: -r["reportable"])
     payer = await _get_payer()
-    return {"success": True, "year": year, "rows": rows,
+    return {"success": True, "year": year, "reporting_threshold": threshold, "rows": rows,
             "payer": payer, "payer_complete": bool(payer.get("ein")),
             "totals": {
                 "providers_needing_1099": sum(1 for r in rows if r["needs_1099"]),
@@ -138,18 +297,33 @@ async def save_w9(provider_id: str, request: Request):
     if not p:
         raise HTTPException(status_code=404, detail="Proveedor no encontrado")
     data = await request.json()
-    w9 = p.get("w9") or {}
-    for k in ("legal_name", "business_name", "tax_classification", "tin_type",
-              "address", "city", "state", "zip"):
-        if k in data:
-            w9[k] = str(data[k]).strip()
-    if "tin" in data:
-        tin = str(data["tin"]).replace("-", "").replace(" ", "")
-        if tin and not (tin.isdigit() and len(tin) == 9):
-            raise HTTPException(status_code=400, detail="TIN debe tener 9 dígitos")
-        w9["tin"] = tin
-    w9["updated_at"] = datetime.utcnow()
+    current = p.get("w9") or {}
+    merged = {
+        key: current.get(key) for key in (
+            "legal_name", "business_name", "tax_classification", "tin_type",
+            "address", "city", "state", "zip", "exempt_payee_code",
+            "fatca_code", "foreign_partners",
+        )
+    }
+    merged.update(data)
+    data = merged
+    if "tin" not in data:
+        data["tin"] = _w9_tin(current)
+    data.setdefault("signature", data.get("legal_name") or current.get("legal_name"))
+    data.setdefault("certified", True)
+    data.setdefault("us_person", True)
+    data.setdefault("certifications", {
+        "tin_correct": True, "not_backup_withholding": True,
+        "us_person": True, "fatca_correct": True,
+    })
+    try:
+        w9 = build_w9_submission(data, request, source="admin")
+    except HTTPException as exc:
+        if exc.detail == "w9_tin_invalid":
+            raise HTTPException(status_code=400, detail="TIN debe tener 9 dígitos") from exc
+        raise
     await db.service_providers.update_one({"_id": provider_id}, {"$set": {"w9": w9}})
+    await record_w9_audit(db, provider_id, "admin_w9_saved", w9, request)
     return {"success": True}
 
 
@@ -182,7 +356,7 @@ def _build_1099_pdf(payer: dict, provider: dict, w9: dict, amount: float, year: 
         L + "f2_9[0]": payer.get("zip", ""),
         L + "f2_10[0]": payer.get("ein", ""),
         # RECIPIENT
-        L + "f2_11[0]": w9.get("tin", ""),
+        L + "f2_11[0]": _w9_tin(w9),
         L + "f2_12[0]": rec_name,
         L + "f2_13[0]": w9.get("address", ""),
         L + "f2_15[0]": w9.get("city", ""),
@@ -285,6 +459,7 @@ async def export_1099_csv(request: Request, year: int = 0):
     await auth_admin(request)
     db = get_db()
     year = year or datetime.utcnow().year
+    threshold = await _nec_threshold(year)
     totals = await _provider_totals(year)
     payer = await _get_payer()
     lines = ["payer_name,payer_ein,payer_address,tax_year,recipient_name,recipient_business,"
@@ -298,17 +473,17 @@ async def export_1099_csv(request: Request, year: int = 0):
     for pid, t in totals.items():
         p = await db.service_providers.find_one({"_id": pid}) or {}
         w9 = p.get("w9") or {}
-        w9_ok = bool(w9.get("legal_name") and w9.get("tin") and w9.get("address"))
+        w9_ok = _w9_complete(w9)
         lines.append(",".join([
             q(payer.get("name")), q(payer.get("ein")),
             q(f"{payer.get('address')}, {payer.get('city')}, {payer.get('state')} {payer.get('zip')}"),
             str(year),
             q(w9.get("legal_name") or p.get("name", "")), q(w9.get("business_name", "")),
-            q(w9.get("tin_type", "")), q(w9.get("tin", "")),
+            q(w9.get("tin_type", "")), q(_w9_tin(w9)),
             q(w9.get("address", "")), q(w9.get("city", "")), q(w9.get("state", "")),
             q(w9.get("zip", "")),
             f"{t['reportable']:.2f}",
-            "YES" if t["reportable"] >= 600 else "NO",
+            "YES" if t["reportable"] >= threshold else "NO",
             "YES" if w9_ok else "NO",
         ]))
     return Response(content="\n".join(lines), media_type="text/csv", headers={
@@ -316,7 +491,7 @@ async def export_1099_csv(request: Request, year: int = 0):
 
 
 # ═══════════════════════════════════════════════════════════════
-# Alerta automática: contratista cruza $600 → genera 1099-NEC y avisa
+# Alerta automática: contratista cruza el umbral anual → genera 1099-NEC y avisa
 # + Recordatorio de deadline (31 de enero) con dirección de envío
 # ═══════════════════════════════════════════════════════════════
 
@@ -368,12 +543,13 @@ def _w9_address_html(w9: dict) -> str:
 
 
 async def check_1099_threshold(provider_id: str):
-    """Llamar tras registrar/marcar un pago 'paid'. Si el contratista cruza $600
+    """Llamar tras registrar/marcar un pago 'paid'. Si cruza el umbral anual
     reportables en el año: genera el 1099-NEC oficial (si tiene W-9) y alerta al
     admin por email (una sola vez por año)."""
     try:
         db = get_db()
         year = datetime.utcnow().year
+        threshold = await _nec_threshold(year)
         start, end = _year_range(year)
         total = 0.0
         async for row in db.provider_payments.aggregate([
@@ -382,14 +558,14 @@ async def check_1099_threshold(provider_id: str):
                             "method": {"$nin": list(EXCLUDED_METHODS)}}},
                 {"$group": {"_id": None, "t": {"$sum": "$amount"}}}]):
             total = row["t"]
-        if total < 600:
+        if total < threshold:
             return
         p = await db.service_providers.find_one({"_id": provider_id})
         if not p or (p.get("tax_1099_alerts") or {}).get(str(year)):
             return  # ya alertado este año
 
         w9 = p.get("w9") or {}
-        w9_ok = bool(w9.get("legal_name") and w9.get("tin") and w9.get("address"))
+        w9_ok = _w9_complete(w9)
         payer = await _get_payer()
         attachment = None
         w9_requested = False
@@ -407,7 +583,7 @@ async def check_1099_threshold(provider_id: str):
                 logger.warning(f"[1099] W-9 request automático falló: {e}")
 
         name = p.get("name", "Contratista")
-        subject = f"📋 1099-NEC requerido: {name} superó $600 en {year} (${total:,.2f})"
+        subject = f"📋 1099-NEC requerido: {name} superó ${threshold:,.0f} en {year} (${total:,.2f})"
         html = f"""
         <div style="font-family:system-ui,Arial,sans-serif;max-width:600px;margin:0 auto">
           <div style="background:#0f172a;color:#fff;padding:18px 22px;border-radius:12px 12px 0 0">
@@ -416,7 +592,7 @@ async def check_1099_threshold(provider_id: str):
           <div style="border:1px solid #e2e8f0;border-top:0;padding:22px;border-radius:0 0 12px 12px">
             <p><b>{name}</b>{f" ({p.get('company_name')})" if p.get('company_name') else ""} acumula
             <b style="color:#b91c1c">${total:,.2f}</b> en pagos reportables (cash/check/Zelle/ACH/wire)
-            en {year} — supera el umbral de $600 del IRS y <b>requiere formulario 1099-NEC</b>.</p>
+            en {year} — supera el umbral de ${threshold:,.0f} y <b>requiere formulario 1099-NEC</b>.</p>
             <table style="width:100%;border-collapse:collapse;font-size:14px;margin:12px 0">
               <tr><td style="padding:6px 0;color:#64748b">W-9:</td>
                   <td>{"✅ Completo" if w9_ok else ("📩 <b>Se le envió automáticamente el W-9 digital</b> — te aviso cuando lo complete" if w9_requested else "<b style='color:#b91c1c'>❌ FALTA — pídeselo ahora para evitar retención del 24% (backup withholding)</b>")}</td></tr>
@@ -444,7 +620,7 @@ async def check_1099_threshold(provider_id: str):
                 "pdf_attached": bool(attachment),
                 "email_sent": sent,
             }}})
-        logger.info(f"[1099] alerta $600 enviada para {name} (${total:,.2f}, email={sent})")
+        logger.info(f"[1099] alerta de umbral enviada para {name} (${total:,.2f}, email={sent})")
     except Exception as e:
         logger.exception(f"[1099] check_1099_threshold falló para {provider_id}: {e}")
 
@@ -460,16 +636,17 @@ async def send_1099_deadline_reminder(db, year: int = 0) -> dict:
     """Email al admin con la lista de 1099-NEC a enviar antes del 31 de enero:
     contratista, monto, estado del W-9 y DIRECCIÓN DE ENVÍO de la Copy B."""
     year = year or (datetime.utcnow().year - 1)  # en enero se reporta el año anterior
+    threshold = await _nec_threshold(year)
     totals = await _provider_totals(year)
     providers = {p["_id"]: p async for p in db.service_providers.find({})}
     rows, n, missing_w9 = "", 0, 0
     for pid, t in sorted(totals.items(), key=lambda kv: -kv[1]["reportable"]):
-        if t["reportable"] < 600:
+        if t["reportable"] < threshold:
             continue
         n += 1
         p = providers.get(pid, {})
         w9 = p.get("w9") or {}
-        w9_ok = bool(w9.get("legal_name") and w9.get("tin") and w9.get("address"))
+        w9_ok = _w9_complete(w9)
         if not w9_ok:
             missing_w9 += 1
         rows += f"""
@@ -481,8 +658,8 @@ async def send_1099_deadline_reminder(db, year: int = 0) -> dict:
           <td style="padding:8px 6px;font-size:12px">{_w9_address_html(w9)}</td>
         </tr>"""
     if n == 0:
-        logger.info(f"[1099] deadline reminder: sin contratistas ≥$600 en {year}")
-        return {"success": True, "sent": 0, "skipped": f"Sin contratistas con $600+ en {year}"}
+        logger.info(f"[1099] deadline reminder: sin contratistas sobre umbral en {year}")
+        return {"success": True, "sent": 0, "skipped": f"Sin contratistas con ${threshold:,.0f}+ en {year}"}
 
     subject = f"🚨 1099-NEC {year}: {n} contratista(s) — enviar antes del 31 de enero"
     html = f"""
@@ -535,21 +712,22 @@ COPYB_FIRE_DATE = (1, 15)
 
 
 async def send_copyb_batch(db, year: int = 0) -> dict:
-    """Envía la Copy B por email a todos los contratistas ≥$600 con W-9 completo
+    """Envía la Copy B a contratistas sobre el umbral anual con W-9 completo
     y email registrado (salta los ya enviados ese año). Devuelve el detalle y
     manda un resumen al admin con los que quedan pendientes de envío postal."""
     year = year or (datetime.utcnow().year - 1)
+    threshold = await _nec_threshold(year)
     totals = await _provider_totals(year)
     payer = await _get_payer()
     sent, no_email, no_w9, already = [], [], [], []
     for pid, t in sorted(totals.items(), key=lambda kv: -kv[1]["reportable"]):
-        if t["reportable"] < 600:
+        if t["reportable"] < threshold:
             continue
         p = await db.service_providers.find_one({"_id": pid})
         if not p:
             continue
         w9 = p.get("w9") or {}
-        w9_ok = bool(w9.get("legal_name") and w9.get("tin") and w9.get("address"))
+        w9_ok = _w9_complete(w9)
         entry = {"name": p.get("name", "?"), "amount": round(t["reportable"], 2),
                  "email": p.get("email", ""), "w9": w9}
         if (p.get("form_1099_sent") or {}).get(str(year)):
@@ -700,9 +878,8 @@ async def send_w9_request(db, p: dict) -> bool:
     if lang == "es":
         if sends == 0:
             subject = "Acción requerida: completa tu W-9 (2 minutos) — Ross House Rentals"
-            lead = (f"<p>Hola {name},</p><p>Este año te hemos pagado <b>$600 o más</b> por tus "
-                    "servicios, así que el IRS nos exige tener tu <b>formulario W-9</b> en archivo "
-                    "para emitirte el 1099-NEC.</p>")
+            lead = (f"<p>Hola {name},</p><p>Antes de continuar recibiendo trabajos necesitamos "
+                    "tener tu <b>formulario W-9</b> completo para los reportes fiscales aplicables.</p>")
         elif sends == 1:
             subject = "Recordatorio: aún falta tu W-9 (2 minutos) — Ross House Rentals"
             lead = (f"<p>Hola {name},</p><p>Te escribimos hace unos días pero aún <b>no hemos "
@@ -725,9 +902,8 @@ async def send_w9_request(db, p: dict) -> bool:
     else:
         if sends == 0:
             subject = "Action required: complete your W-9 (2 minutes) — Ross House Rentals"
-            lead = (f"<p>Hi {name},</p><p>We've paid you <b>$600 or more</b> for your services this "
-                    "year, so the IRS requires us to have your <b>Form W-9</b> on file to issue "
-                    "your 1099-NEC.</p>")
+            lead = (f"<p>Hi {name},</p><p>Before you continue receiving jobs, we need a completed "
+                    "<b>Form W-9</b> on file for applicable tax reporting.</p>")
         elif sends == 1:
             subject = "Reminder: we still need your W-9 (2 minutes) — Ross House Rentals"
             lead = (f"<p>Hi {name},</p><p>We reached out a few days ago but <b>haven't received "
@@ -878,43 +1054,19 @@ async def public_w9_submit(token: str, request: Request):
     if not p:
         raise HTTPException(status_code=404, detail="Enlace no válido")
     data = await request.json()
-    legal_name = str(data.get("legal_name", "")).strip()
-    tin = str(data.get("tin", "")).replace("-", "").replace(" ", "")
-    tin_type = data.get("tin_type", "ssn")
-    address = str(data.get("address", "")).strip()
-    city = str(data.get("city", "")).strip()
-    state = str(data.get("state", "")).strip().upper()[:2]
-    zipc = str(data.get("zip", "")).strip()
-    if not legal_name:
-        raise HTTPException(status_code=422, detail="Nombre legal requerido")
-    if not (tin.isdigit() and len(tin) == 9):
-        raise HTTPException(status_code=422, detail="El SSN/EIN debe tener 9 dígitos")
-    if not (address and city and state and zipc):
-        raise HTTPException(status_code=422, detail="Dirección completa requerida")
-    if not data.get("certified"):
-        raise HTTPException(status_code=422, detail="Debes certificar la información")
-    w9 = {
-        "legal_name": legal_name,
-        "business_name": str(data.get("business_name", "")).strip(),
-        "tax_classification": str(data.get("tax_classification", "individual")).strip(),
-        "tin_type": tin_type if tin_type in ("ssn", "ein") else "ssn",
-        "tin": tin,
-        "address": address, "city": city, "state": state, "zip": zipc,
-        "signature": str(data.get("signature", legal_name)).strip()[:80],
-        "signed_at": datetime.utcnow(),
-        "source": "digital_form",
-        "updated_at": datetime.utcnow(),
-    }
+    w9 = build_w9_submission(data, request, source="digital_link")
     await db.service_providers.update_one(
         {"_id": p["_id"]},
-        {"$set": {"w9": w9, "w9_request.completed_at": datetime.utcnow()}})
+        {"$set": {"w9": w9, "w9_request.completed_at": datetime.utcnow(),
+                  "onboarding.w9_complete": True, "onboarding.updated_at": datetime.utcnow()}})
+    await record_w9_audit(db, str(p["_id"]), "public_w9_submitted", w9, request)
     # Avisar al admin
     try:
         await _send_admin_email(
             db, f"✅ W-9 recibido: {p.get('name','')}",
             f"<div style='font-family:system-ui'><p><b>{p.get('name','')}</b> completó su W-9 digital.</p>"
-            f"<p>Nombre legal: <b>{legal_name}</b><br/>TIN: ***-**-{tin[-4:]} ({w9['tin_type'].upper()})<br/>"
-            f"Dirección: {address}, {city}, {state} {zipc}</p>"
+            f"<p>Nombre legal: <b>{w9['legal_name']}</b><br/>TIN: {_w9_masked(w9)} ({w9['tin_type'].upper()})<br/>"
+            f"Dirección: {w9['address']}, {w9['city']}, {w9['state']} {w9['zip']}</p>"
             f"<p>Ya puedes generar su 1099-NEC desde el panel.</p></div>")
     except Exception:
         pass
