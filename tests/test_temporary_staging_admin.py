@@ -31,6 +31,29 @@ def _safe_staging(monkeypatch):
     monkeypatch.delenv("TWILIO_AUTH_TOKEN", raising=False)
 
 
+def test_temporary_admin_does_not_require_global_fixture_flag(monkeypatch):
+    _safe_staging(monkeypatch)
+    monkeypatch.setenv("STAGING_FIXTURES_ENABLED", "false")
+    app_users = SimpleNamespace(
+        find_one=AsyncMock(return_value=None),
+        insert_one=AsyncMock(return_value=SimpleNamespace(inserted_id="temporary-user-id")),
+    )
+    db = SimpleNamespace(
+        app_users=app_users,
+        admin_2fa_settings=SimpleNamespace(update_one=AsyncMock()),
+        admin_trusted_devices=SimpleNamespace(delete_many=AsyncMock()),
+    )
+    monkeypatch.setattr(twofa, "get_db", lambda: db)
+    monkeypatch.setattr(security, "audit_log", AsyncMock())
+
+    result = asyncio.run(twofa.create_temporary_staging_admin(
+        FakeRequest(),
+        admin={"_id": "creator-id", "email": "creator@example.test", "role": "admin"},
+    ))
+
+    assert result["success"] is True
+
+
 def test_temporary_admin_route_requires_existing_admin():
     route = next(route for route in twofa.router.routes if route.path == "/admin/staging-access/temporary-admin")
     assert any(dep.call is twofa.auth_admin for dep in route.dependant.dependencies)
