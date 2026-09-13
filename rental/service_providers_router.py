@@ -115,6 +115,7 @@ class ServiceProviderUpdate(BaseModel):
     email: Optional[str] = None
     phone: Optional[str] = None
     hourly_rate: Optional[float] = None
+    worker_type: Optional[str] = Field(default=None, pattern='^(contractor|employee)$')
 
 
 class ProviderSettings(BaseModel):
@@ -327,6 +328,9 @@ async def public_register_provider(request: Request, payload: ServiceProviderCre
     settings = await _get_settings(db)
 
     data = payload.dict()
+    # Public enrollment is always an external contractor. Only an admin may
+    # designate a person as a Ross House employee.
+    data['worker_type'] = 'contractor'
     data['created_at'] = datetime.utcnow()
     data['updated_at'] = datetime.utcnow()
     data['status'] = 'pending_review'
@@ -413,6 +417,7 @@ class AdminProviderCreate(BaseModel):
     years_experience: Optional[int] = Field(default=None, ge=0, le=80)
     language_pref: str = Field(default='es', pattern='^(es|en)$')
     admin_notes: str = ''
+    worker_type: str = Field(default='contractor', pattern='^(contractor|employee)$')
 
 
 @router.post('/admin/service-providers')
@@ -677,7 +682,7 @@ async def admin_update_provider(request: Request, provider_id: str, payload: Ser
         if payload.status not in VALID_STATUSES:
             raise HTTPException(400, f"Invalid status. Use: {VALID_STATUSES}")
         update['status'] = payload.status
-    for f in ['admin_notes', 'rating', 'is_featured', 'services', 'name', 'company_name', 'email', 'phone', 'hourly_rate']:
+    for f in ['admin_notes', 'rating', 'is_featured', 'services', 'name', 'company_name', 'email', 'phone', 'hourly_rate', 'worker_type']:
         v = getattr(payload, f)
         if v is not None:
             update[f] = v
@@ -1499,4 +1504,3 @@ async def tenant_request_help(payload: TenantHelpRequest, request: Request):
         'request_id': new_id,
         'message': 'Solicitud enviada. Te contactaremos pronto.',
     }
-

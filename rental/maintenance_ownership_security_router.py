@@ -19,16 +19,17 @@ router = APIRouter()
 _ALLOWED_PRIORITIES = {"low", "medium", "high", "urgent"}
 _ALLOWED_CONTACT = {"phone", "email", "whatsapp"}
 _ALLOWED_STATUSES = {
-    "pending", "reviewing", "assigned", "scheduled", "in_progress",
+    "pending", "reviewing", "assigned", "scheduled", "en_route", "in_progress",
     "waiting_parts", "completed", "resolved", "cancelled", "closed",
 }
 _STATUS_TRANSITIONS = {
     "pending": {"reviewing", "assigned", "scheduled", "in_progress", "completed", "resolved", "cancelled"},
     "reviewing": {"pending", "assigned", "scheduled", "in_progress", "completed", "resolved", "cancelled"},
-    "assigned": {"reviewing", "scheduled", "in_progress", "waiting_parts", "completed", "resolved", "cancelled"},
-    "scheduled": {"assigned", "in_progress", "waiting_parts", "completed", "resolved", "cancelled"},
-    "in_progress": {"assigned", "scheduled", "waiting_parts", "completed", "resolved", "cancelled"},
-    "waiting_parts": {"assigned", "scheduled", "in_progress", "cancelled"},
+    "assigned": {"reviewing", "scheduled", "en_route", "in_progress", "waiting_parts", "completed", "resolved", "cancelled"},
+    "scheduled": {"assigned", "en_route", "in_progress", "waiting_parts", "completed", "resolved", "cancelled"},
+    "en_route": {"assigned", "scheduled", "in_progress", "waiting_parts", "completed", "resolved", "cancelled"},
+    "in_progress": {"assigned", "scheduled", "en_route", "waiting_parts", "completed", "resolved", "cancelled"},
+    "waiting_parts": {"assigned", "scheduled", "en_route", "in_progress", "cancelled"},
     "completed": {"in_progress", "resolved", "closed"},
     "resolved": {"in_progress", "completed", "closed"},
     "cancelled": {"pending", "reviewing"},

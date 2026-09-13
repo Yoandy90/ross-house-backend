@@ -154,6 +154,20 @@ async def secure_admin_dispatch_maintenance(request: Request):
         }}, "$inc": {"total_jobs": 1}, "$set": {"updated_at": datetime.utcnow()}},
     )
 
+    # A linked app account receives the assignment immediately. Email and SMS
+    # remain available for external contractors who do not use the app.
+    if provider.get("app_user_id"):
+        provider_locale = "en" if str(provider.get("language_pref") or "es").startswith("en") else "es"
+        try:
+            await send_rental_push_to_user(
+                user_id=str(provider["app_user_id"]),
+                title="New assigned job" if provider_locale == "en" else "Nuevo trabajo asignado",
+                body=f"#{ticket.get('request_number') or request_id} · {title} · {address}",
+                data={"type": "maintenance_assignment", "request_id": request_id},
+            )
+        except Exception:
+            pass
+
     tenant_locale = "en" if str(ticket.get("notification_language") or "es").startswith("en") else "es"
     tenant_status = "assigned" if status != "in_progress" else "in_progress"
     provider_name = provider.get("name") or provider.get("company_name") or ""

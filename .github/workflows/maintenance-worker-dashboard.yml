@@ -1,0 +1,35 @@
+name: Maintenance Worker Dashboard
+
+on:
+  pull_request:
+    branches: [staging]
+    paths:
+      - 'rental/maintenance_technician_router.py'
+      - 'rental/maintenance_dispatch_security_router.py'
+      - 'rental/maintenance_ownership_security_router.py'
+      - 'rental/service_providers_router.py'
+      - 'tests/test_maintenance_technician_dashboard.py'
+      - 'server.py'
+      - '.github/workflows/maintenance-worker-dashboard.yml'
+  push:
+    branches: [staging]
+    paths:
+      - 'rental/maintenance_technician_router.py'
+      - 'rental/maintenance_dispatch_security_router.py'
+      - 'rental/maintenance_ownership_security_router.py'
+      - 'rental/service_providers_router.py'
+      - 'tests/test_maintenance_technician_dashboard.py'
+      - 'server.py'
+      - '.github/workflows/maintenance-worker-dashboard.yml'
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - run: pip install -r requirements.txt pytest
+      - run: PYTHONPATH=. python -m pytest -q tests/test_maintenance_technician_dashboard.py tests/test_maintenance_tenant_integrity.py tests/test_maintenance_receipt_email.py
