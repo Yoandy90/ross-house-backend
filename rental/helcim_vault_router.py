@@ -7,6 +7,7 @@ es nativo: cobro server-side con /v2/payment/purchase usando el token.
 import hashlib
 import json
 import logging
+import re
 import uuid
 from datetime import datetime, timezone
 
@@ -101,6 +102,66 @@ def _payload_items(payload, *keys):
     return []
 
 
+def _helcim_customer_request(tenant: dict) -> dict:
+    """Build Helcim's non-sensitive customer object from the tenant profile.
+
+    Billing details are included only when Helcim's required street/postal
+    pair is available. Card, bank-account and CVV data never pass through this
+    helper or our API.
+    """
+    name = str(tenant.get("name") or "").strip()[:100]
+    customer = {"contactName": name or "Ross House Rentals tenant"}
+
+    phone = re.sub(r"[^0-9+]", "", str(tenant.get("phone") or ""))
+    if 10 <= len(phone.lstrip("+")) <= 16:
+        customer["cellPhone"] = phone
+
+    raw_address = tenant.get("billing_address")
+    address = raw_address if isinstance(raw_address, dict) else {}
+    street = str(address.get("street1") or tenant.get("address") or "").strip()
+    postal = str(address.get("postalCode") or tenant.get("postal_code") or
+                 tenant.get("zip_code") or tenant.get("zip") or "").strip()
+    if not postal and street:
+        postal_match = re.search(r"\b\d{5}(?:-\d{4})?\b", street)
+        postal = postal_match.group(0) if postal_match else ""
+
+    if street and postal:
+        billing = {
+            "name": name or "Ross House Rentals tenant",
+            "street1": street[:100],
+            "postalCode": postal[:10],
+        }
+        optional = {
+            "street2": address.get("street2"),
+            "city": address.get("city") or tenant.get("city"),
+            "province": address.get("province") or tenant.get("state"),
+            "email": tenant.get("email"),
+            "phone": phone,
+        }
+        for key, value in optional.items():
+            value = str(value or "").strip()
+            if value:
+                billing[key] = value[:100]
+        province = str(billing.get("province") or "").strip()
+        if province:
+            billing["country"] = str(address.get("country") or "USA").strip()[:3]
+        customer["billingAddress"] = billing
+    return customer
+
+
+async def _helcim_customer_context(db, tenant: dict) -> dict:
+    """Reuse an existing Helcim customer; otherwise create one from profile."""
+    tenant_id = str(tenant["_id"])
+    existing = await db.helcim_saved_methods.find_one(
+        {"tenant_id": tenant_id, "customer_code": {"$type": "string", "$ne": ""}},
+        sort=[("created_at", -1)],
+    )
+    customer_code = str((existing or {}).get("customer_code") or "").strip()
+    if customer_code:
+        return {"customerCode": customer_code}
+    return {"customerRequest": _helcim_customer_request(tenant)}
+
+
 async def resolve_ach_vault_ids(api_token: str, customer_code: str,
                                 bank_token: str, last4: str) -> tuple[int | None, int | None]:
     """Resolve opaque Helcim customer/bank IDs after hosted tokenization."""
@@ -150,24 +211,31 @@ async def save_method_session(request: Request):
     cfg = await _helcim_cfg()
     if not cfg.get("api_token"):
         raise HTTPException(400, "Helcim no configurado")
+    db = get_db()
+    customer_context = await _helcim_customer_context(db, tenant)
+    initialize_payload = {
+        "paymentType": "verify", "amount": 0, "currency": "USD",
+        "paymentMethod": helcim_method,
+        "setAsDefaultPaymentMethod": 1,
+        # The app already owns this profile data. Do not make tenants type it
+        # again in Helcim's hosted UI.
+        "displayContactFields": 0,
+        "customStyling": {"appearance": "system", "brandColor": "B30D2F",
+                          "cornerRadius": "rounded"},
+        "confirmationScreen": True,
+        **customer_context,
+    }
     async with httpx.AsyncClient(timeout=20) as x:
         r = await x.post(f"{HELCIM_BASE}/helcim-pay/initialize",
                          headers={"api-token": cfg["api_token"], "accept": "application/json"},
-                         json={"paymentType": "verify", "amount": 0, "currency": "USD",
-                               "paymentMethod": helcim_method,
-                               "setAsDefaultPaymentMethod": 1,
-                               "displayContactFields": 1,
-                               "customStyling": {"appearance": "system",
-                                                 "brandColor": "B30D2F",
-                                                 "cornerRadius": "rounded"},
-                               "confirmationScreen": True})
+                         json=initialize_payload)
     if r.status_code >= 400:
         raise HTTPException(502, f"Helcim: {r.text[:150]}")
     data = r.json()
     sid = uuid.uuid4().hex
     from .payment_processors_router import _public_base_url
     redirect_url = f"rossrentals://pay/methods?helcim_session={sid}"
-    await get_db().helcim_checkout_sessions.insert_one({
+    await db.helcim_checkout_sessions.insert_one({
         "_id": sid, "checkout_token": data["checkoutToken"],
         "secret_token": data["secretToken"], "amount_cents": 0,
         "purpose": "verify", "method_type": method_type,
