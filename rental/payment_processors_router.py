@@ -19,7 +19,7 @@ from fastapi import APIRouter, HTTPException, Request
 from pymongo.errors import DuplicateKeyError
 
 from . import payment_processors_core as core
-from .hosted_rent_charge import resolve_hosted_rent_charge
+from .rent_charge_policy import invoice_balance, resolve_period_rent_charge
 from .webhook_settlement_policy import (
     bofa_webhook_can_settle,
     clover_webhook_can_settle,
@@ -60,6 +60,35 @@ def _hosted_checkout_claim_id(contract_id, year: int, month: int) -> ObjectId:
     return ObjectId(hashlib.sha256(raw).hexdigest()[:24])
 
 
+def _hosted_checkout_batch_claim_id(contract_id, periods: list[str]) -> ObjectId:
+    if len(periods) == 1:
+        year, month = map(int, periods[0].split("-"))
+        return _hosted_checkout_claim_id(contract_id, year, month)
+    raw = f"hosted-rent:{contract_id}:{','.join(periods)}".encode()
+    return ObjectId(hashlib.sha256(raw).hexdigest()[:24])
+
+
+def _requested_periods(data: dict, now: datetime) -> list[str]:
+    raw = data.get("periods")
+    if raw is None:
+        raw = [now.strftime("%Y-%m")]
+    if not isinstance(raw, list) or not 1 <= len(raw) <= 12:
+        raise HTTPException(status_code=400, detail="Selecciona entre 1 y 12 meses")
+    periods = []
+    for value in raw:
+        value = str(value or "")
+        try:
+            parsed = datetime.strptime(value, "%Y-%m").replace(tzinfo=timezone.utc)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="Período de renta inválido") from exc
+        if parsed < now.replace(day=1, hour=0, minute=0, second=0, microsecond=0):
+            raise HTTPException(status_code=400, detail="No se puede seleccionar un mes anterior")
+        periods.append(parsed.strftime("%Y-%m"))
+    if len(set(periods)) != len(periods):
+        raise HTTPException(status_code=400, detail="No puedes seleccionar el mismo mes dos veces")
+    return sorted(periods)
+
+
 def _existing_checkout_response(payment: dict) -> dict:
     """Return a reusable checkout only when its provider URL is already known."""
     if payment.get("status") == "pending_checkout" and payment.get("checkout_url"):
@@ -96,6 +125,53 @@ async def tenant_payment_capabilities(request: Request):
     await core.auth_tenant_flex(request)
     square = await _square_cash_app_config()
     return {"success": True, "cash_app_pay": bool(square["available"])}
+
+
+@router.get("/tenant/rent-payable-periods")
+async def tenant_rent_payable_periods(request: Request):
+    """Return twelve explicit lease months; paid/in-flight months are not payable."""
+    tenant = await core.auth_tenant_flex(request)
+    db = core.get_db()
+    contract = await db.rental_contracts.find_one({
+        "tenant_id": tenant["_id"], "status": "active",
+    })
+    if not contract:
+        raise HTTPException(status_code=404, detail="No se encontró contrato activo")
+    from .rent_payment_cron import ensure_period_payment, _parse_contract_date
+    now = datetime.now(timezone.utc)
+    cursor = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    end_dt = await _parse_contract_date(contract.get("end_date"))
+    result = []
+    for _ in range(12):
+        if end_dt and cursor > end_dt:
+            break
+        _, invoice = await ensure_period_payment(
+            db, contract, cursor,
+            apply_late_fee=(cursor.year, cursor.month) == (now.year, now.month),
+        )
+        if invoice:
+            balance = invoice_balance(invoice)
+            attempt = invoice.get("charge_attempt") or {}
+            in_flight = attempt.get("status") in {"processing", "unknown"}
+            result.append({
+                "period": cursor.strftime("%Y-%m"),
+                "month": cursor.strftime("%B"),
+                "year": cursor.year,
+                "invoice_id": str(invoice["_id"]),
+                "amount": balance["amount"],
+                "late_fee": balance["late_fee"],
+                "total_due": balance["total_due"],
+                "outstanding": balance["outstanding"],
+                "status": balance["status"],
+                "paid": balance["status"] in {"paid", "completed"},
+                "in_flight": in_flight,
+                "payable": balance["outstanding"] > 0 and not in_flight,
+            })
+        if cursor.month == 12:
+            cursor = cursor.replace(year=cursor.year + 1, month=1)
+        else:
+            cursor = cursor.replace(month=cursor.month + 1)
+    return {"success": True, "periods": result, "max_months": 12}
 
 
 async def _create_square_cash_app_checkout(*, amount_cents: int, reference: str,
@@ -170,7 +246,7 @@ async def tenant_create_checkout_payment(request: Request):
         name = "square"
     else:
         name, _ = await core.get_active_processor()
-    if name == "stripe" and not hosted:
+    if name == "stripe" and not hosted and data.get("periods") is None:
         return {"success": True, "processor": "stripe"}
 
     db = core.get_db()
@@ -181,67 +257,51 @@ async def tenant_create_checkout_payment(request: Request):
     if not contract:
         raise HTTPException(status_code=404, detail="No se encontró contrato activo")
 
-    now = datetime.utcnow()
-    current_month = now.strftime("%B").lower()
+    now = datetime.now(timezone.utc)
     contract_id = str(contract["_id"])
+    periods = _requested_periods(data, now)
+    claim_id = _hosted_checkout_batch_claim_id(contract_id, periods)
 
-    # Completed money always blocks a new checkout.
-    existing_paid = await db.rental_payments.find_one({
-        "contract_id": contract_id,
-        "period_month": {"$regex": f"^{current_month[:3]}", "$options": "i"},
-        "period_year": now.year,
-        "status": {"$in": ["completed", "paid", "pending_verification"]},
-    })
-    if existing_paid:
-        raise HTTPException(status_code=400, detail="Ya existe un pago registrado para este mes")
-
-    # Legacy pending checkouts created before deterministic claims must also
-    # block a new provider session. Reuse only if the stored URL is available.
-    legacy_open = await db.rental_payments.find_one({
-        "contract_id": contract_id,
-        "period_month": {"$regex": f"^{current_month[:3]}", "$options": "i"},
-        "period_year": now.year,
-        "status": {"$in": ["pending_checkout", "creating_checkout", "checkout_creation_unknown"]},
-    })
-    claim_id = _hosted_checkout_claim_id(contract_id, now.year, now.month)
-    if legacy_open and legacy_open.get("_id") != claim_id:
-        return _existing_checkout_response(legacy_open)
-
-    # Financial values are resolved from the canonical monthly rent invoice.
-    # The tenant body may choose the payment method, but it cannot choose rent,
-    # late fees or the amount sent to the processor.
+    # Every amount and allocation comes from a canonical server-side invoice.
     try:
-        charge = await resolve_hosted_rent_charge(
-            db, contract, now.replace(tzinfo=timezone.utc)
-        )
+        charges = [
+            await resolve_period_rent_charge(
+                db, contract,
+                datetime.strptime(period, "%Y-%m").replace(tzinfo=timezone.utc),
+            )
+            for period in periods
+        ]
     except (ValueError, RuntimeError) as exc:
         raise HTTPException(
             status_code=409,
-            detail="La renta actual no está disponible para cobro",
+            detail="Uno de los meses seleccionados no está disponible para cobro",
         ) from exc
-
-    amount = charge["amount"]
-    late_fee = charge["late_fee"]
-    total = charge["outstanding"]
+    if any(charge["outstanding"] <= 0 for charge in charges):
+        raise HTTPException(status_code=409,
+                            detail="Uno de los meses ya está pagado o no tiene saldo")
+    amount = round(sum(charge["amount"] for charge in charges), 2)
+    late_fee = round(sum(charge["late_fee"] for charge in charges), 2)
+    total = round(sum(charge["outstanding"] for charge in charges), 2)
 
     claim_doc = {
         "_id": claim_id,
+        "record_type": "checkout_attempt",
         "contract_id": contract_id,
         "property_id": str(contract.get("property_id", "")),
         "tenant_id": str(tenant["_id"]),
         "tenant_name": tenant.get("name", ""),
-        "invoice_id": charge["invoice_id"],
-        "invoice_total_due": charge["total_due"],
-        "invoice_total_paid": charge["total_paid"],
+        "invoice_id": charges[0]["invoice_id"] if len(charges) == 1 else "",
+        "periods": periods,
+        "invoice_allocations": [],
         "amount": amount,
         "late_fee": late_fee,
         "total_paid": total,
         "payment_method": "cash_app_pay" if cash_app_pay else name,
         "checkout_processor": name,
-        "period_month": current_month,
-        "period_month_num": now.month,
-        "period_year": now.year,
-        "period": f"{now.year}-{now.month:02d}",
+        "period_month": datetime.strptime(periods[0], "%Y-%m").strftime("%B").lower(),
+        "period_month_num": int(periods[0][5:7]),
+        "period_year": int(periods[0][:4]),
+        "period": periods[0] if len(periods) == 1 else "",
         "status": "creating_checkout",
         "submitted_by": f"tenant_{name}",
         "submitted_at": now,
@@ -258,15 +318,47 @@ async def tenant_create_checkout_payment(request: Request):
         raise HTTPException(status_code=409, detail="Checkout ya iniciado")
 
     from .rent_charge_claim import claim_rent_charge
-    if not await claim_rent_charge(
-        db, charge["invoice_id"],
-        source="cash_app_pay_checkout" if cash_app_pay else f"{name}_checkout",
-        amount=total,
-        contract_id=contract_id, checkout_id=claim_id
-    ):
-        raise HTTPException(409, "Ya existe un intento de pago o el saldo cambió; requiere revisión")
+    allocations = []
+    for charge in charges:
+        attempt = await claim_rent_charge(
+            db, charge["invoice_id"],
+            source="cash_app_pay_checkout" if cash_app_pay else f"{name}_checkout",
+            amount=charge["outstanding"], contract_id=contract_id,
+            checkout_id=claim_id,
+        )
+        if not attempt:
+            # Provider creation has not started, so claims acquired by this batch
+            # can be safely released before returning the conflict.
+            for acquired in allocations:
+                acquired_id = acquired["invoice_id"]
+                acquired_ids = [acquired_id]
+                if ObjectId.is_valid(acquired_id):
+                    acquired_ids.append(ObjectId(acquired_id))
+                await db.rental_payments.update_one(
+                    {"_id": {"$in": acquired_ids},
+                     "charge_attempt.id": acquired["attempt_id"]},
+                    {"$unset": {"charge_attempt": ""}},
+                )
+            await db.rental_payments.update_one(
+                {"_id": claim_id}, {"$set": {
+                    "status": "checkout_claim_blocked",
+                    "updated_at": datetime.now(timezone.utc),
+                }},
+            )
+            raise HTTPException(
+                409, "Ya existe un intento de pago o el saldo cambió; requiere revisión"
+            )
+        allocations.append({
+            "invoice_id": charge["invoice_id"], "period": charge["period"],
+            "amount": charge["outstanding"], "attempt_id": attempt["id"],
+        })
+    await db.rental_payments.update_one(
+        {"_id": claim_id, "status": "creating_checkout"},
+        {"$set": {"invoice_allocations": allocations}},
+    )
 
-    reference = f"Renta {current_month.title()} {now.year} - {tenant.get('name', '')}"
+    period_label = ", ".join(periods)
+    reference = f"Renta {period_label} - {tenant.get('name', '')}"
     try:
         if cash_app_pay:
             checkout = await _create_square_cash_app_checkout(
@@ -295,7 +387,8 @@ async def tenant_create_checkout_payment(request: Request):
                 customer_email=tenant.get("email") or None,
                 success_url="https://www.rosshouserentals.com/pago-exitoso",
                 cancel_url="https://www.rosshouserentals.com/tenant/dashboard",
-                metadata={"tenant_id": str(tenant["_id"]), "contract_id": contract_id},
+                metadata={"tenant_id": str(tenant["_id"]), "contract_id": contract_id,
+                          "periods": ",".join(periods)},
                 idempotency_key=f"hosted-rent:{claim_id}",
             )
             checkout = {
@@ -327,7 +420,7 @@ async def tenant_create_checkout_payment(request: Request):
                 "checkout_order_id": checkout.get("order_id", ""),
                 "checkout_url": checkout_url,
                 "reference_number": checkout.get("external_id", ""),
-                "updated_at": datetime.utcnow(),
+                "updated_at": datetime.now(timezone.utc),
             }},
         )
         return {
@@ -336,17 +429,29 @@ async def tenant_create_checkout_payment(request: Request):
             "url": checkout_url,
             "payment_id": str(claim_id),
             "amount": total,
+            "periods": periods,
             "reused": False,
         }
     except Exception as exc:
         # Never delete/release the claim after provider creation begins. A local
         # timeout/exception cannot prove that the remote checkout was not created.
+        for allocation in allocations:
+            invoice_id = allocation["invoice_id"]
+            invoice_ids = [invoice_id]
+            if ObjectId.is_valid(invoice_id):
+                invoice_ids.append(ObjectId(invoice_id))
+            await db.rental_payments.update_one(
+                {"_id": {"$in": invoice_ids},
+                 "charge_attempt.id": allocation["attempt_id"]},
+                {"$set": {"charge_attempt.status": "unknown",
+                          "charge_attempt.updated_at": datetime.now(timezone.utc)}},
+            )
         await db.rental_payments.update_one(
             {"_id": claim_id, "status": "creating_checkout"},
             {"$set": {
                 "status": "checkout_creation_unknown",
                 "checkout_creation_error": str(exc)[:500],
-                "updated_at": datetime.utcnow(),
+                "updated_at": datetime.now(timezone.utc),
             }},
         )
         raise
