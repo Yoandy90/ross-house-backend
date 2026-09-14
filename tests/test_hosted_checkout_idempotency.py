@@ -56,3 +56,20 @@ def test_stripe_hosted_checkout_has_provider_idempotency_key():
     )[0]
     stripe_block = route.split("stripe_lib.checkout.Session.create(", 1)[1].split("\n            )", 1)[0]
     assert 'idempotency_key=f"hosted-rent:{claim_id}"' in stripe_block
+
+
+def test_cash_app_pay_uses_square_checkout_with_explicit_wallet_flag():
+    source = Path("rental/payment_processors_router.py").read_text(encoding="utf-8")
+    assert '"cash_app_pay": True' in source
+    assert 'idempotency_key=f"cash-app-rent:{claim_id}"' in source
+    assert '"payment_method": "cash_app_pay" if cash_app_pay else name' in source
+    assert 'source="cash_app_pay_checkout" if cash_app_pay' in source
+
+
+def test_cash_app_capability_never_exposes_credentials():
+    source = Path("rental/payment_processors_router.py").read_text(encoding="utf-8")
+    capability = source.split(
+        'async def tenant_payment_capabilities', 1
+    )[1].split('async def _create_square_cash_app_checkout', 1)[0]
+    assert '"access_token"' not in capability
+    assert 'cash_app_pay' in capability

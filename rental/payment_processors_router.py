@@ -80,6 +80,74 @@ def _existing_checkout_response(payment: dict) -> dict:
     )
 
 
+async def _square_cash_app_config() -> dict:
+    """Return Square credentials for Cash App Pay without changing the active processor."""
+    doc = await core._get_doc()
+    square = doc.get("processors", {}).get("square", {})
+    creds = dict(core._active_creds(square))
+    creds["environment"] = square.get("environment", "sandbox")
+    creds["available"] = bool(creds.get("access_token") and creds.get("location_id"))
+    return creds
+
+
+@router.get("/tenant/payment-capabilities")
+async def tenant_payment_capabilities(request: Request):
+    """Expose only safe availability flags; provider credentials never leave the server."""
+    await core.auth_tenant_flex(request)
+    square = await _square_cash_app_config()
+    return {"success": True, "cash_app_pay": bool(square["available"])}
+
+
+async def _create_square_cash_app_checkout(*, amount_cents: int, reference: str,
+                                           redirect_url: str, idempotency_key: str) -> dict:
+    """Create a Square-hosted checkout with the official Cash App Pay option."""
+    cfg = await _square_cash_app_config()
+    if not cfg["available"]:
+        raise HTTPException(status_code=409,
+                            detail="Cash App Pay no está configurado")
+    base = core.SQUARE_BASE.get(cfg["environment"], core.SQUARE_BASE["sandbox"])
+    checkout_options = {
+        "accepted_payment_methods": {
+            "apple_pay": False,
+            "google_pay": False,
+            "cash_app_pay": True,
+            "afterpay_clearpay": False,
+        },
+    }
+    if redirect_url:
+        checkout_options["redirect_url"] = redirect_url
+    body = {
+        "idempotency_key": idempotency_key,
+        "quick_pay": {
+            "name": reference[:255] or "Pago de renta",
+            "price_money": {"amount": amount_cents, "currency": "USD"},
+            "location_id": cfg["location_id"],
+        },
+        "checkout_options": checkout_options,
+        "payment_note": reference[:500],
+    }
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        response = await client.post(
+            f"{base}/online-checkout/payment-links",
+            headers={
+                "Authorization": f"Bearer {cfg['access_token']}",
+                "Square-Version": core.SQUARE_VERSION,
+                "Content-Type": "application/json",
+            },
+            json=body,
+        )
+    if response.status_code >= 400:
+        raise HTTPException(status_code=502,
+                            detail=f"Cash App Pay no disponible (Square HTTP {response.status_code})")
+    link = response.json().get("payment_link", {})
+    url = link.get("url") or link.get("long_url", "")
+    if not url:
+        raise HTTPException(status_code=502,
+                            detail="Square no devolvió el enlace de Cash App Pay")
+    return {"processor": "square", "url": url, "external_id": link.get("id", ""),
+            "order_id": link.get("order_id", "")}
+
+
 @router.post("/tenant/create-checkout-payment")
 async def tenant_create_checkout_payment(request: Request):
     """Create at most one hosted checkout for a contract/month.
@@ -92,8 +160,16 @@ async def tenant_create_checkout_payment(request: Request):
     tenant = await core.auth_tenant_flex(request)
     data = await request.json()
     hosted = bool(data.get("hosted"))
+    requested_method = str(data.get("payment_method") or "").strip().lower()
+    cash_app_pay = requested_method == "cashapp"
 
-    name, _ = await core.get_active_processor()
+    if cash_app_pay:
+        square = await _square_cash_app_config()
+        if not square["available"]:
+            raise HTTPException(status_code=409, detail="Cash App Pay no está configurado")
+        name = "square"
+    else:
+        name, _ = await core.get_active_processor()
     if name == "stripe" and not hosted:
         return {"success": True, "processor": "stripe"}
 
@@ -160,7 +236,7 @@ async def tenant_create_checkout_payment(request: Request):
         "amount": amount,
         "late_fee": late_fee,
         "total_paid": total,
-        "payment_method": name,
+        "payment_method": "cash_app_pay" if cash_app_pay else name,
         "checkout_processor": name,
         "period_month": current_month,
         "period_month_num": now.month,
@@ -183,14 +259,23 @@ async def tenant_create_checkout_payment(request: Request):
 
     from .rent_charge_claim import claim_rent_charge
     if not await claim_rent_charge(
-        db, charge["invoice_id"], source=f"{name}_checkout", amount=total,
+        db, charge["invoice_id"],
+        source="cash_app_pay_checkout" if cash_app_pay else f"{name}_checkout",
+        amount=total,
         contract_id=contract_id, checkout_id=claim_id
     ):
         raise HTTPException(409, "Ya existe un intento de pago o el saldo cambió; requiere revisión")
 
     reference = f"Renta {current_month.title()} {now.year} - {tenant.get('name', '')}"
     try:
-        if name == "stripe":
+        if cash_app_pay:
+            checkout = await _create_square_cash_app_checkout(
+                amount_cents=int(round(total * 100)),
+                reference=reference,
+                redirect_url="https://www.rosshouserentals.com/pago-exitoso",
+                idempotency_key=f"cash-app-rent:{claim_id}",
+            )
+        elif name == "stripe":
             company = await db.rental_config.find_one({"type": "company"}) or {}
             sk = company.get("stripe_secret_key", "")
             if not sk:
@@ -236,7 +321,7 @@ async def tenant_create_checkout_payment(request: Request):
             {"_id": claim_id, "status": "creating_checkout"},
             {"$set": {
                 "status": "pending_checkout",
-                "payment_method": name,
+                "payment_method": "cash_app_pay" if cash_app_pay else name,
                 "checkout_processor": name,
                 "checkout_external_id": checkout.get("external_id", ""),
                 "checkout_order_id": checkout.get("order_id", ""),
@@ -247,7 +332,7 @@ async def tenant_create_checkout_payment(request: Request):
         )
         return {
             "success": True,
-            "processor": name,
+            "processor": "cash_app_pay" if cash_app_pay else name,
             "url": checkout_url,
             "payment_id": str(claim_id),
             "amount": total,

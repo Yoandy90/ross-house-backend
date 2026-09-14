@@ -73,6 +73,14 @@ def seed():
         await DB.rental_contracts.insert_one({
             "_id": CONTRACT_ID, "tenant_id": str(TENANT_ID), "status": "active",
             "property_id": "prop1", "property_address": "121 Oak Ave", "rent_amount": 1100})
+        now = datetime.now(timezone.utc)
+        await DB.rental_payments.insert_one({
+            "_id": ObjectId(), "contract_id": str(CONTRACT_ID),
+            "tenant_id": str(TENANT_ID), "amount": 1100, "late_fee": 0,
+            "total_due": 1100, "total_paid": 0, "status": "pending",
+            "period": now.strftime("%Y-%m"), "period_month": now.strftime("%B"),
+            "period_month_num": now.month, "period_year": now.year,
+        })
     asyncio.run(_s())
     yield
 
@@ -107,7 +115,7 @@ async def test_4_requires_active_lease():
 async def test_5_no_completed_payment_on_submit():
     async with client() as c:
         await submit(c)
-    assert await DB.rental_payments.count_documents({}) == 0
+    assert await DB.rental_payments.count_documents({"status": "completed"}) == 0
 
 
 @pytest.mark.asyncio
@@ -119,6 +127,33 @@ async def test_6_tenant_id_derived_from_session_not_body():
         assert r.status_code == 200
     d = await DB.manual_payment_confirmations.find_one({})
     assert d["tenant_id"] == str(TENANT_ID)
+
+
+@pytest.mark.asyncio
+async def test_6b_client_cannot_spoof_amount_or_period():
+    async with client() as c:
+        r = await c.post("/api/tenant/manual-payment/confirm", json={
+            "method": "cashapp", "amount": 1,
+            "period_month": 1, "period_year": 1999, "reference": "SPOOF"})
+        assert r.status_code == 200
+    d = await DB.manual_payment_confirmations.find_one({"reference": "SPOOF"})
+    now = datetime.now(timezone.utc)
+    assert d["amount"] == 1100
+    assert d["period_month"] == now.month and d["period_year"] == now.year
+    assert d["invoice_id"]
+
+
+@pytest.mark.asyncio
+async def test_6c_changed_balance_blocks_approval():
+    async with client() as c:
+        cid = (await submit(c, reference="BALANCE")).json()["id"]
+        await DB.rental_payments.update_one(
+            {"contract_id": str(CONTRACT_ID), "status": "pending"},
+            {"$set": {"total_paid": 100}})
+        r = await c.post(f"/api/admin/manual-payment/confirmations/{cid}/approve",
+                         json={}, headers={"x-test-admin": "1"})
+        assert r.status_code == 409
+    assert await DB.rental_payments.count_documents({"status": "completed"}) == 0
 
 
 @pytest.mark.asyncio
@@ -167,7 +202,7 @@ async def test_12_reject_creates_no_payment_and_reason_visible():
         assert r.status_code == 200
         mine = (await c.get("/api/tenant/manual-payment/confirmations")).json()["confirmations"]
         assert mine[0]["status"] == "rejected" and mine[0]["reject_reason"] == "Monto incorrecto"
-    assert await DB.rental_payments.count_documents({}) == 0
+    assert await DB.rental_payments.count_documents({"status": "completed"}) == 0
 
 
 @pytest.mark.asyncio
@@ -190,11 +225,11 @@ async def test_14_invalid_file_rejected():
 
 @pytest.mark.asyncio
 async def test_15_already_paid_month_cannot_approve():
-    await DB.rental_payments.insert_one({
-        "contract_id": str(CONTRACT_ID), "period_month": 6, "period_year": 2026,
-        "status": "completed", "created_at": datetime.now(timezone.utc)})
     async with client() as c:
         cid = (await submit(c)).json()["id"]
+        await DB.rental_payments.update_one(
+            {"contract_id": str(CONTRACT_ID), "status": "pending"},
+            {"$set": {"status": "completed", "total_paid": 1100}})
         r = await c.post(f"/api/admin/manual-payment/confirmations/{cid}/approve",
                          json={}, headers={"x-test-admin": "1"})
         assert r.status_code == 409
