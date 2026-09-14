@@ -157,6 +157,31 @@ async def test_6c_changed_balance_blocks_approval():
 
 
 @pytest.mark.asyncio
+async def test_6d_future_month_uses_server_invoice_and_can_be_approved():
+    now = datetime.now(timezone.utc)
+    if now.month == 12:
+        year, month = now.year + 1, 1
+    else:
+        year, month = now.year, now.month + 1
+    period = f"{year:04d}-{month:02d}"
+    async with client() as c:
+        sent = await submit(c, reference="FUTURE", period=period, amount=1)
+        assert sent.status_code == 200
+        cid = sent.json()["id"]
+        confirmation = await DB.manual_payment_confirmations.find_one({"_id": ObjectId(cid)})
+        assert confirmation["period_month"] == month
+        assert confirmation["period_year"] == year
+        assert confirmation["amount"] == 1100
+        approved = await c.post(
+            f"/api/admin/manual-payment/confirmations/{cid}/approve",
+            json={}, headers={"x-test-admin": "1"},
+        )
+        assert approved.status_code == 200
+    invoice = await DB.rental_payments.find_one({"period": period, "record_type": "invoice"})
+    assert invoice["status"] == "completed"
+
+
+@pytest.mark.asyncio
 async def test_7_tenant_cannot_read_others():
     async with client() as c:
         await submit(c)
