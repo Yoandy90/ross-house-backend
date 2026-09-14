@@ -33,6 +33,7 @@ import uuid
 from datetime import datetime, timezone, timedelta
 
 import httpx
+from bson import ObjectId
 from fastapi import APIRouter, HTTPException, Request
 
 from .shared import get_db, auth_admin, auth_tenant_flex
@@ -793,9 +794,54 @@ def _square_webhook_can_complete(payment: dict, verified: bool) -> bool:
 
 async def _mark_checkout_completed(payment: dict) -> dict:
     """Marca un rental_payment de checkout como completado y genera recibo."""
+    if payment.get("status") == "completed" and payment.get("receipt_number"):
+        return {"receipt_number": payment["receipt_number"]}
     now = datetime.now(timezone.utc)
     prefix = _receipt_prefix(payment.get("checkout_processor", ""))
     receipt_number = f"{prefix}-{now.strftime('%Y%m%d')}-{str(payment.get('tenant_id', ''))[-4:]}"
+    allocations = payment.get("invoice_allocations") or []
+    if allocations:
+        db = get_db()
+        for allocation in allocations:
+            invoice_id = str(allocation.get("invoice_id") or "")
+            ids = [invoice_id]
+            if ObjectId.is_valid(invoice_id):
+                ids.append(ObjectId(invoice_id))
+            invoice = await db.rental_payments.find_one({"_id": {"$in": ids}})
+            if not invoice:
+                await db.rental_payments.update_one(
+                    {"_id": payment["_id"]}, {"$set": {
+                        "status": "settlement_review_required", "updated_at": now,
+                    }},
+                )
+                raise RuntimeError("No se encontró una factura asignada al cobro")
+            if invoice.get("status") in ("paid", "completed"):
+                continue
+            attempt = invoice.get("charge_attempt") or {}
+            if (attempt.get("id") != allocation.get("attempt_id") or
+                    invoice.get("status") not in ("pending", "late", "partial")):
+                await db.rental_payments.update_one(
+                    {"_id": payment["_id"]}, {"$set": {
+                        "status": "settlement_review_required", "updated_at": now,
+                    }},
+                )
+                raise RuntimeError("La asignación de renta cambió; requiere conciliación")
+            period_receipt = f"{receipt_number}-{str(allocation.get('period') or '').replace('-', '')}"
+            result = await db.rental_payments.update_one(
+                {"_id": invoice["_id"], "status": {"$in": ["pending", "late", "partial"]},
+                 "charge_attempt.id": allocation.get("attempt_id")},
+                {"$set": {
+                    "status": "completed", "paid": True,
+                    "total_paid": float(invoice.get("total_due") or allocation.get("amount") or 0),
+                    "payment_method": payment.get("payment_method", ""),
+                    "checkout_payment_id": str(payment["_id"]),
+                    "receipt_number": period_receipt, "payment_date": now.isoformat(),
+                    "charge_attempt.status": "settled", "charge_attempt.settled_at": now,
+                    "updated_at": now,
+                }},
+            )
+            if result.modified_count != 1:
+                raise RuntimeError("No se pudo liquidar una factura asignada")
     await get_db().rental_payments.update_one(
         {"_id": payment["_id"], "status": {"$ne": "completed"}},
         {"$set": {
