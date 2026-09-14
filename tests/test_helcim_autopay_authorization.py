@@ -1,5 +1,6 @@
 """Durable, idempotent Helcim autopay authorization contract."""
 import asyncio
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -18,6 +19,7 @@ class _Collection:
         self.result = result or SimpleNamespace(modified_count=1, upserted_id=None)
         self.find_queries = []
         self.update = None
+        self.updates = []
 
     async def find_one(self, query):
         self.find_queries.append(query)
@@ -25,6 +27,7 @@ class _Collection:
 
     async def update_one(self, query, update, upsert=False):
         self.update = (query, update, upsert)
+        self.updates.append(self.update)
         return self.result
 
 
@@ -32,6 +35,7 @@ class _DB:
     def __init__(self, method=None, existing=None, result=None):
         self.helcim_saved_methods = _Collection(method)
         self.autopay_config = _Collection(existing, result)
+        self.autopay_notification_deliveries = _Collection()
 
 
 class _Request:
@@ -50,9 +54,13 @@ def _run(coro):
 
 def _install(monkeypatch, db):
     async def auth(_request):
-        return {"_id": "tenant-123"}
+        return {"_id": "tenant-123", "name": "Tenant One",
+                "email": "tenant@example.com", "locale": "es"}
+    async def send_email(_db, **_kwargs):
+        return True
     monkeypatch.setattr(vault, "auth_tenant_flex", auth)
     monkeypatch.setattr(vault, "get_db", lambda: db)
+    monkeypatch.setattr(vault, "send_autopay_changed_email", send_email)
 
 
 def _payload(**changes):
@@ -73,7 +81,8 @@ def test_authorization_is_atomic_append_only_and_contains_no_payment_token(monke
     response = _run(vault.authorize_autopay(_Request(_payload())))
 
     assert response == {"success": True, "enabled": True,
-                        "authorization_id": REQUEST_ID, "duplicate": False}
+                        "authorization_id": REQUEST_ID, "duplicate": False,
+                        "email_confirmation_sent": True}
     query, update, upsert = db.autopay_config.update
     assert upsert is True
     assert query == {"_id": "helcim:tenant-123",
@@ -114,21 +123,87 @@ def test_duplicate_request_returns_original_state_without_second_append(monkeypa
     assert response["enabled"] is True
     assert response["authorization_id"] == REQUEST_ID
     assert db.autopay_config.update is None
+    assert db.autopay_notification_deliveries.update is None
 
 
 def test_revocation_records_event_and_removes_charge_credentials(monkeypatch):
-    db = _DB()
+    db = _DB(existing={"_id": "helcim:tenant-123", "enabled": True,
+                       "helcim_method_id": METHOD_ID, "day_of_month": 5})
     _install(monkeypatch, db)
 
     response = _run(vault.authorize_autopay(_Request(_payload(
         enabled=False, accepted=False, method_id=""))))
 
     assert response["enabled"] is False
+    assert response["email_confirmation_sent"] is True
     _, update, _ = db.autopay_config.update
     assert update["$push"]["authorization_history"]["action"] == "revoked"
     assert set(update["$unset"]) == {
         "helcim_method_id", "helcim_card_token", "helcim_customer_code",
         "helcim_method_type", "helcim_customer_id", "helcim_bank_account_id"}
+
+
+def test_enabled_schedule_change_sends_one_update_email(monkeypatch):
+    existing = {"_id": "helcim:tenant-123", "enabled": True,
+                "helcim_method_id": METHOD_ID, "day_of_month": 3}
+    db = _DB(method={"_id": ObjectId(METHOD_ID), "tenant_id": "tenant-123",
+                    "brand": "Mastercard", "last4": "9931", "type": "card"},
+             existing=existing)
+    calls = []
+    _install(monkeypatch, db)
+
+    async def send_email(_db, **kwargs):
+        calls.append(kwargs)
+        return True
+    monkeypatch.setattr(vault, "send_autopay_changed_email", send_email)
+
+    response = _run(vault.authorize_autopay(_Request(_payload(day_of_month=5))))
+
+    assert response["email_confirmation_sent"] is True
+    assert len(calls) == 1
+    assert calls[0]["change_type"] == "updated"
+    assert calls[0]["method_brand"] == "Mastercard"
+    assert calls[0]["method_last4"] == "9931"
+    audit = db.autopay_notification_deliveries.update[1]["$setOnInsert"]
+    assert audit["status"] == "sent"
+    assert audit["authorization_request_id"] == REQUEST_ID
+    assert "method" not in audit
+
+
+def test_email_failure_does_not_rollback_authorization(monkeypatch):
+    db = _DB(method={"_id": ObjectId(METHOD_ID), "tenant_id": "tenant-123",
+                    "brand": "Visa", "last4": "1234", "type": "card"})
+    _install(monkeypatch, db)
+
+    async def fail_email(_db, **_kwargs):
+        return False
+    monkeypatch.setattr(vault, "send_autopay_changed_email", fail_email)
+
+    response = _run(vault.authorize_autopay(_Request(_payload())))
+
+    assert response["success"] is True
+    assert response["enabled"] is True
+    assert response["email_confirmation_sent"] is False
+    audit = db.autopay_notification_deliveries.update[1]["$setOnInsert"]
+    assert audit["status"] == "failed"
+    assert "sent_at" not in audit
+
+
+def test_masked_localized_email_contains_no_sensitive_payment_data():
+    from rental.security_email import build_autopay_changed_message
+
+    content = build_autopay_changed_message(
+        name="Tenant <One>", change_type="activated", method_brand="Mastercard",
+        method_last4="9931", day_of_month=5,
+        changed_at=datetime(2026, 9, 14, 1, 0, tzinfo=timezone.utc), locale="es")
+
+    combined = " ".join(content.values())
+    assert "Pagos automáticos activados" in combined
+    assert "día 5 de cada mes" in combined
+    assert "Mastercard ••••9931" in combined
+    assert "Tenant &lt;One&gt;" in content["html"]
+    assert "507f1f77" not in combined
+    assert "token" not in combined.lower()
 
 
 @pytest.mark.parametrize("enabled,status", [
