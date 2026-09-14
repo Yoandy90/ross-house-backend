@@ -25,9 +25,9 @@ from .shared import (
 router = APIRouter()
 logger = logging.getLogger("manual_confirmations")
 
-METHODS = {"cashapp", "money_order", "bank_transfer"}
-METHOD_LABEL = {"cashapp": "Cash App", "money_order": "Money Order",
-                "bank_transfer": "Bank Transfer"}
+METHODS = {"cashapp", "cash", "money_order", "bank_transfer"}
+METHOD_LABEL = {"cashapp": "Cash App", "cash": "Efectivo",
+                "money_order": "Money Order", "bank_transfer": "Bank Transfer"}
 MAX_RECEIPT_B64 = 8_000_000  # ~6 MB imagen (igual que Zelle)
 LIVE_STATUSES = ["submitted", "under_review", "approved"]
 
@@ -90,23 +90,31 @@ async def tenant_submit_confirmation(request: Request):
         raise HTTPException(status_code=404, detail="No se encontró contrato activo")
 
     now = datetime.now(timezone.utc)
-    period_month = int(data.get("period_month") or now.month)
-    period_year = int(data.get("period_year") or now.year)
+    db = get_db()
+    from .rent_charge_policy import resolve_current_rent_charge
     try:
-        amount = round(float(data.get("amount") or 0), 2)
-    except (TypeError, ValueError):
-        amount = 0
+        charge = await resolve_current_rent_charge(db, contract, now)
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=409,
+                            detail="La renta actual no está disponible para confirmación") from exc
+
+    # El cliente nunca decide el período ni el importe financiero. Ambos salen
+    # de la factura canónica vigente creada por el servidor.
+    period_month = now.month
+    period_year = now.year
+    amount = charge["outstanding"]
     if amount <= 0:
-        raise HTTPException(status_code=400, detail="Monto inválido")
+        raise HTTPException(status_code=409, detail="No existe saldo pendiente este mes")
 
     reference = str(data.get("reference") or "").strip()[:80]
+    if method == "money_order" and not reference:
+        raise HTTPException(status_code=400, detail="Número de money order requerido")
     receipt = (data.get("receipt_base64") or "").split(",")[-1].strip()
     if receipt and len(receipt) > MAX_RECEIPT_B64:
         raise HTTPException(status_code=400, detail="Imagen demasiado grande")
     if receipt and not all(c.isalnum() or c in "+/=\n\r" for c in receipt[:200]):
         raise HTTPException(status_code=400, detail="Comprobante inválido")
 
-    db = get_db()
     # Dedupe: mismo tenant+contrato+mes+método con estado vivo (o misma referencia)
     dup_q = {
         "tenant_id": str(tenant["_id"]), "contract_id": str(contract["_id"]),
@@ -126,6 +134,9 @@ async def tenant_submit_confirmation(request: Request):
         "property_id": str(contract.get("property_id", "")),
         "property_address": contract.get("property_address", ""),
         "method": method, "amount": amount,
+        "invoice_id": charge["invoice_id"],
+        "invoice_total_due": charge["total_due"],
+        "invoice_total_paid": charge["total_paid"],
         "period_month": period_month, "period_year": period_year,
         "reference": reference,
         "issuer": str(data.get("issuer") or "").strip()[:80],       # money order
@@ -199,38 +210,46 @@ async def admin_approve(cid: str, request: Request):
     if not contract or contract.get("status") not in ("active", "activo"):
         raise HTTPException(status_code=400, detail="El contrato ya no está activo")
 
-    # Anti double-payment: el mes no puede estar ya pagado
-    already_paid = await db.rental_payments.find_one({
-        "contract_id": s["contract_id"], "period_month": s["period_month"],
-        "period_year": s["period_year"], "status": "completed"})
-    if already_paid:
-        raise HTTPException(status_code=409, detail="Ese mes ya está pagado")
+    # Revalidar la misma factura y el mismo saldo antes de aprobar.
+    from .rent_charge_policy import resolve_current_rent_charge
+    try:
+        charge = await resolve_current_rent_charge(db, contract, datetime.now(timezone.utc))
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=409,
+                            detail="La renta actual requiere revisión") from exc
+    if (charge["invoice_id"] != str(s.get("invoice_id") or "") or
+            round(charge["outstanding"], 2) != round(float(s.get("amount") or 0), 2) or
+            charge["outstanding"] <= 0):
+        raise HTTPException(status_code=409,
+                            detail="El saldo cambió desde la confirmación; requiere revisión")
 
     now = datetime.now(timezone.utc)
-    prefix = {"cashapp": "CSH", "money_order": "MOR", "bank_transfer": "TRF"}[s["method"]]
+    prefix = {"cashapp": "CSH", "cash": "CSH", "money_order": "MOR",
+              "bank_transfer": "TRF"}[s["method"]]
     receipt = f"{prefix}-{now.strftime('%Y%m%d')}-{s['tenant_id'][-4:]}"
-    pending = await db.rental_payments.find_one({
-        "contract_id": s["contract_id"],
-        "period_month": s["period_month"], "period_year": s["period_year"],
-        "status": {"$in": ["pending", "late", "partial"]}})
-    if pending:
-        await db.rental_payments.update_one({"_id": pending["_id"]}, {"$set": {
-            "status": "completed", "payment_method": s["method"],
-            "receipt_number": receipt, "reference_number": s.get("reference", ""),
-            "total_paid": s["amount"], "payment_date": now.isoformat(), "updated_at": now}})
-        payment_id = str(pending["_id"])
-    else:
-        r = await db.rental_payments.insert_one({
-            "contract_id": s["contract_id"], "property_id": s.get("property_id", ""),
-            "tenant_id": s["tenant_id"], "tenant_name": s.get("tenant_name", ""),
-            "amount": s["amount"], "late_fee": 0, "total_paid": s["amount"],
-            "payment_method": s["method"], "reference_number": s.get("reference", ""),
-            "receipt_number": receipt,
-            "period_month": s["period_month"], "period_year": s["period_year"],
-            "status": "completed", "payment_date": now.isoformat(),
-            "submitted_by": "tenant_manual_confirmation", "submitted_at": s["created_at"],
-            "created_at": now, "updated_at": now})
-        payment_id = str(r.inserted_id)
+    try:
+        invoice_oid = ObjectId(charge["invoice_id"])
+    except Exception as exc:
+        raise HTTPException(status_code=409, detail="Factura inválida; requiere revisión") from exc
+
+    result = await db.rental_payments.update_one({
+        "_id": invoice_oid,
+        "status": {"$in": ["pending", "late", "partial"]},
+        "total_paid": charge["total_paid"],
+    }, {"$set": {
+        "status": "completed", "paid": True, "payment_method": s["method"],
+        "receipt_number": receipt, "reference_number": s.get("reference", ""),
+        "total_paid": charge["total_due"], "payment_date": now.isoformat(),
+        "updated_at": now,
+    }})
+    if result.modified_count != 1:
+        fresh = await db.manual_payment_confirmations.find_one({"_id": s["_id"]})
+        if fresh and fresh.get("status") == "approved":
+            return {"success": True, "already": True,
+                    "payment_id": fresh.get("rental_payment_id", "")}
+        raise HTTPException(status_code=409,
+                            detail="La factura cambió durante la aprobación; requiere revisión")
+    payment_id = charge["invoice_id"]
 
     # Idempotencia dura: solo transiciona si sigue sin aprobar (doble click seguro)
     upd = await db.manual_payment_confirmations.update_one(
