@@ -19,7 +19,10 @@ from fastapi import APIRouter, HTTPException, Request
 from pymongo.errors import DuplicateKeyError
 
 from . import payment_processors_core as core
-from .rent_charge_policy import invoice_balance, resolve_period_rent_charge
+from .rent_charge_policy import (
+    preview_period_rent_charge,
+    resolve_period_rent_charge,
+)
 from .webhook_settlement_policy import (
     bofa_webhook_can_settle,
     clover_webhook_can_settle,
@@ -129,7 +132,7 @@ async def tenant_payment_capabilities(request: Request):
 
 @router.get("/tenant/rent-payable-periods")
 async def tenant_rent_payable_periods(request: Request):
-    """Return twelve explicit lease months; paid/in-flight months are not payable."""
+    """Preview twelve lease months without materializing future invoices."""
     tenant = await core.auth_tenant_flex(request)
     db = core.get_db()
     contract = await db.rental_contracts.find_one({
@@ -137,7 +140,7 @@ async def tenant_rent_payable_periods(request: Request):
     })
     if not contract:
         raise HTTPException(status_code=404, detail="No se encontró contrato activo")
-    from .rent_payment_cron import ensure_period_payment, _parse_contract_date
+    from .rent_payment_cron import _parse_contract_date
     now = datetime.now(timezone.utc)
     cursor = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     end_dt = await _parse_contract_date(contract.get("end_date"))
@@ -145,19 +148,20 @@ async def tenant_rent_payable_periods(request: Request):
     for _ in range(12):
         if end_dt and cursor > end_dt:
             break
-        _, invoice = await ensure_period_payment(
-            db, contract, cursor,
-            apply_late_fee=(cursor.year, cursor.month) == (now.year, now.month),
-        )
-        if invoice:
-            balance = invoice_balance(invoice)
+        try:
+            charge = await preview_period_rent_charge(db, contract, cursor)
+        except ValueError:
+            charge = None
+        if charge:
+            invoice = charge.get("invoice") or {}
+            balance = charge
             attempt = invoice.get("charge_attempt") or {}
             in_flight = attempt.get("status") in {"processing", "unknown"}
             result.append({
                 "period": cursor.strftime("%Y-%m"),
                 "month": cursor.strftime("%B"),
                 "year": cursor.year,
-                "invoice_id": str(invoice["_id"]),
+                "invoice_id": charge["invoice_id"],
                 "amount": balance["amount"],
                 "late_fee": balance["late_fee"],
                 "total_due": balance["total_due"],

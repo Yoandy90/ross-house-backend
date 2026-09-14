@@ -13,6 +13,7 @@ from rental.payment_processors_router import (
     _requested_periods,
 )
 from rental.rent_payment_cron import canonical_invoice_id, ensure_period_payment
+from rental.rent_charge_policy import preview_period_rent_charge
 
 
 def _contract():
@@ -51,6 +52,19 @@ def test_concurrent_invoice_generation_creates_one_row():
             "contract_id": str(contract["_id"]), "period": "2026-10",
             "record_type": "invoice",
         }) == 1
+    asyncio.run(scenario())
+
+
+def test_previewing_future_month_does_not_create_an_invoice():
+    async def scenario():
+        db = AsyncMongoMockClient()["read_only_month_preview"]
+        contract = _contract()
+        preview = await preview_period_rent_charge(
+            db, contract, datetime(2026, 10, 1, tzinfo=timezone.utc)
+        )
+        assert preview["period"] == "2026-10"
+        assert preview["outstanding"] == 1200
+        assert await db.rental_payments.count_documents({}) == 0
     asyncio.run(scenario())
 
 
@@ -100,4 +114,3 @@ def test_dashboard_history_excludes_open_invoices_and_checkout_attempts():
     history = source.split("cursor = db.rental_payments.find", 1)[1]
     assert '"record_type": {"$ne": "checkout_attempt"}' in history
     assert '"status": {"$in": ["completed", "paid"]}' in history
-

@@ -2163,7 +2163,7 @@ async def tenant_submit_payment(request: Request):
 
 @router.get('/tenant/payment-history')
 async def tenant_payment_history(request: Request):
-    """Tenant: Get detailed payment history"""
+    """Tenant: settled payments and genuine attempts, never future invoices."""
     tenant = await auth_tenant_flex(request)
     
     # Get all contracts for this tenant
@@ -2176,30 +2176,28 @@ async def tenant_payment_history(request: Request):
     if not contract_ids:
         return {"success": True, "payments": [], "total_paid": 0}
     
+    from .tenant_payment_history import (
+        is_payment_activity,
+        payment_activity_query,
+        serialize_payment_activity,
+    )
+
     cursor = get_db().rental_payments.find(
-        {"contract_id": {"$in": contract_ids}}
-    ).sort("created_at", -1).limit(100)
+        payment_activity_query(contract_ids)
+    ).sort("created_at", -1).limit(300)
     
     payments = []
-    total_paid = 0
     async for p in cursor:
-        amt = p.get("total_paid") or p.get("amount", 0)
-        if p.get("status") in ["completed", "paid"]:
-            total_paid += amt
-        payments.append({
-            "id": str(p["_id"]),
-            "receipt_number": p.get("receipt_number", ""),
-            "amount": p.get("amount", 0),
-            "late_fee": p.get("late_fee", 0),
-            "total_paid": amt,
-            "payment_method": p.get("payment_method", ""),
-            "reference_number": p.get("reference_number", ""),
-            "period_month": p.get("period_month", ""),
-            "period_year": p.get("period_year", 0),
-            "payment_date": p.get("payment_date", ""),
-            "status": p.get("status", ""),
-            "notes": p.get("notes", ""),
-        })
+        if not is_payment_activity(p):
+            continue
+        item = serialize_payment_activity(p)
+        payments.append(item)
+
+    payments.sort(key=lambda item: item.get("payment_date") or "", reverse=True)
+    payments = payments[:100]
+    total_paid = sum(
+        item["total_paid"] for item in payments
+        if item["status"] == "completed"
+    )
     
     return {"success": True, "payments": payments, "total_paid": total_paid}
-
