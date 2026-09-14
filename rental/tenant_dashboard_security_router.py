@@ -118,8 +118,13 @@ async def secure_tenant_dashboard(request: Request):
         current_month_paid = await db.rental_payments.find_one({
             "contract_id": contract_id,
             "tenant_id": tenant_id,
-            "period_month": today.strftime("%B").lower(),
-            "period_year": today.year,
+            "record_type": {"$ne": "checkout_attempt"},
+            "$or": [
+                {"period": today.strftime("%Y-%m")},
+                {"period_year": today.year, "period_month_num": today.month},
+                {"period_year": today.year,
+                 "period_month": {"$regex": f"^{today.strftime('%B')[:3]}", "$options": "i"}},
+            ],
             "status": {"$in": ["completed", "paid"]},
         })
         next_payment = {
@@ -132,8 +137,22 @@ async def secure_tenant_dashboard(request: Request):
     # Historical payment rows remain tenant-scoped.  They are not used as
     # authority for the active lease/property relation.
     payments = []
-    cursor = db.rental_payments.find({"tenant_id": tenant_id}).sort("payment_date", -1).limit(24)
+    cursor = db.rental_payments.find({
+        "tenant_id": tenant_id,
+        "record_type": {"$ne": "checkout_attempt"},
+        "status": {"$in": ["completed", "paid"]},
+    }).sort("payment_date", -1).limit(48)
+    seen_periods = set()
     async for payment in cursor:
+        period_key = payment.get("period") or (
+            f"{int(payment.get('period_year') or 0):04d}-"
+            f"{int(payment.get('period_month_num') or 0):02d}"
+        )
+        if period_key == "0000-00":
+            period_key = str(payment["_id"])
+        if period_key in seen_periods:
+            continue
+        seen_periods.add(period_key)
         payments.append({
             "id": str(payment["_id"]),
             "receipt_number": payment.get("receipt_number", ""),
@@ -146,6 +165,8 @@ async def secure_tenant_dashboard(request: Request):
             "payment_date": str(payment.get("payment_date", "")),
             "status": payment.get("status", ""),
         })
+        if len(payments) >= 24:
+            break
 
     return {
         "success": True,
