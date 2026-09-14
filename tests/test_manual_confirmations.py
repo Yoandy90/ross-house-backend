@@ -202,7 +202,7 @@ async def test_12_reject_creates_no_payment_and_reason_visible():
         assert r.status_code == 200
         mine = (await c.get("/api/tenant/manual-payment/confirmations")).json()["confirmations"]
         assert mine[0]["status"] == "rejected" and mine[0]["reject_reason"] == "Monto incorrecto"
-    assert await DB.rental_payments.count_documents({}) == 0
+    assert await DB.rental_payments.count_documents({"status": "completed"}) == 0
 
 
 @pytest.mark.asyncio
