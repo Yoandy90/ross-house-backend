@@ -232,11 +232,15 @@ async def admin_approve(cid: str, request: Request):
     except Exception as exc:
         raise HTTPException(status_code=409, detail="Factura inválida; requiere revisión") from exc
 
-    result = await db.rental_payments.update_one({
+    invoice_query = {
         "_id": invoice_oid,
         "status": {"$in": ["pending", "late", "partial"]},
-        "total_paid": charge["total_paid"],
-    }, {"$set": {
+    }
+    if "total_paid" in charge["invoice"]:
+        invoice_query["total_paid"] = charge["invoice"]["total_paid"]
+    else:
+        invoice_query["total_paid"] = {"$exists": False}
+    result = await db.rental_payments.update_one(invoice_query, {"$set": {
         "status": "completed", "paid": True, "payment_method": s["method"],
         "receipt_number": receipt, "reference_number": s.get("reference", ""),
         "total_paid": charge["total_due"], "payment_date": now.isoformat(),
