@@ -13,17 +13,23 @@ SETTLED_STATUSES = frozenset({"paid", "completed"})
 NON_CHARGEABLE_STATUSES = frozenset({"cancelled", "canceled"})
 
 
-def current_period_query(contract_id: Any, now: datetime | None = None) -> dict:
-    """Mongo query matching all period encodings used by the rent cron."""
-    now = now or datetime.now(timezone.utc)
+def period_query(contract_id: Any, period_start: datetime) -> dict:
+    """Mongo query matching all supported encodings of one lease month."""
     return {
         "contract_id": str(contract_id),
+        "record_type": {"$ne": "checkout_attempt"},
+        "invoice_id": {"$exists": False},
         "$or": [
-            {"period": now.strftime("%Y-%m")},
-            {"period_year": now.year, "period_month_num": now.month},
-            {"period_year": now.year, "period_month": now.strftime("%B")},
+            {"period": period_start.strftime("%Y-%m")},
+            {"period_year": period_start.year, "period_month_num": period_start.month},
+            {"period_year": period_start.year, "period_month": period_start.strftime("%B")},
         ],
     }
+
+
+def current_period_query(contract_id: Any, now: datetime | None = None) -> dict:
+    """Compatibility wrapper for callers charging the current month."""
+    return period_query(contract_id, now or datetime.now(timezone.utc))
 
 
 def _status_query(base: dict, statuses) -> dict:
@@ -58,8 +64,8 @@ def invoice_balance(invoice: dict) -> dict:
     }
 
 
-async def _find_current_invoice(db, contract_id: Any, now: datetime) -> dict | None:
-    base = current_period_query(contract_id, now)
+async def _find_period_invoice(db, contract_id: Any, period_start: datetime) -> dict | None:
+    base = period_query(contract_id, period_start)
 
     # A successful payment for the period wins over any stale pending duplicate.
     settled = await db.rental_payments.find_one(_status_query(base, SETTLED_STATUSES))
@@ -67,6 +73,31 @@ async def _find_current_invoice(db, contract_id: Any, now: datetime) -> dict | N
         return settled
 
     return await db.rental_payments.find_one(_status_query(base, CHARGEABLE_STATUSES))
+
+
+async def resolve_period_rent_charge(db, contract: dict, period_start: datetime) -> dict:
+    """Ensure/read an authoritative charge for an explicit lease month."""
+    if period_start.tzinfo is None:
+        period_start = period_start.replace(tzinfo=timezone.utc)
+    period_start = period_start.astimezone(timezone.utc).replace(
+        day=1, hour=0, minute=0, second=0, microsecond=0
+    )
+    invoice = await _find_period_invoice(db, contract.get("_id"), period_start)
+    if invoice is None:
+        from .rent_payment_cron import ensure_period_payment
+        result, invoice = await ensure_period_payment(
+            db, contract, period_start,
+            apply_late_fee=(period_start.year, period_start.month) ==
+                           (datetime.now(timezone.utc).year, datetime.now(timezone.utc).month),
+        )
+        if result.startswith("skip_"):
+            raise ValueError(f"rent invoice unavailable: {result}")
+        invoice = invoice or await _find_period_invoice(db, contract.get("_id"), period_start)
+    if invoice is None:
+        raise RuntimeError("rent invoice is not in a chargeable state")
+    balance = invoice_balance(invoice)
+    return {"invoice": invoice, "invoice_id": str(invoice.get("_id", "")),
+            "period": period_start.strftime("%Y-%m"), **balance}
 
 
 async def resolve_current_rent_charge(db, contract: dict, now: datetime | None = None) -> dict:
@@ -78,24 +109,4 @@ async def resolve_current_rent_charge(db, contract: dict, now: datetime | None =
     cause a second charge for the same period.
     """
     now = now or datetime.now(timezone.utc)
-    invoice = await _find_current_invoice(db, contract.get("_id"), now)
-
-    if invoice is None:
-        from .rent_payment_cron import ensure_current_period_payment
-
-        result = await ensure_current_period_payment(db, contract)
-        if result.startswith("skip_"):
-            raise ValueError(f"current rent invoice unavailable: {result}")
-        invoice = await _find_current_invoice(db, contract.get("_id"), now)
-
-    if invoice is None:
-        # Existing cancelled/unknown-state documents are intentionally not
-        # converted into a charge. Manual reconciliation is safer than billing.
-        raise RuntimeError("current rent invoice is not in a chargeable state")
-
-    balance = invoice_balance(invoice)
-    return {
-        "invoice": invoice,
-        "invoice_id": str(invoice.get("_id", "")),
-        **balance,
-    }
+    return await resolve_period_rent_charge(db, contract, now)
