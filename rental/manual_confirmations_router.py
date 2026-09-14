@@ -91,17 +91,25 @@ async def tenant_submit_confirmation(request: Request):
 
     now = datetime.now(timezone.utc)
     db = get_db()
-    from .rent_charge_policy import resolve_current_rent_charge
+    requested_period = str(data.get("period") or now.strftime("%Y-%m"))
     try:
-        charge = await resolve_current_rent_charge(db, contract, now)
+        period_start = datetime.strptime(requested_period, "%Y-%m").replace(tzinfo=timezone.utc)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Período de renta inválido") from exc
+    current_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    if period_start < current_start:
+        raise HTTPException(status_code=400, detail="No se puede confirmar un mes anterior")
+    from .rent_charge_policy import resolve_period_rent_charge
+    try:
+        charge = await resolve_period_rent_charge(db, contract, period_start)
     except (ValueError, RuntimeError) as exc:
         raise HTTPException(status_code=409,
                             detail="La renta actual no está disponible para confirmación") from exc
 
-    # El cliente nunca decide el período ni el importe financiero. Ambos salen
-    # de la factura canónica vigente creada por el servidor.
-    period_month = now.month
-    period_year = now.year
+    # El cliente elige un período explícito, pero nunca decide el importe.
+    # El servidor valida el mes contra el contrato y deriva el saldo canónico.
+    period_month = period_start.month
+    period_year = period_start.year
     amount = charge["outstanding"]
     if amount <= 0:
         raise HTTPException(status_code=409, detail="No existe saldo pendiente este mes")
@@ -211,9 +219,11 @@ async def admin_approve(cid: str, request: Request):
         raise HTTPException(status_code=400, detail="El contrato ya no está activo")
 
     # Revalidar la misma factura y el mismo saldo antes de aprobar.
-    from .rent_charge_policy import resolve_current_rent_charge
+    from .rent_charge_policy import resolve_period_rent_charge
     try:
-        charge = await resolve_current_rent_charge(db, contract, datetime.now(timezone.utc))
+        period_start = datetime(int(s["period_year"]), int(s["period_month"]), 1,
+                                tzinfo=timezone.utc)
+        charge = await resolve_period_rent_charge(db, contract, period_start)
     except (ValueError, RuntimeError) as exc:
         raise HTTPException(status_code=409,
                             detail="La renta actual requiere revisión") from exc
