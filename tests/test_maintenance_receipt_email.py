@@ -149,6 +149,8 @@ def test_spanish_receipt_is_localized_escaped_and_contains_tracking_details():
     combined = " ".join(content.values())
     assert "REQ-123" in combined
     assert "Fotos recibidas: 1" in combined
+    assert "Categoría: Plomería" in combined
+    assert "Prioridad: Urgente" in combined
     assert "Maintenance request received" not in combined
     assert "info@rosshouserentals.com" in combined
     assert "Tenant &lt;One&gt;" in content["html"]
@@ -171,8 +173,24 @@ def test_english_receipt_contains_only_english_copy():
     combined = " ".join(content.values())
     assert "Maintenance request received" in combined
     assert "Photos received: 2" in combined
+    assert "Category: Plumbing" in combined
+    assert "Priority: Urgent" in combined
     assert "Solicitud de mantenimiento recibida" not in combined
     assert "Fotos recibidas" not in combined
+
+
+def test_spanish_receipt_translates_electrical_category():
+    content = build_maintenance_received_message(
+        name="Prueba Inquilino", request_id="0001", title="test24",
+        property_address="999 Staging Test Ave", category="electrical",
+        priority="normal", photo_count=2,
+        submitted_at=datetime(2026, 9, 14, 15, 47, tzinfo=timezone.utc),
+        locale="es",
+    )
+    combined = " ".join(content.values())
+    assert "Categoría: Eléctrico" in combined
+    assert "Categoría: electrical" not in combined
+    assert "Prioridad: Normal" in combined
 
 
 def test_status_update_email_includes_schedule_and_assignment_in_locale():
