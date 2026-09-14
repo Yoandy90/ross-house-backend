@@ -75,6 +75,51 @@ async def _find_period_invoice(db, contract_id: Any, period_start: datetime) -> 
     return await db.rental_payments.find_one(_status_query(base, CHARGEABLE_STATUSES))
 
 
+async def preview_period_rent_charge(db, contract: dict, period_start: datetime) -> dict:
+    """Read a lease-month charge without creating an invoice.
+
+    The month picker may preview up to twelve months. Merely opening that screen
+    must not turn those future obligations into payment-history records.
+    Checkout remains responsible for materializing the canonical invoice.
+    """
+    from .rent_payment_cron import _parse_contract_date, canonical_invoice_id
+
+    if period_start.tzinfo is None:
+        period_start = period_start.replace(tzinfo=timezone.utc)
+    period_start = period_start.astimezone(timezone.utc).replace(
+        day=1, hour=0, minute=0, second=0, microsecond=0
+    )
+    start_dt = await _parse_contract_date(contract.get("start_date"))
+    end_dt = await _parse_contract_date(contract.get("end_date"))
+    if start_dt and (period_start.year, period_start.month) < (start_dt.year, start_dt.month):
+        raise ValueError("rent invoice unavailable: skip_not_started")
+    if end_dt and (period_start.year, period_start.month) > (end_dt.year, end_dt.month):
+        raise ValueError("rent invoice unavailable: skip_ended")
+
+    invoice = await _find_period_invoice(db, contract.get("_id"), period_start)
+    if invoice is not None:
+        return {
+            "invoice": invoice, "invoice_id": str(invoice.get("_id", "")),
+            "period": period_start.strftime("%Y-%m"), **invoice_balance(invoice),
+        }
+
+    monthly_rent = max(float(
+        contract.get("monthly_rent") or contract.get("rent_amount") or 0
+    ), 0.0)
+    if monthly_rent <= 0:
+        raise ValueError("rent invoice unavailable: skip_no_rent")
+    invoice_id = canonical_invoice_id(
+        str(contract.get("_id")), period_start.year, period_start.month
+    )
+    return {
+        "invoice": None, "invoice_id": str(invoice_id),
+        "period": period_start.strftime("%Y-%m"), "status": "pending",
+        "amount": round(monthly_rent, 2), "late_fee": 0.0,
+        "total_due": round(monthly_rent, 2), "total_paid": 0.0,
+        "outstanding": round(monthly_rent, 2),
+    }
+
+
 async def resolve_period_rent_charge(db, contract: dict, period_start: datetime) -> dict:
     """Ensure/read an authoritative charge for an explicit lease month."""
     if period_start.tzinfo is None:
