@@ -97,7 +97,8 @@ async def tenant_invoices_history(
     # ─── Rent payments ─────────────────────────────────────────
     if type in (None, "rent"):
         async for p in db.rental_payments.find(
-            {"tenant_id": {"$in": tenant_ids}}
+            {"tenant_id": {"$in": tenant_ids},
+             "record_type": {"$ne": "checkout_attempt"}}
         ).sort("payment_date", -1).limit(limit):
             # Real paid flag: only true if explicit flag set OR status indicates payment
             doc_status = (p.get("status") or "").lower()

@@ -15,8 +15,13 @@ Algorithm:
      (one-time, won't be doubled)
 """
 import asyncio
+import hashlib
 import logging
+from calendar import monthrange
 from datetime import datetime, timezone, timedelta
+
+from bson import ObjectId
+from pymongo.errors import DuplicateKeyError
 
 logger = logging.getLogger("rent_payment_cron")
 
@@ -72,66 +77,74 @@ async def _parse_contract_date(value) -> datetime | None:
     return None
 
 
-async def ensure_current_period_payment(db, contract: dict) -> str:
-    """Ensure a pending rental_payments doc exists for this contract's
-    current period. Returns a short status string."""
-    now = datetime.now(timezone.utc)
-    period_month_name = now.strftime("%B")  # e.g. 'June'
-    period_year = now.year
-    period_iso = now.strftime(PERIOD_FORMAT)
-    period_month_num = now.month
+def canonical_invoice_id(contract_id: str, year: int, month: int) -> ObjectId:
+    """Database-enforced identity for exactly one canonical invoice per period."""
+    raw = f"rent-invoice:{contract_id}:{year:04d}-{month:02d}".encode()
+    return ObjectId(hashlib.sha256(raw).hexdigest()[:24])
 
+
+async def ensure_period_payment(db, contract: dict, period_start: datetime,
+                                *, apply_late_fee: bool = False) -> tuple[str, dict | None]:
+    """Ensure and return one canonical invoice for a lease month.
+
+    The deterministic ``_id`` makes concurrent creation safe at MongoDB level.
+    Legacy invoices are reused so this can be deployed without a data migration.
+    """
+    if period_start.tzinfo is None:
+        period_start = period_start.replace(tzinfo=timezone.utc)
+    period_start = period_start.astimezone(timezone.utc).replace(
+        day=1, hour=0, minute=0, second=0, microsecond=0
+    )
+    period_end = period_start.replace(
+        day=monthrange(period_start.year, period_start.month)[1],
+        hour=23, minute=59, second=59, microsecond=999999,
+    )
     contract_id = str(contract["_id"])
-
-    # ── Validate contract date window ──
-    # Don't generate or apply late fees outside the contract's effective range.
     start_dt = await _parse_contract_date(contract.get("start_date"))
     end_dt = await _parse_contract_date(contract.get("end_date"))
-    if start_dt and now < start_dt:
-        return "skip_not_started"
-    if end_dt and now > end_dt:
-        return "skip_ended"
+    if start_dt and period_end < start_dt:
+        return "skip_not_started", None
+    if end_dt and period_start > end_dt:
+        return "skip_ended", None
 
-    monthly_rent = float(
-        contract.get("monthly_rent") or contract.get("rent_amount") or 0
-    )
+    monthly_rent = float(contract.get("monthly_rent") or contract.get("rent_amount") or 0)
     if monthly_rent <= 0:
-        return "skip_no_rent"
+        return "skip_no_rent", None
 
-    late_fee_amount, grace_days = await _resolve_late_fee_config(db, contract)
-
-    # Look for existing payment for this period
+    period_iso = period_start.strftime(PERIOD_FORMAT)
+    period_month_name = period_start.strftime("%B")
     existing = await db.rental_payments.find_one({
         "contract_id": contract_id,
+        "record_type": {"$ne": "checkout_attempt"},
+        "invoice_id": {"$exists": False},
         "$or": [
             {"period": period_iso},
-            {"period_year": period_year, "period_month_num": period_month_num},
-            {"period_year": period_year, "period_month": period_month_name},
+            {"period_year": period_start.year, "period_month_num": period_start.month},
+            {"period_year": period_start.year, "period_month": period_month_name},
         ],
     })
-
     if existing:
-        # Apply late fee if past grace period and still unpaid
-        status = existing.get("status", "pending")
-        if status == "pending" and now.day > grace_days and late_fee_amount > 0:
+        if apply_late_fee and existing.get("status", "pending") == "pending":
+            late_fee_amount, grace_days = await _resolve_late_fee_config(db, contract)
+            now = datetime.now(timezone.utc)
+            due_date = datetime(period_start.year, period_start.month, 1, tzinfo=timezone.utc)
+            grace_deadline = due_date + timedelta(days=max(grace_days, 0))
             current_fee = float(existing.get("late_fee", 0) or 0)
-            # Only update if the configured fee differs from what's stored
-            if abs(current_fee - late_fee_amount) > 0.01:
+            if now > grace_deadline and late_fee_amount > 0 and abs(current_fee - late_fee_amount) > 0.01:
                 await db.rental_payments.update_one(
                     {"_id": existing["_id"]},
-                    {"$set": {
-                        "late_fee": late_fee_amount,
-                        "total_due": monthly_rent + late_fee_amount,
-                        "late_fee_applied_at": now,
-                    }},
+                    {"$set": {"late_fee": late_fee_amount,
+                              "total_due": monthly_rent + late_fee_amount,
+                              "late_fee_applied_at": now}},
                 )
-                return "late_fee_applied"
-        return "already_exists"
+                existing = await db.rental_payments.find_one({"_id": existing["_id"]})
+                return "late_fee_applied", existing
+        return "already_exists", existing
 
-    # Generate receipt number placeholder (real one assigned on payment)
-    due_date = datetime(period_year, period_month_num, 1, tzinfo=timezone.utc)
-
+    now = datetime.now(timezone.utc)
     payment_doc = {
+        "_id": canonical_invoice_id(contract_id, period_start.year, period_start.month),
+        "record_type": "invoice",
         "contract_id": contract_id,
         "property_id": str(contract.get("property_id", "")),
         "property_address": contract.get("property_address", ""),
@@ -140,18 +153,31 @@ async def ensure_current_period_payment(db, contract: dict) -> str:
         "amount": monthly_rent,
         "late_fee": 0.0,
         "total_due": monthly_rent,
+        "total_paid": 0.0,
         "period": period_iso,
         "period_month": period_month_name,
-        "period_month_num": period_month_num,
-        "period_year": period_year,
-        "due_date": due_date,
+        "period_month_num": period_start.month,
+        "period_year": period_start.year,
+        "due_date": period_start,
         "status": "pending",
         "paid": False,
         "auto_generated": True,
         "created_at": now,
     }
-    await db.rental_payments.insert_one(payment_doc)
-    return "created"
+    try:
+        await db.rental_payments.insert_one(payment_doc)
+        return "created", payment_doc
+    except DuplicateKeyError:
+        existing = await db.rental_payments.find_one({"_id": payment_doc["_id"]})
+        return "already_exists", existing
+
+
+async def ensure_current_period_payment(db, contract: dict) -> str:
+    """Ensure a pending rental_payments doc exists for this contract's
+    current period. Returns a short status string."""
+    now = datetime.now(timezone.utc)
+    status, _ = await ensure_period_payment(db, contract, now, apply_late_fee=True)
+    return status
 
 
 async def run_once(db) -> dict:
@@ -199,38 +225,8 @@ async def run_once(db) -> dict:
                 next_in_range = False
 
             if days_until_next <= 7 and next_in_range:
-                # Temporarily simulate "now" being the next month
-                contract_copy = dict(c)
-                # We use a fake current period directly:
-                next_period_iso = next_month_first.strftime(PERIOD_FORMAT)
-                existing_next = await db.rental_payments.find_one({
-                    "contract_id": str(c["_id"]),
-                    "period": next_period_iso,
-                })
-                if not existing_next:
-                    monthly_rent = float(c.get("monthly_rent") or c.get("rent_amount") or 0)
-                    if monthly_rent > 0:
-                        payment_doc = {
-                            "contract_id": str(c["_id"]),
-                            "property_id": str(c.get("property_id", "")),
-                            "property_address": c.get("property_address", ""),
-                            "tenant_id": str(c.get("tenant_id", "")),
-                            "tenant_name": c.get("tenant_name", ""),
-                            "amount": monthly_rent,
-                            "late_fee": 0.0,
-                            "total_due": monthly_rent,
-                            "period": next_period_iso,
-                            "period_month": next_month_first.strftime("%B"),
-                            "period_month_num": next_month_first.month,
-                            "period_year": next_month_first.year,
-                            "due_date": next_month_first,
-                            "status": "pending",
-                            "paid": False,
-                            "auto_generated": True,
-                            "created_at": now,
-                        }
-                        await db.rental_payments.insert_one(payment_doc)
-                        stats["created"] += 1
+                status, _ = await ensure_period_payment(db, c, next_month_first)
+                stats[status] = stats.get(status, 0) + 1
         except Exception as e:
             logger.exception(f"Failed pre-generating next month for {c.get('_id')}: {e}")
 
