@@ -16,6 +16,7 @@ from bson import ObjectId
 from fastapi import APIRouter, HTTPException, Request
 
 from .shared import get_db, auth_admin, auth_tenant_flex
+from .security_email import send_autopay_changed_email
 
 logger = logging.getLogger("helcim_vault")
 router = APIRouter(tags=["helcim-vault"])
@@ -30,6 +31,59 @@ def _authorization_event(config: dict, request_id: str):
         if event.get("authorization_request_id") == request_id:
             return event
     return None
+
+
+def _autopay_change_type(existing: dict, *, enabled: bool,
+                         method_id: str, day_of_month: int) -> str | None:
+    was_enabled = bool((existing or {}).get("enabled"))
+    if enabled and not was_enabled:
+        return "activated"
+    if not enabled and was_enabled:
+        return "deactivated"
+    if enabled and was_enabled:
+        old_method = str((existing or {}).get("helcim_method_id") or "")
+        try:
+            old_day = int((existing or {}).get("day_of_month") or 1)
+        except (TypeError, ValueError):
+            old_day = 1
+        if old_method != method_id or old_day != day_of_month:
+            return "updated"
+    return None
+
+
+async def _send_and_audit_autopay_notice(
+    db, *, tenant: dict, event: dict, change_type: str | None,
+) -> bool | None:
+    """Send once per durable request and record delivery without payment secrets."""
+    if not change_type:
+        return None
+    sent = await send_autopay_changed_email(
+        db,
+        to_email=str(tenant.get("email") or ""),
+        name=str(tenant.get("name") or ""),
+        change_type=change_type,
+        method_brand=str(event.get("method_brand") or ""),
+        method_last4=str(event.get("method_last4") or ""),
+        day_of_month=int(event.get("day_of_month") or 1),
+        changed_at=event["recorded_at"],
+        locale=str(tenant.get("locale") or tenant.get("language") or "es"),
+    )
+    delivery = {
+        "_id": event["authorization_request_id"],
+        "authorization_request_id": event["authorization_request_id"],
+        "tenant_id": str(tenant["_id"]),
+        "change_type": change_type,
+        "status": "sent" if sent else "failed",
+        "attempted_at": datetime.now(timezone.utc),
+    }
+    if sent:
+        delivery["sent_at"] = delivery["attempted_at"]
+    try:
+        await db.autopay_notification_deliveries.update_one(
+            {"_id": delivery["_id"]}, {"$setOnInsert": delivery}, upsert=True)
+    except Exception:
+        logger.exception("Could not record autopay email delivery")
+    return sent
 
 
 async def _helcim_cfg() -> dict:
@@ -506,6 +560,8 @@ async def authorize_autopay(request: Request):
             raise HTTPException(409, "El método todavía está siendo verificado por Helcim")
 
     now = datetime.now(timezone.utc)
+    change_type = _autopay_change_type(
+        existing or {}, enabled=enabled, method_id=method_id, day_of_month=day)
     event = {
         "authorization_request_id": request_id,
         "authorization_version": AUTOPAY_AUTHORIZATION_VERSION,
@@ -562,5 +618,8 @@ async def authorize_autopay(request: Request):
                     "enabled": duplicate_event.get("action") == "authorized",
                     "authorization_id": request_id, "duplicate": True}
         raise HTTPException(409, "No se pudo registrar la autorización")
+    email_sent = await _send_and_audit_autopay_notice(
+        db, tenant=tenant, event=event, change_type=change_type)
     return {"success": True, "enabled": enabled,
-            "authorization_id": request_id, "duplicate": False}
+            "authorization_id": request_id, "duplicate": False,
+            "email_confirmation_sent": email_sent}
