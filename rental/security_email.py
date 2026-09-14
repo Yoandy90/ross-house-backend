@@ -12,6 +12,7 @@ logger = logging.getLogger("security_email")
 SUPPORT_EMAIL = "info@rosshouserentals.com"
 SUPPORT_PHONE = "(806) 934-2018"
 SECURITY_FROM_NAME = "Ross House Security"
+TRANSACTIONAL_FROM_NAME = "Ross House Rentals"
 CENTRAL_TIME = ZoneInfo("America/Chicago")
 SPANISH_MONTHS = (
     "enero", "febrero", "marzo", "abril", "mayo", "junio",
@@ -66,6 +67,100 @@ def build_password_changed_message(name: str, changed_at: datetime) -> dict:
       </div>
       <p style="color:#687080;font-size:13px">Este correo nunca incluye tu contraseña.</p>
       <p>Ross House Rentals</p>
+    </div>
+    """.strip()
+    return {"subject": subject, "text": text, "html": html}
+
+
+def build_autopay_changed_message(
+    *,
+    name: str,
+    change_type: str,
+    method_brand: str,
+    method_last4: str,
+    day_of_month: int,
+    changed_at: datetime,
+    locale: str = "es",
+) -> dict:
+    """Build a localized autopay notice using masked display data only."""
+    locale = _normalize_locale(locale)
+    fallback_name = "customer" if locale == "en" else "cliente"
+    raw_name = " ".join(str(name or "").split()) or fallback_name
+    safe_name = escape(raw_name)
+    safe_brand = escape(" ".join(str(method_brand or "").split())[:40])
+    safe_last4 = escape(str(method_last4 or "")[-4:])
+    safe_day = max(1, min(28, int(day_of_month or 1)))
+    timestamp = _format_changed_at(changed_at, locale)
+    method = f"{safe_brand} ••••{safe_last4}" if safe_last4 else safe_brand
+
+    if locale == "en":
+        labels = {
+            "activated": ("Automatic payments activated", "Automatic payments are now active."),
+            "deactivated": ("Automatic payments deactivated", "Automatic payments have been turned off."),
+            "updated": ("Automatic payment settings updated", "Your automatic payment settings were updated."),
+        }
+        subject, summary = labels.get(change_type, labels["updated"])
+        detail_lines = []
+        detail_html = ""
+        if change_type != "deactivated":
+            detail_lines = [f"Payment day: day {safe_day} of each month"]
+            detail_html = f"<strong>Payment day:</strong> day {safe_day} of each month<br>"
+            if method:
+                detail_lines.append(f"Payment method: {method}")
+                detail_html += f"<strong>Payment method:</strong> {method}<br>"
+        text = (
+            f"Hello {raw_name},\n\n{summary}\n"
+            + ("\n".join(detail_lines) + "\n" if detail_lines else "")
+            + f"Date: {timestamp}\n\n"
+            "You can review or change this setting in the Ross House Rentals app. "
+            f"If you did not make this change, contact us at {SUPPORT_EMAIL} or {SUPPORT_PHONE}.\n\n"
+            "Ross House Rentals"
+        )
+        date_label = "Date"
+        help_text = "If you did not make this change, contact us immediately."
+    else:
+        labels = {
+            "activated": ("Pagos automáticos activados", "Tus pagos automáticos quedaron activados."),
+            "deactivated": ("Pagos automáticos desactivados", "Tus pagos automáticos fueron desactivados."),
+            "updated": ("Configuración de pagos automáticos actualizada", "Actualizamos la configuración de tus pagos automáticos."),
+        }
+        subject, summary = labels.get(change_type, labels["updated"])
+        detail_lines = []
+        detail_html = ""
+        if change_type != "deactivated":
+            detail_lines = [f"Día de cobro: día {safe_day} de cada mes"]
+            detail_html = f"<strong>Día de cobro:</strong> día {safe_day} de cada mes<br>"
+            if method:
+                detail_lines.append(f"Método de pago: {method}")
+                detail_html += f"<strong>Método de pago:</strong> {method}<br>"
+        text = (
+            f"Hola {raw_name},\n\n{summary}\n"
+            + ("\n".join(detail_lines) + "\n" if detail_lines else "")
+            + f"Fecha: {timestamp}\n\n"
+            "Puedes revisar o cambiar esta configuración desde la aplicación de Ross House Rentals. "
+            f"Si no hiciste este cambio, contáctanos en {SUPPORT_EMAIL} o al {SUPPORT_PHONE}.\n\n"
+            "Ross House Rentals"
+        )
+        date_label = "Fecha"
+        help_text = "Si no hiciste este cambio, contáctanos inmediatamente."
+
+    html = f"""
+    <div style="font-family:Arial,sans-serif;max-width:620px;margin:auto;color:#202124">
+      <div style="background:#202124;color:white;padding:22px;border-bottom:4px solid #c8102e">
+        <h2 style="margin:0">{escape(subject)}</h2>
+      </div>
+      <div style="padding:24px">
+        <p>{'Hello' if locale == 'en' else 'Hola'} {safe_name},</p>
+        <p>{escape(summary)}</p>
+        <div style="background:#f7f7f8;border-radius:10px;padding:16px;line-height:1.7">
+          {detail_html}<strong>{date_label}:</strong> {escape(timestamp)}
+        </div>
+        <div style="background:#fff3f5;border-left:4px solid #c8102e;padding:16px;margin:20px 0">
+          <strong>{help_text}</strong><br>
+          <a href="mailto:{SUPPORT_EMAIL}">{SUPPORT_EMAIL}</a> · {SUPPORT_PHONE}
+        </div>
+        <p style="color:#687080;font-size:13px">Ross House Rentals</p>
+      </div>
     </div>
     """.strip()
     return {"subject": subject, "text": text, "html": html}
@@ -255,6 +350,57 @@ async def _sendgrid_config(db) -> tuple[str, str]:
         except Exception:
             logger.exception("Could not load SendGrid configuration")
     return api_key, from_email or SUPPORT_EMAIL
+
+
+async def _transactional_sendgrid_config(db) -> tuple[str, str]:
+    """Load the ordinary customer-notification sender, never the security sender."""
+    api_key = os.getenv("SENDGRID_API_KEY", "").strip()
+    from_email = (os.getenv("SENDGRID_FROM_EMAIL") or SUPPORT_EMAIL).strip()
+    if not api_key:
+        try:
+            config = await db.api_config.find_one({"_id": "main"}) or {}
+            api_key = str(
+                config.get("sendgrid_api_key") or config.get("SENDGRID_API_KEY") or ""
+            ).strip()
+            from_email = str(
+                config.get("sendgrid_from_email")
+                or config.get("SENDGRID_FROM_EMAIL")
+                or from_email
+            ).strip()
+        except Exception:
+            logger.exception("Could not load transactional SendGrid configuration")
+    return api_key, from_email or SUPPORT_EMAIL
+
+
+async def send_autopay_changed_email(db, *, to_email: str, **kwargs) -> bool:
+    """Send a best-effort autopay notice after the authorization is durable."""
+    recipient = (to_email or "").strip()
+    if not recipient:
+        logger.warning("Autopay email skipped: tenant has no email")
+        return False
+    api_key, from_email = await _transactional_sendgrid_config(db)
+    if not api_key:
+        logger.warning("Autopay email skipped: SendGrid is not configured")
+        return False
+    content = build_autopay_changed_message(**kwargs)
+
+    def _send() -> bool:
+        from sendgrid import SendGridAPIClient
+        from sendgrid.helpers.mail import Mail
+        response = SendGridAPIClient(api_key).send(Mail(
+            from_email=(from_email, TRANSACTIONAL_FROM_NAME),
+            to_emails=recipient,
+            subject=content["subject"],
+            plain_text_content=content["text"],
+            html_content=content["html"],
+        ))
+        return 200 <= int(response.status_code) < 300
+
+    try:
+        return await asyncio.to_thread(_send)
+    except Exception:
+        logger.exception("Autopay notification email failed")
+        return False
 
 
 async def send_password_changed_email(
