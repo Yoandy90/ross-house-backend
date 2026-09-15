@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 def is_expo_token(token: str) -> bool:
     """Check if a token is an Expo push token"""
-    return token and isinstance(token, str) and token.startswith('ExponentPushToken[')
+    return isinstance(token, str) and token.startswith(('ExponentPushToken[', 'ExpoPushToken[')) and token.endswith(']')
 
 
 class PushNotificationService:
@@ -92,20 +92,21 @@ class PushNotificationService:
                         total_sent += 1
                     else:
                         total_failed += 1
-                        err_msg = results_data[0].get("message", "") if results_data else ""
-                        logger.warning(f"⚠️ Expo push failed for token {token[:30]}...: {err_msg}")
+                        error_code = results_data[0].get("details", {}).get("error", "unknown") if results_data else "empty_response"
+                        logger.warning("Expo rejected push (%s)", error_code)
                 else:
                     # Try to handle PUSH_TOO_MANY_EXPERIENCE_IDS gracefully
                     err_body = response.json() if response.headers.get('content-type', '').startswith('application/json') else {}
                     errors = err_body.get("errors", [])
                     if any(e.get("code") == "PUSH_TOO_MANY_EXPERIENCE_IDS" for e in errors):
-                        logger.warning(f"⚠️ Token {token[:30]}... belongs to different project, skipping")
+                        total_failed += 1
+                        logger.warning("Expo rejected push (PUSH_TOO_MANY_EXPERIENCE_IDS)")
                     else:
                         total_failed += 1
-                        logger.warning(f"⚠️ Expo API error {response.status_code} for token {token[:30]}...")
+                        logger.warning("Expo API error %s", response.status_code)
             except Exception as e:
                 total_failed += 1
-                logger.error(f"❌ Expo push error for token: {e}")
+                logger.error("Expo push request failed (%s)", type(e).__name__)
         
         logger.info(f"📬 Expo Push: {total_sent} sent, {total_failed} failed out of {len(expo_tokens)}")
         

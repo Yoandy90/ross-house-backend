@@ -23,6 +23,7 @@ from rental.shared import (
     TENANT_JWT_SECRET,
 )
 from rental.security_email import send_password_changed_email
+from rental.notification_identity import notification_audience, push_recipient
 
 router = APIRouter()
 
@@ -92,24 +93,35 @@ async def marketplace_register_push_token(request: Request):
     user = await auth_marketplace(request)
     data = await request.json()
     
-    push_token = data.get("push_token", "").strip()
+    push_token = data.get("push_token", "")
     platform = data.get("platform", "ios")
     device_name = data.get("device_name", "")
     
-    if not push_token:
-        raise HTTPException(status_code=400, detail="push_token es requerido")
+    if not isinstance(push_token, str) or not re.fullmatch(
+        r"(?:ExponentPushToken|ExpoPushToken)\[[A-Za-z0-9_-]+\]", push_token.strip()
+    ) or len(push_token) > 256:
+        raise HTTPException(status_code=400, detail="Token de Expo inválido")
+    push_token = push_token.strip()
+    if platform not in ("ios", "android") or not isinstance(device_name, str):
+        raise HTTPException(status_code=400, detail="Dispositivo inválido")
+    db = get_db()
+    collection, recipient = await push_recipient(db, user["_id"])
+    if not recipient:
+        raise HTTPException(status_code=404, detail="Cuenta no encontrada")
     
-    await get_db().app_users.update_one(
-        {"_id": user["_id"]},
+    result = await db[collection].update_one(
+        {"_id": recipient["_id"]},
         {"$set": {
             "push_token": push_token,
             "push_platform": platform,
-            "push_device_name": device_name,
+            "push_device_name": device_name[:120],
             "push_token_updated_at": datetime.utcnow(),
         }}
     )
+    if result.matched_count != 1:
+        raise HTTPException(status_code=409, detail="No se pudo registrar el dispositivo")
     
-    logging.info(f"📱 Push token registered for {user.get('email', '')} ({platform}/{device_name})")
+    logging.info("Push device registered (%s)", platform)
     return {"success": True, "message": "Push token registrado"}
 
 
@@ -119,11 +131,15 @@ async def marketplace_get_notifications(request: Request):
     user = await auth_marketplace(request)
     user_id = str(user["_id"])
     
-    limit = int(request.query_params.get("limit", "30"))
+    try:
+        limit = max(1, min(100, int(request.query_params.get("limit", "30"))))
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="Límite inválido")
+    audience = await notification_audience(get_db(), user)
     
     notifications = []
     cursor = get_db().rental_notifications.find(
-        {"$or": [{"user_id": user_id}, {"target": "all"}, {"target": user.get("role", "")}]}
+        audience
     ).sort("created_at", -1).limit(limit)
     
     async for n in cursor:
@@ -140,7 +156,7 @@ async def marketplace_get_notifications(request: Request):
         })
     
     unread = await get_db().rental_notifications.count_documents({
-        "$or": [{"user_id": user_id}, {"target": "all"}, {"target": user.get("role", "")}],
+        **audience,
         "read_by": {"$ne": user_id}
     })
     
@@ -153,10 +169,15 @@ async def marketplace_mark_notification_read(notif_id: str, request: Request):
     user = await auth_marketplace(request)
     user_id = str(user["_id"])
     
-    await get_db().rental_notifications.update_one(
-        {"_id": ObjectId(notif_id)},
+    if not ObjectId.is_valid(notif_id):
+        raise HTTPException(status_code=404, detail="Notificación no encontrada")
+    audience = await notification_audience(get_db(), user)
+    result = await get_db().rental_notifications.update_one(
+        {"_id": ObjectId(notif_id), **audience},
         {"$addToSet": {"read_by": user_id}}
     )
+    if result.matched_count != 1:
+        raise HTTPException(status_code=404, detail="Notificación no encontrada")
     
     return {"success": True}
 

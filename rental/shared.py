@@ -393,48 +393,44 @@ def serialize(doc):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def send_rental_push_to_user(user_id: str, title: str, body: str, data: dict = None):
-    """Send push notification to a specific marketplace user by their ID"""
+    """Resolve the linked app identity and preserve maintenance notices in the inbox."""
     db = get_db()
     if not user_id:
-        return
+        return False
 
-    user = None
-    try:
-        user = await db.app_users.find_one({"_id": ObjectId(user_id)})
-    except:
-        user = await db.app_users.find_one({"_id": user_id})
-
-    if not user:
-        try:
-            user = await db.tenants.find_one({"_id": ObjectId(user_id)})
-        except:
-            user = await db.tenants.find_one({"_id": user_id})
+    # Persist before token lookup: users without push permission still have a bell.
+    await _save_maintenance_notice(db, title, body, data, user_id=str(user_id))
+    from rental.notification_identity import push_recipient
+    _, user = await push_recipient(db, user_id)
 
     if not user:
-        logging.warning(f"⚠️ Push: User {user_id} not found")
-        return
+        logging.info("Push recipient unavailable")
+        return False
 
-    push_token = user.get("push_token", "")
+    push_token = user.get("push_token") or user.get("expo_push_token")
     if not push_token:
-        logging.info(f"ℹ️ Push: User {user_id} ({user.get('name', '')}) has no push token")
-        return
+        logging.info("Push recipient has no registered device")
+        return False
 
     try:
         from push_notification_service import send_push_notification
-        await send_push_notification(
+        accepted = await send_push_notification(
             expo_push_token=push_token,
             title=title,
             body=body,
             data=data or {}
         )
-        logging.info(f"📱 Push sent to {user.get('name', '')} ({user.get('email', '')}): {title}")
+        logging.info("Push provider accepted=%s", bool(accepted))
+        return bool(accepted)
     except Exception as e:
-        logging.warning(f"⚠️ Push send error: {e}")
+        logging.warning("Push send failed (%s)", type(e).__name__)
+        return False
 
 
 async def send_rental_push_to_admins(title: str, body: str, data: dict = None):
     """Send push notification to Ross House admin users only (app_users collection)"""
     db = get_db()
+    await _save_maintenance_notice(db, title, body, data, target="admin")
 
     # Only query app_users (Ross House Rentals app tokens)
     # NOT db.users which belongs to Ross Lending/Tax app
@@ -447,13 +443,28 @@ async def send_rental_push_to_admins(title: str, body: str, data: dict = None):
         if push_token:
             try:
                 from push_notification_service import send_push_notification
-                await send_push_notification(
+                accepted = await send_push_notification(
                     expo_push_token=push_token,
                     title=title,
                     body=body,
                     data=data or {}
                 )
-                logging.info(f"📱 Push sent to admin {admin.get('email', '')}: {title}")
+                logging.info("Admin push provider accepted=%s", bool(accepted))
             except Exception as e:
-                logging.warning(f"⚠️ Push to admin error: {e}")
+                logging.warning("Admin push failed (%s)", type(e).__name__)
 
+
+async def _save_maintenance_notice(db, title, body, data, *, user_id="", target=""):
+    """Existing payment flows already persist notices; maintenance previously did not."""
+    if (data or {}).get("type") not in {
+        "maintenance_new", "maintenance_update", "maintenance_assignment",
+    }:
+        return
+    try:
+        await db.rental_notifications.insert_one({
+            "title": title, "body": body, "type": data["type"], "data": dict(data),
+            "read_by": [], "created_at": datetime.now(timezone.utc),
+            **({"user_id": user_id} if user_id else {"target": target}),
+        })
+    except Exception as exc:
+        logging.warning("Maintenance inbox insert failed (%s)", type(exc).__name__)
