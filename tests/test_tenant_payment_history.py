@@ -5,12 +5,14 @@ from bson import ObjectId
 from rental.tenant_payment_history import (
     collapse_payment_periods,
     is_payment_activity,
+    is_payment_timeline_candidate,
     normalize_payment_status,
     payment_activity_date,
     payment_activity_query,
     payment_period,
     serialize_payment_activity,
     payment_attempt_requires_review,
+    sequential_payment_timeline,
 )
 
 
@@ -20,6 +22,7 @@ def test_untouched_future_invoice_is_not_payment_activity():
         "period": "2026-10", "amount": 1200,
     }
     assert not is_payment_activity(invoice)
+    assert is_payment_timeline_candidate(invoice)
     query = payment_activity_query(["contract-1"])
     assert query["record_type"] == {"$ne": "checkout_attempt"}
 
@@ -150,3 +153,19 @@ def test_recent_unconfirmed_attempt_remains_processing():
     now = datetime(2026, 9, 14, 11, tzinfo=timezone.utc)
     assert not payment_attempt_requires_review(attempt, now)
     assert normalize_payment_status(attempt, now) == "processing"
+
+
+def test_sequential_timeline_keeps_all_paid_and_only_oldest_open_month():
+    items = [
+        {"id": "jul", "period": "2026-07", "status": "completed"},
+        {"id": "aug", "period": "2026-08", "status": "completed"},
+        {"id": "sep", "period": "2026-09", "status": "review_required"},
+        {"id": "oct", "period": "2026-10", "status": "review_required"},
+        {"id": "nov", "period": "2026-11", "status": "pending"},
+    ]
+    timeline = sequential_payment_timeline(items)
+    assert {item["id"] for item in timeline} == {"jul", "aug", "sep"}
+
+
+def test_plain_invoice_is_normalized_as_pending_not_processing():
+    assert normalize_payment_status({"status": "pending", "period": "2026-09"}) == "pending"
