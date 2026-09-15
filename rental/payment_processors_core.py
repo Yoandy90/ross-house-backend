@@ -826,13 +826,24 @@ async def _mark_checkout_completed(payment: dict) -> dict:
                     }},
                 )
                 raise RuntimeError("La asignación de renta cambió; requiere conciliación")
+            from .rent_charge_policy import invoice_balance
+            balance = invoice_balance(invoice)
+            if round(float(allocation.get("amount") or 0), 2) != balance["outstanding"]:
+                await db.rental_payments.update_one(
+                    {"_id": payment["_id"]}, {"$set": {
+                        "status": "settlement_review_required", "updated_at": now,
+                    }},
+                )
+                raise RuntimeError("El saldo cambió durante el cobro; requiere conciliación")
             period_receipt = f"{receipt_number}-{str(allocation.get('period') or '').replace('-', '')}"
             result = await db.rental_payments.update_one(
                 {"_id": invoice["_id"], "status": {"$in": ["pending", "late", "partial"]},
-                 "charge_attempt.id": allocation.get("attempt_id")},
+                 "charge_attempt.id": allocation.get("attempt_id"),
+                 **{key: invoice[key] if key in invoice else {"$exists": False}
+                    for key in ("amount", "late_fee", "total_due", "total_paid")}},
                 {"$set": {
                     "status": "completed", "paid": True,
-                    "total_paid": float(invoice.get("total_due") or allocation.get("amount") or 0),
+                    "total_paid": balance["total_due"],
                     "payment_method": payment.get("payment_method", ""),
                     "checkout_payment_id": str(payment["_id"]),
                     "receipt_number": period_receipt, "payment_date": now.isoformat(),
@@ -841,6 +852,11 @@ async def _mark_checkout_completed(payment: dict) -> dict:
                 }},
             )
             if result.modified_count != 1:
+                await db.rental_payments.update_one(
+                    {"_id": payment["_id"]}, {"$set": {
+                        "status": "settlement_review_required", "updated_at": now,
+                    }},
+                )
                 raise RuntimeError("No se pudo liquidar una factura asignada")
     await get_db().rental_payments.update_one(
         {"_id": payment["_id"], "status": {"$ne": "completed"}},
