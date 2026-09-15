@@ -113,6 +113,7 @@ def upload_property_photo(property_id: str, file_data: bytes, filename: str, con
     path = f"{APP_NAME}/properties/{property_id}/{file_id}.{ext}"
     result = put_object(path, file_data, content_type)
     return {
+        **({"base64_data": result["base64_data"], "storage_type": "mongodb"} if result.get("base64_data") else {}),
         "file_id": file_id,
         "storage_path": result.get("path", path),
         "original_filename": filename,

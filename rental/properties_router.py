@@ -54,6 +54,21 @@ async def public_serve_property_file(path: str):
     allowed_prefixes = ("properties/", "checklists/", "tenants/", "profile-photos/")
     if not path.startswith(allowed_prefixes):
         raise HTTPException(status_code=403, detail="Acceso denegado")
+    # Resolve only an exact non-deleted property photo stored by the fallback.
+    if path.startswith("properties/"):
+        stored = await get_db().property_photos.find_one({
+            "storage_path": "ross-rentals/" + path,
+            "storage_type": "mongodb", "is_deleted": {"$ne": True},
+        })
+        if stored and stored.get("base64_data"):
+            try:
+                mime = stored.get("content_type", "image/jpeg")
+                if mime not in ("image/jpeg", "image/png", "image/webp"):
+                    raise ValueError("Invalid photo type")
+                raw = base64.b64decode(stored["base64_data"].split(",", 1)[-1], validate=True)
+                return Response(raw, media_type=mime, headers={"Cache-Control": "public, max-age=86400", "X-Content-Type-Options": "nosniff"})
+            except (ValueError, TypeError):
+                raise HTTPException(status_code=404, detail="Foto no encontrada")
     try:
         from rental_storage_service import get_object, set_emergent_key, APP_NAME
         # Load key from DB if not in env
