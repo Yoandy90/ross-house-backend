@@ -2,6 +2,9 @@
 changes atomic on both standalone MongoDB and replica sets, without cross-collection
 partial writes. Hard size/capacity limits fail closed; no rental ledger writes.
 """
+import base64
+import binascii
+import re
 import copy
 import hashlib
 import json
@@ -9,7 +12,9 @@ from datetime import datetime, timezone
 from uuid import uuid4
 from typing import Literal
 from bson import BSON
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request, Response
+from starlette.concurrency import run_in_threadpool
+from rental.catalog_images import normalize_product_photo, MAX_INPUT_BYTES
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from pymongo.errors import DuplicateKeyError
 from rental.shared import get_db, auth_admin, auth_marketplace
@@ -300,3 +305,38 @@ async def record_payment(oid:str,body:Payment,request:Request):
         audit(s,uid,'payment_recorded',oid)
         return order_public(o)
     return await mutate(operation)
+
+
+class ProductPhoto(Strict):
+    data: str = Field(min_length=1, max_length=4_000_000)
+
+
+@router.post('/admin/store/images')
+async def upload_product_photo(body: ProductPhoto, request: Request):
+    actor = identity(await auth_admin(request))
+    try:
+        raw = base64.b64decode(body.data, validate=True)
+        normalized = await run_in_threadpool(normalize_product_photo, raw)
+    except (ValueError, binascii.Error) as exc:
+        raise HTTPException(400, str(exc)) from exc
+    image_id = hashlib.sha256(normalized).hexdigest()
+    await get_db().resident_store_images.update_one(
+        {'_id': image_id},
+        {'$setOnInsert': {'data': normalized, 'created_at': now(), 'actor': actor}},
+        upsert=True,
+    )
+    return {'path': '/api/public/store-images/' + image_id, 'width': 1200,
+            'height': 1200, 'bytes': len(normalized), 'format': 'webp'}
+
+
+@router.get('/public/store-images/{image_id}')
+async def product_photo(image_id: str):
+    if not re.fullmatch(r'[a-f0-9]{64}', image_id):
+        raise HTTPException(404, 'store_image_not_found')
+    photo = await get_db().resident_store_images.find_one({'_id': image_id})
+    if not photo:
+        raise HTTPException(404, 'store_image_not_found')
+    return Response(bytes(photo['data']), media_type='image/webp', headers={
+        'Cache-Control': 'public, max-age=31536000, immutable',
+        'X-Content-Type-Options': 'nosniff',
+    })
