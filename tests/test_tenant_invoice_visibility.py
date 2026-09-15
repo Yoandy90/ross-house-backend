@@ -49,9 +49,34 @@ def test_history_separates_obligations_from_checkout_and_future_rent(monkeypatch
         monkeypatch.setattr(router, 'auth_marketplace', auth)
         monkeypatch.setattr(router, '_resolve_tenant_ids_for_user', ids)
         result = await router.tenant_invoices_history(None)
-        assert len(result['items']) == 4
-        assert result['summary']['total_pending'] == 1550
-        assert result['summary']['pending_count'] == 2
-        assert result['summary']['total_future'] == 1200
-        assert result['summary']['future_count'] == 1
+        assert result['items'] == []
+        assert result['summary']['total_pending'] == 0
+        assert result['summary']['pending_count'] == 0
+        assert result['summary']['total_future'] == 0
+        assert result['summary']['future_count'] == 0
+    asyncio.run(scenario())
+
+
+def test_invoice_history_contains_only_paid_receipts(monkeypatch):
+    import asyncio
+    from mongomock_motor import AsyncMongoMockClient
+    from rental import tenant_invoices_router as router
+
+    async def scenario():
+        db = AsyncMongoMockClient()['paid_invoice_history']
+        await db.rental_payments.insert_many([
+            {'tenant_id': 'tenant', 'period': '2026-08', 'status': 'completed',
+             'paid': True, 'amount': 1200, 'total_due': 1200},
+            {'tenant_id': 'tenant', 'period': '2026-09', 'status': 'pending',
+             'amount': 1200, 'total_due': 1200},
+        ])
+        async def auth(_): return {'_id': 'tenant'}
+        async def ids(_): return ['tenant']
+        monkeypatch.setattr(router, 'get_db', lambda: db)
+        monkeypatch.setattr(router, 'auth_marketplace', auth)
+        monkeypatch.setattr(router, '_resolve_tenant_ids_for_user', ids)
+        result = await router.tenant_invoices_history(None)
+        assert [item['period'] for item in result['items']] == ['2026-08']
+        assert result['summary']['paid_count'] == 1
+        assert result['summary']['pending_count'] == 0
     asyncio.run(scenario())

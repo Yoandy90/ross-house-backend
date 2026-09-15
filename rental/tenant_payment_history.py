@@ -15,6 +15,7 @@ PROCESSING_STATUSES = frozenset({
     "pending_checkout", "creating_checkout", "checkout_creation_unknown",
     "pending_verification", "processing", "unknown",
 })
+OPEN_INVOICE_STATUSES = frozenset({"pending", "late"})
 FAILED_STATUSES = frozenset({"failed", "declined", "rejected"})
 REFUNDED_STATUSES = frozenset({"refunded", "refund"})
 CANCELLED_STATUSES = frozenset({"cancelled", "canceled"})
@@ -23,7 +24,8 @@ REVIEW_AFTER = timedelta(minutes=30)
 
 PUBLIC_ACTIVITY_STATUSES = (
     SETTLED_STATUSES | PROCESSING_STATUSES | FAILED_STATUSES |
-    REFUNDED_STATUSES | CANCELLED_STATUSES | REVIEW_STATUSES | {"partial"}
+    REFUNDED_STATUSES | CANCELLED_STATUSES | REVIEW_STATUSES |
+    OPEN_INVOICE_STATUSES | {"partial"}
 )
 
 
@@ -53,7 +55,20 @@ def is_payment_activity(payment: dict) -> bool:
             float(payment.get("total_paid") or 0) > 0 or
             bool(payment.get("charge_attempt"))
         )
+    if status in OPEN_INVOICE_STATUSES and not payment.get("charge_attempt"):
+        return False
     return status in PUBLIC_ACTIVITY_STATUSES or bool(payment.get("charge_attempt"))
+
+
+def is_payment_timeline_candidate(payment: dict) -> bool:
+    """Include activity plus plain invoices needed to select the next month."""
+    if is_payment_activity(payment):
+        return True
+    return (
+        payment.get("record_type") != "checkout_attempt"
+        and _status(payment.get("status")) in OPEN_INVOICE_STATUSES
+        and bool(payment_period(payment))
+    )
 
 
 def _as_utc(value) -> datetime | None:
@@ -106,6 +121,8 @@ def normalize_payment_status(payment: dict, now: datetime | None = None) -> str:
         return "cancelled"
     if status == "partial":
         return "partial"
+    if status in OPEN_INVOICE_STATUSES and not payment.get("charge_attempt"):
+        return "pending"
     if payment_attempt_requires_review(payment, now):
         return "review_required"
     attempt_status = _status((payment.get("charge_attempt") or {}).get("status"))
@@ -197,7 +214,9 @@ def collapse_payment_periods(items: list[dict]) -> list[dict]:
         "completed": 6,
         "refunded": 5,
         "partial": 4,
+        "review_required": 3,
         "processing": 3,
+        "pending": 2,
         "failed": 2,
         "cancelled": 1,
     }
@@ -218,3 +237,22 @@ def collapse_payment_periods(items: list[dict]) -> list[dict]:
         if current is None or candidate_key > current_key:
             by_period[period] = item
     return list(by_period.values()) + without_period
+
+
+def sequential_payment_timeline(items: list[dict]) -> list[dict]:
+    """Return settled months plus only the oldest unresolved rent month.
+
+    The database retains every invoice and provider attempt for audit and
+    reconciliation. The tenant timeline is deliberately mortgage-like: paid
+    months accumulate, while only the next unpaid month is presented as open.
+    """
+    collapsed = collapse_payment_periods(items)
+    settled = [item for item in collapsed if item.get("status") == "completed"]
+    open_statuses = {"pending", "partial", "processing", "review_required"}
+    unresolved = [
+        item for item in collapsed
+        if item.get("status") in open_statuses and item.get("period")
+    ]
+    next_open = min(unresolved, key=lambda item: str(item.get("period"))) \
+        if unresolved else None
+    return settled + ([next_open] if next_open else [])
