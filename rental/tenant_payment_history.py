@@ -139,3 +139,39 @@ def serialize_payment_activity(payment: dict) -> dict:
         "status": status,
         "notes": payment.get("notes", ""),
     }
+
+
+def collapse_payment_periods(items: list[dict]) -> list[dict]:
+    """Expose one tenant-facing row per rent period.
+
+    Legacy data may contain more than one local row for the same month. A
+    settled row always wins; otherwise the most recent activity represents the
+    current state of that month.
+    """
+    by_period: dict[str, dict] = {}
+    without_period = []
+    priority = {
+        "completed": 6,
+        "refunded": 5,
+        "partial": 4,
+        "processing": 3,
+        "failed": 2,
+        "cancelled": 1,
+    }
+    for item in items:
+        period = str(item.get("period") or "")
+        if not period:
+            without_period.append(item)
+            continue
+        current = by_period.get(period)
+        candidate_key = (
+            priority.get(str(item.get("status") or ""), 0),
+            str(item.get("payment_date") or ""),
+        )
+        current_key = (
+            priority.get(str((current or {}).get("status") or ""), 0),
+            str((current or {}).get("payment_date") or ""),
+        )
+        if current is None or candidate_key > current_key:
+            by_period[period] = item
+    return list(by_period.values()) + without_period
