@@ -39,6 +39,7 @@ def test_reject_invalid_files(raw):
 
 @pytest.mark.asyncio
 async def test_upload_roundtrip_dedup_and_auth(monkeypatch):
+    monkeypatch.setenv('RAILWAY_PUBLIC_DOMAIN', 'images-staging.example.test')
     db=AsyncMongoMockClient()['images_test']
     monkeypatch.setattr(s,'get_db',lambda:db)
     auth=AsyncMock(return_value={'_id':'admin-1'});monkeypatch.setattr(s,'auth_admin',auth)
@@ -47,6 +48,7 @@ async def test_upload_roundtrip_dedup_and_auth(monkeypatch):
     async with AsyncClient(transport=ASGITransport(app=app),base_url='http://test') as client:
         first=await client.post('/admin/store/images',json=body)
         assert first.status_code==200,first.text
+        assert first.json()['url']=='https://images-staging.example.test'+first.json()['path']
         second=await client.post('/admin/store/images',json=body)
         assert first.json()==second.json()
         assert await db.resident_store_images.count_documents({})==1
