@@ -136,3 +136,28 @@ def test_dashboard_history_excludes_open_invoices_and_checkout_attempts():
     history = source.split("cursor = db.rental_payments.find", 1)[1]
     assert '"record_type": {"$ne": "checkout_attempt"}' in history
     assert '"status": {"$in": ["completed", "paid"]}' in history
+
+
+def test_settlement_requires_review_when_fee_changed_during_checkout(monkeypatch):
+    async def scenario():
+        db = AsyncMongoMockClient()['changed_fee']
+        invoice_id, checkout_id = ObjectId(), ObjectId()
+        await db.rental_payments.insert_one({
+            '_id': invoice_id, 'status': 'pending', 'amount': 1200,
+            'late_fee': 50, 'total_due': 1250,
+            'charge_attempt': {'id': 'attempt', 'status': 'processing'},
+        })
+        checkout = {'_id': checkout_id, 'status': 'pending_checkout', 'invoice_allocations': [
+            {'invoice_id': str(invoice_id), 'attempt_id': 'attempt', 'amount': 1200},
+        ]}
+        await db.rental_payments.insert_one(checkout)
+        monkeypatch.setattr(core, 'get_db', lambda: db)
+        with pytest.raises(RuntimeError, match='saldo cambió'):
+            await core._mark_checkout_completed(checkout)
+        invoice = await db.rental_payments.find_one({'_id': invoice_id})
+        assert invoice['status'] == 'pending'
+        assert invoice['charge_attempt']['status'] == 'processing'
+        assert not invoice.get('paid')
+        saved = await db.rental_payments.find_one({'_id': checkout_id})
+        assert saved['status'] == 'settlement_review_required'
+    asyncio.run(scenario())
