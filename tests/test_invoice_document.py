@@ -73,3 +73,23 @@ def test_reference_contains_only_id_and_rejects_arbitrary_input():
     assert parse_invoice_reference(ref) == identity
     for value in ['https://example.com', 'RHR:.*', 'RHR:'+identity+'/pay']:
         assert parse_invoice_reference(value) is None
+
+
+@pytest.mark.parametrize('change', [
+    {'paid':True,'status':'completed'},
+    {'charge_attempt':{'status':'processing'}},
+    {'charge_attempt':{'status':'unknown'}},
+])
+def test_office_confirmation_blocks_paid_or_unresolved_invoice(monkeypatch, change):
+    async def run():
+        db=setup(monkeypatch)
+        row={'_id':ObjectId(),'status':'pending','amount':1200,'late_fee':0,**change}
+        await db.rental_payments.insert_one(row)
+        class Request:
+            async def json(self):
+                return {'confirm_unpaid':True,'status':'completed','total_paid':1200,'payment_method':'cash','payment_date':'2026-09-15'}
+        with pytest.raises(HTTPException) as exc:
+            await routes.update_rental_payment(str(row['_id']),Request())
+        assert exc.value.status_code == 409
+        assert await db.rental_payments.find_one({'_id':row['_id']}) == row
+    asyncio.run(run())

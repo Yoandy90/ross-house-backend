@@ -1704,6 +1704,19 @@ async def update_rental_payment(payment_id: str, request: Request):
     if not existing:
         raise HTTPException(status_code=404, detail="Pago no encontrado")
 
+    if data.get('confirm_unpaid') is True:
+        if existing.get('paid') is True or existing.get('status') in ('paid', 'completed'):
+            raise HTTPException(409, 'Esta factura ya está pagada. No registres otro cobro.')
+        attempt = existing.get('charge_attempt') or {}
+        if attempt.get('status') in ('processing', 'pending', 'unknown', 'review_required'):
+            raise HTTPException(409, 'Revisa el intento electrónico antes de recibir otro pago.')
+        if data.get('total_paid') is None or not data.get('payment_method'):
+            raise HTTPException(400, 'Indica el importe recibido y el método de pago.')
+        try:
+            datetime.strptime(str(data.get('payment_date', '')), '%Y-%m-%d')
+        except ValueError:
+            raise HTTPException(400, 'Fecha de pago inválida. Usa AAAA-MM-DD.')
+
     now = datetime.utcnow()
     update_fields = {"updated_at": now}
 
