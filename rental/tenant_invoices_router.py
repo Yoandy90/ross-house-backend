@@ -72,6 +72,17 @@ def _safe_period(date_value, fallback: str = "") -> str:
     return fallback
 
 
+def _is_unissued_future_rent(payment: dict, current_period: str) -> bool:
+    """Hide untouched future rent rows from invoice history and debt totals."""
+    status = str(payment.get("status") or "").lower()
+    if bool(payment.get("paid")) or status in {"paid", "completed"}:
+        return False
+    if payment.get("charge_attempt"):
+        return False
+    period = payment.get("period") or _safe_period(payment.get("due_date"))
+    return bool(period and period > current_period)
+
+
 @router.get("/tenant/invoices/history")
 async def tenant_invoices_history(
     request: Request,
@@ -93,6 +104,7 @@ async def tenant_invoices_history(
         return {"items": [], "total_count": 0, "summary": {}}
 
     items: List[dict] = []
+    current_period = datetime.now(timezone.utc).strftime("%Y-%m")
 
     # ─── Rent payments ─────────────────────────────────────────
     if type in (None, "rent"):
@@ -100,6 +112,8 @@ async def tenant_invoices_history(
             {"tenant_id": {"$in": tenant_ids},
              "record_type": {"$ne": "checkout_attempt"}}
         ).sort("payment_date", -1).limit(limit):
+            if _is_unissued_future_rent(p, current_period):
+                continue
             # Real paid flag: only true if explicit flag set OR status indicates payment
             doc_status = (p.get("status") or "").lower()
             paid = bool(p.get("paid", False)) or doc_status in ("paid", "completed")
