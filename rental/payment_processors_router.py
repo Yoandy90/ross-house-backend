@@ -75,8 +75,11 @@ def _requested_periods(data: dict, now: datetime) -> list[str]:
     raw = data.get("periods")
     if raw is None:
         raw = [now.strftime("%Y-%m")]
-    if not isinstance(raw, list) or not 1 <= len(raw) <= 12:
-        raise HTTPException(status_code=400, detail="Selecciona entre 1 y 12 meses")
+    if not isinstance(raw, list) or len(raw) != 1:
+        raise HTTPException(
+            status_code=400,
+            detail="Solo puedes pagar un mes por transacción; al confirmarse se habilitará el siguiente",
+        )
     periods = []
     for value in raw:
         value = str(value or "")
@@ -89,18 +92,6 @@ def _requested_periods(data: dict, now: datetime) -> list[str]:
         periods.append(parsed.strftime("%Y-%m"))
     if len(set(periods)) != len(periods):
         raise HTTPException(status_code=400, detail="No puedes seleccionar el mismo mes dos veces")
-    periods = sorted(periods)
-    for previous, current in zip(periods, periods[1:]):
-        previous_dt = datetime.strptime(previous, "%Y-%m")
-        expected = previous_dt.replace(
-            year=previous_dt.year + (1 if previous_dt.month == 12 else 0),
-            month=1 if previous_dt.month == 12 else previous_dt.month + 1,
-        ).strftime("%Y-%m")
-        if current != expected:
-            raise HTTPException(
-                status_code=400,
-                detail="Los meses adelantados deben ser consecutivos",
-            )
     return periods
 
 
@@ -111,7 +102,10 @@ async def _payable_period_previews(db, contract: dict, now: datetime) -> list[di
     cursor = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     end_dt = await _parse_contract_date(contract.get("end_date"))
     result = []
-    for _ in range(12):
+    # Scan through already-paid months and stop at the first open obligation.
+    # This creates no arbitrary advance-payment limit: after that month settles,
+    # the next request scans again and exposes the following lease month.
+    for _ in range(600):
         if end_dt and cursor > end_dt:
             break
         try:
@@ -134,34 +128,26 @@ async def _payable_period_previews(db, contract: dict, now: datetime) -> list[di
                 "status": charge["status"],
                 "paid": charge["status"] in {"paid", "completed"},
                 "in_flight": in_flight,
-                "payable": False,
+                "payable": not in_flight and charge["outstanding"] > 0,
             })
+            if charge["status"] not in {"paid", "completed"} and charge["outstanding"] > 0:
+                break
         if cursor.month == 12:
             cursor = cursor.replace(year=cursor.year + 1, month=1)
         else:
             cursor = cursor.replace(month=cursor.month + 1)
 
-    # Only a consecutive prefix beginning with the first unpaid month can be
-    # charged.  An unresolved attempt blocks later months until it settles.
-    blocked = False
-    for item in result:
-        if item["paid"] or item["outstanding"] <= 0:
-            continue
-        if item["in_flight"]:
-            blocked = True
-        item["payable"] = not blocked
     return result
 
 
 def _require_next_period_prefix(previews: list[dict], periods: list[str]) -> None:
-    """Require requested months to start at the next unpaid lease month."""
+    """Require exactly the next unpaid lease month."""
     eligible = [item["period"] for item in previews if item["payable"]]
     if not eligible or periods != eligible[:len(periods)]:
         raise HTTPException(
             status_code=409,
             detail=(
-                "Debes comenzar por la próxima renta sin pagar y seleccionar "
-                "solamente meses consecutivos"
+                "Solo está habilitada la próxima renta sin pagar"
             ),
         )
 
@@ -206,7 +192,7 @@ async def tenant_payment_capabilities(request: Request):
 
 @router.get("/tenant/rent-payable-periods")
 async def tenant_rent_payable_periods(request: Request):
-    """Preview twelve lease months without materializing future invoices."""
+    """Return paid months plus exactly the next open lease month."""
     tenant = await core.auth_tenant_flex(request)
     db = core.get_db()
     contract = await db.rental_contracts.find_one({
@@ -216,7 +202,7 @@ async def tenant_rent_payable_periods(request: Request):
         raise HTTPException(status_code=404, detail="No se encontró contrato activo")
     now = datetime.now(timezone.utc)
     result = await _payable_period_previews(db, contract, now)
-    return {"success": True, "periods": result, "max_months": 12}
+    return {"success": True, "periods": result, "max_months_per_payment": 1}
 
 
 async def _create_square_cash_app_checkout(*, amount_cents: int, reference: str,
