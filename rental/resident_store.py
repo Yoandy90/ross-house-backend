@@ -322,7 +322,7 @@ async def upload_product_photo(body: ProductPhoto, request: Request):
     image_id = hashlib.sha256(normalized).hexdigest()
     await get_db().resident_store_images.update_one(
         {'_id': image_id},
-        {'$setOnInsert': {'data': normalized, 'created_at': now(), 'actor': actor}},
+        {'$setOnInsert': {'data': base64.b64encode(normalized).decode('ascii'), 'created_at': now(), 'actor': actor}},
         upsert=True,
     )
     return {'path': '/api/public/store-images/' + image_id, 'width': 1200,
@@ -336,7 +336,7 @@ async def product_photo(image_id: str):
     photo = await get_db().resident_store_images.find_one({'_id': image_id})
     if not photo:
         raise HTTPException(404, 'store_image_not_found')
-    return Response(bytes(photo['data']), media_type='image/webp', headers={
+    return Response(base64.b64decode(photo['data']), media_type='image/webp', headers={
         'Cache-Control': 'public, max-age=31536000, immutable',
         'X-Content-Type-Options': 'nosniff',
     })
