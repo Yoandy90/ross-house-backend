@@ -123,13 +123,15 @@ def payment_activity_date(payment: dict, normalized_status: str) -> str:
 def serialize_payment_activity(payment: dict) -> dict:
     status = normalize_payment_status(payment)
     paid_amount = float(payment.get("total_paid") or 0)
-    amount = float(payment.get("amount") or 0)
+    amount = float((payment.get("charge_attempt") or {}).get("amount")
+                   or payment.get("amount") or 0)
+    confirmed_paid = (paid_amount if paid_amount > 0 else amount) if status == "completed" else (paid_amount if status == "partial" else 0.0)
     return {
         "id": str(payment.get("_id", "")),
         "receipt_number": payment.get("receipt_number", ""),
         "amount": amount,
         "late_fee": float(payment.get("late_fee") or 0),
-        "total_paid": paid_amount if paid_amount > 0 else amount,
+        "total_paid": confirmed_paid,
         "payment_method": payment.get("payment_method", ""),
         "reference_number": payment.get("reference_number", ""),
         "period": payment_period(payment),
