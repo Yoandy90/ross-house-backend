@@ -93,3 +93,16 @@ def test_office_confirmation_blocks_paid_or_unresolved_invoice(monkeypatch, chan
         assert exc.value.status_code == 409
         assert await db.rental_payments.find_one({'_id':row['_id']}) == row
     asyncio.run(run())
+
+
+def test_admin_receipt_resolves_contract_and_tenant_metadata(monkeypatch):
+    async def run():
+        db=setup(monkeypatch)
+        contract_id, tenant_id, payment_id = ObjectId(), ObjectId(), ObjectId()
+        await db.rental_contracts.insert_one({'_id':contract_id,'contract_number':'CT-TEST-123','property_address':'Test Address'})
+        await db.tenants.insert_one({'_id':tenant_id,'name':'Test Tenant'})
+        await db.rental_payments.insert_one({'_id':payment_id,'contract_id':str(contract_id),'tenant_id':str(tenant_id),'amount':1200,'late_fee':50,'total_paid':1250,'status':'completed','payment_date':'2026-09-15'})
+        result=await routes.admin_rental_payment_document(str(payment_id),None)
+        text=PdfReader(io.BytesIO(base64.b64decode(result['pdf_base64']))).pages[0].extract_text()
+        assert 'CT-TEST-123' in text and 'Test Tenant' in text and 'Test Address' in text
+    asyncio.run(run())

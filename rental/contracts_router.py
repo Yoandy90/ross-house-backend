@@ -1506,8 +1506,12 @@ async def admin_rental_payment_document(payment_id: str, request: Request):
         raise HTTPException(404, 'Factura no encontrada.')
     from rental_pdf_service import generate_rental_receipt_pdf, DEFAULT_COMPANY
     from rental.invoice_document import render_invoice_document
+    contract_id = str(payment.get('contract_id') or '')
+    tenant_id = str(payment.get('tenant_id') or '')
+    contract = (await get_db().rental_contracts.find_one({'_id': ObjectId(contract_id)})) if ObjectId.is_valid(contract_id) else None
+    tenant = (await get_db().tenants.find_one({'_id': ObjectId(tenant_id)})) if ObjectId.is_valid(tenant_id) else None
     if payment.get('status') in ('paid', 'completed') or payment.get('paid') is True:
-        document = generate_rental_receipt_pdf(payment)
+        document = generate_rental_receipt_pdf(payment, contract=contract, tenant=tenant)
         prefix = 'Recibo'
     else:
         if payment.get('status') not in ('pending', 'late', 'partial'):
@@ -1521,8 +1525,8 @@ async def admin_rental_payment_document(payment_id: str, request: Request):
         if total <= 0 or round(amount + late, 2) != total:
             raise HTTPException(409, 'El importe no coincide con el desglose de la factura.')
         document = render_invoice_document(payment, company=DEFAULT_COMPANY,
-            tenant_name=payment.get('tenant_name', ''), tenant_email=payment.get('tenant_email', ''),
-            property_address=payment.get('property_address', ''), contract_number=payment.get('contract_number', ''),
+            tenant_name=payment.get('tenant_name') or (tenant or {}).get('name', ''), tenant_email=payment.get('tenant_email') or (tenant or {}).get('email', ''),
+            property_address=payment.get('property_address', ''), contract_number=payment.get('contract_number') or (contract or {}).get('contract_number', ''),
             period=payment.get('period') or f"{payment.get('period_month', '')} {payment.get('period_year', '')}",
             amount=amount, late_fee=late, total=total, paid=False,
             date=str(payment.get('due_date') or '')[:10])
