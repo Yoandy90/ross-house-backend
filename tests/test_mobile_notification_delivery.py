@@ -166,3 +166,14 @@ async def test_both_expo_token_formats_route_to_expo():
     result = await service.send_push_notification(tokens, "Test", "Test")
     assert result["sent_count"] == 2
     assert service._send_via_expo.await_args.args[0] == tokens
+
+@pytest.mark.asyncio
+async def test_device_registration_removes_previous_account_token(state):
+    db,_,app=state
+    old,_=await account(db,push_token='ExpoPushToken[shared-phone]')
+    current,headers=await account(db)
+    async with client(app,headers) as c:
+        r=await c.post('/api/marketplace/register-push-token',json={'push_token':'ExpoPushToken[shared-phone]'})
+        assert r.status_code==200
+    assert not (await db.app_users.find_one({'_id':old})).get('push_token')
+    assert (await db.app_users.find_one({'_id':current}))['push_token']=='ExpoPushToken[shared-phone]'

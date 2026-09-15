@@ -379,64 +379,8 @@ async def bulk_push_to_segment(payload: BulkPushPayload, request: Request):
     Send an Expo push notification to all users matching a segment.
     Only users with a valid push_token can receive it.
     """
-    admin = await auth_admin(request)
-    db = get_db()
-
-    if not payload.title.strip() or not payload.body.strip():
-        raise HTTPException(status_code=400, detail="title y body son requeridos")
-
-    query: dict = {"push_token": {"$exists": True, "$nin": [None, ""]}}
-    if payload.role != "all":
-        query["role"] = payload.role
-
-    users = await db.app_users.find(query).to_list(length=5000)
-
-    if payload.status != "all":
-        users = [u for u in users if _classify(u) == payload.status]
-
-    if not users:
-        return {"status": "success", "sent": 0, "failed": 0, "message": "No users match segment"}
-
-    sent = 0
-    failed = 0
-    from push_notification_service import send_push_notification
-
-    for u in users:
-        token = (u.get("push_token") or "").strip()
-        if not token:
-            failed += 1
-            continue
-        try:
-            await send_push_notification(
-                expo_push_token=token,
-                title=payload.title.strip()[:60],
-                body=payload.body.strip()[:200],
-                data={
-                    "type": "admin_broadcast",
-                    "deep_link": payload.deep_link or "",
-                    "campaign": "app_adoption_bulk",
-                },
-            )
-            sent += 1
-        except Exception as e:
-            logger.warning(f"[app-adoption] bulk push to {u.get('email')} failed: {e}")
-            failed += 1
-
-    # Audit
-    await db.app_adoption_broadcasts.insert_one({
-        "role": payload.role,
-        "status": payload.status,
-        "title": payload.title,
-        "body": payload.body,
-        "deep_link": payload.deep_link,
-        "target_count": len(users),
-        "sent": sent,
-        "failed": failed,
-        "sent_by_admin": admin.get("email", ""),
-        "sent_at": datetime.now(timezone.utc),
-    })
-
-    return {"status": "success", "sent": sent, "failed": failed, "target_count": len(users)}
+    await auth_admin(request)
+    raise HTTPException(410, "Usa el Centro de notificaciones para revisar destinatarios y enviar")
 
 
 @router.get("/broadcasts")
