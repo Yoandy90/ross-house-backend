@@ -59,3 +59,15 @@ async def test_upload_roundtrip_dedup_and_auth(monkeypatch):
         assert (await client.post('/admin/store/images',json={'data':'!'})).status_code==400
         auth.side_effect=HTTPException(403,'denied')
         assert (await client.post('/admin/store/images',json=body)).status_code==403
+
+
+def test_gallery_preserves_legacy_and_uses_first_photo_as_cover():
+    base={'name':'Agua','name_en':'Water','category':'Bebidas','price_cents':100,'cost_cents':50,'tax_bps':0,'stock':5}
+    legacy=s.Product(**base,image_url='https://test/front.webp')
+    assert legacy.image_urls==['https://test/front.webp']
+    gallery=s.Product(**base,image_url='https://test/old.webp',image_urls=['https://test/back.webp','https://test/front.webp','https://test/back.webp'])
+    assert gallery.image_url=='https://test/back.webp'
+    assert gallery.image_urls==['https://test/back.webp','https://test/front.webp']
+    with pytest.raises(ValueError): s.Product(**base,image_urls=['http://test/not-secure.jpg'])
+    with pytest.raises(ValueError): s.Product(**base,image_urls=[f'https://test/{i}.jpg' for i in range(9)])
+    assert s.Product(**base,image_url='',image_urls=[]).image_urls==[]
