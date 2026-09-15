@@ -108,3 +108,16 @@ def test_settled_row_wins_over_later_stale_attempt():
          "payment_date": "2026-09-14T11:00:00"},
     ]
     assert collapse_payment_periods(items) == [items[0]]
+
+
+def test_unconfirmed_checkout_amount_is_not_reported_as_paid():
+    row = serialize_payment_activity({'status': 'pending_checkout', 'amount': 1200, 'total_paid': 1200})
+    assert row['total_paid'] == 0
+    assert row['amount'] == 1200
+
+
+def test_activity_uses_attempt_amount_when_invoice_fee_changes():
+    row = serialize_payment_activity({'status': 'pending', 'amount': 1200, 'late_fee': 50,
+                                      'charge_attempt': {'amount': 1200, 'status': 'processing'}})
+    assert row['amount'] == 1200
+    assert row['total_paid'] == 0
