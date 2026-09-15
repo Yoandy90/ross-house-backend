@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 from bson import ObjectId
 
 from rental.tenant_payment_history import (
+    collapse_payment_periods,
     is_payment_activity,
     normalize_payment_status,
     payment_activity_date,
@@ -84,3 +85,26 @@ def test_failed_charge_attempt_is_normalized_from_nested_state():
         "status": "pending", "charge_attempt": {"status": "failed"},
     }
     assert normalize_payment_status(payment) == "failed"
+
+
+def test_duplicate_legacy_rows_collapse_to_one_period():
+    items = [
+        {"id": "old", "period": "2026-09", "status": "processing",
+         "payment_date": "2026-09-14T10:00:00"},
+        {"id": "new", "period": "2026-09", "status": "processing",
+         "payment_date": "2026-09-14T11:00:00"},
+        {"id": "oct", "period": "2026-10", "status": "processing",
+         "payment_date": "2026-09-14T12:00:00"},
+    ]
+    collapsed = collapse_payment_periods(items)
+    assert {item["id"] for item in collapsed} == {"new", "oct"}
+
+
+def test_settled_row_wins_over_later_stale_attempt():
+    items = [
+        {"id": "paid", "period": "2026-09", "status": "completed",
+         "payment_date": "2026-09-14T10:00:00"},
+        {"id": "retry", "period": "2026-09", "status": "processing",
+         "payment_date": "2026-09-14T11:00:00"},
+    ]
+    assert collapse_payment_periods(items) == [items[0]]

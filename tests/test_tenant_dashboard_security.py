@@ -1,9 +1,12 @@
+import asyncio
 from datetime import datetime
 
 from fastapi import FastAPI
+from bson import ObjectId
+from mongomock_motor import AsyncMongoMockClient
 
 from rental.auth_metrics import router as pre_tenant_router
-from rental.tenant_dashboard_security_router import _next_due
+from rental.tenant_dashboard_security_router import _next_due, _next_unpaid_payment
 from rental.tenant_router import router as historical_tenant_router
 
 
@@ -39,3 +42,35 @@ def test_due_date_clamps_short_months():
 
 def test_due_date_invalid_value_fails_to_safe_day_one():
     assert _next_due(datetime(2026, 8, 2), "bad").strftime("%Y-%m-%d") == "2026-09-01"
+
+
+def test_unpaid_current_month_remains_next_even_after_due_day():
+    async def scenario():
+        db = AsyncMongoMockClient()["next_unpaid_current"]
+        contract = {
+            "_id": ObjectId(), "rent_amount": 1200, "payment_due_day": 1,
+            "start_date": "2026-09-01", "end_date": "2027-08-31",
+        }
+        result = await _next_unpaid_payment(db, contract, datetime(2026, 9, 15))
+        assert result["period"] == "2026-09"
+        assert result["due_date"] == "2026-09-01"
+        assert result["amount"] == 1200
+    asyncio.run(scenario())
+
+
+def test_paid_current_month_advances_to_next_month():
+    async def scenario():
+        db = AsyncMongoMockClient()["next_unpaid_advance"]
+        contract = {
+            "_id": ObjectId(), "rent_amount": 1200, "payment_due_day": 1,
+            "start_date": "2026-09-01", "end_date": "2027-08-31",
+        }
+        await db.rental_payments.insert_one({
+            "contract_id": str(contract["_id"]), "period": "2026-09",
+            "status": "completed", "amount": 1200, "total_due": 1200,
+        })
+        result = await _next_unpaid_payment(db, contract, datetime(2026, 9, 15))
+        assert result["period"] == "2026-10"
+        assert result["due_date"] == "2026-10-01"
+        assert result["current_month_paid"] is True
+    asyncio.run(scenario())

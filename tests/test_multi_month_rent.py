@@ -10,6 +10,7 @@ from mongomock_motor import AsyncMongoMockClient
 from rental import payment_processors_core as core
 from rental.payment_processors_router import (
     _hosted_checkout_batch_claim_id,
+    _require_next_period_prefix,
     _requested_periods,
 )
 from rental.rent_payment_cron import canonical_invoice_id, ensure_period_payment
@@ -37,6 +38,27 @@ def test_requested_periods_rejects_duplicate_month():
     with pytest.raises(HTTPException) as exc:
         _requested_periods({"periods": ["2026-09", "2026-09"]}, now)
     assert exc.value.status_code == 400
+
+
+def test_requested_periods_rejects_month_gap():
+    now = datetime(2026, 9, 14, tzinfo=timezone.utc)
+    with pytest.raises(HTTPException) as exc:
+        _requested_periods({"periods": ["2026-09", "2026-11"]}, now)
+    assert exc.value.status_code == 400
+    assert "consecutivos" in exc.value.detail
+
+
+def test_checkout_must_start_with_next_unpaid_month():
+    previews = [
+        {"period": "2026-09", "payable": True},
+        {"period": "2026-10", "payable": True},
+        {"period": "2026-11", "payable": True},
+    ]
+    _require_next_period_prefix(previews, ["2026-09"])
+    _require_next_period_prefix(previews, ["2026-09", "2026-10"])
+    with pytest.raises(HTTPException) as exc:
+        _require_next_period_prefix(previews, ["2026-10"])
+    assert exc.value.status_code == 409
 
 
 def test_concurrent_invoice_generation_creates_one_row():
