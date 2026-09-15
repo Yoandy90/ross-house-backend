@@ -465,6 +465,7 @@ try:
     from rental.title_companies_router import router as title_companies_router
     from rental.app_adoption_router import router as app_adoption_router
     from rental.notification_center import router as notification_center_router
+    from rental.resident_store import router as resident_store_router
     from rental.social_poster_router import router as social_poster_router
     from rental.tiktok_router import router as tiktok_router
     from rental.facebook_router import router as facebook_router
@@ -542,6 +543,7 @@ try:
     app.include_router(title_companies_router, prefix="/api")
     app.include_router(app_adoption_router, prefix="/api")
     app.include_router(notification_center_router, prefix="/api")
+    app.include_router(resident_store_router, prefix="/api")
     app.include_router(social_poster_router, prefix="/api")
     app.include_router(tiktok_router, prefix="/api")
     app.include_router(facebook_router, prefix="/api")
