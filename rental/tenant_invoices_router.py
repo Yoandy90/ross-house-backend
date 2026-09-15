@@ -189,6 +189,11 @@ async def tenant_invoices_history(
                 "color": color,
             })
 
+    # The tenant-facing invoice history is a receipt archive. Open and future
+    # obligations belong on the payments screen, where only the next unpaid
+    # month is presented. Accounting rows remain untouched in MongoDB.
+    items = [x for x in items if x.get("paid")]
+
     # ─── Filters ───────────────────────────────────────────────
     if year:
         items = [
