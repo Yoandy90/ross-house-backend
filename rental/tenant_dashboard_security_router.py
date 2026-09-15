@@ -5,7 +5,7 @@ bound to one authenticated tenant identity and one active lease.  This is a
 compatibility shim while the oversized tenant_router is decomposed.
 """
 from calendar import monthrange
-from datetime import datetime
+from datetime import datetime, timezone
 
 from bson import ObjectId
 from fastapi import APIRouter, Request
@@ -70,6 +70,52 @@ async def _contract_property(contract: dict):
     return result
 
 
+async def _next_unpaid_payment(db, contract: dict, today: datetime) -> dict | None:
+    """Return the first uncovered lease month, including an overdue current month."""
+    from rental.rent_charge_policy import preview_period_rent_charge
+    from rental.rent_payment_cron import _parse_contract_date
+
+    try:
+        due_day = int(contract.get("payment_due_day") or 1)
+    except (TypeError, ValueError):
+        due_day = 1
+    due_day = max(1, min(due_day, 31))
+    if today.tzinfo is None:
+        today = today.replace(tzinfo=timezone.utc)
+    cursor = today.astimezone(timezone.utc).replace(
+        day=1, hour=0, minute=0, second=0, microsecond=0
+    )
+    end_dt = await _parse_contract_date(contract.get("end_date"))
+    current_month_paid = False
+    for index in range(12):
+        if end_dt and cursor > end_dt:
+            break
+        try:
+            charge = await preview_period_rent_charge(db, contract, cursor)
+        except ValueError:
+            charge = None
+        if charge:
+            paid = charge["status"] in {"paid", "completed"}
+            if index == 0:
+                current_month_paid = paid
+            if not paid:
+                invoice = charge.get("invoice") or {}
+                attempt = invoice.get("charge_attempt") or {}
+                safe_day = min(due_day, monthrange(cursor.year, cursor.month)[1])
+                return {
+                    "due_date": cursor.replace(day=safe_day).strftime("%Y-%m-%d"),
+                    "period": cursor.strftime("%Y-%m"),
+                    "amount": charge["outstanding"],
+                    "current_month_paid": current_month_paid,
+                    "in_flight": attempt.get("status") in {"processing", "unknown"},
+                }
+        if cursor.month == 12:
+            cursor = cursor.replace(year=cursor.year + 1, month=1)
+        else:
+            cursor = cursor.replace(month=cursor.month + 1)
+    return None
+
+
 @router.get('/tenant/dashboard')
 async def secure_tenant_dashboard(request: Request):
     user = await auth_marketplace(request)
@@ -114,24 +160,7 @@ async def secure_tenant_dashboard(request: Request):
         }
 
         today = datetime.utcnow()
-        next_due = _next_due(today, contract.get("payment_due_day", 1))
-        current_month_paid = await db.rental_payments.find_one({
-            "contract_id": contract_id,
-            "tenant_id": tenant_id,
-            "record_type": {"$ne": "checkout_attempt"},
-            "$or": [
-                {"period": today.strftime("%Y-%m")},
-                {"period_year": today.year, "period_month_num": today.month},
-                {"period_year": today.year,
-                 "period_month": {"$regex": f"^{today.strftime('%B')[:3]}", "$options": "i"}},
-            ],
-            "status": {"$in": ["completed", "paid"]},
-        })
-        next_payment = {
-            "due_date": next_due.strftime("%Y-%m-%d"),
-            "amount": contract.get("rent_amount", 0),
-            "current_month_paid": bool(current_month_paid),
-        }
+        next_payment = await _next_unpaid_payment(db, contract, today)
         property_data = await _contract_property(contract)
 
     # Historical payment rows remain tenant-scoped.  They are not used as
