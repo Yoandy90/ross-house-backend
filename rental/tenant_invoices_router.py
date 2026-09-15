@@ -13,6 +13,7 @@ from bson import ObjectId
 from fastapi import APIRouter, HTTPException, Request
 
 from .shared import get_db, auth_marketplace, serialize
+from .rent_charge_policy import invoice_balance
 
 logger = logging.getLogger("tenant_invoices")
 router = APIRouter()
@@ -110,7 +111,8 @@ async def tenant_invoices_history(
     if type in (None, "rent"):
         async for p in db.rental_payments.find(
             {"tenant_id": {"$in": tenant_ids},
-             "record_type": {"$ne": "checkout_attempt"}}
+             "record_type": {"$ne": "checkout_attempt"},
+             "invoice_id": {"$exists": False}}
         ).sort("payment_date", -1).limit(limit):
             if _is_unissued_future_rent(p, current_period):
                 continue
@@ -133,6 +135,8 @@ async def tenant_invoices_history(
                 "amount": round(total_due, 2),
                 "base_amount": round(amount, 2),
                 "late_fee": round(late_fee, 2),
+                "outstanding": 0.0 if paid else invoice_balance(p)["outstanding"],
+                "is_future": bool(period and period > current_period),
                 "paid": paid,
                 "paid_at": _safe_iso(paid_at) if paid_at else None,
                 "due_date": _safe_iso(p.get("due_date")),
@@ -208,7 +212,10 @@ async def tenant_invoices_history(
 
     # ─── Summary ──────────────────────────────────────────────
     total_paid = round(sum(x["amount"] for x in items if x["paid"]), 2)
-    total_pending = round(sum(x["amount"] for x in items if not x["paid"]), 2)
+    pending = [x for x in items if not x["paid"] and x.get("status") not in {"cancelled", "canceled", "refunded"}]
+    current = [x for x in pending if not x.get("is_future")]
+    future = [x for x in pending if x.get("is_future")]
+    total_pending = round(sum(x.get("outstanding", x["amount"]) for x in current), 2)
     years_set = sorted(
         {(x.get("paid_at") or x.get("due_date") or x.get("period") or "")[:4]
          for x in items
@@ -223,7 +230,9 @@ async def tenant_invoices_history(
             "total_paid": total_paid,
             "total_pending": total_pending,
             "paid_count": sum(1 for x in items if x["paid"]),
-            "pending_count": sum(1 for x in items if not x["paid"]),
+            "pending_count": sum(1 for x in current if x.get("outstanding", x["amount"]) > 0),
+            "total_future": round(sum(x.get("outstanding", x["amount"]) for x in future), 2),
+            "future_count": len(future),
         },
         "filters": {
             "available_years": [y for y in years_set if y],
