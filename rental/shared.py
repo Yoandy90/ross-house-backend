@@ -398,6 +398,12 @@ async def send_rental_push_to_user(user_id: str, title: str, body: str, data: di
     if not user_id:
         return False
 
+    if (data or {}).get("type", "").startswith("maintenance_"):
+        states = {"completed": "Completada", "resolved": "Resuelta", "pending": "Pendiente", "assigned": "Asignada", "in_progress": "En progreso", "scheduled": "Programada", "cancelled": "Cancelada", "waiting_parts": "En espera de piezas", "en_route": "En camino", "reviewing": "En revisión"}
+        prefix, separator, state = body.rpartition(": ")
+        if separator and state in states:
+            body = prefix + separator + states[state]
+
     # Persist before token lookup: users without push permission still have a bell.
     await _save_maintenance_notice(db, title, body, data, user_id=str(user_id))
     from rental.notification_identity import push_recipient

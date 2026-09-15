@@ -1,0 +1,50 @@
+name: Notification Center Integrity
+
+on:
+  pull_request:
+    branches: [staging]
+    paths:
+      - 'rental/notification_*.py'
+      - 'rental/auth_router.py'
+      - 'rental/shared.py'
+      - 'rental/app_adoption_router.py'
+      - 'rental/drip_router.py'
+      - 'push_notification_service.py'
+      - 'server.py'
+      - 'requirements.txt'
+      - 'tests/test_notification_center.py'
+      - 'tests/test_mobile_notification_delivery.py'
+      - 'tests/conftest.py'
+      - '.github/workflows/notification-center-integrity.yml'
+  push:
+    branches: [staging]
+    paths:
+      - 'rental/notification_*.py'
+      - 'rental/auth_router.py'
+      - 'rental/shared.py'
+      - 'rental/app_adoption_router.py'
+      - 'rental/drip_router.py'
+      - 'push_notification_service.py'
+      - 'server.py'
+      - 'requirements.txt'
+      - 'tests/test_notification_center.py'
+      - 'tests/test_mobile_notification_delivery.py'
+      - 'tests/conftest.py'
+      - '.github/workflows/notification-center-integrity.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  notifications:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - run: pip install -r requirements.txt pytest pytest-asyncio mongomock-motor
+      - name: Notification audiences, confirmation and delivery with fake MongoDB and Expo
+        run: PYTHONPATH=. python -m pytest -q tests/test_notification_center.py tests/test_mobile_notification_delivery.py

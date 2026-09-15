@@ -121,6 +121,13 @@ async def marketplace_register_push_token(request: Request):
     if result.matched_count != 1:
         raise HTTPException(status_code=409, detail="No se pudo registrar el dispositivo")
     
+    # A shared phone belongs to the most recently authenticated account.
+    if collection == "app_users":
+        for field in ("push_token", "expo_push_token"):
+            await db.app_users.update_many(
+                {"_id": {"$ne": recipient["_id"]}, field: push_token},
+                {"$unset": {field: ""}},
+            )
     logging.info("Push device registered (%s)", platform)
     return {"success": True, "message": "Push token registrado"}
 

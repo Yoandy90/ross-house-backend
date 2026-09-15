@@ -120,6 +120,9 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"   ⚠️ Inspection indexes deferred: {e}")
 
+    from rental.notification_center import ensure_indexes as notification_indexes
+    await notification_indexes(db)
+
     # Staging must never execute autonomous jobs (payments, messages, or syncs).
     # DISABLE_BACKGROUND_JOBS also provides an explicit kill switch elsewhere.
     if should_disable_background_jobs():
@@ -170,6 +173,9 @@ async def lifespan(app: FastAPI):
         logger.info("   ✅ Autopay cron scheduled")
     except Exception as e:
         logger.warning(f"   ⚠️ Autopay cron not started: {e}")
+
+    from rental.notification_center import scheduler as notification_scheduler
+    asyncio.create_task(notification_scheduler())
 
     # Start newsletter scheduler — sends scheduled/recurring campaigns
     try:
@@ -458,6 +464,7 @@ try:
     from rental.pm_waitlist_router import router as pm_waitlist_router
     from rental.title_companies_router import router as title_companies_router
     from rental.app_adoption_router import router as app_adoption_router
+    from rental.notification_center import router as notification_center_router
     from rental.social_poster_router import router as social_poster_router
     from rental.tiktok_router import router as tiktok_router
     from rental.facebook_router import router as facebook_router
@@ -534,6 +541,7 @@ try:
     app.include_router(pm_waitlist_router, prefix="/api")
     app.include_router(title_companies_router, prefix="/api")
     app.include_router(app_adoption_router, prefix="/api")
+    app.include_router(notification_center_router, prefix="/api")
     app.include_router(social_poster_router, prefix="/api")
     app.include_router(tiktok_router, prefix="/api")
     app.include_router(facebook_router, prefix="/api")

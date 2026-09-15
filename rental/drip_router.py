@@ -19,7 +19,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from bson import ObjectId
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request, BackgroundTasks
 from pydantic import BaseModel
 
 from .shared import get_db, auth_admin
@@ -236,7 +236,7 @@ class TemplateUpdate(BaseModel):
 
 
 @router.patch("/admin/drip/templates/{tpl_id}")
-async def update_template(request: Request, tpl_id: str, body: TemplateUpdate):
+async def update_template(request: Request, tpl_id: str, body: TemplateUpdate, tasks: BackgroundTasks):
     await auth_admin(request)
     db = get_db()
     updates = {k: v for k, v in body.model_dump().items() if v is not None}
@@ -244,13 +244,20 @@ async def update_template(request: Request, tpl_id: str, body: TemplateUpdate):
         raise HTTPException(400, "Nada que actualizar")
     if "status" in updates and updates["status"] not in ("active", "draft", "archived"):
         raise HTTPException(400, "status inválido")
-    if updates.get("published_to_blog"):
+    previous = await db.email_templates.find_one({"_id": ObjectId(tpl_id)})
+    first_publication = bool(updates.get("published_to_blog") and not (previous or {}).get("published_to_blog"))
+    if first_publication:
         updates["blog_published_at"] = datetime.utcnow()
     updates["updated_at"] = datetime.utcnow()
     res = await db.email_templates.update_one({"_id": ObjectId(tpl_id)}, {"$set": updates})
     if res.matched_count == 0:
         raise HTTPException(404, "Plantilla no encontrada")
     doc = await db.email_templates.find_one({"_id": ObjectId(tpl_id)})
+    if first_publication:
+        from rental.notification_center import queue_news, deliver_campaign
+        campaign_id = await queue_news(db, doc)
+        if campaign_id:
+            tasks.add_task(deliver_campaign, db, campaign_id)
     return {"success": True, "template": _tpl_out(doc)}
 
 
