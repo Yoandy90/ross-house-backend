@@ -157,12 +157,25 @@ async def create_campaign(body:CampaignCreate,request:Request,tasks:BackgroundTa
     p=await db.push_previews.find_one({'_id':body.preview_id,'actor':actor_id(actor),'expires_at':{'$gt':now()}})
     if not p: raise HTTPException(409,'La vista previa expiró. Revísala nuevamente')
     scheduled=body.scheduled_at
-    if scheduled and (scheduled.tzinfo is None or scheduled<=now()):
+    if scheduled and scheduled.tzinfo is None:
         raise HTTPException(400,'Selecciona una fecha futura con zona horaria')
+    if scheduled:
+        # MongoDB stores UTC milliseconds. Compare retries at the same precision.
+        scheduled=scheduled.astimezone(timezone.utc)
+        scheduled=scheduled.replace(microsecond=scheduled.microsecond//1000*1000)
     cid=p['_id']
-    await db.push_campaigns.update_one({'_id':cid},{'$setOnInsert':{'audience':p['audience'],'message':p['message'],'preview_recipients':p['recipients'],'created_by':actor_id(actor),'created_at':now(),'due_at':scheduled or now(),'dynamic_at_send':bool(scheduled),'status':'queued'}},upsert=True)
-    if not scheduled: tasks.add_task(deliver_campaign,db,cid)
-    return {'id':cid,'status':'queued','scheduled':bool(scheduled)}
+    campaign=await db.push_campaigns.find_one({'_id':cid})
+    if not campaign:
+        if scheduled and scheduled<=now():
+            raise HTTPException(400,'Selecciona una fecha futura con zona horaria')
+        campaign=await db.push_campaigns.find_one_and_update({'_id':cid},{'$setOnInsert':{'audience':p['audience'],'message':p['message'],'preview_recipients':p['recipients'],'created_by':actor_id(actor),'created_at':now(),'due_at':scheduled or now(),'dynamic_at_send':bool(scheduled),'status':'queued'}},upsert=True,return_document=ReturnDocument.AFTER)
+    was_scheduled=bool(campaign.get('dynamic_at_send'))
+    saved_due=campaign['due_at']
+    if saved_due.tzinfo is None: saved_due=saved_due.replace(tzinfo=timezone.utc)
+    if was_scheduled!=bool(scheduled) or (scheduled and saved_due!=scheduled):
+        raise HTTPException(409,'Esta vista previa ya fue confirmada con otra fecha. Revisa el aviso nuevamente')
+    if not was_scheduled and campaign['status']=='queued': tasks.add_task(deliver_campaign,db,cid)
+    return {'id':cid,'status':campaign['status'],'scheduled':was_scheduled}
 
 @router.get(BASE+'/campaigns')
 async def get_campaigns(request:Request):

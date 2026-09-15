@@ -163,7 +163,9 @@ async def test_preview_bound_to_admin_and_repeat_submit(state,monkeypatch):
         assert (await client.post(c.BASE+'/campaigns',json=body)).status_code==409
         monkeypatch.setattr(c,'auth_admin',AsyncMock(return_value={'_id':'admin-test'}))
         assert (await client.post(c.BASE+'/campaigns',json=body)).status_code==200
-        assert (await client.post(c.BASE+'/campaigns',json=body)).status_code==200
+        repeated = await client.post(c.BASE+'/campaigns',json=body)
+        assert repeated.status_code==200
+        assert repeated.json()['status']=='finished'
         assert await db.push_campaigns.count_documents({})==1
         assert await db.rental_notifications.count_documents({})==1
 
@@ -194,3 +196,42 @@ async def test_detail_is_scoped_to_current_user(state,monkeypatch):
     monkeypatch.setattr(c,'auth_marketplace',AsyncMock(return_value={'_id':uid,'role':'tenant'}))
     async with AsyncClient(transport=ASGITransport(app=app),base_url='http://test') as client:
         assert (await client.get('/marketplace/notification-detail/'+str(nid))).status_code==200
+
+@pytest.mark.asyncio
+async def test_schedule_replay_preserves_original_confirmation(state, monkeypatch):
+    db, sender, app = state
+    await tenant(db, push_token='ExpoPushToken[test]')
+    async with AsyncClient(transport=ASGITransport(app=app), base_url='http://test') as client:
+        p = await client.post(c.BASE+'/preview', json={'audience': Audience().model_dump(), 'message': {'title':'A','body':'B'}})
+        due = c.now() + timedelta(minutes=2)
+        body = {'preview_id': p.json()['preview_id'], 'scheduled_at': due.isoformat()}
+        assert (await client.post(c.BASE+'/campaigns', json=body)).status_code == 200
+        for replacement in [None, (due + timedelta(hours=1)).isoformat()]:
+            result = await client.post(c.BASE+'/campaigns', json={**body, 'scheduled_at': replacement})
+            assert result.status_code == 409
+        saved = await db.push_campaigns.find_one({})
+        assert saved['due_at'].replace(tzinfo=due.tzinfo) == due.replace(microsecond=due.microsecond // 1000 * 1000)
+        assert saved['status'] == 'queued'
+        assert await db.push_campaigns.count_documents({}) == 1
+        assert not sender.called
+        # Retrying the same confirmation after its due time still reports its stored state.
+        monkeypatch.setattr(c, 'now', lambda: due + timedelta(seconds=1))
+        repeated = await client.post(c.BASE+'/campaigns', json=body)
+        assert repeated.status_code == 200
+        assert repeated.json() == {'id': p.json()['preview_id'], 'status': 'queued', 'scheduled': True}
+
+@pytest.mark.asyncio
+async def test_cancelled_campaign_replay_does_not_claim_it_is_scheduled(state):
+    db, sender, app = state
+    await tenant(db, push_token='ExpoPushToken[test]')
+    async with AsyncClient(transport=ASGITransport(app=app), base_url='http://test') as client:
+        p = await client.post(c.BASE+'/preview', json={'audience': Audience().model_dump(), 'message': {'title':'A','body':'B'}})
+        cid = p.json()['preview_id']
+        body = {'preview_id': cid, 'scheduled_at': (c.now()+timedelta(hours=1)).isoformat()}
+        await client.post(c.BASE+'/campaigns', json=body)
+        assert (await client.post(c.BASE+'/campaigns/'+cid+'/cancel')).status_code == 200
+        repeated = await client.post(c.BASE+'/campaigns', json=body)
+        assert repeated.status_code == 200
+        assert repeated.json()['status'] == 'cancelled'
+        assert not sender.called
+        assert await db.rental_notifications.count_documents({}) == 0
