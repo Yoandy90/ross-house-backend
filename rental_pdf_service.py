@@ -1704,9 +1704,18 @@ def generate_rental_receipt_pdf(payment: dict, contract: dict = None, tenant: di
         if isinstance(payment_date_raw, datetime):
             payment_dt = payment_date_raw
         else:
-            payment_dt = datetime.fromisoformat(str(payment_date_raw).replace(' ', 'T').split('.')[0])
+            payment_dt = datetime.fromisoformat(str(payment_date_raw).replace('Z', '+00:00'))
+        precision = payment.get('payment_date_precision')
+        date_only = precision == 'date' or len(str(payment_date_raw)) == 10
+        if not precision and payment_dt.time().isoformat() == '00:00:00':
+            date_only = True  # Legacy date-only admin inputs became midnight.
+        if not date_only:
+            from datetime import timezone
+            from zoneinfo import ZoneInfo
+            payment_dt = (payment_dt.replace(tzinfo=timezone.utc) if payment_dt.tzinfo is None else payment_dt)
+            payment_dt = payment_dt.astimezone(ZoneInfo('America/Chicago'))
         payment_date = payment_dt.strftime('%d %b %Y')
-        payment_time = payment_dt.strftime('%I:%M %p')
+        payment_time = '' if date_only else payment_dt.strftime('%I:%M %p %Z')
     except Exception:
         payment_date = str(payment_date_raw)[:10]
         payment_time = ''
@@ -1728,7 +1737,16 @@ def generate_rental_receipt_pdf(payment: dict, contract: dict = None, tenant: di
 
     amount = float(payment.get('amount', 0) or 0)
     late_fee = float(payment.get('late_fee', 0) or 0)
-    total_paid = float(payment.get('total_paid', payment.get('amount', 0)) or 0)
+    from rental.manual_payment_confirmation import recorded_paid_amount
+    from fastapi import HTTPException
+    total_paid = recorded_paid_amount(payment)
+    if payment.get('record_type') == 'checkout_attempt' or payment.get('invoice_id'):
+        raise HTTPException(409, 'El recibo debe emitirse desde la factura de renta confirmada.')
+    if (str(payment.get('status') or '').lower() not in ('paid', 'completed')
+            and payment.get('paid') is not True):
+        raise HTTPException(409, 'El recibo solo está disponible para pagos confirmados.')
+    if total_paid <= 0 or round(amount + late_fee, 2) != total_paid:
+        raise HTTPException(409, 'El importe confirmado no coincide con el desglose. Revisa el pago antes de emitir el recibo.')
 
     payment_method_raw = (payment.get('payment_method') or 'N/A').lower()
     method_map = {
@@ -1945,7 +1963,7 @@ def generate_rental_receipt_pdf(payment: dict, contract: dict = None, tenant: di
         [[
             Paragraph("MÉTODO DE PAGO", S['lbl']),
             Paragraph(payment_method, S['val']),
-            Paragraph("PROCESADO", S['lbl']),
+            Paragraph("FECHA DE PAGO", S['lbl']),
             Paragraph(f"{payment_date}  {payment_time}", S['val']),
         ]],
         colWidths=[1.4 * inch, 2.4 * inch, 1.3 * inch, 2.4 * inch],
@@ -1963,17 +1981,21 @@ def generate_rental_receipt_pdf(payment: dict, contract: dict = None, tenant: di
     elements.append(Spacer(1, 28))
 
     # ─── PAID STAMP (decorative) ───────────────────────────
-    if status == 'completed':
+    if status in ('completed', 'paid'):
         elements.append(Paragraph("✓ PAGO RECIBIDO", S['stamp']))
         elements.append(Spacer(1, 4))
         elements.append(Paragraph(
-            "Este recibo confirma que su pago ha sido procesado y recibido exitosamente.",
+            ("Pago confirmado manualmente por la administración."
+             if payment.get('confirmation_source') == 'admin_manual'
+             else "Este recibo confirma que su pago ha sido procesado y recibido exitosamente."),
             ParagraphStyle('thanks', parent=base_styles['Normal'],
                 fontSize=9, leading=12, textColor=GRAY,
                 fontName='Helvetica-Oblique', alignment=TA_CENTER)
         ))
         elements.append(Paragraph(
-            "This receipt confirms your payment has been successfully processed and received.",
+            ("Payment manually confirmed by management."
+             if payment.get('confirmation_source') == 'admin_manual'
+             else "This receipt confirms your payment has been successfully processed and received."),
             ParagraphStyle('thanks2', parent=base_styles['Normal'],
                 fontSize=8, leading=11, textColor=MUTED_GRAY,
                 fontName='Helvetica-Oblique', alignment=TA_CENTER)

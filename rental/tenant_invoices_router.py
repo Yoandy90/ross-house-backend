@@ -14,6 +14,7 @@ from fastapi import APIRouter, HTTPException, Request
 
 from .shared import get_db, auth_marketplace, serialize
 from .rent_charge_policy import invoice_balance
+from .manual_payment_confirmation import recorded_paid_amount
 
 logger = logging.getLogger("tenant_invoices")
 router = APIRouter()
@@ -132,7 +133,7 @@ async def tenant_invoices_history(
                 "label": "Renta mensual",
                 "subtitle": p.get("notes") or p.get("description") or "",
                 "period": period,
-                "amount": round(total_due, 2),
+                "amount": recorded_paid_amount(p) if paid else round(total_due, 2),
                 "base_amount": round(amount, 2),
                 "late_fee": round(late_fee, 2),
                 "outstanding": 0.0 if paid else invoice_balance(p)["outstanding"],

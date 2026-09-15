@@ -18,6 +18,7 @@ from rental.shared import (
     TENANT_JWT_SECRET,
 )
 from rental.lease_signature_state import effective_lease_status
+from rental.manual_payment_confirmation import manual_confirmation, payment_money
 
 router = APIRouter()
 
@@ -1475,6 +1476,12 @@ async def register_rental_payment(request: Request):
     if nmi_transaction:
         payment_doc['nmi_transaction'] = nmi_transaction
         payment_doc['customer_vault_id'] = vault_id
+    elif is_paid:
+        confirmation = manual_confirmation({}, payment_doc, {**data, 'status': target_status}, user, now)
+        payment_doc['manual_confirmation_history'] = [confirmation]
+        payment_doc['payment_date_precision'] = (
+            'date' if len(str(data.get('payment_date') or '')) == 10 else 'datetime'
+        )
 
     result = await get_db().rental_payments.insert_one(payment_doc)
 
@@ -1597,7 +1604,7 @@ async def list_rental_payments(request: Request):
             ]}},
             'total_completed': {'$sum': {'$cond': [
                 {'$in': [{'$ifNull': ['$status', '']}, ['completed', 'paid']]},
-                {'$add': [{'$ifNull': ['$amount', 0]}, {'$ifNull': ['$late_fee', 0]}]},
+                {'$ifNull': ['$total_paid', {'$ifNull': ['$amount', 0]}]},
                 0,
             ]}},
             'total_pending': {'$sum': {'$cond': [
@@ -1652,6 +1659,8 @@ async def update_rental_payment(payment_id: str, request: Request):
     user = await auth_admin(request)
     data = await request.json()
 
+    if not ObjectId.is_valid(payment_id):
+        raise HTTPException(400, 'ID de pago inválido')
     existing = await get_db().rental_payments.find_one({"_id": ObjectId(payment_id)})
     if not existing:
         raise HTTPException(status_code=404, detail="Pago no encontrado")
@@ -1666,10 +1675,7 @@ async def update_rental_payment(payment_id: str, request: Request):
 
     for f in float_fields:
         if f in data:
-            try:
-                update_fields[f] = float(data[f] or 0)
-            except (TypeError, ValueError):
-                pass
+            update_fields[f] = payment_money(data[f], f)
     for f in str_fields:
         if f in data:
             update_fields[f] = str(data[f] or "")
@@ -1689,30 +1695,41 @@ async def update_rental_payment(payment_id: str, request: Request):
                         update_fields[f] = datetime.fromisoformat(v.replace("Z", "+00:00"))
                     else:
                         update_fields[f] = datetime.strptime(v, "%Y-%m-%d")
+                    if f == 'payment_date':
+                        update_fields['payment_date_precision'] = 'date' if len(v) == 10 else 'datetime'
                 else:
                     update_fields[f] = v
             except Exception:
-                pass
+                raise HTTPException(400, f'Fecha inválida: {f}')
 
+    confirmation_event = manual_confirmation(existing, update_fields, data, user, now)
     # Auto-set paid flag based on status
     new_status = update_fields.get("status", existing.get("status", "pending")).lower()
     if new_status in ("completed", "paid"):
         update_fields["paid"] = True
         if not update_fields.get("payment_date") and not existing.get("payment_date"):
             update_fields["payment_date"] = now
+            update_fields['payment_date_precision'] = 'datetime'
         # Auto-assign receipt number if missing
         if not (update_fields.get("receipt_number") or existing.get("receipt_number")):
             pay_count = await get_db().rental_payments.count_documents({
                 "status": {"$in": ["completed", "paid"]}
             })
             update_fields["receipt_number"] = f"REC-{now.year}-{str(pay_count + 1).zfill(4)}"
-    elif new_status in ("pending", "late", "cancelled"):
+    elif new_status in ("pending", "late", "partial", "cancelled"):
         update_fields["paid"] = False
 
-    await get_db().rental_payments.update_one(
-        {"_id": ObjectId(payment_id)},
-        {"$set": update_fields}
-    )
+    # Prevent a manual edit from overwriting a concurrent provider settlement.
+    query = {'_id': existing['_id']}
+    for field in ('updated_at', 'status', 'paid', 'amount', 'late_fee',
+                  'total_due', 'total_paid', 'charge_attempt'):
+        query[field] = existing[field] if field in existing else {'$exists': False}
+    mutation = {'$set': update_fields}
+    if confirmation_event:
+        mutation['$push'] = {'manual_confirmation_history': confirmation_event}
+    result = await get_db().rental_payments.update_one(query, mutation)
+    if result.matched_count != 1:
+        raise HTTPException(409, 'El pago cambió durante la confirmación. Actualiza y revisa sus datos.')
 
     updated = await get_db().rental_payments.find_one({"_id": ObjectId(payment_id)})
     return {"success": True, "payment": serialize(updated)}
@@ -3460,4 +3477,3 @@ async def update_property_location(property_id: str, request: Request):
     )
 
     return {"success": True, "message": "Ubicación actualizada"}
-
