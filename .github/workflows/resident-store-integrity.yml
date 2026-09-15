@@ -1,0 +1,22 @@
+name: Resident store integrity
+on:
+  pull_request:
+    branches: [staging]
+    paths: ['rental/resident_store.py', 'rental/shared.py', 'server.py', 'tests/test_resident_store.py', '.github/workflows/resident-store-integrity.yml']
+  push:
+    branches: [staging]
+    paths: ['rental/resident_store.py', 'rental/shared.py', 'server.py', 'tests/test_resident_store.py', '.github/workflows/resident-store-integrity.yml']
+permissions:
+  contents: read
+jobs:
+  store:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - run: pip install -r requirements.txt pytest pytest-asyncio mongomock-motor
+      - run: PYTHONPATH=. python -m pytest -q tests/test_resident_store.py
