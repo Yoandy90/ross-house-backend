@@ -41,12 +41,12 @@ def test_requested_periods_rejects_duplicate_month():
     assert exc.value.status_code == 400
 
 
-def test_requested_periods_rejects_month_gap():
+def test_requested_periods_rejects_multiple_months_per_transaction():
     now = datetime(2026, 9, 14, tzinfo=timezone.utc)
     with pytest.raises(HTTPException) as exc:
-        _requested_periods({"periods": ["2026-09", "2026-11"]}, now)
+        _requested_periods({"periods": ["2026-09", "2026-10"]}, now)
     assert exc.value.status_code == 400
-    assert "consecutivos" in exc.value.detail
+    assert "un mes por transacción" in exc.value.detail
 
 
 def test_checkout_must_start_with_next_unpaid_month():
@@ -56,7 +56,6 @@ def test_checkout_must_start_with_next_unpaid_month():
         {"period": "2026-11", "payable": True},
     ]
     _require_next_period_prefix(previews, ["2026-09"])
-    _require_next_period_prefix(previews, ["2026-09", "2026-10"])
     with pytest.raises(HTTPException) as exc:
         _require_next_period_prefix(previews, ["2026-10"])
     assert exc.value.status_code == 409
@@ -89,10 +88,32 @@ def test_unresolved_current_month_blocks_every_later_month(monkeypatch):
         previews = await processor_router._payable_period_previews(None, contract, current)
         assert previews[0]["period"] == "2026-09"
         assert not previews[0]["payable"]
-        assert not previews[1]["payable"]
+        assert len(previews) == 1
         with pytest.raises(HTTPException) as exc:
             _require_next_period_prefix(previews, ["2026-10"])
         assert exc.value.status_code == 409
+
+    asyncio.run(scenario())
+
+
+def test_paid_month_exposes_exactly_the_next_unpaid_month(monkeypatch):
+    async def scenario():
+        contract = _contract()
+        current = datetime(2026, 9, 14, tzinfo=timezone.utc)
+
+        async def preview(_db, _contract, cursor):
+            paid = cursor.strftime("%Y-%m") == "2026-09"
+            return {
+                "invoice": {}, "invoice_id": cursor.strftime("%Y-%m"),
+                "amount": 1200, "late_fee": 0, "total_due": 1200,
+                "outstanding": 0 if paid else 1200,
+                "status": "completed" if paid else "pending",
+            }
+
+        monkeypatch.setattr(processor_router, "preview_period_rent_charge", preview)
+        previews = await processor_router._payable_period_previews(None, contract, current)
+        assert [item["period"] for item in previews] == ["2026-09", "2026-10"]
+        assert [item["payable"] for item in previews] == [False, True]
 
     asyncio.run(scenario())
 
