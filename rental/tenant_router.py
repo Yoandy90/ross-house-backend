@@ -2177,9 +2177,9 @@ async def tenant_payment_history(request: Request):
         return {"success": True, "payments": [], "total_paid": 0}
     
     from .tenant_payment_history import (
-        collapse_payment_periods,
-        is_payment_activity,
+        is_payment_timeline_candidate,
         payment_activity_query,
+        sequential_payment_timeline,
         serialize_payment_activity,
     )
 
@@ -2189,12 +2189,12 @@ async def tenant_payment_history(request: Request):
     
     payments = []
     async for p in cursor:
-        if not is_payment_activity(p):
+        if not is_payment_timeline_candidate(p):
             continue
         item = serialize_payment_activity(p)
         payments.append(item)
 
-    payments = collapse_payment_periods(payments)
+    payments = sequential_payment_timeline(payments)
     payments.sort(key=lambda item: item.get("payment_date") or "", reverse=True)
     payments = payments[:100]
     total_paid = sum(
