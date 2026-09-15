@@ -179,11 +179,14 @@ def payment_activity_date(payment: dict, normalized_status: str) -> str:
 
 
 def serialize_payment_activity(payment: dict) -> dict:
+    from rental.manual_payment_confirmation import recorded_paid_amount
     status = normalize_payment_status(payment)
     paid_amount = float(payment.get("total_paid") or 0)
     amount = float((payment.get("charge_attempt") or {}).get("amount")
                    or payment.get("amount") or 0)
-    confirmed_paid = (paid_amount if paid_amount > 0 else amount) if status == "completed" else (paid_amount if status == "partial" else 0.0)
+    confirmed_paid = recorded_paid_amount(payment) if status == "completed" else (paid_amount if status == "partial" else 0.0)
+    if status == 'completed':
+        amount = confirmed_paid
     return {
         "id": str(payment.get("_id", "")),
         "receipt_number": payment.get("receipt_number", ""),
