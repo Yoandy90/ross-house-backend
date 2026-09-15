@@ -3201,7 +3201,7 @@ async def upload_property_photo(property_id: str, request: Request):
         {"$push": {"photos": storage_path}}
     )
 
-    return {"success": True, "message": "Foto subida exitosamente", "photo": photo_info}
+    return {"success": True, "message": "Foto subida exitosamente", "photo": {k: v for k, v in photo_info.items() if k != "base64_data"}}
 
 
 @router.get('/admin/properties/{property_id}/photos')
@@ -3212,7 +3212,7 @@ async def list_property_photos(property_id: str, request: Request):
         {"property_id": property_id, "is_deleted": {"$ne": True}}
     ).sort("uploaded_at", -1).to_list(100)
     
-    result_photos = [serialize(p) for p in photos]
+    result_photos = [serialize({k: v for k, v in p.items() if k != "base64_data"}) for p in photos]
 
     # Merge legacy entries from property.photos array not tracked in property_photos
     prop = await get_db().properties.find_one({"_id": ObjectId(property_id)})
