@@ -99,3 +99,46 @@ def test_stale_current_attempt_is_exposed_as_review_without_advancing_month():
         assert result["requires_review"] is True
 
     asyncio.run(scenario())
+
+
+def test_next_month_after_more_than_one_year_prepaid():
+    async def scenario():
+        db = AsyncMongoMockClient()["prepaid_horizon"]
+        contract = {
+            "_id": ObjectId(), "rent_amount": 1200,
+            "start_date": "2026-09-01", "end_date": "2029-08-31",
+        }
+        for offset in range(18):
+            absolute = 2026 * 12 + 8 + offset
+            year, month = divmod(absolute, 12)
+            await db.rental_payments.insert_one({
+                "contract_id": str(contract["_id"]),
+                "period": f"{year:04d}-{month + 1:02d}",
+                "status": "completed", "amount": 1200, "total_due": 1200,
+            })
+        before = await db.rental_payments.count_documents({})
+        result = await _next_unpaid_payment(db, contract, datetime(2026, 9, 15))
+        assert result["period"] == "2028-03"
+        assert result["current_month_paid"] is True
+        assert await db.rental_payments.count_documents({}) == before
+        contract["end_date"] = "2028-02-29"
+        assert await _next_unpaid_payment(db, contract, datetime(2026, 9, 15)) is None
+        contract.pop("end_date")
+        assert (await _next_unpaid_payment(db, contract, datetime(2026, 9, 15)))["period"] == "2028-03"
+    asyncio.run(scenario())
+
+
+def test_future_lease_and_no_rent_terminate_without_creating_invoice():
+    async def scenario():
+        db = AsyncMongoMockClient()["future_horizon"]
+        contract = {
+            "_id": ObjectId(), "rent_amount": 1200,
+            "start_date": "2028-01-01", "end_date": "2028-12-31",
+        }
+        result = await _next_unpaid_payment(db, contract, datetime(2026, 9, 15))
+        assert result["period"] == "2028-01"
+        assert result["current_month_paid"] is False
+        contract["rent_amount"] = 0
+        assert await _next_unpaid_payment(db, contract, datetime(2026, 9, 15)) is None
+        assert await db.rental_payments.count_documents({}) == 0
+    asyncio.run(scenario())

@@ -87,17 +87,23 @@ async def _next_unpaid_payment(db, contract: dict, today: datetime) -> dict | No
         day=1, hour=0, minute=0, second=0, microsecond=0
     )
     end_dt = await _parse_contract_date(contract.get("end_date"))
+    start_dt = await _parse_contract_date(contract.get("start_date"))
+    current_period = (cursor.year, cursor.month)
+    if start_dt and (start_dt.year, start_dt.month) > current_period:
+        cursor = start_dt.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     current_month_paid = False
-    for index in range(12):
+    # Each paid month advances the cursor. The first uncovered month or lease
+    # boundary ends this read; advance payments have no fixed look-ahead cap.
+    while True:
         if end_dt and cursor > end_dt:
             break
         try:
             charge = await preview_period_rent_charge(db, contract, cursor)
         except ValueError:
-            charge = None
+            return None
         if charge:
             paid = charge["status"] in {"paid", "completed"}
-            if index == 0:
+            if (cursor.year, cursor.month) == current_period:
                 current_month_paid = paid
             if not paid:
                 invoice = charge.get("invoice") or {}
