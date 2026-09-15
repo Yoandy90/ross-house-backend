@@ -8,6 +8,7 @@ from fastapi import HTTPException
 from mongomock_motor import AsyncMongoMockClient
 
 from rental import payment_processors_core as core
+from rental import payment_processors_router as processor_router
 from rental.payment_processors_router import (
     _hosted_checkout_batch_claim_id,
     _require_next_period_prefix,
@@ -59,6 +60,41 @@ def test_checkout_must_start_with_next_unpaid_month():
     with pytest.raises(HTTPException) as exc:
         _require_next_period_prefix(previews, ["2026-10"])
     assert exc.value.status_code == 409
+
+
+def test_unresolved_current_month_blocks_every_later_month(monkeypatch):
+    async def scenario():
+        contract = _contract()
+        current = datetime(2026, 9, 14, tzinfo=timezone.utc)
+
+        async def preview(_db, _contract, cursor):
+            period = cursor.strftime("%Y-%m")
+            return {
+                "invoice": {
+                    "charge_attempt": {
+                        "id": "stuck-september",
+                        "status": "processing",
+                        "created_at": current,
+                    }
+                } if period == "2026-09" else {},
+                "invoice_id": period,
+                "amount": 1200,
+                "late_fee": 0,
+                "total_due": 1200,
+                "outstanding": 1200,
+                "status": "pending",
+            }
+
+        monkeypatch.setattr(processor_router, "preview_period_rent_charge", preview)
+        previews = await processor_router._payable_period_previews(None, contract, current)
+        assert previews[0]["period"] == "2026-09"
+        assert not previews[0]["payable"]
+        assert not previews[1]["payable"]
+        with pytest.raises(HTTPException) as exc:
+            _require_next_period_prefix(previews, ["2026-10"])
+        assert exc.value.status_code == 409
+
+    asyncio.run(scenario())
 
 
 def test_concurrent_invoice_generation_creates_one_row():

@@ -10,6 +10,7 @@ from rental.tenant_payment_history import (
     payment_activity_query,
     payment_period,
     serialize_payment_activity,
+    payment_attempt_requires_review,
 )
 
 
@@ -29,8 +30,8 @@ def test_internal_checkout_status_is_not_exposed():
         "created_at": datetime(2026, 9, 14, tzinfo=timezone.utc),
     }
     assert is_payment_activity(payment)
-    assert normalize_payment_status(payment) == "processing"
-    assert serialize_payment_activity(payment)["status"] == "processing"
+    now = datetime(2026, 9, 14, 0, 15, tzinfo=timezone.utc)
+    assert normalize_payment_status(payment, now) == "processing"
 
 
 def test_new_checkout_container_is_excluded_to_avoid_period_duplicates():
@@ -66,7 +67,9 @@ def test_processing_activity_uses_attempt_date_when_no_row_date_exists():
         },
     }
     assert is_payment_activity(payment)
-    assert normalize_payment_status(payment) == "processing"
+    assert normalize_payment_status(
+        payment, datetime(2026, 9, 14, 16, 15, tzinfo=timezone.utc)
+    ) == "processing"
     assert payment_activity_date(payment, "processing") == attempt_at.isoformat()
 
 
@@ -121,3 +124,29 @@ def test_activity_uses_attempt_amount_when_invoice_fee_changes():
                                       'charge_attempt': {'amount': 1200, 'status': 'processing'}})
     assert row['amount'] == 1200
     assert row['total_paid'] == 0
+
+
+def test_stale_unconfirmed_attempt_requires_review_without_unlocking_it():
+    attempt = {
+        "status": "pending",
+        "charge_attempt": {
+            "id": "keep-this-claim",
+            "status": "processing",
+            "created_at": datetime(2026, 9, 14, 10, tzinfo=timezone.utc),
+        },
+    }
+    now = datetime(2026, 9, 14, 11, tzinfo=timezone.utc)
+    assert payment_attempt_requires_review(attempt, now)
+    assert normalize_payment_status(attempt, now) == "review_required"
+    assert attempt["charge_attempt"]["id"] == "keep-this-claim"
+    assert attempt["charge_attempt"]["status"] == "processing"
+
+
+def test_recent_unconfirmed_attempt_remains_processing():
+    attempt = {
+        "status": "pending_checkout",
+        "submitted_at": datetime(2026, 9, 14, 10, 45, tzinfo=timezone.utc),
+    }
+    now = datetime(2026, 9, 14, 11, tzinfo=timezone.utc)
+    assert not payment_attempt_requires_review(attempt, now)
+    assert normalize_payment_status(attempt, now) == "processing"

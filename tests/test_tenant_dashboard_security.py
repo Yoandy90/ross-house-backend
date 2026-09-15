@@ -1,5 +1,5 @@
 import asyncio
-from datetime import datetime
+from datetime import datetime, timezone
 
 from fastapi import FastAPI
 from bson import ObjectId
@@ -73,4 +73,29 @@ def test_paid_current_month_advances_to_next_month():
         assert result["period"] == "2026-10"
         assert result["due_date"] == "2026-10-01"
         assert result["current_month_paid"] is True
+    asyncio.run(scenario())
+
+
+def test_stale_current_attempt_is_exposed_as_review_without_advancing_month():
+    async def scenario():
+        db = AsyncMongoMockClient()["next_unpaid_review"]
+        contract = {
+            "_id": ObjectId(), "rent_amount": 1200, "payment_due_day": 1,
+            "start_date": "2026-09-01", "end_date": "2027-08-31",
+        }
+        await db.rental_payments.insert_one({
+            "contract_id": str(contract["_id"]), "period": "2026-09",
+            "status": "pending", "amount": 1200, "total_due": 1200,
+            "charge_attempt": {
+                "id": "stuck", "status": "processing",
+                "created_at": datetime(2026, 9, 15, 10, tzinfo=timezone.utc),
+            },
+        })
+        result = await _next_unpaid_payment(
+            db, contract, datetime(2026, 9, 15, 11, tzinfo=timezone.utc)
+        )
+        assert result["period"] == "2026-09"
+        assert result["in_flight"] is True
+        assert result["requires_review"] is True
+
     asyncio.run(scenario())
