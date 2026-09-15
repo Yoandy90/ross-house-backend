@@ -16,7 +16,7 @@ from bson import BSON
 from fastapi import APIRouter, HTTPException, Request, Response
 from starlette.concurrency import run_in_threadpool
 from rental.catalog_images import normalize_product_photo, MAX_INPUT_BYTES
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pymongo.errors import DuplicateKeyError
 from rental.shared import get_db, auth_admin, auth_marketplace
 
@@ -34,11 +34,27 @@ class Product(Strict):
     description_en: str = Field(default='', max_length=500)
     category: str = Field(min_length=1, max_length=50)
     image_url: str = Field(default='', max_length=1000)
+    image_urls: list[str] = Field(default_factory=list, max_length=8)
     price_cents: int = Field(strict=True, gt=0, le=1000000)
     cost_cents: int = Field(strict=True, ge=0, le=1000000)
     tax_bps: int = Field(strict=True, ge=0, le=10000)
     stock: int = Field(strict=True, ge=0, le=100000)
     active: bool = False
+
+    @field_validator('image_urls')
+    @classmethod
+    def valid_gallery(cls, values):
+        if any(not v.startswith('https://') or len(v) > 1000 for v in values):
+            raise ValueError('Gallery images must use HTTPS')
+        return list(dict.fromkeys(values))
+
+    @model_validator(mode='after')
+    def primary_photo(self):
+        if self.image_urls:
+            self.image_url = self.image_urls[0]
+        elif self.image_url:
+            self.image_urls = [self.image_url]
+        return self
 
     @field_validator('image_url')
     @classmethod
@@ -344,3 +360,4 @@ async def product_photo(image_id: str):
         'Cache-Control': 'public, max-age=31536000, immutable',
         'X-Content-Type-Options': 'nosniff',
     })
+
