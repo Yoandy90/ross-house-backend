@@ -74,6 +74,7 @@ async def _next_unpaid_payment(db, contract: dict, today: datetime) -> dict | No
     """Return the first uncovered lease month, including an overdue current month."""
     from rental.rent_charge_policy import preview_period_rent_charge
     from rental.rent_payment_cron import _parse_contract_date
+    from rental.tenant_payment_history import payment_attempt_requires_review
 
     try:
         due_day = int(contract.get("payment_due_day") or 1)
@@ -108,6 +109,7 @@ async def _next_unpaid_payment(db, contract: dict, today: datetime) -> dict | No
                     "amount": charge["outstanding"],
                     "current_month_paid": current_month_paid,
                     "in_flight": attempt.get("status") in {"processing", "unknown"},
+                    "requires_review": payment_attempt_requires_review(invoice, today),
                 }
         if cursor.month == 12:
             cursor = cursor.replace(year=cursor.year + 1, month=1)
