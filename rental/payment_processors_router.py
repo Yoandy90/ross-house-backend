@@ -89,7 +89,81 @@ def _requested_periods(data: dict, now: datetime) -> list[str]:
         periods.append(parsed.strftime("%Y-%m"))
     if len(set(periods)) != len(periods):
         raise HTTPException(status_code=400, detail="No puedes seleccionar el mismo mes dos veces")
-    return sorted(periods)
+    periods = sorted(periods)
+    for previous, current in zip(periods, periods[1:]):
+        previous_dt = datetime.strptime(previous, "%Y-%m")
+        expected = previous_dt.replace(
+            year=previous_dt.year + (1 if previous_dt.month == 12 else 0),
+            month=1 if previous_dt.month == 12 else previous_dt.month + 1,
+        ).strftime("%Y-%m")
+        if current != expected:
+            raise HTTPException(
+                status_code=400,
+                detail="Los meses adelantados deben ser consecutivos",
+            )
+    return periods
+
+
+async def _payable_period_previews(db, contract: dict, now: datetime) -> list[dict]:
+    """Return the next lease months without creating accounting records."""
+    from .rent_payment_cron import _parse_contract_date
+
+    cursor = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    end_dt = await _parse_contract_date(contract.get("end_date"))
+    result = []
+    for _ in range(12):
+        if end_dt and cursor > end_dt:
+            break
+        try:
+            charge = await preview_period_rent_charge(db, contract, cursor)
+        except ValueError:
+            charge = None
+        if charge:
+            invoice = charge.get("invoice") or {}
+            attempt = invoice.get("charge_attempt") or {}
+            in_flight = attempt.get("status") in {"processing", "unknown"}
+            result.append({
+                "period": cursor.strftime("%Y-%m"),
+                "month": cursor.strftime("%B"),
+                "year": cursor.year,
+                "invoice_id": charge["invoice_id"],
+                "amount": charge["amount"],
+                "late_fee": charge["late_fee"],
+                "total_due": charge["total_due"],
+                "outstanding": charge["outstanding"],
+                "status": charge["status"],
+                "paid": charge["status"] in {"paid", "completed"},
+                "in_flight": in_flight,
+                "payable": False,
+            })
+        if cursor.month == 12:
+            cursor = cursor.replace(year=cursor.year + 1, month=1)
+        else:
+            cursor = cursor.replace(month=cursor.month + 1)
+
+    # Only a consecutive prefix beginning with the first unpaid month can be
+    # charged.  An unresolved attempt blocks later months until it settles.
+    blocked = False
+    for item in result:
+        if item["paid"] or item["outstanding"] <= 0:
+            continue
+        if item["in_flight"]:
+            blocked = True
+        item["payable"] = not blocked
+    return result
+
+
+def _require_next_period_prefix(previews: list[dict], periods: list[str]) -> None:
+    """Require requested months to start at the next unpaid lease month."""
+    eligible = [item["period"] for item in previews if item["payable"]]
+    if not eligible or periods != eligible[:len(periods)]:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Debes comenzar por la próxima renta sin pagar y seleccionar "
+                "solamente meses consecutivos"
+            ),
+        )
 
 
 def _existing_checkout_response(payment: dict) -> dict:
@@ -140,41 +214,8 @@ async def tenant_rent_payable_periods(request: Request):
     })
     if not contract:
         raise HTTPException(status_code=404, detail="No se encontró contrato activo")
-    from .rent_payment_cron import _parse_contract_date
     now = datetime.now(timezone.utc)
-    cursor = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    end_dt = await _parse_contract_date(contract.get("end_date"))
-    result = []
-    for _ in range(12):
-        if end_dt and cursor > end_dt:
-            break
-        try:
-            charge = await preview_period_rent_charge(db, contract, cursor)
-        except ValueError:
-            charge = None
-        if charge:
-            invoice = charge.get("invoice") or {}
-            balance = charge
-            attempt = invoice.get("charge_attempt") or {}
-            in_flight = attempt.get("status") in {"processing", "unknown"}
-            result.append({
-                "period": cursor.strftime("%Y-%m"),
-                "month": cursor.strftime("%B"),
-                "year": cursor.year,
-                "invoice_id": charge["invoice_id"],
-                "amount": balance["amount"],
-                "late_fee": balance["late_fee"],
-                "total_due": balance["total_due"],
-                "outstanding": balance["outstanding"],
-                "status": balance["status"],
-                "paid": balance["status"] in {"paid", "completed"},
-                "in_flight": in_flight,
-                "payable": balance["outstanding"] > 0 and not in_flight,
-            })
-        if cursor.month == 12:
-            cursor = cursor.replace(year=cursor.year + 1, month=1)
-        else:
-            cursor = cursor.replace(month=cursor.month + 1)
+    result = await _payable_period_previews(db, contract, now)
     return {"success": True, "periods": result, "max_months": 12}
 
 
@@ -264,6 +305,8 @@ async def tenant_create_checkout_payment(request: Request):
     now = datetime.now(timezone.utc)
     contract_id = str(contract["_id"])
     periods = _requested_periods(data, now)
+    previews = await _payable_period_previews(db, contract, now)
+    _require_next_period_prefix(previews, periods)
     claim_id = _hosted_checkout_batch_claim_id(contract_id, periods)
 
     # Every amount and allocation comes from a canonical server-side invoice.
