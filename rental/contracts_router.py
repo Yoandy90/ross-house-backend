@@ -1495,6 +1495,41 @@ async def register_rental_payment(request: Request):
     }
 
 
+@router.get('/admin/rental-payments/{payment_id}/document')
+async def admin_rental_payment_document(payment_id: str, request: Request):
+    """Admin-only printable document; GET never changes payment state."""
+    await auth_admin(request)
+    if not ObjectId.is_valid(payment_id):
+        raise HTTPException(400, 'Referencia de factura inválida.')
+    payment = await get_db().rental_payments.find_one({'_id': ObjectId(payment_id)})
+    if not payment or payment.get('record_type') == 'checkout_attempt' or payment.get('invoice_id'):
+        raise HTTPException(404, 'Factura no encontrada.')
+    from rental_pdf_service import generate_rental_receipt_pdf, DEFAULT_COMPANY
+    from rental.invoice_document import render_invoice_document
+    if payment.get('status') in ('paid', 'completed') or payment.get('paid') is True:
+        document = generate_rental_receipt_pdf(payment)
+        prefix = 'Recibo'
+    else:
+        if payment.get('status') not in ('pending', 'late', 'partial'):
+            raise HTTPException(409, 'Esta factura no está disponible para cobro.')
+        amount = payment_money(payment.get('amount', 0), 'amount')
+        late = payment_money(payment.get('late_fee', 0), 'late_fee')
+        received = payment_money(payment.get('total_paid', 0), 'total_paid')
+        if received:
+            raise HTTPException(409, 'Revisa el abono parcial antes de emitir el documento de cobro.')
+        total = payment_money(payment.get('total_due', amount + late), 'total_due')
+        if total <= 0 or round(amount + late, 2) != total:
+            raise HTTPException(409, 'El importe no coincide con el desglose de la factura.')
+        document = render_invoice_document(payment, company=DEFAULT_COMPANY,
+            tenant_name=payment.get('tenant_name', ''), tenant_email=payment.get('tenant_email', ''),
+            property_address=payment.get('property_address', ''), contract_number=payment.get('contract_number', ''),
+            period=payment.get('period') or f"{payment.get('period_month', '')} {payment.get('period_year', '')}",
+            amount=amount, late_fee=late, total=total, paid=False,
+            date=str(payment.get('due_date') or '')[:10])
+        prefix = 'Factura'
+    return {'success': True, 'pdf_base64': document, 'filename': f'{prefix}_{payment_id}.pdf'}
+
+
 @router.get('/admin/rental-payments')
 async def list_rental_payments(request: Request):
     """List rental payments with server-side pagination and filtering.
@@ -1561,6 +1596,8 @@ async def list_rental_payments(request: Request):
             pass
 
     if search:
+        from rental.invoice_document import parse_invoice_reference
+        scanned_id = parse_invoice_reference(search)
         # Case-insensitive partial match across common text fields
         import re as _re
         escaped = _re.escape(search)
@@ -1570,6 +1607,8 @@ async def list_rental_payments(request: Request):
             {'property_address': regex},
             {'receipt_number': regex},
         ]
+        if scanned_id:
+            text_or = [{'_id': ObjectId(scanned_id)}]
         if '$or' in query:
             # Combine with year filter using $and
             query = {'$and': [{'$or': query.pop('$or')}, {'$or': text_or}], **query}
@@ -1664,6 +1703,19 @@ async def update_rental_payment(payment_id: str, request: Request):
     existing = await get_db().rental_payments.find_one({"_id": ObjectId(payment_id)})
     if not existing:
         raise HTTPException(status_code=404, detail="Pago no encontrado")
+
+    if data.get('confirm_unpaid') is True:
+        if existing.get('paid') is True or existing.get('status') in ('paid', 'completed'):
+            raise HTTPException(409, 'Esta factura ya está pagada. No registres otro cobro.')
+        attempt = existing.get('charge_attempt') or {}
+        if attempt.get('status') in ('processing', 'pending', 'unknown', 'review_required'):
+            raise HTTPException(409, 'Revisa el intento electrónico antes de recibir otro pago.')
+        if data.get('total_paid') is None or not data.get('payment_method'):
+            raise HTTPException(400, 'Indica el importe recibido y el método de pago.')
+        try:
+            datetime.strptime(str(data.get('payment_date', '')), '%Y-%m-%d')
+        except ValueError:
+            raise HTTPException(400, 'Fecha de pago inválida. Usa AAAA-MM-DD.')
 
     now = datetime.utcnow()
     update_fields = {"updated_at": now}

@@ -144,6 +144,7 @@ async def secure_tenant_dashboard(request: Request):
     contract_data = None
     next_payment = None
     property_data = None
+    current_payment = None
 
     if contract:
         contract_id = str(contract["_id"])
@@ -163,6 +164,17 @@ async def secure_tenant_dashboard(request: Request):
 
         today = datetime.utcnow()
         next_payment = await _next_unpaid_payment(db, contract, today)
+        from rental.rent_charge_policy import preview_period_rent_charge
+        try:
+            current_charge = await preview_period_rent_charge(db, contract, today.replace(day=1))
+        except ValueError:
+            current_charge = None
+        if current_charge:
+            current_payment = {
+                "period": today.strftime("%Y-%m"),
+                "paid": current_charge["status"] in {"paid", "completed"},
+                "rent_amount": contract.get("rent_amount", 0),
+            }
         property_data = await _contract_property(contract)
 
     # Historical payment rows remain tenant-scoped.  They are not used as
@@ -209,6 +221,7 @@ async def secure_tenant_dashboard(request: Request):
         },
         "contract": contract_data,
         "next_payment": next_payment,
+        "current_payment": current_payment,
         "payments": payments,
         "property": property_data,
     }
