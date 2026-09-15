@@ -2,6 +2,7 @@
 changes atomic on both standalone MongoDB and replica sets, without cross-collection
 partial writes. Hard size/capacity limits fail closed; no rental ledger writes.
 """
+import os
 import base64
 import binascii
 import re
@@ -325,7 +326,10 @@ async def upload_product_photo(body: ProductPhoto, request: Request):
         {'$setOnInsert': {'data': base64.b64encode(normalized).decode('ascii'), 'created_at': now(), 'actor': actor}},
         upsert=True,
     )
-    return {'path': '/api/public/store-images/' + image_id, 'width': 1200,
+    path = '/api/public/store-images/' + image_id
+    domain = os.environ.get('RAILWAY_PUBLIC_DOMAIN', '').strip()
+    origin = ('https://' + domain) if domain else str(request.base_url).rstrip('/')
+    return {'path': path, 'url': origin + path, 'width': 1200,
             'height': 1200, 'bytes': len(normalized), 'format': 'webp'}
 
 
