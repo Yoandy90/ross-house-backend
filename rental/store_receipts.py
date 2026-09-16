@@ -4,7 +4,6 @@ import hashlib
 import io
 import re
 from pathlib import Path
-from xml.sax.saxutils import escape
 
 from pymongo.errors import DuplicateKeyError
 from starlette.concurrency import run_in_threadpool
@@ -29,89 +28,54 @@ def issue_receipt(state, order):
     }
 
 
-def render_receipt(order, language='es'):
-    from reportlab.lib import colors
-    from reportlab.lib.styles import ParagraphStyle
-    from reportlab.lib.enums import TA_RIGHT
-    from reportlab.lib.pagesizes import letter
-    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, KeepTogether
-    es = language == 'es'
-    tr = lambda a, b: a if es else b
-    money = lambda cents: f'${cents / 100:,.2f}'
-    ink, muted, red = colors.HexColor('#16202B'), colors.HexColor('#586575'), colors.HexColor('#C8102E')
-    body = ParagraphStyle('body', fontName='StoreSans', fontSize=10, leading=15, textColor=ink)
-    small = ParagraphStyle('small', parent=body, fontSize=9, leading=13, textColor=muted)
-    heading = ParagraphStyle('heading', parent=body, fontName='StoreSansBold', fontSize=25, leading=31)
-    right = ParagraphStyle('right', parent=body, alignment=TA_RIGHT)
-    p = lambda value, style=body: Paragraph(escape(str(value)), style)
-    meta = order['receipt']
-    out = io.BytesIO()
-    doc = SimpleDocTemplate(out, pagesize=letter, leftMargin=44, rightMargin=44, topMargin=42, bottomMargin=46,
-                            title=meta['number'], author=meta['merchant'])
-    flow = [p(meta['merchant'], small), Spacer(1, 18), p(tr('Recibo de compra', 'Purchase receipt'), heading),
-            Spacer(1, 10), p(meta['number']), Spacer(1, 8),
-            p(tr('PAGADO', 'PAID'), ParagraphStyle('paid', parent=body, textColor=red, fontName='StoreSansBold')),
-            Spacer(1, 22)]
-    info = [
-        [p(tr('Cliente', 'Customer'), small), p(order.get('customer_name') or tr('Cliente', 'Customer'))],
-        [p(tr('Fecha de pago (UTC)', 'Payment date (UTC)'), small), p(meta['issued_at'].replace('T', ' ')[:19])],
-        [p(tr('Pedido', 'Order'), small), p(order['id'])],
-        [p(tr('Referencia', 'Reference'), small), p(order.get('payment_reference', ''))],
-    ]
-    table = Table(info, colWidths=[145, 379], hAlign='LEFT')
-    table.setStyle(TableStyle([('VALIGN', (0, 0), (-1, -1), 'TOP'), ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
-                               ('LEFTPADDING', (0, 0), (-1, -1), 0)]))
-    flow += [table, Spacer(1, 20)]
-    headers = [tr('Producto', 'Product'), tr('Cant.', 'Qty.'), tr('Precio', 'Price'), tr('Importe', 'Amount')]
-    rows = [[p(h, small) for h in headers]]
-    for line in order['items']:
-        name = (line.get('name') if es else line.get('name_en')) or line['name']
-        name = ' · '.join(str(v) for v in (name, line.get('size'), line.get('color'), line.get('sku')) if v)
-        name = re.sub(r'^DEMO\s*[·:—-]\s*', '', name, flags=re.I)
-        rows.append([p(name), p(line['quantity'], right), p(money(line['price_cents']), right), p(money(line['subtotal_cents']), right)])
-    table = Table(rows, colWidths=[286, 44, 94, 100], repeatRows=1, hAlign='LEFT')
-    table.setStyle(TableStyle([
-        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#F2F4F7')), ('VALIGN', (0, 0), (-1, -1), 'TOP'),
-        ('TOPPADDING', (0, 0), (-1, -1), 11), ('BOTTOMPADDING', (0, 0), (-1, -1), 11),
-        ('LINEBELOW', (0, 0), (-1, -1), .4, colors.HexColor('#E3E7EC')),
-    ]))
-    flow += [table, Spacer(1, 18)]
-    totals = [[p(label, small), p(money(value), right)] for label, value in [
-        (tr('Subtotal', 'Subtotal'), order['subtotal_cents']),
-        (tr('Entrega', 'Delivery'), order['delivery_fee_cents']),
-        (tr('Impuestos', 'Tax'), order['tax_cents']),
-        (tr('Total pagado', 'Total paid'), order['total_cents']),
-    ]]
-    total = Table(totals, colWidths=[380, 144], hAlign='LEFT')
-    total.setStyle(TableStyle([('TOPPADDING', (0, 0), (-1, -1), 7), ('BOTTOMPADDING', (0, 0), (-1, -1), 7),
-                               ('BACKGROUND', (0, -1), (-1, -1), colors.HexColor('#F2F4F7'))]))
-    flow.append(KeepTogether([total, Spacer(1, 18), p(tr('Gracias por tu compra.', 'Thank you for your purchase.'), small)]))
-    def footer(canvas, document):
-        canvas.saveState()
-        canvas.setStrokeColor(red)
-        canvas.setLineWidth(2)
-        canvas.line(44, 32, 568, 32)
-        canvas.setFont('StoreSans', 8)
-        canvas.setFillColor(muted)
-        canvas.drawString(44, 20, meta['number'])
-        canvas.drawRightString(568, 20, str(document.page))
-        canvas.restoreState()
-    doc.build(flow, onFirstPage=footer, onLaterPages=footer)
-    return out.getvalue()
+def render_receipt(order, language='es', assets=None):
+    from rental.store_receipt_design import render
+    return render(order, language, assets)
+
+
+async def receipt_photos(db, order):
+    """Use immutable uploaded images, never fetch remote or customer URLs."""
+    from urllib.parse import urlsplit
+    from PIL import Image, ImageOps
+    legacy = any('image_url' not in item for item in order['items'])
+    catalog = await db.resident_store.find_one({'_id': 'resident-store-v1'}, {'products': 1}) if legacy else None
+    assets = {}
+    for item in order['items']:
+        url = item.get('image_url') if 'image_url' in item else (catalog or {}).get('products', {}).get(item['product_id'], {}).get('image_url', '')
+        try:
+            path = urlsplit(url or '').path
+        except ValueError:
+            continue
+        match = re.fullmatch(r'/api/public/store-images/([a-f0-9]{64})', path)
+        if not match: continue
+        stored = await db.resident_store_images.find_one({'_id': match[1]})
+        if not stored or not isinstance(stored.get('data'), str) or len(stored['data']) > 4_000_000: continue
+        try:
+            raw = base64.b64decode(stored['data'], validate=True)
+            with Image.open(io.BytesIO(raw)) as image:
+                if image.width * image.height > 4_000_000: continue
+                image = ImageOps.exif_transpose(image).convert('RGB')
+                image.thumbnail((240,240))
+                out = io.BytesIO(); image.save(out,format='JPEG',quality=88)
+                assets[item['product_id']] = out.getvalue()
+        except (ValueError, OSError, Image.DecompressionBombError):
+            continue
+    return assets
 
 
 async def receipt_payload(db, order, language):
     """Persist once; subsequent downloads return the same bytes, not a new receipt."""
-    key = order['id'] + ':' + language + ':v1'
+    key = order['id'] + ':' + language + ':v2'
     stored = await db.store_receipt_files.find_one({'_id': key})
     if not stored:
-        data = await run_in_threadpool(render_receipt, order, language)
+        assets = await receipt_photos(db, order)
+        data = await run_in_threadpool(render_receipt, order, language, assets)
         filename = order['receipt']['number'] + '-' + language + '.pdf'
         try:
             await db.store_receipt_files.update_one({'_id': key}, {'$setOnInsert': {
                 'order_id': order['id'], 'user_id': order['user_id'], 'filename': filename,
                 'pdf': data, 'sha256': hashlib.sha256(data).hexdigest(),
-                'issued_at': order['receipt']['issued_at'],
+                'issued_at': order['receipt']['issued_at'], 'design_version': 2, 'language': language,
             }}, upsert=True)
         except DuplicateKeyError:
             pass

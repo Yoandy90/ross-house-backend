@@ -242,7 +242,7 @@ def quote(state, body):
         subtotal=p['price_cents']*qty
         from rental.store_inventory import tax_rate, sku_for
         rate = tax_rate(state, p)
-        lines.append({'product_id':pid,'sku':sku_for(pid,p),'sale_unit':p.get('sale_unit','unit'),'pack_size':p.get('pack_size','1'),'size':p.get('size',''),'color':p.get('color',''),'tax_bps':rate,'name':p['name'],'name_en':p['name_en'],'quantity':qty,'price_cents':p['price_cents'],'subtotal_cents':subtotal,'tax_cents':(subtotal*rate+5000)//10000})
+        lines.append({'product_id':pid,'image_url':p.get('image_url',''),'sku':sku_for(pid,p),'sale_unit':p.get('sale_unit','unit'),'pack_size':p.get('pack_size','1'),'size':p.get('size',''),'color':p.get('color',''),'tax_bps':rate,'name':p['name'],'name_en':p['name_en'],'quantity':qty,'price_cents':p['price_cents'],'subtotal_cents':subtotal,'tax_cents':(subtotal*rate+5000)//10000})
     subtotal=sum(x['subtotal_cents'] for x in lines)
     if subtotal<cfg['minimum_cents']:
         raise HTTPException(400,'store_minimum_not_met')

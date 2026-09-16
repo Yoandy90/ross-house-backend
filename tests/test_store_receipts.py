@@ -82,3 +82,49 @@ async def test_legacy_paid_receipt_gets_number_without_repayment_or_notice(shop)
         assert await db.rental_notifications.count_documents({'data.status': 'paid'}) == 0
         second = await c.get(f'/store/orders/{oid}/receipt')
         assert result.json()['receipt_number'] == second.json()['receipt_number']
+
+
+@pytest.mark.asyncio
+async def test_photo_snapshot_v2_cache_and_legacy_pdf_preserved(shop):
+    from PIL import Image
+    db, app = shop
+    await setup(db)
+    image_id = 'a' * 64
+    url = '/api/public/store-images/' + image_id
+    image = io.BytesIO()
+    Image.new('RGB', (80, 120), 'red').save(image, format='PNG')
+    await db.resident_store_images.insert_one({'_id': image_id, 'data': base64.b64encode(image.getvalue()).decode()})
+    await db.resident_store.update_one({'_id': s.KEY}, {'$set': {'products.water.image_url': url}})
+    async with AsyncClient(transport=ASGITransport(app=app), base_url='http://test') as c:
+        oid = (await order(c)).json()['id']
+        original = (await s.read_state())['orders'][oid]
+        assert original['items'][0]['image_url'] == url
+        await db.resident_store.update_one({'_id': s.KEY}, {'$set': {'products.water.image_url': ''}})
+        await db.store_receipt_files.insert_one({'_id': oid + ':es:v1', 'pdf': b'original-v1'})
+        assert (await c.post(f'/admin/store/orders/{oid}/payment', json={'reference': 'cash-123'})).status_code == 200
+        payload = (await c.get(f'/store/orders/{oid}/receipt?language=en')).json()
+        pdf = PdfReader(io.BytesIO(base64.b64decode(payload['pdf_base64'])))
+        assert len(pdf.pages[0].images) >= 2
+        assert 'Water' in pdf.pages[0].extract_text()
+        assert 'USD' in pdf.pages[0].extract_text()
+        assert (await db.store_receipt_files.find_one({'_id': oid + ':es:v1'}))['pdf'] == b'original-v1'
+        await db.resident_store_images.delete_many({})
+        assert (await c.get(f'/store/orders/{oid}/receipt?language=en')).json() == payload
+
+
+@pytest.mark.asyncio
+async def test_missing_and_foreign_photos_degrade_without_external_requests(shop):
+    db, _ = shop
+    await setup(db)
+    for url in ['', 'https://example.com/image.png', 'http://169.254.169.254/credentials', '/api/public/store-images/' + 'b' * 64]:
+        assert await receipts.receipt_photos(db, {'items': [{'product_id': 'water', 'image_url': url}]}) == {}
+
+
+def test_qr_contains_only_environment_specific_order_reference(monkeypatch):
+    from rental.store_receipt_design import order_lookup_url, STAGING_ORIGIN, PRODUCTION_ORIGIN
+    oid = '36d5e024-4d07-49fc-926b-b731053cb829'
+    monkeypatch.setenv('ENVIRONMENT', 'staging')
+    assert order_lookup_url(oid) == STAGING_ORIGIN + '/admin/tienda?order_id=' + oid
+    monkeypatch.setenv('ENVIRONMENT', 'production')
+    assert order_lookup_url(oid) == PRODUCTION_ORIGIN + '/admin/tienda?order_id=' + oid
+    assert order_lookup_url('invalid?token=secret') is None
