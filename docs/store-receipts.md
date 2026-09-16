@@ -57,3 +57,13 @@ Validation: 50 backend tests, 13 admin interaction tests, scoped web TypeScript;
 ES/EN sample pages and long multi-page receipts rendered and inspected. QR payloads
 decoded from both rendered sample pages. This changes the downloadable PDF,
 not outbound email delivery; no email was sent or automation enabled.
+
+## App seal v3
+
+Adds the app's existing gold/burgundy shield (the optimized 180px
+frontend/assets/apple-touch-icon.png asset) at 40pt beside the closing thanks,
+in both languages. It is a brand mark, not a signature or payment validation.
+The QR and financial data are unchanged. Cache design v3 preserves existing v1/v2
+files and receipt numbers while allowing previous orders to download this layout.
+ES/EN and six-page receipt layouts visually reviewed; receipt regression suite
+covers the embedded seal and preservation of the older cached PDFs.

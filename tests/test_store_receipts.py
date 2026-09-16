@@ -85,7 +85,7 @@ async def test_legacy_paid_receipt_gets_number_without_repayment_or_notice(shop)
 
 
 @pytest.mark.asyncio
-async def test_photo_snapshot_v2_cache_and_legacy_pdf_preserved(shop):
+async def test_photo_snapshot_seal_cache_and_legacy_pdf_preserved(shop):
     from PIL import Image
     db, app = shop
     await setup(db)
@@ -101,12 +101,16 @@ async def test_photo_snapshot_v2_cache_and_legacy_pdf_preserved(shop):
         assert original['items'][0]['image_url'] == url
         await db.resident_store.update_one({'_id': s.KEY}, {'$set': {'products.water.image_url': ''}})
         await db.store_receipt_files.insert_one({'_id': oid + ':es:v1', 'pdf': b'original-v1'})
+        await db.store_receipt_files.insert_one({'_id': oid + ':en:v2', 'pdf': b'original-v2'})
         assert (await c.post(f'/admin/store/orders/{oid}/payment', json={'reference': 'cash-123'})).status_code == 200
         payload = (await c.get(f'/store/orders/{oid}/receipt?language=en')).json()
         pdf = PdfReader(io.BytesIO(base64.b64decode(payload['pdf_base64'])))
-        assert len(pdf.pages[0].images) >= 2
+        assert len(pdf.pages[0].images) >= 3  # header logo, product photo, app seal
         assert 'Water' in pdf.pages[0].extract_text()
         assert 'USD' in pdf.pages[0].extract_text()
+        assert 'Thank you for being part of Ross House.' in pdf.pages[0].extract_text()
+        assert (await db.store_receipt_files.find_one({'_id': oid + ':en:v3'}))['design_version'] == 3
+        assert (await db.store_receipt_files.find_one({'_id': oid + ':en:v2'}))['pdf'] == b'original-v2'
         assert (await db.store_receipt_files.find_one({'_id': oid + ':es:v1'}))['pdf'] == b'original-v1'
         await db.resident_store_images.delete_many({})
         assert (await c.get(f'/store/orders/{oid}/receipt?language=en')).json() == payload

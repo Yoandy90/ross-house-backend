@@ -65,7 +65,7 @@ async def receipt_photos(db, order):
 
 async def receipt_payload(db, order, language):
     """Persist once; subsequent downloads return the same bytes, not a new receipt."""
-    key = order['id'] + ':' + language + ':v2'
+    key = order['id'] + ':' + language + ':v3'
     stored = await db.store_receipt_files.find_one({'_id': key})
     if not stored:
         assets = await receipt_photos(db, order)
@@ -75,7 +75,7 @@ async def receipt_payload(db, order, language):
             await db.store_receipt_files.update_one({'_id': key}, {'$setOnInsert': {
                 'order_id': order['id'], 'user_id': order['user_id'], 'filename': filename,
                 'pdf': data, 'sha256': hashlib.sha256(data).hexdigest(),
-                'issued_at': order['receipt']['issued_at'], 'design_version': 2, 'language': language,
+                'issued_at': order['receipt']['issued_at'], 'design_version': 3, 'language': language,
             }}, upsert=True)
         except DuplicateKeyError:
             pass
