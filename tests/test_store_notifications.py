@@ -52,7 +52,10 @@ async def test_retry_and_concurrent_workers_have_one_notice_and_push_per_recipie
     owner_call = next(c for c in transport.call_args_list if c.args[0] == 'ExpoPushToken[resident]')
     assert owner_call.args[1] == 'Order received'
     assert set(owner_call.args[3]) == {'type', 'order_id', 'status', 'notification_id'}
-    assert 'address' not in str(owner_call) and '432' not in str(owner_call)
+    # IDs can coincidentally contain the amount digits; inspect customer-visible copy.
+    assert 'address' not in str(owner_call)
+    assert '432' not in ' '.join(owner_call.args[1:3])
+    assert '4.32' not in ' '.join(owner_call.args[1:3])
 
 
 @pytest.mark.asyncio

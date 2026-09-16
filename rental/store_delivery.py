@@ -126,6 +126,8 @@ async def assign(oid: str, body: Assignment, request: Request):
             raise HTTPException(404, 'store_order_not_found')
         if order['fulfillment'] != 'delivery' or order['status'] in ('delivered', 'cancelled') or order.get('tracking', {}).get('handoff_at'):
             raise HTTPException(409, 'store_transition_invalid')
+        if order.get('payment_review_required') or order.get('refund_attempt') or (order.get('payment_attempt') and order['payment_status'] != 'paid'):
+            raise HTTPException(409, 'store_payment_required')
         if order.get('driver_id', '') != body.expected_driver_id:
             raise HTTPException(409, 'store_assignment_changed')
         order['driver_id'] = body.driver_id
@@ -165,6 +167,8 @@ async def delivery_action(oid: str, body: DriverAction, request: Request):
             return driver_order(order)
         if order['status'] in ('cancelled', 'delivered'):
             raise HTTPException(409, 'store_transition_invalid')
+        if body.action in ('depart', 'handoff') and (order.get('payment_review_required') or order.get('refund_attempt') or (order.get('payment_attempt') and order['payment_status'] != 'paid')):
+            raise HTTPException(409, 'store_payment_required')
         if body.action == 'depart':
             if order['status'] not in ('ready', 'out_for_delivery'):
                 raise HTTPException(409, 'store_transition_invalid')

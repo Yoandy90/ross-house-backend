@@ -42,6 +42,9 @@ def build_message(order, kind, language, photos=None):
     number = order['receipt']['number'] if paid else '#' + order['id'][:8]
     title = tr('Tu recibo de compra', 'Your purchase receipt') if paid else tr('Recibimos tu pedido', 'We received your order')
     intro = tr('Tu pago está registrado. Adjuntamos tu recibo de compra.', 'Your payment is recorded. Your purchase receipt is attached.') if paid else tr('Estamos coordinando tu entrega a domicilio. El pago se realiza al recibir.', 'We are arranging your home delivery. Payment is due upon receipt.')
+    online = bool(order.get('payment_attempt')) or str(order.get('payment_method', '')).startswith('helcim')
+    if online and not paid:
+        intro = tr('Recibimos tu pedido. Consulta el estado de tu pago y de la entrega en la app. Enviaremos tu recibo cuando el pago esté confirmado.', 'We received your order. Check payment and delivery status in the app. We will send your receipt when payment is confirmed.')
     attachments = [
         {'content': base64.b64encode(LOGO.read_bytes()).decode(), 'type': 'image/png', 'filename': 'ross-house.png', 'disposition': 'inline', 'content_id': 'ross-brand'},
         {'content': base64.b64encode(APP_SEAL.read_bytes()).decode(), 'type': 'image/png', 'filename': 'ross-seal.png', 'disposition': 'inline', 'content_id': 'ross-seal'},
@@ -61,6 +64,8 @@ def build_message(order, kind, language, photos=None):
         rows.append(f'<tr><td width="76" style="padding:14px 0;border-bottom:1px solid #e2e8f0">{thumb}</td><td style="padding:14px 8px;border-bottom:1px solid #e2e8f0"><strong>{e(name)}</strong><br><span style="color:#526173;font-size:13px">{e(detail)}<br>{e(item.get("sku", ""))}</span></td><td align="right" style="padding:14px 0;border-bottom:1px solid #e2e8f0;white-space:nowrap">{money(item["subtotal_cents"])}</td></tr>')
         plain.append(f'{item["quantity"]} × {name} — {money(item["subtotal_cents"])}')
     total_label = tr('Total pagado', 'Total paid') if paid else tr('Total al recibir', 'Total due upon receipt')
+    if online and not paid:
+        total_label = tr('Total del pedido', 'Order total')
     totals = [(tr('Subtotal','Subtotal'),order['subtotal_cents']), (tr('Entrega','Delivery'),order['delivery_fee_cents']), (tr('Impuestos','Tax'),order['tax_cents'])]
     summary = ''.join(f'<tr><td style="padding:5px 0">{label}</td><td align="right">{money(value)}</td></tr>' for label,value in totals)
     address = ' '.join(str(order.get(k) or '') for k in ('address','zip')).strip()

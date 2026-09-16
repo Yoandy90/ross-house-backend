@@ -20,6 +20,7 @@ STORE_KEY = 'resident-store-v1'
 CURSOR_KEY = 'source:' + STORE_KEY
 INACTIVE = {'deleted', 'inactive', 'disabled', 'suspended'}
 COPY = {
+    'refunded': ('Reembolso confirmado', 'Tu compra fue reembolsada al método original. Consulta los detalles en Pedidos.', 'Refund confirmed', 'Your purchase was refunded to the original method. Check details in Orders.'),
     'out_for_delivery': ('Tu pedido va en camino', 'Consulta la hora estimada de llegada en Pedidos.', 'Your order is on its way', 'Check the estimated arrival time in Orders.'),
     'handoff': ('Entrega confirmada', 'El repartidor confirmó la entrega de tu pedido.', 'Delivery confirmed', 'Your courier confirmed your order was delivered.'),
     'paid': ('Pago recibido', 'Tu pago de la tienda fue registrado. Tu recibo está disponible en Pedidos.',
@@ -188,6 +189,8 @@ async def deliver(db, delivery):
 
 
 async def drain(db):
+    from rental.store_payments import reconcile_pending
+    await reconcile_pending(db)
     await sync_inbox(db)
     await db.push_deliveries.update_many(
         {'store_event_id': {'$exists': True}, 'status': 'sending',
