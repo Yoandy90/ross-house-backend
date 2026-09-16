@@ -33,3 +33,27 @@ snapshots. Actual pickup location and offered hours remain admin configuration.
 Validation: isolated receipt/payment/notification and mobile interaction tests;
 sample PDF rendered and visually inspected. Do not interpret a passed test or
 removal of fixture labels as evidence of live payment processing.
+
+## Premium design v2
+
+The ES/EN renderer uses the official logo, local product thumbnails, SKU, quantity,
+unit price, line totals, UTC payment date and a vector QR. App build 155 already
+passes its current UI language; no binary update is required. Product names use
+the corresponding catalogue translation, with the original name as fallback.
+
+New order lines snapshot the cover URL at confirmation. Only normalized uploaded
+images from resident_store_images are read; rendering never fetches remote URLs.
+Legacy orders without an image snapshot use the current catalogue image once.
+Missing/corrupt images display a placeholder. Once generated, v2 PDF bytes remain
+cached under order:language:v2, so later catalogue edits do not change the receipt.
+Existing v1 files and financial receipt numbers remain intact.
+
+The QR contains only the opaque order UUID in an environment-specific admin URL.
+It grants no access: the existing admin login and backend authorization still
+apply. The store panel opens all order statuses and filters by UUID; operators
+can also paste a scanner URL or search by receipt number.
+
+Validation: 50 backend tests, 13 admin interaction tests, scoped web TypeScript;
+ES/EN sample pages and long multi-page receipts rendered and inspected. QR payloads
+decoded from both rendered sample pages. This changes the downloadable PDF,
+not outbound email delivery; no email was sent or automation enabled.
