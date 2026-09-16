@@ -12,6 +12,7 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, Tabl
 from reportlab.graphics.barcode import createBarcodeDrawing
 
 LOGO = Path(__file__).resolve().parent.parent / 'assets' / 'ross_house_logo.png'
+APP_SEAL = LOGO.with_name('ross_house_app_seal.png')
 STAGING_ORIGIN = 'https://ross-house-rentals-git-staging-yoandyross-2350s-projects.vercel.app'
 PRODUCTION_ORIGIN = 'https://www.rosshouserentals.com'
 
@@ -85,7 +86,12 @@ def render(order, language='es', assets=None):
     total.setStyle(TableStyle([('BACKGROUND',(0,-1),(-1,-1),red),('VALIGN',(0,-1),(-1,-1),'MIDDLE')]))
     link = order_lookup_url(order['id'])
     lookup = [createBarcodeDrawing('QR',value=link,width=106,height=106,barBorder=4),p(tr('Consulta administrativa','Staff order lookup'),8,True),p(tr('Escanear requiere iniciar sesión.','Scanning requires sign-in.'),7,color=muted)] if link else []
-    flow += [KeepTogether([table([[lookup,total]],[216,316]),Spacer(1,12),p(tr('Conserva este recibo como comprobante de tu compra.','Keep this receipt as proof of your purchase.'),8,color=muted)])]
+    closing = table([[picture(APP_SEAL,40,40),[
+        p(tr('Gracias por ser parte de Ross House.','Thank you for being part of Ross House.'),10,True),
+        p(tr('Conserva este recibo como comprobante de tu compra.','Keep this receipt as proof of your purchase.'),8,color=muted),
+    ]]],[54,478])
+    closing.setStyle(TableStyle([('VALIGN',(0,0),(-1,-1),'MIDDLE')]))
+    flow += [KeepTogether([table([[lookup,total]],[216,316]),Spacer(1,14),closing])]
     def footer(canvas, document):
         canvas.saveState(); canvas.setStrokeColor(red); canvas.setLineWidth(2); canvas.line(40,34,572,34)
         canvas.setFont('StoreSans',7.5); canvas.setFillColor(muted)
