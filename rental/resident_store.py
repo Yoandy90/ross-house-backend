@@ -153,11 +153,18 @@ async def mutate(operation):
             raise HTTPException(409, 'store_capacity_review_required')
         saved = await get_db().resident_store.replace_one({'_id':KEY,'revision':revision},state)
         if saved.modified_count:
+            # The audit entry is the durable outbox. Failure to publish a notice
+            # must never turn an accepted purchase into an apparent failure.
+            from rental.store_notifications import sync_inbox_safely
+            await sync_inbox_safely(get_db())
             return result
     raise HTTPException(409, 'store_busy_retry')
 
-def audit(state, actor, action, target):
-    state['audit'].append({'at':now(),'actor':actor,'action':action,'target':target})
+def audit(state, actor, action, target, store_notice=None):
+    entry = {'at':now(),'actor':actor,'action':action,'target':target}
+    if store_notice:
+        entry['store_notice'] = store_notice
+    state['audit'].append(entry)
     # Fail closed instead of silently discarding audit history.
     if len(state['audit']) > 15000:
         raise HTTPException(409,'store_capacity_review_required')
@@ -230,13 +237,16 @@ async def place_order(body:PlaceOrder,request:Request):
             p=s['products'][line['product_id']]
             p['stock']-=line['quantity'];cost+=p['cost_cents']*line['quantity']
         order={**q,'id':oid,'user_id':uid,'customer_name':str(user.get('name',''))[:150],'created_at':now(),'updated_at':now(),'status':'received','payment_status':'unpaid','cost_cents':cost,'idempotency_key':body.idempotency_key,'fingerprint':fingerprint}
-        s['orders'][oid]=order;audit(s,uid,'order_created',oid)
+        s['orders'][oid]=order
+        audit(s,uid,'order_created',oid,{'order_id':oid,'user_id':uid,'status':'received'})
         return order_public(order)
     return await mutate(operation)
 
 @router.get('/store/orders')
 async def my_orders(request:Request):
     uid=identity(await resident(request));s=await read_state()
+    from rental.store_notifications import sync_inbox_safely
+    await sync_inbox_safely(get_db())
     return {'orders':sorted([order_public(o) for o in s['orders'].values() if o['user_id']==uid],key=lambda o:o['created_at'],reverse=True)}
 
 @router.post('/store/orders/{oid}/cancel')
@@ -252,6 +262,8 @@ async def cancel_order(oid:str,request:Request):
 @router.get('/admin/store')
 async def admin_state(request:Request):
     await auth_admin(request);s=await read_state()
+    from rental.store_notifications import sync_inbox_safely
+    await sync_inbox_safely(get_db())
     paid=[o for o in s['orders'].values() if o['payment_status']=='paid']
     return {'revision':s['revision'],'settings':s['settings'],'products':[{'id':k,**v} for k,v in s['products'].items()],'orders':sorted(list(s['orders'].values()),key=lambda o:o['created_at'],reverse=True),'summary':{'collected_cents':sum(o['total_cents'] for o in paid),'merchandise_margin_cents':sum(o['subtotal_cents']-o['cost_cents'] for o in paid),'tax_cents':sum(o['tax_cents'] for o in paid),'pending_orders':sum(o['status'] not in ('cancelled','delivered') for o in s['orders'].values())}}
 
@@ -297,7 +309,8 @@ def change_status(s,o,target,uid,resident_action=False):
             s['products'][line['product_id']]['stock']+=line['quantity']
     if target=='delivered' and o['payment_status']!='paid':
         raise HTTPException(409,'store_payment_required')
-    o['status']=target;o['updated_at']=now();audit(s,uid,'order_'+target,o['id'])
+    o['status']=target;o['updated_at']=now()
+    audit(s,uid,'order_'+target,o['id'],{'order_id':o['id'],'user_id':o['user_id'],'status':target})
     return order_public(o)
 
 @router.post('/admin/store/orders/{oid}/status')
@@ -360,4 +373,3 @@ async def product_photo(image_id: str):
         'Cache-Control': 'public, max-age=31536000, immutable',
         'X-Content-Type-Options': 'nosniff',
     })
-

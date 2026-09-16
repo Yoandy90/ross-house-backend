@@ -122,6 +122,8 @@ async def lifespan(app: FastAPI):
 
     from rental.notification_center import ensure_indexes as notification_indexes
     await notification_indexes(db)
+    from rental.store_notifications import ensure_indexes as store_notification_indexes
+    await store_notification_indexes(db)
 
     # Staging must never execute autonomous jobs (payments, messages, or syncs).
     # DISABLE_BACKGROUND_JOBS also provides an explicit kill switch elsewhere.

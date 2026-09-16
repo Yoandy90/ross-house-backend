@@ -295,6 +295,10 @@ async def check_receipts(db):
 
 async def scheduler():
     while True:
+        try:
+            from rental.store_notifications import drain as drain_store
+            await drain_store(get_db())
+        except Exception as exc: log.warning('Store notification worker (%s)',type(exc).__name__)
         try: await drain(get_db())
         except Exception as exc: log.warning('Notification worker (%s)',type(exc).__name__)
         await asyncio.sleep(30)
