@@ -120,6 +120,8 @@ async def sync_inbox(db):
         await materialize(db, event)
         if event['status_code'] == 'received':
             await materialize(db, event, admin=True)
+        from rental.store_email import enqueue
+        await enqueue(db, event)
         await db.store_notification_events.update_one(
             {'_id': event['_id'], 'status': 'pending'}, {'$set': {'status': 'materialized'}})
 
@@ -193,8 +195,11 @@ async def drain(db):
         {'$set': {'status': 'uncertain', 'error': 'worker_interrupted', 'updated_at': now()}})
     async for delivery in db.push_deliveries.find({'status': 'store_pending'}).sort('created_at', 1).limit(50):
         await deliver(db, delivery)
+    from rental.store_email import drain as drain_email
+    await drain_email(db)
 
 
 async def ensure_indexes(db):
     await db.store_notification_events.create_index([('status', 1), ('created_at', 1)])
     await db.push_deliveries.create_index([('status', 1), ('created_at', 1)])
+    await db.store_email_deliveries.create_index([('status', 1), ('created_at', 1)])

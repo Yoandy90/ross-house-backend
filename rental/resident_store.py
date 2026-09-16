@@ -81,6 +81,7 @@ class Product(Strict):
 
 class Settings(Strict):
     enabled: bool = False
+    email_notifications: bool = True
     home_delivery_only: bool = True
     tax_classes: list[TaxClass] = Field(default_factory=list, max_length=30)
 
@@ -116,6 +117,7 @@ class Item(Strict):
     quantity: int = Field(strict=True, ge=1, le=99)
 
 class Checkout(Strict):
+    language: Literal['es','en'] | None = None
     items: list[Item] = Field(min_length=1, max_length=40)
     delivery_instructions: str = Field(default='', max_length=300)
     fulfillment: Literal['delivery','pickup']
@@ -271,7 +273,7 @@ async def checkout_quote(body:Checkout,request:Request):
 @router.post('/store/orders')
 async def place_order(body:PlaceOrder,request:Request):
     user=await resident(request);uid=identity(user)
-    fingerprint=hashlib.sha256(json.dumps(body.model_dump(exclude={'idempotency_key'}),sort_keys=True).encode()).hexdigest()
+    fingerprint=hashlib.sha256(json.dumps(body.model_dump(exclude={'idempotency_key'}, exclude_none=True),sort_keys=True).encode()).hexdigest()
     oid=str(uuid4())
     initial = await read_state()
     # Recover committed requests even if the lease or address has since changed.
@@ -301,12 +303,13 @@ async def place_order(body:PlaceOrder,request:Request):
             p['stock']-=line['quantity'];cost+=p['cost_cents']*line['quantity']
         order={**q,'id':oid,'user_id':uid,'customer_name':str(user.get('name',''))[:150],'created_at':now(),'updated_at':now(),'status':'received','payment_status':'unpaid','cost_cents':cost,'idempotency_key':body.idempotency_key,'fingerprint':fingerprint}
         if home: order['residence'] = home
+        order['language'] = body.language or ('en' if str(user.get('language') or user.get('preferred_language') or '').startswith('en') else 'es')
         order['tracking'] = {'received_at': order['created_at']}
         s['orders'][oid]=order
         from rental.store_inventory import movement
         for line in q['items']:
             movement(s, uid, line['product_id'], -line['quantity'], 'order_reserved', oid)
-        audit(s,uid,'order_created',oid,{'order_id':oid,'user_id':uid,'status':'received'})
+        audit(s,uid,'order_created',oid,{'order_id':oid,'user_id':uid,'status':'received','email_notice':True})
         return order_public(order)
     return await mutate(operation)
 
@@ -416,7 +419,7 @@ async def record_payment(oid:str,body:Payment,request:Request):
         issue_receipt(s,o)
         if o.get('tracking', {}).get('handoff_at') and o['status'] == 'out_for_delivery':
             change_status(s, o, 'delivered', uid)
-        audit(s,uid,'payment_recorded',oid,{'order_id':oid,'user_id':o['user_id'],'status':'paid'})
+        audit(s,uid,'payment_recorded',oid,{'order_id':oid,'user_id':o['user_id'],'status':'paid','email_notice':True})
         return order_public(o)
     result = await mutate(operation)
     # Durable receipt metadata commits with the payment. PDF storage is retried

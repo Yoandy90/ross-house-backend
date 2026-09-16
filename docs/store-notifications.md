@@ -47,3 +47,26 @@ uncertain sends, missing/disabled devices, superseded updates, rejected purchase
 owner/admin audience boundaries, status transitions and pending counts.
 Receipt tracking reuses the Notification Center's tests. Physical-device delivery
 and visual QA are not established by these isolated tests.
+
+## Purchase email outbox
+
+New received/paid intents explicitly opt into email. Existing events are never
+backfilled. Checkout snapshots the app language (ES/EN); older clients fall back
+to the authenticated account preference. A missing optional language keeps the
+legacy idempotency fingerprint unchanged.
+
+`store_email_deliveries` uses the event ID as its unique key. The existing worker
+sends confirmation after commit and a branded PDF after recorded payment, using
+the ordinary transactional SendGrid configuration and the owner's current account
+email. Product images are embedded from local normalized storage. No external
+image fetch or customer-supplied email recipient is allowed.
+
+Admin Settings > Correos de compra controls new sends. Missing sender configuration
+retries later. Inactive accounts, suppressed environments and disabled settings
+have explicit terminal outcomes. Ambiguous provider acceptance becomes uncertain
+and is not automatically resent. An accepted status means provider acceptance,
+not inbox delivery. The staging background-job gate remains unchanged: in-app
+notices work, outbound purchase email and push remain suppressed.
+
+`tests/test_store_email.py` checks language, private attachments, concurrent claims,
+recovery, legacy exclusion and the staging boundary with a mocked provider.
