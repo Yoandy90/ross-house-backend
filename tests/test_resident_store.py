@@ -11,6 +11,8 @@ from rental import resident_store as s
 def shop(monkeypatch):
     db=AsyncMongoMockClient()['store_test']
     monkeypatch.setattr(s,'get_db',lambda:db)
+    from rental import tenant_integrity
+    monkeypatch.setattr(tenant_integrity,'get_db',lambda:db)
     monkeypatch.setattr(s,'auth_marketplace',AsyncMock(return_value={'_id':'resident-1','role':'tenant','name':'Resident'}))
     monkeypatch.setattr(s,'auth_admin',AsyncMock(return_value={'_id':'admin-1'}))
     app=FastAPI();app.include_router(s.router)
@@ -18,7 +20,7 @@ def shop(monkeypatch):
 
 async def setup(db,stock=3):
     state=await s.read_state()
-    state['settings'].update(enabled=True,slots=['Tuesday 5–7'],delivery_zips=['79029'],pickup_address='Office, Dumas',delivery_fee_cents=200,delivery_tax_bps=825)
+    state['settings'].update(home_delivery_only=False,enabled=True,slots=['Tuesday 5–7'],delivery_zips=['79029'],pickup_address='Office, Dumas',delivery_fee_cents=200,delivery_tax_bps=825)
     state['products']['water']={'name':'Agua','name_en':'Water','description':'','description_en':'','category':'Bebidas','image_url':'','price_cents':199,'cost_cents':100,'tax_bps':825,'stock':stock,'active':True}
     await db.resident_store.replace_one({'_id':s.KEY},state)
     return state

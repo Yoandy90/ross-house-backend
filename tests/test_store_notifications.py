@@ -192,7 +192,7 @@ async def test_status_events_and_admin_count_follow_order_lifecycle(shop, monkey
         assert (await client.post(f'/admin/store/orders/{oid}/status', json={'status': 'delivered'})).status_code == 409
         await client.post(f'/admin/store/orders/{oid}/payment', json={'reference': 'test-receipt'})
         assert (await client.post(f'/admin/store/orders/{oid}/status', json={'status': 'delivered'})).status_code == 200
-    assert await db.rental_notifications.count_documents({'user_id': 'resident-1'}) == 4
+    assert await db.rental_notifications.count_documents({'user_id': 'resident-1'}) == 5
     assert (await nav.nav_summary(None))['store_orders'] == 0
 
 
