@@ -1017,25 +1017,12 @@ async def public_marketplace_listings(
     }
 
 
+from rental.property_inquiries import router as inquiry_router, Create as InquiryCreate, create_inquiry, admin_list as list_property_inquiries
+router.include_router(inquiry_router)
+
 @router.post('/public/property-inquiry')
-async def property_inquiry(request: Request):
-    """Public: Send an inquiry about a property (apply/contact)"""
-    data = await request.json()
-    inquiry = {
-        "property_id": data.get("property_id", ""),
-        "property_type": data.get("property_type", ""),  # ross_house or marketplace
-        "name": data.get("name", ""),
-        "email": data.get("email", ""),
-        "phone": data.get("phone", ""),
-        "message": data.get("message", ""),
-        "inquiry_type": data.get("inquiry_type", "contact"),  # contact, apply, visit
-        "status": "new",
-        "created_at": datetime.utcnow(),
-    }
-    result = await get_db().property_inquiries.insert_one(inquiry)
-    return {"success": True, "inquiry_id": str(result.inserted_id), "message": "Consulta enviada exitosamente"}
-
-
+async def property_inquiry(request: Request, data: InquiryCreate):
+    return await create_inquiry(request, data)
 
 
 # ── Admin: Marketplace Management ──
@@ -1732,13 +1719,7 @@ async def admin_approve_landlord_kyc(landlord_id: str, request: Request):
 
 @router.get('/admin/property-inquiries')
 async def admin_list_inquiries(request: Request):
-    """Admin: List all property inquiries"""
-    await auth_admin(request)
-    cursor = get_db().property_inquiries.find().sort("created_at", -1).limit(100)
-    inquiries = []
-    async for i in cursor:
-        inquiries.append(serialize(i))
-    return {"success": True, "inquiries": inquiries, "count": len(inquiries)}
+    return await list_property_inquiries(request)
 
 
 @router.get('/admin/marketplace-stats')

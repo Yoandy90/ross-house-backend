@@ -1,0 +1,20 @@
+name: Property inquiry integrity
+on:
+  pull_request:
+    branches: [staging]
+    paths: ['rental/property_inquir*.py', 'rental/properties_router.py', 'rental/notification_center.py', 'tests/test_property_inquiries.py', '.github/workflows/property-inquiries.yml']
+  push:
+    branches: [staging]
+    paths: ['rental/property_inquir*.py', 'rental/properties_router.py', 'rental/notification_center.py', 'tests/test_property_inquiries.py', '.github/workflows/property-inquiries.yml']
+permissions:
+  contents: read
+jobs:
+  inquiries:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install -r requirements.txt pytest pytest-asyncio mongomock-motor
+      - run: PYTHONPATH=. python -m pytest -q tests/test_property_inquiries.py

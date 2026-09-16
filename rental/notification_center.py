@@ -296,6 +296,10 @@ async def check_receipts(db):
 async def scheduler():
     while True:
         try:
+            from rental.property_inquiry_notices import drain as drain_inquiries
+            await drain_inquiries(get_db())
+        except Exception as exc: log.warning('Inquiry notification worker (%s)', type(exc).__name__)
+        try:
             from rental.store_notifications import drain as drain_store
             await drain_store(get_db())
         except Exception as exc: log.warning('Store notification worker (%s)',type(exc).__name__)
