@@ -40,10 +40,18 @@ async def nav_summary(request: Request):
         {"match.status": "unmatched"})
     manual_confirmations = await db.manual_payment_confirmations.count_documents(
         {"status": {"$in": ["submitted", "under_review"]}})
+    store_counts = await db.resident_store.aggregate([
+        {'$match': {'_id': 'resident-store-v1'}},
+        {'$project': {'count': {'$size': {'$filter': {
+            'input': {'$objectToArray': {'$ifNull': ['$orders', {}]}},
+            'as': 'order', 'cond': {'$in': ['$$order.v.status', ['received', 'preparing', 'ready']]}
+        }}}}}
+    ]).to_list(1)
+    store_orders = store_counts[0]['count'] if store_counts else 0
 
     total = (new_applications + open_maintenance + pending_signatures +
              late_payments + delinquent_taxes["count"] + bank_unmatched +
-             manual_confirmations)
+             manual_confirmations + store_orders)
     return {
         "success": True,
         "total": total,
@@ -54,6 +62,7 @@ async def nav_summary(request: Request):
         "delinquent_taxes": delinquent_taxes,
         "bank_unmatched": bank_unmatched,
         "manual_confirmations": manual_confirmations,
+        "store_orders": store_orders,
     }
 
 

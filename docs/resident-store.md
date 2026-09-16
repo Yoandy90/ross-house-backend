@@ -43,14 +43,14 @@ for NEW orders; already reserved units are excluded.
 
 Online Helcim checkout needs a distinct merchandise payment purpose, provider
 reconciliation, uncertain-result handling and refund flow. Existing rent charge
-endpoints must not be reused. Push status updates/marketing opt-in, recurring
+endpoints must not be reused. Marketing opt-in, recurring
 orders, delivery capacity and inventory procurement are future extensions.
 Product/fulfillment tax rates are explicit configuration; no fiscal classification
 is inferred. No products, tax rates or real delivery windows ship preconfigured.
 
 ## Validation
 
-`PYTHONPATH=. python -m pytest -q tests/test_resident_store.py`
+`PYTHONPATH=. python -m pytest -q tests/test_resident_store.py tests/test_store_notifications.py`
 
 Covers concurrency/last unit, injected CAS conflict, duplicate retries, quote
 changes, cancellation/restock, ownership and real unauthenticated requests,

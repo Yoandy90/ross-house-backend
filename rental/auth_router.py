@@ -143,6 +143,8 @@ async def marketplace_get_notifications(request: Request):
     except (ValueError, TypeError):
         raise HTTPException(status_code=400, detail="Límite inválido")
     audience = await notification_audience(get_db(), user)
+    from rental.store_notifications import sync_inbox_safely
+    await sync_inbox_safely(get_db())
     
     notifications = []
     cursor = get_db().rental_notifications.find(
