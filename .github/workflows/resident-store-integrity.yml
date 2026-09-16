@@ -2,10 +2,10 @@ name: Resident store integrity
 on:
   pull_request:
     branches: [staging]
-    paths: ['rental/resident_store.py', 'rental/store_receipts.py', 'rental/store_email.py', 'tests/test_store_email.py', 'rental/store_receipt_design.py', 'rental/store_delivery.py', 'rental/store_inventory.py', 'tests/test_store_delivery.py', 'tests/test_store_inventory.py', 'rental/store_notifications.py', 'rental/admin_nav_router.py', 'rental/notification_*.py', 'rental/background_job_policy.py', 'rental/shared.py', 'server.py', 'tests/test_resident_store.py', 'tests/test_store_notifications.py', 'tests/test_store_receipts.py', '.github/workflows/resident-store-integrity.yml']
+    paths: ['rental/resident_store.py', 'rental/store_payments.py', 'tests/test_store_payments.py', 'rental/store_receipts.py', 'rental/store_email.py', 'tests/test_store_email.py', 'rental/store_receipt_design.py', 'rental/store_delivery.py', 'rental/store_inventory.py', 'tests/test_store_delivery.py', 'tests/test_store_inventory.py', 'rental/store_notifications.py', 'rental/admin_nav_router.py', 'rental/notification_*.py', 'rental/background_job_policy.py', 'rental/shared.py', 'server.py', 'tests/test_resident_store.py', 'tests/test_store_notifications.py', 'tests/test_store_receipts.py', '.github/workflows/resident-store-integrity.yml']
   push:
     branches: [staging]
-    paths: ['rental/resident_store.py', 'rental/store_receipts.py', 'rental/store_email.py', 'tests/test_store_email.py', 'rental/store_receipt_design.py', 'rental/store_delivery.py', 'rental/store_inventory.py', 'tests/test_store_delivery.py', 'tests/test_store_inventory.py', 'rental/store_notifications.py', 'rental/admin_nav_router.py', 'rental/notification_*.py', 'rental/background_job_policy.py', 'rental/shared.py', 'server.py', 'tests/test_resident_store.py', 'tests/test_store_notifications.py', 'tests/test_store_receipts.py', '.github/workflows/resident-store-integrity.yml']
+    paths: ['rental/resident_store.py', 'rental/store_payments.py', 'tests/test_store_payments.py', 'rental/store_receipts.py', 'rental/store_email.py', 'tests/test_store_email.py', 'rental/store_receipt_design.py', 'rental/store_delivery.py', 'rental/store_inventory.py', 'tests/test_store_delivery.py', 'tests/test_store_inventory.py', 'rental/store_notifications.py', 'rental/admin_nav_router.py', 'rental/notification_*.py', 'rental/background_job_policy.py', 'rental/shared.py', 'server.py', 'tests/test_resident_store.py', 'tests/test_store_notifications.py', 'tests/test_store_receipts.py', '.github/workflows/resident-store-integrity.yml']
 permissions:
   contents: read
 jobs:
@@ -19,4 +19,4 @@ jobs:
           python-version: '3.11'
           cache: pip
       - run: pip install -r requirements.txt pytest pytest-asyncio mongomock-motor
-      - run: PYTHONPATH=. python -m pytest -q tests/test_resident_store.py tests/test_store_notifications.py tests/test_store_receipts.py tests/test_store_email.py tests/test_store_delivery.py tests/test_store_inventory.py tests/test_background_job_policy.py
+      - run: PYTHONPATH=. python -m pytest -q tests/test_resident_store.py tests/test_store_notifications.py tests/test_store_receipts.py tests/test_store_email.py tests/test_store_delivery.py tests/test_store_inventory.py tests/test_background_job_policy.py tests/test_store_payments.py

@@ -81,6 +81,7 @@ class Product(Strict):
 
 class Settings(Strict):
     enabled: bool = False
+    online_payments: bool = True
     email_notifications: bool = True
     home_delivery_only: bool = True
     tax_classes: list[TaxClass] = Field(default_factory=list, max_length=30)
@@ -117,6 +118,9 @@ class Item(Strict):
     quantity: int = Field(strict=True, ge=1, le=99)
 
 class Checkout(Strict):
+    payment_method_id: str | None = Field(default=None, pattern=r'^[a-f0-9]{24}$')
+    payment_authorized: bool | None = None
+    payment_authorization_version: str | None = Field(default=None, max_length=50)
     language: Literal['es','en'] | None = None
     items: list[Item] = Field(min_length=1, max_length=40)
     delivery_instructions: str = Field(default='', max_length=300)
@@ -203,7 +207,9 @@ def product_public(pid, p):
     return {'id':pid, **{k:v for k,v in p.items() if k!='cost_cents'}, 'sku':sku_for(pid,p)}
 
 def order_public(order):
-    result = order_display({k:v for k,v in order.items() if k not in ('fingerprint','idempotency_key','cost_cents','payment_actor','driver_id','residence')})
+    result = order_display({k:v for k,v in order.items() if k not in ('fingerprint','idempotency_key','cost_cents','payment_actor','driver_id','residence','payment_attempt','refund_attempt')})
+    from rental.store_payments import public_payment
+    result['online_payment'] = public_payment(order)
     if result.get('tracking'):
         result['tracking'].pop('issue', None)
         result['tracking'].pop('issue_at', None)
@@ -251,6 +257,9 @@ def quote(state, body):
     fee=cfg['delivery_fee_cents'] if body.fulfillment=='delivery' else 0
     tax=sum(x['tax_cents'] for x in lines)+(fee*cfg['delivery_tax_bps']+5000)//10000
     result={'items':lines,'subtotal_cents':subtotal,'tax_cents':tax,'delivery_fee_cents':fee,'total_cents':subtotal+tax+fee,'fulfillment':body.fulfillment,'address':body.address if body.fulfillment=='delivery' else cfg['pickup_address'],'zip':body.zip if body.fulfillment=='delivery' else '', 'slot':body.slot,'payment_method':'pay_on_receipt','delivery_instructions':body.delivery_instructions}
+    if body.payment_method_id:
+        result['payment_method'] = 'helcim'
+        result['selected_method_id'] = body.payment_method_id
     result['quote_hash']=hashlib.sha256(json.dumps(result,sort_keys=True).encode()).hexdigest()
     return result
 
@@ -268,6 +277,8 @@ async def checkout_quote(body:Checkout,request:Request):
     state = await read_state()
     from rental.store_delivery import home_checkout
     body, _ = await home_checkout(state, body, user)
+    from rental.store_payments import prepare
+    await prepare(user, body, state)
     return quote(state,body)
 
 @router.post('/store/orders')
@@ -284,14 +295,18 @@ async def place_order(body:PlaceOrder,request:Request):
             return order_public(existing)
     from rental.store_delivery import home_checkout
     body, home = await home_checkout(initial, body, user)
+    from rental.store_payments import prepare, attach, charge
+    prepared = await prepare(user, body, initial)
     def operation(s):
         for existing in s['orders'].values():
             if existing['user_id']==uid and existing['idempotency_key']==body.idempotency_key:
                 if existing['fingerprint']!=fingerprint:
                     raise HTTPException(409,'store_idempotency_conflict')
-                return order_public(existing)
+                return {'order': existing, 'created': False}
         if s['settings'].get('home_delivery_only', False) != initial['settings'].get('home_delivery_only', False):
             raise HTTPException(409, 'store_quote_changed')
+        if prepared and not s['settings'].get('online_payments', True):
+            raise HTTPException(409, 'store_payment_disabled')
         q=quote(s,body)
         if q['quote_hash']!=body.quote_hash:
             raise HTTPException(409,'store_quote_changed')
@@ -305,13 +320,17 @@ async def place_order(body:PlaceOrder,request:Request):
         if home: order['residence'] = home
         order['language'] = body.language or ('en' if str(user.get('language') or user.get('preferred_language') or '').startswith('en') else 'es')
         order['tracking'] = {'received_at': order['created_at']}
+        attach(order, prepared)
         s['orders'][oid]=order
         from rental.store_inventory import movement
         for line in q['items']:
             movement(s, uid, line['product_id'], -line['quantity'], 'order_reserved', oid)
         audit(s,uid,'order_created',oid,{'order_id':oid,'user_id':uid,'status':'received','email_notice':True})
-        return order_public(order)
-    return await mutate(operation)
+        return {'order': order, 'created': True}
+    result = await mutate(operation)
+    if result['created'] and prepared:
+        return await charge(result['order'], prepared, request.client.host if request.client else '127.0.0.1')
+    return order_public(result['order'])
 
 @router.get('/store/orders')
 async def my_orders(request:Request):
@@ -377,12 +396,20 @@ async def save_product(pid:str,body:SaveProduct,request:Request):
 def change_status(s,o,target,uid,resident_action=False):
     if o['status']==target:
         return order_public(o)
+    if o.get('payment_review_required'):
+        raise HTTPException(409, 'store_payment_review_required')
+    if o.get('payment_attempt') and target != 'cancelled' and o['payment_status'] != 'paid':
+        raise HTTPException(409, 'store_payment_required')
+    if o.get('refund_attempt') and target != 'cancelled':
+        raise HTTPException(409, 'store_refund_in_progress')
     allowed={'received':{'preparing','cancelled'},'preparing':{'ready','cancelled'},'ready':{'out_for_delivery','delivered','cancelled'},'out_for_delivery':{'delivered'}}
     if target not in allowed.get(o['status'],set()) or (resident_action and o['status']!='received'):
         raise HTTPException(409,'store_transition_invalid')
     if target == 'out_for_delivery' and not o.get('driver_id'):
         raise HTTPException(409, 'store_driver_required')
     if target=='cancelled':
+        if o.get('payment_attempt') and o['payment_status'] not in ('failed','refunded'):
+            raise HTTPException(409, 'store_payment_review_required')
         if o['payment_status']=='paid':
             raise HTTPException(409,'store_refund_required')
         for line in o['items']:
@@ -412,6 +439,8 @@ async def record_payment(oid:str,body:Payment,request:Request):
         o=s['orders'].get(oid)
         if not o:raise HTTPException(404,'store_order_not_found')
         if o['payment_status']=='paid':return order_public(o)
+        if o.get('payment_attempt'):
+            raise HTTPException(409, 'store_online_payment_requires_verification')
         if o['status'] not in ('received','preparing','ready','out_for_delivery'):
             raise HTTPException(409,'store_transition_invalid')
         o.update(payment_status='paid',payment_reference=body.reference,payment_actor=uid,paid_at=now(),updated_at=now())
@@ -442,7 +471,7 @@ async def download_receipt(oid, request, response, admin=False, language='es'):
     order = state['orders'].get(oid)
     if not order or (not admin and order['user_id'] != identity(user)):
         raise HTTPException(404, 'store_order_not_found')
-    if order['payment_status'] != 'paid':
+    if order['payment_status'] not in ('paid','refunded'):
         raise HTTPException(409, 'store_receipt_requires_payment')
     if not order.get('receipt'):
         # Give legacy paid purchases one durable number, without another charge
@@ -509,3 +538,5 @@ async def product_photo(image_id: str):
 
 from rental.store_delivery import router as delivery_router
 router.include_router(delivery_router)
+from rental.store_payments import router as payments_router
+router.include_router(payments_router)
