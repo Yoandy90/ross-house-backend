@@ -20,12 +20,16 @@ STORE_KEY = 'resident-store-v1'
 CURSOR_KEY = 'source:' + STORE_KEY
 INACTIVE = {'deleted', 'inactive', 'disabled', 'suspended'}
 COPY = {
+    'out_for_delivery': ('Tu pedido va en camino', 'Consulta la hora estimada de llegada en Pedidos.', 'Your order is on its way', 'Check the estimated arrival time in Orders.'),
+    'handoff': ('Entrega confirmada', 'El repartidor confirmó la entrega de tu pedido.', 'Delivery confirmed', 'Your courier confirmed your order was delivered.'),
+    'paid': ('Pago recibido', 'Tu pago de la tienda fue registrado. Tu recibo está disponible en Pedidos.',
+             'Payment received', 'Your store payment was recorded. Your receipt is available in Orders.'),
     'received': ('Pedido recibido', 'Recibimos tu pedido. Te avisaremos cuando esté listo.',
                  'Order received', 'We received your order. We will let you know when it is ready.'),
     'preparing': ('Estamos preparando tu pedido', 'Tu pedido de la tienda está en preparación.',
                   'Preparing your order', 'Your store order is being prepared.'),
-    'ready': ('Tu pedido está listo', 'Consulta los detalles de recogida o entrega en Pedidos.',
-              'Your order is ready', 'Check pickup or delivery details in Orders.'),
+    'ready': ('Tu pedido está listo', 'Consulta los detalles y el seguimiento en Pedidos.',
+              'Your order is ready', 'Check details and tracking in Orders.'),
     'delivered': ('Pedido entregado', 'Tu pedido fue entregado. Puedes consultar tu recibo en Pedidos.',
                   'Order delivered', 'Your order was delivered. You can view your receipt in Orders.'),
     'cancelled': ('Pedido cancelado', 'Tu pedido fue cancelado. No hay ningún pago pendiente por este pedido.',
@@ -147,8 +151,10 @@ async def deliver(db, delivery):
         outcome = {'status': 'no_device'}
     else:
         oid = delivery['data']['order_id']
-        state = await db.resident_store.find_one({'_id': STORE_KEY}, {f'orders.{oid}.status': 1}) or {}
-        current = state.get('orders', {}).get(oid, {}).get('status')
+        field = 'payment_status' if delivery['data']['status'] == 'paid' else 'status'
+        state = await db.resident_store.find_one({'_id': STORE_KEY}, {f'orders.{oid}.{field}': 1, f'orders.{oid}.tracking.handoff_at': 1}) or {}
+        order = state.get('orders', {}).get(oid, {})
+        current = 'handoff' if delivery['data']['status'] == 'handoff' and order.get('tracking', {}).get('handoff_at') else order.get(field)
         created = delivery['created_at'].replace(tzinfo=timezone.utc)
         if current != delivery['data']['status'] or created < now() - timedelta(days=1):
             outcome = {'status': 'superseded'}
