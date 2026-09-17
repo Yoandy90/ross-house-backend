@@ -271,9 +271,29 @@ def build_maintenance_received_message(
 
 
 _STATUS_LABELS = {
-    "es": {"pending": "Pendiente", "reviewing": "En revisión", "assigned": "Asignada", "scheduled": "Programada", "in_progress": "En progreso", "waiting_parts": "Esperando piezas", "completed": "Completada", "resolved": "Resuelta", "cancelled": "Cancelada", "closed": "Cerrada"},
-    "en": {"pending": "Pending", "reviewing": "Under review", "assigned": "Assigned", "scheduled": "Scheduled", "in_progress": "In progress", "waiting_parts": "Waiting for parts", "completed": "Completed", "resolved": "Resolved", "cancelled": "Cancelled", "closed": "Closed"},
+    "es": {"pending": "Pendiente", "reviewing": "En revisión", "assigned": "Asignada", "scheduled": "Programada", "en_route": "En camino", "in_progress": "En progreso", "waiting_parts": "Esperando piezas", "completed": "Completada", "resolved": "Resuelta", "cancelled": "Cancelada", "closed": "Cerrada"},
+    "en": {"pending": "Pending", "reviewing": "Under review", "assigned": "Assigned", "scheduled": "Scheduled", "en_route": "On the way", "in_progress": "In progress", "waiting_parts": "Waiting for parts", "completed": "Completed", "resolved": "Resolved", "cancelled": "Cancelled", "closed": "Closed"},
 }
+
+
+def maintenance_request_label(ticket: dict, locale: str = "es") -> str:
+    """Human-facing reference; internal ids remain only in navigation data."""
+    locale = _normalize_locale(locale)
+    number = str(ticket.get("request_number") or "").strip()
+    prefix = "Request" if locale == "en" else "Solicitud"
+    # Legacy records can lack the sequential display number entirely.
+    if number.isascii() and number.isdecimal() and len(number) <= 12:
+        return f"{prefix} #{number.zfill(4)}"
+    title = " ".join(str(ticket.get("title") or "").split())
+    if title:
+        return title if len(title) <= 100 else title[:99] + "…"
+    return "Maintenance request" if locale == "en" else "Solicitud de mantenimiento"
+
+
+def maintenance_update_push(ticket: dict, status: str, locale: str = "es") -> str:
+    locale = _normalize_locale(locale)
+    label = _STATUS_LABELS[locale].get(status, "Updated" if locale == "en" else "Actualizada")
+    return f"{maintenance_request_label(ticket, locale)}: {label}"
 
 
 def build_maintenance_updated_message(

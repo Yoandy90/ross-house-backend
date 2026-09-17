@@ -12,7 +12,7 @@ from fastapi import APIRouter, HTTPException, Request
 
 from rental.shared import auth_admin, get_db, send_rental_push_to_user
 from rental.maintenance_ownership_security_router import _canonical_status, _load_bound_maintenance_request
-from rental.security_email import send_maintenance_updated_email
+from rental.security_email import send_maintenance_updated_email, maintenance_update_push, maintenance_request_label
 from rental.service_providers_router import _get_settings, _send_email, _send_sms
 from rental._provider_email_templates import dispatch_job_html
 
@@ -162,7 +162,7 @@ async def secure_admin_dispatch_maintenance(request: Request):
             await send_rental_push_to_user(
                 user_id=str(provider["app_user_id"]),
                 title="New assigned job" if provider_locale == "en" else "Nuevo trabajo asignado",
-                body=f"#{ticket.get('request_number') or request_id} · {title} · {address}",
+                body=f"{maintenance_request_label(ticket, provider_locale)} · {address}",
                 data={"type": "maintenance_assignment", "request_id": request_id},
             )
         except Exception:
@@ -175,11 +175,7 @@ async def secure_admin_dispatch_maintenance(request: Request):
         await send_rental_push_to_user(
             user_id=str(ticket.get("tenant_id") or ""),
             title="📋 Maintenance Update" if tenant_locale == "en" else "📋 Actualización de Mantenimiento",
-            body=(
-                f"Request #{ticket.get('request_number') or request_id} was assigned."
-                if tenant_locale == "en"
-                else f"La solicitud #{ticket.get('request_number') or request_id} fue asignada."
-            ),
+            body=maintenance_update_push(ticket, tenant_status, tenant_locale),
             data={"type": "maintenance_update", "request_id": request_id, "status": tenant_status},
         )
     except Exception:

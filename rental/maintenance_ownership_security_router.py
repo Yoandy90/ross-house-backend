@@ -12,7 +12,7 @@ from fastapi import APIRouter, HTTPException, Request
 from rental.shared import auth_admin, auth_marketplace, get_db, send_rental_push_to_user
 from rental.tenant_integrity import find_active_contract_for_tenant, resolve_authenticated_tenant
 from rental.maintenance_security_router import _canonical_lease_location, _next_maintenance_number, _normalize_locale
-from rental.security_email import send_maintenance_updated_email
+from rental.security_email import send_maintenance_updated_email, maintenance_update_push
 from rental.maintenance_workflow import (
     ALLOWED_STATUSES as _ALLOWED_STATUSES, STATUS_TRANSITIONS as _STATUS_TRANSITIONS,
     canonical_status as _canonical_status,
@@ -274,13 +274,8 @@ async def secure_update_maintenance_request(request_id: str, request: Request):
         scheduled_end = update_fields.get("scheduled_end", ticket.get("scheduled_end"))
         visible_note = update_fields.get("tenant_visible_note", ticket.get("tenant_visible_note") or "")
         try:
-            status_label = resulting_status.replace("_", " ")
             push_title = "📋 Maintenance Update" if locale == "en" else "📋 Actualización de Mantenimiento"
-            push_body = (
-                f"Request #{ticket.get('request_number') or request_id}: {status_label}"
-                if locale == "en"
-                else f"Solicitud #{ticket.get('request_number') or request_id}: {status_label}"
-            )
+            push_body = maintenance_update_push(ticket, resulting_status, locale)
             await send_rental_push_to_user(
                 user_id=str(ticket.get("tenant_id") or ""),
                 title=push_title,
@@ -293,7 +288,7 @@ async def secure_update_maintenance_request(request_id: str, request: Request):
                 await send_rental_push_to_user(
                     user_id=str(prop["owner_id"]),
                     title="📋 Mantenimiento Actualizado",
-                    body=f"'{ticket.get('title', '')}' → {resulting_status}",
+                    body=maintenance_update_push(ticket, resulting_status, "es"),
                     data={"type": "maintenance_update", "request_id": request_id, "status": resulting_status},
                 )
         except Exception:

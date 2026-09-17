@@ -6,6 +6,8 @@ on:
     paths:
       - 'rental/tenant_router.py'
       - 'rental/maintenance_workflow.py'
+      - 'rental/security_email.py'
+      - 'tests/test_maintenance_receipt_email.py'
       - 'tests/test_admin_maintenance_listing.py'
       - 'rental/maintenance_technician_router.py'
       - 'rental/maintenance_dispatch_security_router.py'
@@ -24,6 +26,8 @@ on:
     paths:
       - 'rental/tenant_router.py'
       - 'rental/maintenance_workflow.py'
+      - 'rental/security_email.py'
+      - 'tests/test_maintenance_receipt_email.py'
       - 'tests/test_admin_maintenance_listing.py'
       - 'rental/maintenance_technician_router.py'
       - 'rental/maintenance_dispatch_security_router.py'
