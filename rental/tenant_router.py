@@ -1789,6 +1789,8 @@ async def admin_list_maintenance_requests(
       - page, limit (default 50, max 200)
       - sort: date (default) | urgency (active first, then priority and newest)
     """
+    from rental.maintenance_workflow import canonical_status, available_statuses
+
     user = await auth_admin(request)
     # Clamp
     page = max(1, int(page or 1))
@@ -1841,8 +1843,7 @@ async def admin_list_maintenance_requests(
     requests_list = []
     async for r in cursor:
         # Normalize legacy 'open' status to 'pending' for the frontend
-        raw_status = (r.get("status") or "pending").lower()
-        norm_status = "pending" if raw_status == "open" else raw_status
+        norm_status = canonical_status(r.get("status"))
         requests_list.append({
             "id": str(r["_id"]),
             "_id": str(r["_id"]),  # backward compatibility for legacy frontend
@@ -1859,6 +1860,7 @@ async def admin_list_maintenance_requests(
             "category": r.get("category", ""),
             "priority": r.get("priority", ""),
             "status": norm_status,
+            "available_statuses": available_statuses(norm_status),
             "photos": r.get("photos", []) or [],
             "photo_count": len(r.get("photos", []) or []),
             "created_at": r.get("created_at", "").isoformat() if r.get("created_at") else "",

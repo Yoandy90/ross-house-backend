@@ -13,37 +13,19 @@ from rental.shared import auth_admin, auth_marketplace, get_db, send_rental_push
 from rental.tenant_integrity import find_active_contract_for_tenant, resolve_authenticated_tenant
 from rental.maintenance_security_router import _canonical_lease_location, _next_maintenance_number, _normalize_locale
 from rental.security_email import send_maintenance_updated_email
+from rental.maintenance_workflow import (
+    ALLOWED_STATUSES as _ALLOWED_STATUSES, STATUS_TRANSITIONS as _STATUS_TRANSITIONS,
+    canonical_status as _canonical_status,
+)
 
 router = APIRouter()
 
 _ALLOWED_PRIORITIES = {"low", "medium", "high", "urgent"}
 _ALLOWED_CONTACT = {"phone", "email", "whatsapp"}
-_ALLOWED_STATUSES = {
-    "pending", "reviewing", "assigned", "scheduled", "en_route", "in_progress",
-    "waiting_parts", "completed", "resolved", "cancelled", "closed",
-}
-_STATUS_TRANSITIONS = {
-    "pending": {"reviewing", "assigned", "scheduled", "in_progress", "completed", "resolved", "cancelled"},
-    "reviewing": {"pending", "assigned", "scheduled", "in_progress", "completed", "resolved", "cancelled"},
-    "assigned": {"reviewing", "scheduled", "en_route", "in_progress", "waiting_parts", "completed", "resolved", "cancelled"},
-    "scheduled": {"assigned", "en_route", "in_progress", "waiting_parts", "completed", "resolved", "cancelled"},
-    "en_route": {"assigned", "scheduled", "in_progress", "waiting_parts", "completed", "resolved", "cancelled"},
-    "in_progress": {"assigned", "scheduled", "en_route", "waiting_parts", "completed", "resolved", "cancelled"},
-    "waiting_parts": {"assigned", "scheduled", "en_route", "in_progress", "cancelled"},
-    "completed": {"in_progress", "resolved", "closed"},
-    "resolved": {"in_progress", "completed", "closed"},
-    "cancelled": {"pending", "reviewing"},
-    "closed": {"in_progress"},
-}
 _IMMUTABLE_OWNERSHIP_FIELDS = {
     "tenant_id", "contract_id", "property_id", "unit_id", "relationship_source",
     "tenant_name", "tenant_email", "tenant_phone", "property_address",
 }
-
-
-def _canonical_status(value) -> str:
-    raw = str(value or "pending").strip().lower()
-    return "pending" if raw == "open" else raw
 
 
 def _parse_optional_datetime(value, field: str):

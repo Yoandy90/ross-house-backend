@@ -5,6 +5,7 @@ on:
     branches: [staging]
     paths:
       - 'rental/tenant_router.py'
+      - 'rental/maintenance_workflow.py'
       - 'tests/test_admin_maintenance_listing.py'
       - 'rental/maintenance_technician_router.py'
       - 'rental/maintenance_dispatch_security_router.py'
@@ -22,6 +23,7 @@ on:
     branches: [staging]
     paths:
       - 'rental/tenant_router.py'
+      - 'rental/maintenance_workflow.py'
       - 'tests/test_admin_maintenance_listing.py'
       - 'rental/maintenance_technician_router.py'
       - 'rental/maintenance_dispatch_security_router.py'
