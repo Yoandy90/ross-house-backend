@@ -1,0 +1,20 @@
+name: FAQ content and publishing
+on:
+  pull_request:
+    branches: [staging]
+    paths: ['rental/faq_router.py', 'rental/content/default_faqs.json', 'tests/test_faq_content.py', '.github/workflows/faq-content.yml']
+  push:
+    branches: [staging]
+    paths: ['rental/faq_router.py', 'rental/content/default_faqs.json', 'tests/test_faq_content.py', '.github/workflows/faq-content.yml']
+permissions:
+  contents: read
+jobs:
+  faq:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install -r requirements.txt pytest pytest-asyncio mongomock-motor
+      - run: PYTHONPATH=. python -m pytest -q tests/test_faq_content.py

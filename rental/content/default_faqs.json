@@ -1,0 +1,138 @@
+[
+  {
+    "category": "rentals",
+    "question_es": "¿Cómo solicito información sobre una vivienda?",
+    "question_en": "How do I request information about a home?",
+    "answer_es": "Abre Propiedades, elige una vivienda y toca Contactar o Aplicar. Envía tus datos y tu mensaje. Si has iniciado sesión, puedes consultar el seguimiento en Perfil → Mis solicitudes.",
+    "answer_en": "Open Properties, choose a home and tap Contact or Apply. Send your details and message. When signed in, you can track the request in Profile → My requests.",
+    "order": 1
+  },
+  {
+    "category": "rentals",
+    "question_es": "¿Mi visita queda confirmada al enviar el formulario?",
+    "question_en": "Is my visit confirmed when I submit the form?",
+    "answer_es": "No. Puedes proponer una fecha y hora, pero la visita queda agendada cuando Ross House confirma la cita. Consulta la fecha confirmada y nuestra respuesta en Mis solicitudes.",
+    "answer_en": "No. You can suggest a date and time, but your visit is scheduled only when Ross House confirms it. Check My requests for the confirmed appointment and our response.",
+    "order": 2
+  },
+  {
+    "category": "rentals",
+    "question_es": "¿Dónde consulto los requisitos y las condiciones de renta?",
+    "question_en": "Where can I find rental requirements and terms?",
+    "answer_es": "Revisa la información de la vivienda y contacta al equipo antes de enviar documentación. Los requisitos, depósitos y condiciones aplicables se confirman durante el proceso y en tu contrato.",
+    "answer_en": "Review the property information and contact our team before submitting documents. Applicable requirements, deposits and terms are confirmed during the application process and in your lease.",
+    "order": 3
+  },
+  {
+    "category": "payments",
+    "question_es": "¿Cómo pago mi renta desde la app?",
+    "question_en": "How do I pay rent in the app?",
+    "answer_es": "Entra en Pagos, revisa el mes, el importe y los conceptos antes de continuar. Selecciona un método disponible y espera la confirmación del pago. Un pago pendiente todavía no es un pago confirmado.",
+    "answer_en": "Open Payments and review the month, amount and charges before continuing. Choose an available payment method and wait for confirmation. A pending payment is not yet a confirmed payment.",
+    "order": 4
+  },
+  {
+    "category": "payments",
+    "question_es": "¿Cómo guardo una tarjeta o cuenta bancaria?",
+    "question_en": "How do I save a card or bank account?",
+    "answer_es": "Abre Métodos de pago y selecciona Agregar método de pago. Completa el formulario seguro de Helcim y regresa a la app para verificar que el método aparezca. Las opciones disponibles se muestran durante el proceso.",
+    "answer_en": "Open Payment methods and select Add payment method. Complete the secure Helcim form and return to the app to check that the method appears. Available options are shown during the process.",
+    "order": 5
+  },
+  {
+    "category": "payments",
+    "question_es": "¿Dónde encuentro mis recibos?",
+    "question_en": "Where can I find my receipts?",
+    "answer_es": "Consulta el Historial de facturas para ver los recibos disponibles de renta, servicios y tienda. Usa el filtro correspondiente y el botón PDF para abrir o descargar un recibo.",
+    "answer_en": "Open Invoice history to view available rent, service and store receipts. Use the relevant filter and the PDF button to open or download a receipt.",
+    "order": 6
+  },
+  {
+    "category": "payments",
+    "question_es": "¿Qué hago si un pago aparece pendiente?",
+    "question_en": "What should I do if a payment is pending?",
+    "answer_es": "Revisa su estado antes de volver a pagar. Algunos métodos requieren procesamiento o revisión. Si tienes dudas, contacta al equipo con la fecha, el importe y la referencia del pago; no envíes números completos de tarjeta o cuenta.",
+    "answer_en": "Check its status before paying again. Some methods require processing or review. If you need help, contact our team with the date, amount and payment reference; do not send full card or bank account numbers.",
+    "order": 7
+  },
+  {
+    "category": "maintenance",
+    "question_es": "¿Cómo reporto un problema de mantenimiento?",
+    "question_en": "How do I report a maintenance issue?",
+    "answer_es": "Desde Inicio, abre Reportar problema. Describe lo ocurrido y agrega fotos claras si es posible. Guarda el número de solicitud y abre su detalle para consultar el estado y las actualizaciones.",
+    "answer_en": "From Home, open Report a problem. Describe the issue and add clear photos when possible. Keep the request number and open its details to check the status and updates.",
+    "order": 8
+  },
+  {
+    "category": "maintenance",
+    "question_es": "¿Puedo ampliar las fotos de una solicitud?",
+    "question_en": "Can I enlarge photos in a maintenance request?",
+    "answer_es": "Abre el detalle de la solicitud y toca una foto para verla en grande. Usa el zoom para revisar los detalles de la imagen.",
+    "answer_en": "Open the request details and tap a photo to view it full screen. Use zoom to inspect image details.",
+    "order": 9
+  },
+  {
+    "category": "general",
+    "question_es": "¿Cómo cambio el idioma y la apariencia?",
+    "question_en": "How do I change language and appearance?",
+    "answer_es": "Abre Perfil y revisa los ajustes de idioma y tema. Puedes usar español o inglés y elegir la apariencia clara, oscura o del sistema.",
+    "answer_en": "Open Profile and check the language and theme settings. You can use Spanish or English and choose light, dark or system appearance.",
+    "order": 10
+  },
+  {
+    "category": "general",
+    "question_es": "¿Cómo contacto a Ross House Rentals?",
+    "question_en": "How do I contact Ross House Rentals?",
+    "answer_es": "Usa los botones de llamada o correo de esta pantalla. También puedes escribir a info@rosshouserentals.com o llamar al (806) 934-2018. Incluye el número de pedido o solicitud si necesitas ayuda con uno.",
+    "answer_en": "Use the call or email buttons on this screen. You can also email info@rosshouserentals.com or call (806) 934-2018. Include your order or request number when asking about one.",
+    "order": 11
+  },
+  {
+    "category": "store",
+    "question_es": "¿Cómo compro en la tienda?",
+    "question_en": "How do I shop in the store?",
+    "answer_es": "Abre Tienda, elige una categoría y toca un producto para revisar fotos y descripción. Comprueba la talla, el color o la presentación de la opción elegida, agrégala al carrito y revisa tu pedido antes de confirmarlo.",
+    "answer_en": "Open Store, choose a category and tap a product to review photos and details. Check the size, color or pack of the selected option, add it to your cart and review the order before confirming.",
+    "order": 12
+  },
+  {
+    "category": "store",
+    "question_es": "¿Dónde recibiré mi pedido?",
+    "question_en": "Where will my order be delivered?",
+    "answer_es": "Por ahora ofrecemos entrega a domicilio. Revisa la dirección y las indicaciones de entrega antes de confirmar el pedido. Si la dirección no es correcta, contacta al equipo antes de comprar.",
+    "answer_en": "We currently offer home delivery. Review the address and delivery instructions before confirming your order. If the address is incorrect, contact our team before purchasing.",
+    "order": 13
+  },
+  {
+    "category": "store",
+    "question_es": "¿Cómo sigo el estado de mi pedido?",
+    "question_en": "How do I track my order?",
+    "answer_es": "En Tienda → Pedidos puedes consultar el avance: recibido, preparando, listo para salir, en camino y entrega confirmada. La hora estimada aparece cuando se programa la entrega.",
+    "answer_en": "In Store → Orders, follow progress from received to preparing, ready to leave, on the way and delivery confirmed. The estimated time appears once delivery is scheduled.",
+    "order": 14
+  },
+  {
+    "category": "store",
+    "question_es": "¿Los productos tienen tallas, colores o presentaciones diferentes?",
+    "question_en": "Do products come in different sizes, colors or packs?",
+    "answer_es": "Cuando hay varias opciones, cada una tiene su precio y disponibilidad. Revisa la talla, el color y el contenido de la presentación antes de agregarla. Los productos por peso se ofrecen en presentaciones de peso fijo indicadas en la ficha.",
+    "answer_en": "When several options are offered, each has its own price and availability. Check the size, color and pack contents before adding it. Products sold by weight come in the fixed-weight packs shown in the product details.",
+    "order": 15
+  },
+  {
+    "category": "store",
+    "question_es": "¿La compra de la tienda se suma a mi renta?",
+    "question_en": "Is my store purchase added to my rent?",
+    "answer_es": "La compra y su recibo se registran por separado de la renta. Revisa el método de pago, los productos, la entrega, los impuestos y el total en el resumen antes de confirmar.",
+    "answer_en": "Your purchase and receipt are recorded separately from rent. Review the payment method, products, delivery, taxes and total in the summary before confirming.",
+    "order": 16
+  },
+  {
+    "category": "store",
+    "question_es": "¿Puedo cancelar un pedido o reportar un problema?",
+    "question_en": "Can I cancel an order or report an issue?",
+    "answer_es": "Abre el pedido y revisa si aparece Cancelar pedido. Si ya no está disponible o recibiste un producto incorrecto, contacta al equipo con el número de pedido y una descripción del problema.",
+    "answer_en": "Open the order and check whether Cancel order is available. If it is no longer available or you received an incorrect item, contact our team with the order number and a description of the issue.",
+    "order": 17
+  }
+]
