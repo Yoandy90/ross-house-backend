@@ -4,6 +4,8 @@ on:
   pull_request:
     branches: [staging]
     paths:
+      - 'rental/tenant_router.py'
+      - 'tests/test_admin_maintenance_listing.py'
       - 'rental/maintenance_technician_router.py'
       - 'rental/maintenance_dispatch_security_router.py'
       - 'rental/maintenance_ownership_security_router.py'
@@ -19,6 +21,8 @@ on:
   push:
     branches: [staging]
     paths:
+      - 'rental/tenant_router.py'
+      - 'tests/test_admin_maintenance_listing.py'
       - 'rental/maintenance_technician_router.py'
       - 'rental/maintenance_dispatch_security_router.py'
       - 'rental/maintenance_ownership_security_router.py'
@@ -41,5 +45,5 @@ jobs:
         with:
           python-version: '3.11'
           cache: pip
-      - run: pip install -r requirements.txt pytest
-      - run: PYTHONPATH=. python -m pytest -q tests/test_maintenance_technician_dashboard.py tests/test_public_contractor_registration.py tests/test_w9_secure_onboarding.py tests/test_maintenance_tenant_integrity.py tests/test_maintenance_receipt_email.py
+      - run: pip install -r requirements.txt pytest pytest-asyncio mongomock-motor
+      - run: PYTHONPATH=. python -m pytest -q tests/test_admin_maintenance_listing.py tests/test_admin_nav_maintenance.py tests/test_maintenance_technician_dashboard.py tests/test_public_contractor_registration.py tests/test_w9_secure_onboarding.py tests/test_maintenance_tenant_integrity.py tests/test_maintenance_receipt_email.py

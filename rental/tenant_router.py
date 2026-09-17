@@ -1778,6 +1778,7 @@ async def admin_list_maintenance_requests(
     search: str = "",
     page: int = 1,
     limit: int = 50,
+    sort: str = "date",
 ):
     """Admin: List all maintenance requests with server-side pagination + filters.
 
@@ -1786,6 +1787,7 @@ async def admin_list_maintenance_requests(
       - priority: low | medium | high | urgent (or '' for all)
       - search: substring across tenant_name | property_address | title | description
       - page, limit (default 50, max 200)
+      - sort: date (default) | urgency (active first, then priority and newest)
     """
     user = await auth_admin(request)
     # Clamp
@@ -1793,10 +1795,14 @@ async def admin_list_maintenance_requests(
     limit = max(1, min(int(limit or 50), 200))
 
     query: dict = {}
+    status = status.strip().lower()
+    priority = priority.strip().lower()
     if status:
-        query["status"] = status
+        query["status"] = {"$in": ["pending", "open", "", None]} if status in ("pending", "open") else status
     if priority:
-        query["priority"] = priority
+        aliases = {"urgent": ["urgent", "emergency"], "emergency": ["urgent", "emergency"],
+                   "medium": ["medium", "normal"], "normal": ["medium", "normal"]}
+        query["priority"] = {"$in": aliases[priority]} if priority in aliases else priority
     if search:
         import re as _re
         rg = {"$regex": _re.escape(search), "$options": "i"}
@@ -1812,7 +1818,25 @@ async def admin_list_maintenance_requests(
     total_pages = max(1, (total + limit - 1) // limit)
     page = min(page, total_pages) if total > 0 else 1
     skip = (page - 1) * limit
-    cursor = db.maintenance_requests.find(query).sort("created_at", -1).skip(skip).limit(limit)
+    terminal_statuses = ["completed", "resolved", "cancelled", "closed"]
+    if sort == "urgency":
+        # Rank the whole matching set before pagination, including legacy priorities.
+        cursor = db.maintenance_requests.aggregate([
+            {"$match": query},
+            {"$addFields": {
+                "_sort_finished": {"$cond": [{"$in": [{"$toLower": {"$ifNull": ["$status", ""]}}, terminal_statuses]}, 1, 0]},
+                "_sort_priority": {"$switch": {
+                    "branches": [
+                        {"case": {"$in": [{"$toLower": {"$ifNull": ["$priority", ""]}}, values]}, "then": rank}
+                        for rank, values in enumerate([["urgent", "emergency"], ["high"], ["medium", "normal"], ["low"]])
+                    ], "default": 4,
+                }},
+            }},
+            {"$sort": {"_sort_finished": 1, "_sort_priority": 1, "created_at": -1, "_id": -1}},
+            {"$skip": skip}, {"$limit": limit},
+        ])
+    else:
+        cursor = db.maintenance_requests.find(query).sort([("created_at", -1), ("_id", -1)]).skip(skip).limit(limit)
 
     requests_list = []
     async for r in cursor:
@@ -1864,26 +1888,29 @@ async def admin_list_maintenance_requests(
     # Aggregate counts (status breakdown across full filtered set — useful for UI badges)
     stats = {
         "open": 0, "pending": 0, "reviewing": 0, "assigned": 0,
-        "scheduled": 0, "in_progress": 0, "waiting_parts": 0,
+        "scheduled": 0, "en_route": 0, "in_progress": 0, "waiting_parts": 0,
         "completed": 0, "resolved": 0, "cancelled": 0, "closed": 0,
-        "urgent": 0,
+        "urgent": 0, "active": 0, "finished": 0,
     }
-    try:
-        async for d in db.maintenance_requests.aggregate([
-            {"$match": query},
-            {"$group": {"_id": "$status", "count": {"$sum": 1}}},
-        ]):
-            k = (d.get("_id") or "").lower()
-            if k in stats:
-                stats[k] = d.get("count", 0)
-        # Merge legacy 'open' into 'pending' for UI display
-        stats["pending"] = stats.get("pending", 0) + stats.get("open", 0)
-        stats["open"] = stats["pending"]  # legacy alias for older clients
-        # Count urgent (across all statuses still in query)
-        urgent_q = {**query, "priority": "urgent"}
-        stats["urgent"] = await db.maintenance_requests.count_documents(urgent_q)
-    except Exception:
-        pass
+    async for d in db.maintenance_requests.aggregate([
+        {"$match": query},
+        {"$group": {"_id": "$status", "count": {"$sum": 1}}},
+    ]):
+        k = (d.get("_id") or "pending").lower()
+        k = "pending" if k == "open" else k
+        count = d.get("count", 0)
+        if k in stats and k not in ("open", "urgent", "active", "finished"):
+            stats[k] += count
+        if k not in terminal_statuses:
+            stats["active"] += count
+        elif k != "cancelled":
+            stats["finished"] += count
+    stats["open"] = stats["pending"]  # Preserve the legacy pending-only alias.
+    # Intersect with all current filters; never replace the requested priority.
+    stats["urgent"] = await db.maintenance_requests.count_documents({"$and": [
+        query, {"priority": {"$in": ["urgent", "emergency"]}},
+        {"status": {"$nin": terminal_statuses}},
+    ]})
 
     return {
         "success": True,
