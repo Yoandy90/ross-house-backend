@@ -22,8 +22,9 @@ async def nav_summary(request: Request):
     now = datetime.utcnow()
 
     new_applications = await db.rental_applications.count_documents({"status": "new"})
+    # Resolved tickets are finished too; reopening them restores the alert.
     open_maintenance = await db.maintenance_requests.count_documents(
-        {"status": {"$nin": ["completed", "cancelled", "closed"]}}
+        {"status": {"$nin": ["completed", "resolved", "cancelled", "closed"]}}
     )
     pending_signatures = await db.rental_contracts.count_documents(
         {"$or": [{"signature_status": "pending"}, {"status": "pending_signatures"}]}
