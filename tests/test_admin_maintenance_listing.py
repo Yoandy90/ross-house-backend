@@ -9,6 +9,7 @@ from httpx import ASGITransport, AsyncClient
 from mongomock_motor import AsyncMongoMockClient
 
 from rental import tenant_router as tenant
+from rental import maintenance_ownership_security_router as ownership
 
 
 @pytest.fixture
@@ -30,6 +31,64 @@ async def data(app, **params):
     response = await fetch(app, **params)
     assert response.status_code == 200, response.text
     return response.json()
+
+
+@pytest.mark.asyncio
+async def test_available_actions_follow_mutation_policy_for_all_states(listing):
+    db, app = listing
+    values = list(ownership._ALLOWED_STATUSES) + ["open", " ASSIGNED ", "future_state", None]
+    await db.maintenance_requests.insert_many([
+        {"_id": str(i), "status": status} for i, status in enumerate(values)
+    ])
+    result = await data(app)
+    for row in result["requests"]:
+        original = values[int(row["id"])]
+        canonical = ownership._canonical_status(original)
+        assert row["status"] == canonical
+        assert row["available_statuses"] == sorted(ownership._STATUS_TRANSITIONS.get(canonical, set()))
+        assert canonical not in row["available_statuses"]
+
+
+@pytest.mark.asyncio
+async def test_scheduling_to_closure_refreshes_actions_and_preserves_visit(listing, monkeypatch):
+    from bson import ObjectId
+
+    db, _ = listing
+    monkeypatch.setattr(ownership, "get_db", lambda: db)
+    monkeypatch.setattr(ownership, "auth_admin", AsyncMock(return_value={"role": "admin"}))
+    email = AsyncMock()
+    monkeypatch.setattr(ownership, "send_maintenance_updated_email", email)
+    monkeypatch.setattr(ownership, "send_rental_push_to_user", AsyncMock())
+    tenant_id, contract_id, property_id, ticket_id = [ObjectId() for _ in range(4)]
+    await db.tenants.insert_one({"_id": tenant_id})
+    await db.properties.insert_one({"_id": property_id})
+    await db.rental_contracts.insert_one({"_id": contract_id, "tenant_id": str(tenant_id), "property_id": str(property_id)})
+    await db.maintenance_requests.insert_one({
+        "_id": ticket_id, "tenant_id": str(tenant_id), "contract_id": str(contract_id),
+        "property_id": str(property_id), "status": "assigned", "assigned_to": "Test technician",
+    })
+    app = FastAPI()
+    app.include_router(ownership.router, prefix="/api")
+    app.include_router(tenant.router, prefix="/api")
+    visit = {"scheduled_start": "2026-09-18T15:00:00Z", "scheduled_end": "2026-09-18T16:00:00Z", "tenant_visible_note": "Test only"}
+    states = ["scheduled", "en_route", "in_progress", "completed", "closed"]
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        for state in states:
+            row = (await client.get("/api/admin/maintenance-requests")).json()["requests"][0]
+            assert state in row["available_statuses"]
+            payload = {"status": state, **(visit if state == "scheduled" else {})}
+            response = await client.put(f"/api/admin/maintenance-requests/{ticket_id}", json=payload)
+            assert response.status_code == 200, response.text
+        row = (await client.get("/api/admin/maintenance-requests")).json()["requests"][0]
+        assert row["status"] == "closed" and row["available_statuses"] == ["in_progress"]
+        assert row["scheduled_start"] == "2026-09-18T15:00:00"
+        assert row["scheduled_end"] == "2026-09-18T16:00:00"
+        assert row["assigned_to"] == "Test technician"
+        assert [event["status"] for event in row["timeline"]] == states
+        rejected = await client.put(f"/api/admin/maintenance-requests/{ticket_id}", json={"status": "pending"})
+        assert rejected.status_code == 409
+        assert rejected.json()["detail"] == "maintenance_status_transition_invalid"
+        assert email.await_count == len(states)
 
 
 @pytest.mark.asyncio
