@@ -89,6 +89,12 @@ async def test_scheduling_to_closure_refreshes_actions_and_preserves_visit(listi
         assert rejected.status_code == 409
         assert rejected.json()["detail"] == "maintenance_status_transition_invalid"
         assert email.await_count == len(states)
+        pushes = ownership.send_rental_push_to_user.await_args_list
+        assert len(pushes) == len(states)
+        assert pushes[0].kwargs["body"] == "Solicitud de mantenimiento: Programada"
+        assert pushes[-1].kwargs["body"] == "Solicitud de mantenimiento: Cerrada"
+        assert all(call.kwargs["data"]["request_id"] == str(ticket_id) for call in pushes)
+        assert all(str(ticket_id) not in call.kwargs["body"] for call in pushes)
 
 
 @pytest.mark.asyncio

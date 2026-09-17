@@ -12,7 +12,7 @@ from bson import ObjectId
 from fastapi import APIRouter, HTTPException, Request, Response
 
 from rental.maintenance_security_router import _iso, _validated_photos
-from rental.security_email import send_maintenance_updated_email
+from rental.security_email import send_maintenance_updated_email, maintenance_update_push
 from rental.shared import (
     auth_admin,
     auth_marketplace,
@@ -456,15 +456,10 @@ async def update_maintenance_job(job_id: str, request: Request):
     if new_status != old_status or tenant_note:
         locale = "en" if str(row.get("notification_language") or "es").startswith("en") else "es"
         try:
-            label = new_status.replace("_", " ")
             await send_rental_push_to_user(
                 user_id=str(row.get("tenant_id") or ""),
                 title="Maintenance update" if locale == "en" else "Actualización de mantenimiento",
-                body=(
-                    f"Request #{row.get('request_number') or job_id}: {label}"
-                    if locale == "en"
-                    else f"Solicitud #{row.get('request_number') or job_id}: {label}"
-                ),
+                body=maintenance_update_push(row, new_status, locale),
                 data={"type": "maintenance_update", "request_id": job_id, "status": new_status},
             )
         except Exception:

@@ -6,6 +6,31 @@ from bson import ObjectId
 
 import rental.maintenance_security_router as maintenance
 from rental.security_email import build_maintenance_received_message, build_maintenance_updated_message
+from rental.security_email import maintenance_update_push, maintenance_request_label
+
+
+def test_push_uses_short_number_and_localized_status():
+    ticket = {"request_number": "12", "title": "Sink leak"}
+    assert maintenance_update_push(ticket, "en_route", "es") == "Solicitud #0012: En camino"
+    assert maintenance_update_push(ticket, "waiting_parts", "en-US") == "Request #0012: Waiting for parts"
+    assert maintenance_request_label({"request_number": "10001"}, "en") == "Request #10001"
+
+
+def test_legacy_push_uses_title_without_exposing_internal_id():
+    oid = "6aa5879688a2d9fb53e53077"
+    for number in [None, "", oid]:
+        ticket = {"_id": oid, "request_number": number, "title": "PRUEBA STAGING — fuga"}
+        body = maintenance_update_push(ticket, "scheduled", "es")
+        assert body == "PRUEBA STAGING — fuga: Programada"
+        assert oid not in body
+
+
+def test_push_fallback_and_long_title_stay_readable():
+    assert maintenance_update_push({}, "closed", "es") == "Solicitud de mantenimiento: Cerrada"
+    assert maintenance_update_push({}, "closed", "en") == "Maintenance request: Closed"
+    assert maintenance_request_label({"title": "  Leak\n in\t kitchen "}) == "Leak in kitchen"
+    assert len(maintenance_request_label({"title": "a" * 200})) == 100
+    assert maintenance_update_push({}, "future_state", "es").endswith(": Actualizada")
 
 
 def run(coro):
