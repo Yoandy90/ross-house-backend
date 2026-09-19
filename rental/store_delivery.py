@@ -131,6 +131,7 @@ async def assign(oid: str, body: Assignment, request: Request):
         if order.get('driver_id', '') != body.expected_driver_id:
             raise HTTPException(409, 'store_assignment_changed')
         order['driver_id'] = body.driver_id
+        order.pop('_live', None)
         tracking = order.setdefault('tracking', {})
         tracking.update(driver_name=state['drivers'][body.driver_id]['name'].split(' ')[0], eta=body.eta.astimezone(timezone.utc).isoformat(), assigned_at=s.now())
         order['updated_at'] = s.now()
@@ -177,6 +178,7 @@ async def delivery_action(oid: str, body: DriverAction, request: Request):
             if order['status'] != 'out_for_delivery':
                 raise HTTPException(409, 'store_transition_invalid')
             tracking['handoff_at'] = s.now()
+            order.pop('_live', None)
             s.audit(state, uid, 'delivery_handoff', oid, {'order_id': oid, 'user_id': order['user_id'], 'status': 'handoff'})
             if order['payment_status'] == 'paid':
                 s.change_status(state, order, 'delivered', uid)

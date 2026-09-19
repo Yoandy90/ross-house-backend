@@ -217,7 +217,7 @@ def order_public(order):
 
 def order_display(order):
     # Presentation only: legacy purchase snapshots and accounting stay intact.
-    result = copy.deepcopy(order)
+    result = copy.deepcopy({k: v for k, v in order.items() if k != '_live'})
     if result.get('address') == 'DEMO · Recepción de staging (sin entregas reales)':
         result['address'] = 'Recepción · Ross House Rentals'
     if result.get('slot') == 'DEMO · Solo simulación':
@@ -419,6 +419,8 @@ def change_status(s,o,target,uid,resident_action=False):
     if target=='delivered' and o['payment_status']!='paid':
         raise HTTPException(409,'store_payment_required')
     o['status']=target;o['updated_at']=now()
+    if target in ('delivered', 'cancelled'):
+        o.pop('_live', None)
     o.setdefault('tracking', {})[target + '_at'] = o['updated_at']
     audit(s,uid,'order_'+target,o['id'],{'order_id':o['id'],'user_id':o['user_id'],'status':target})
     return order_public(o)
@@ -540,3 +542,5 @@ from rental.store_delivery import router as delivery_router
 router.include_router(delivery_router)
 from rental.store_payments import router as payments_router
 router.include_router(payments_router)
+from rental.store_live_tracking import router as live_tracking_router
+router.include_router(live_tracking_router)
