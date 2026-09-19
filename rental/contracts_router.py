@@ -463,7 +463,615 @@ async def get_lease_detail(lease_id: str, request: Request):
         # Enrich property_address from properties collection
         if not doc.get("property_address") and doc.get("property_id"):
             try:
-                prop = await db.properties.find_one({"_id": ObjectId(d…7396 tokens truncated…n        sig_type = 'saved'
+                prop = await db.properties.find_one({"_id": ObjectId(doc["property_id"])})
+                if prop:
+                    doc["property_address"] = prop.get("address") or prop.get("name") or ""
+            except Exception:
+                pass
+
+    return {"success": True, "lease": doc}
+
+
+
+
+
+@router.get('/admin/rental-contracts')
+async def list_contracts(request: Request):
+    """List all rental contracts"""
+    user = await auth_admin(request)
+    from urllib.parse import parse_qs
+    params = parse_qs(str(request.url.query))
+    status_filter = params.get('status', [None])[0]
+
+    query = {}
+    if status_filter:
+        query['status'] = status_filter
+
+    cursor = get_db().rental_contracts.find(query).sort("created_at", -1)
+    contracts = []
+    async for c in cursor:
+        doc = serialize(c)
+        doc["status"] = effective_lease_status(doc)
+        contracts.append(doc)
+
+    return {"success": True, "contracts": contracts, "count": len(contracts)}
+
+
+@router.get('/admin/properties/{property_id}/contract-defaults')
+async def get_contract_defaults_from_property(property_id: str, request: Request):
+    """Returns suggested defaults for a new rental contract based on the property's
+    saved rent/deposit. Frontend should call this when selecting a property
+    in the contract form to prefill rent_amount and deposit_amount."""
+    await auth_admin(request)
+    try:
+        prop = await get_db().properties.find_one({"_id": ObjectId(property_id)})
+    except Exception:
+        raise HTTPException(status_code=400, detail="ID de propiedad inválido")
+    if not prop:
+        raise HTTPException(status_code=404, detail="Propiedad no encontrada")
+
+    # Try multiple field names used historically
+    rent = float(prop.get('rent_amount') or prop.get('monthly_rent') or prop.get('rent') or 0)
+    deposit = float(prop.get('deposit_amount') or prop.get('security_deposit') or prop.get('deposit') or 0)
+
+    return {
+        "success": True,
+        "property_id": str(prop["_id"]),
+        "property_address": prop.get('address', ''),
+        "rent_amount": rent,
+        "deposit_amount": deposit,
+        "suggested_late_fee_amount": 50.0,
+        "suggested_late_fee_grace_days": 5,
+        "suggested_payment_due_day": 1,
+    }
+
+
+@router.post('/admin/rental-contracts')
+async def create_contract(request: Request):
+    """Create a rental contract linking a tenant to a property"""
+    user = await auth_admin(request)
+    data = await request.json()
+    now = datetime.utcnow()
+
+    property_id = data.get('property_id')
+    tenant_id = data.get('tenant_id')
+
+    if not property_id or not tenant_id:
+        raise HTTPException(status_code=400, detail="Se requiere property_id y tenant_id")
+
+    prop = await get_db().properties.find_one({"_id": ObjectId(property_id)})
+    if not prop:
+        raise HTTPException(status_code=404, detail="Propiedad no encontrada")
+
+    tenant = await get_db().tenants.find_one({"_id": ObjectId(tenant_id)})
+    if not tenant:
+        raise HTTPException(status_code=404, detail="Inquilino no encontrado")
+
+    # Unidad opcional (propiedades multi-unidad)
+    unit_id = data.get('unit_id') or None
+    unit = None
+    if unit_id:
+        if not ObjectId.is_valid(unit_id):
+            raise HTTPException(status_code=400, detail="unit_id inválido")
+        unit = await get_db().property_units.find_one({"_id": ObjectId(unit_id)})
+        if not unit or unit.get('property_id') != property_id:
+            raise HTTPException(status_code=404, detail="Unidad no encontrada en esta propiedad")
+        if unit.get('status') == 'rented' and unit.get('current_contract_id'):
+            raise HTTPException(status_code=400,
+                                detail=f"La unidad {unit.get('unit_name')} ya está rentada")
+
+    count = await get_db().rental_contracts.count_documents({})
+    contract_number = f"CONT-{now.year}-{str(count + 1).zfill(3)}"
+
+    rent_amount = float(data.get('rent_amount', (unit or prop).get('rent_amount', 0)))
+    deposit_amount = float(data.get('deposit_amount', (unit or prop).get('deposit_amount', 0)))
+
+    # Build addendums from request data or defaults from rental config
+    addendums_data = data.get('addendums', {})
+    if not addendums_data:
+        # Try to load defaults from rental config
+        try:
+            rental_cfg = await get_db().rental_config.find_one({"type": "company"})
+            if rental_cfg and rental_cfg.get('lease_clauses'):
+                lc = rental_cfg['lease_clauses']
+                addendums_data = {
+                    'mold': lc.get('mold_addendum', True),
+                    'bedbug': lc.get('bedbug_addendum', True),
+                    'military': lc.get('military_scra', True),
+                    'lead_paint': lc.get('lead_paint', False),
+                    'pets': lc.get('pet_addendum', False),
+                }
+                if addendums_data.get('pets') and rental_cfg.get('pet_defaults'):
+                    addendums_data['pet_details'] = rental_cfg['pet_defaults']
+            else:
+                addendums_data = {'mold': True, 'bedbug': True, 'military': True, 'lead_paint': False, 'pets': False}
+        except Exception:
+            addendums_data = {'mold': True, 'bedbug': True, 'military': True, 'lead_paint': False, 'pets': False}
+
+    contract_doc = {
+        "contract_number": contract_number,
+        "property_id": property_id,
+        "property_address": prop.get('address', '') + (f" — {unit['unit_name']}" if unit else ''),
+        "property_number": prop.get('property_number', ''),
+        "unit_id": unit_id,
+        "unit_name": unit.get('unit_name', '') if unit else '',
+        "tenant_id": tenant_id,
+        "tenant_name": tenant.get('name', ''),
+        "tenant_phone": tenant.get('phone', ''),
+        "tenant_email": tenant.get('email', ''),
+        "start_date": data.get('start_date', now.strftime('%Y-%m-%d')),
+        "end_date": data.get('end_date', ''),
+        "rent_amount": rent_amount,
+        "deposit_amount": deposit_amount,
+        "payment_due_day": int(data.get('payment_due_day', 1)),
+        "late_fee_amount": float(data.get('late_fee_amount', 50)),
+        "late_fee_grace_days": int(data.get('late_fee_grace_days', 5)),
+        "terms": data.get('terms', ''),
+        "special_conditions": data.get('special_conditions', ''),
+        "payment_method_type": data.get('payment_method_type', 'cash'),
+        "customer_vault_id": data.get('customer_vault_id', ''),
+        "vault_display": data.get('vault_display', ''),
+        "vault_customer_name": data.get('vault_customer_name', ''),
+        "addendums": addendums_data,
+        "status": data.get('status', 'draft'),  # draft, active, expired, terminated
+        "signature": None,
+        "signature_status": "pending",
+        "created_at": now,
+        "updated_at": now,
+        "created_by": user.get('email', 'admin'),
+    }
+
+    result = await get_db().rental_contracts.insert_one(contract_doc)
+    contract_id = str(result.inserted_id)
+
+    # If contract is active, update property/unit and tenant
+    if contract_doc['status'] == 'active':
+        if unit_id:
+            from rental.units_router import mark_unit_rented
+            await mark_unit_rented(unit_id, tenant_id, contract_id)
+        else:
+            await get_db().properties.update_one(
+                {"_id": ObjectId(property_id)},
+                {"$set": {"status": "rented", "current_tenant_id": tenant_id, "current_contract_id": contract_id, "updated_at": now}}
+            )
+        await get_db().tenants.update_one(
+            {"_id": ObjectId(tenant_id)},
+            {"$set": {"current_property_id": property_id, "current_unit_id": unit_id, "updated_at": now}}
+        )
+
+    return {
+        "success": True,
+        "message": f"Contrato {contract_number} creado",
+        "contract_id": contract_id,
+        "contract_number": contract_number,
+    }
+
+
+# ─── Get Single Contract Detail ───────────────────────────────────────────
+@router.get('/admin/rental-contracts/{contract_id}')
+async def get_contract_detail(contract_id: str, request: Request):
+    """Get a single rental contract by ID"""
+    user = await auth_admin(request)
+    
+    contract = await get_db().rental_contracts.find_one({"_id": ObjectId(contract_id)})
+    if not contract:
+        raise HTTPException(status_code=404, detail="Contrato no encontrado")
+    
+    return {"success": True, "contract": serialize(contract)}
+
+
+@router.patch('/admin/rental-contracts/{contract_id}/status')
+async def update_contract_status(contract_id: str, request: Request):
+    """Update contract status (activate, terminate, expire)"""
+    user = await auth_admin(request)
+    data = await request.json()
+    new_status = data.get('status')
+    now = datetime.utcnow()
+
+    contract = await get_db().rental_contracts.find_one({"_id": ObjectId(contract_id)})
+    if not contract:
+        raise HTTPException(status_code=404, detail="Contrato no encontrado")
+
+    update = {"status": new_status, "updated_at": now}
+
+    if new_status == 'active':
+        # ── Validate ALL required signatures before activating ─────────
+        force = bool(data.get('force_activate', False))  # admin override
+        missing = []
+        if not contract.get('tenant_signature'):
+            missing.append('Inquilino')
+        # Either landlord or admin signature is acceptable as "office" signer
+        if not (contract.get('landlord_signature') or contract.get('admin_signature')):
+            missing.append('Propietario/Admin')
+        if missing and not force:
+            raise HTTPException(
+                status_code=400,
+                detail=f"No se puede activar el contrato. Firmas faltantes: {', '.join(missing)}. "
+                       f"Para forzar la activación envía force_activate=true."
+            )
+
+        # Mark property/unit as rented
+        if contract.get('unit_id'):
+            from rental.units_router import mark_unit_rented
+            await mark_unit_rented(contract['unit_id'], contract['tenant_id'], contract_id)
+        else:
+            await get_db().properties.update_one(
+                {"_id": ObjectId(contract['property_id'])},
+                {"$set": {"status": "rented", "current_tenant_id": contract['tenant_id'], "current_contract_id": contract_id, "updated_at": now}}
+            )
+        await get_db().tenants.update_one(
+            {"_id": ObjectId(contract['tenant_id'])},
+            {"$set": {"current_property_id": contract['property_id'],
+                      "current_unit_id": contract.get('unit_id'), "updated_at": now}}
+        )
+    elif new_status in ('terminated', 'expired'):
+        # Free the property/unit (only if not manually overridden)
+        if contract.get('unit_id'):
+            from rental.units_router import free_unit
+            await free_unit(contract['unit_id'])
+        else:
+            prop = await get_db().properties.find_one({"_id": ObjectId(contract['property_id'])})
+            if prop and not prop.get('status_manually_set'):
+                await get_db().properties.update_one(
+                    {"_id": ObjectId(contract['property_id'])},
+                    {"$set": {"status": "available", "current_tenant_id": None, "current_contract_id": None, "updated_at": now}}
+                )
+        await get_db().tenants.update_one(
+            {"_id": ObjectId(contract['tenant_id'])},
+            {"$set": {"current_property_id": None, "current_unit_id": None, "updated_at": now},
+             "$push": {"rental_history": {
+                 "property_id": contract['property_id'],
+                 "property_address": contract.get('property_address', ''),
+                 "start_date": contract.get('start_date'),
+                 "end_date": now.strftime('%Y-%m-%d'),
+                 "rent_amount": contract.get('rent_amount', 0),
+             }}}
+        )
+    elif new_status in ('draft', 'pending_signature', 'pending'):
+        # Contract reverted to draft/pending — free the unit/property if no other active contract uses it
+        if contract.get('unit_id'):
+            from rental.units_router import free_unit
+            unit = await get_db().property_units.find_one({"_id": ObjectId(contract['unit_id'])})
+            if unit and unit.get('current_contract_id') == contract_id:
+                await free_unit(contract['unit_id'])
+        else:
+            prop_id = contract.get('property_id')
+            if prop_id:
+                prop = await get_db().properties.find_one({"_id": ObjectId(prop_id)})
+                if prop and not prop.get('status_manually_set'):
+                    # Check if there's any OTHER active contract on this property
+                    other_active = await get_db().rental_contracts.find_one({
+                        "property_id": prop_id,
+                        "status": "active",
+                        "_id": {"$ne": ObjectId(contract_id)},
+                    })
+                    if not other_active:
+                        await get_db().properties.update_one(
+                            {"_id": ObjectId(prop_id)},
+                            {"$set": {"status": "available", "current_tenant_id": None, "current_contract_id": None, "updated_at": now}}
+                        )
+
+    await get_db().rental_contracts.update_one({"_id": ObjectId(contract_id)}, {"$set": update})
+    return {"success": True, "message": f"Contrato actualizado a: {new_status}"}
+
+
+# ─── Reconcile properties ↔ contracts (admin tool) ─────────────────────────
+@router.post('/admin/properties/sync-status')
+async def sync_property_status(request: Request):
+    """Reconcile property statuses based on actual active contracts.
+    For each property:
+      - If there's an active contract → status = rented (with current_contract_id, current_tenant_id)
+      - Else if status_manually_set is False/missing → status = available
+      - If status_manually_set is True → leave it alone (admin's manual override)
+    """
+    user = await auth_admin(request)
+    db = get_db()
+    now = datetime.utcnow()
+
+    fixed = []
+    skipped_manual = []
+    unchanged = []
+
+    async for prop in db.properties.find({}):
+        pid = str(prop["_id"])
+
+        # Multi-unidad: el status se deriva de las unidades, no del contrato global
+        if prop.get('is_multi_unit'):
+            from rental.units_router import sync_property_from_units
+            await sync_property_from_units(pid)
+            unchanged.append({"id": pid, "address": prop.get('address', ''), "status": "multi-unit (derivado de unidades)"})
+            continue
+
+        active_contract = await db.rental_contracts.find_one({"property_id": pid, "status": "active"})
+
+        if prop.get('status_manually_set'):
+            skipped_manual.append({"id": pid, "address": prop.get('address', ''), "status": prop.get('status')})
+            continue
+
+        if active_contract:
+            target = {
+                "status": "rented",
+                "current_tenant_id": str(active_contract.get('tenant_id', '')),
+                "current_contract_id": str(active_contract.get('_id', '')),
+            }
+        else:
+            target = {
+                "status": "available",
+                "current_tenant_id": None,
+                "current_contract_id": None,
+            }
+
+        # Only update if different
+        needs_update = (
+            prop.get('status') != target['status'] or
+            (str(prop.get('current_contract_id', '') or '') != (target.get('current_contract_id') or ''))
+        )
+        if needs_update:
+            await db.properties.update_one({"_id": prop["_id"]}, {"$set": {**target, "updated_at": now}})
+            fixed.append({
+                "id": pid,
+                "address": prop.get('address', ''),
+                "old_status": prop.get('status'),
+                "new_status": target['status'],
+            })
+        else:
+            unchanged.append({"id": pid, "status": prop.get('status')})
+
+    return {
+        "success": True,
+        "summary": f"{len(fixed)} corregidas, {len(skipped_manual)} ignoradas (manuales), {len(unchanged)} ya correctas",
+        "fixed": fixed,
+        "skipped_manual": skipped_manual,
+        "unchanged_count": len(unchanged),
+    }
+
+
+@router.put('/admin/rental-contracts/{contract_id}')
+async def update_contract(contract_id: str, request: Request):
+    """Update a rental contract"""
+    user = await auth_admin(request)
+    data = await request.json()
+    now = datetime.utcnow()
+
+    contract = await get_db().rental_contracts.find_one({"_id": ObjectId(contract_id)})
+    if not contract:
+        raise HTTPException(status_code=404, detail="Contrato no encontrado")
+
+    update_fields = {"updated_at": now}
+
+    # Accept legacy `late_fee` (from Next.js admin) as alias of `late_fee_amount`
+    if 'late_fee' in data and 'late_fee_amount' not in data:
+        data['late_fee_amount'] = data['late_fee']
+    # Accept legacy `grace_period_days` alias
+    if 'grace_period_days' in data and 'late_fee_grace_days' not in data:
+        data['late_fee_grace_days'] = data['grace_period_days']
+    # Accept legacy `payment_day` alias
+    if 'payment_day' in data and 'payment_due_day' not in data:
+        data['payment_due_day'] = data['payment_day']
+
+    # Fields that can be updated
+    editable_fields = [
+        'start_date', 'end_date', 'rent_amount', 'deposit_amount',
+        'payment_due_day', 'late_fee_amount', 'late_fee_grace_days',
+        'terms', 'special_conditions', 'payment_method_type',
+        'customer_vault_id', 'vault_display', 'vault_customer_name',
+        'status',
+    ]
+
+    for field in editable_fields:
+        if field in data:
+            val = data[field]
+            if field in ('rent_amount', 'deposit_amount', 'late_fee_amount'):
+                val = float(val) if val else 0
+            elif field in ('payment_due_day', 'late_fee_grace_days'):
+                val = int(val) if val else 1
+            update_fields[field] = val
+
+    # Allow changing property and tenant if contract is draft
+    if contract.get('status') == 'draft':
+        if 'property_id' in data and data['property_id'] != contract.get('property_id'):
+            prop = await get_db().properties.find_one({"_id": ObjectId(data['property_id'])})
+            if prop:
+                update_fields['property_id'] = data['property_id']
+                update_fields['property_address'] = prop.get('address', '')
+                update_fields['property_number'] = prop.get('property_number', '')
+        if 'tenant_id' in data and data['tenant_id'] != contract.get('tenant_id'):
+            tenant = await get_db().tenants.find_one({"_id": ObjectId(data['tenant_id'])})
+            if tenant:
+                update_fields['tenant_id'] = data['tenant_id']
+                update_fields['tenant_name'] = tenant.get('name', '')
+                update_fields['tenant_phone'] = tenant.get('phone', '')
+                update_fields['tenant_email'] = tenant.get('email', '')
+
+    # Update addendums if provided
+    if 'addendums' in data:
+        update_fields['addendums'] = data['addendums']
+
+    await get_db().rental_contracts.update_one({"_id": ObjectId(contract_id)}, {"$set": update_fields})
+
+    # ---- Sync late_fee_amount changes to pending invoices ----
+    synced_invoices = 0
+    if 'late_fee_amount' in data:
+        try:
+            new_late_fee = float(data['late_fee_amount']) if data['late_fee_amount'] else 0.0
+            old_late_fee = float(contract.get('late_fee_amount') or contract.get('late_fee') or 0)
+            if abs(new_late_fee - old_late_fee) > 0.001:
+                # Update pending invoices that ALREADY have a late fee applied.
+                # We don't touch pending invoices with late_fee=0 (not late yet)
+                # because the cron will apply the new amount when they go past due.
+                pending_cursor = get_db().rental_payments.find({
+                    "contract_id": contract_id,
+                    "status": "pending",
+                    "late_fee": {"$gt": 0},
+                })
+                async for inv in pending_cursor:
+                    base_amount = float(inv.get('amount') or 0)
+                    new_total = base_amount + new_late_fee
+                    new_paid = new_total if (inv.get('total_paid') or 0) >= (inv.get('total_due') or 0) else float(inv.get('total_paid') or 0)
+                    await get_db().rental_payments.update_one(
+                        {"_id": inv["_id"]},
+                        {"$set": {
+                            "late_fee": new_late_fee,
+                            "total_due": new_total,
+                            "total_paid": new_paid,
+                            "updated_at": now,
+                            "late_fee_synced_from_contract": True,
+                        }},
+                    )
+                    synced_invoices += 1
+        except Exception as e:
+            # Don't fail the contract update if sync fails — log and continue.
+            print(f"[contract update] late_fee sync error: {e}")
+
+    msg = f"Contrato {contract.get('contract_number', '')} actualizado exitosamente"
+    if synced_invoices:
+        msg += f". {synced_invoices} factura(s) pendiente(s) recalculada(s) con el nuevo cargo por mora."
+
+    return {
+        "success": True,
+        "message": msg,
+        "synced_pending_invoices": synced_invoices,
+    }
+
+
+@router.delete('/admin/rental-contracts/{contract_id}')
+async def delete_contract(contract_id: str, request: Request):
+    """Delete a contract (draft only unless forced). Also frees up the property if it was rented by this contract."""
+    user = await auth_admin(request)
+    contract = await get_db().rental_contracts.find_one({"_id": ObjectId(contract_id)})
+    if not contract:
+        raise HTTPException(status_code=404, detail="Contrato no encontrado")
+
+    if contract['status'] == 'active':
+        from urllib.parse import parse_qs
+        params = parse_qs(str(request.url.query))
+        force = params.get('force', ['false'])[0].lower() == 'true'
+        if not force:
+            raise HTTPException(status_code=400, detail="No se puede eliminar un contrato activo. Use ?force=true")
+
+    # Free up the property if this contract was the one renting it
+    prop_id = contract.get('property_id')
+    if prop_id:
+        try:
+            prop = await get_db().properties.find_one({"_id": ObjectId(prop_id)})
+        except Exception:
+            prop = None
+        if prop and not prop.get('status_manually_set'):
+            # Only auto-free if admin hasn't manually overridden the status
+            if str(prop.get('current_contract_id', '')) == contract_id:
+                await get_db().properties.update_one(
+                    {"_id": ObjectId(prop_id)},
+                    {"$set": {
+                        "status": "available",
+                        "current_tenant_id": None,
+                        "current_contract_id": None,
+                        "updated_at": datetime.utcnow(),
+                    }}
+                )
+
+    # Also clear the tenant's current_property_id if it pointed to this property
+    tenant_id = contract.get('tenant_id')
+    if tenant_id and prop_id:
+        try:
+            await get_db().tenants.update_one(
+                {"_id": ObjectId(tenant_id), "current_property_id": prop_id},
+                {"$set": {"current_property_id": None, "updated_at": datetime.utcnow()}}
+            )
+        except Exception:
+            pass
+
+    await get_db().rental_contracts.delete_one({"_id": ObjectId(contract_id)})
+    return {"success": True, "message": "Contrato eliminado y propiedad liberada"}
+
+
+# ─── Contract Signature ─────────────────────────────────────────────────────
+@router.post('/admin/rental-contracts/{contract_id}/sign')
+async def sign_contract(contract_id: str, request: Request):
+    """Sign a rental contract"""
+    import hashlib
+    user = await auth_admin(request)
+    data = await request.json()
+
+    contract = await get_db().rental_contracts.find_one({"_id": ObjectId(contract_id)})
+    if not contract:
+        raise HTTPException(status_code=404, detail="Contrato no encontrado")
+
+    sig_type = data.get('type', 'canvas')
+    image_data = data.get('image_data', '')
+    biometric_data = data.get('biometric_data', '')
+
+    if not image_data and not biometric_data:
+        raise HTTPException(status_code=400, detail="No se recibió firma")
+
+    sig_payload = (image_data or biometric_data).encode('utf-8')
+    sig_hash = hashlib.sha256(sig_payload).hexdigest()
+    now = datetime.utcnow()
+    client_ip = request.client.host if request.client else 'unknown'
+
+    signature_record = {
+        "type": sig_type,
+        "image_data": image_data,
+        "biometric_data": biometric_data if sig_type == 'topaz' else '',
+        "pad_model": data.get('pad_model', ''),
+        "hash": sig_hash,
+        "signed_at": now,
+        "signed_by_admin": user.get('email', 'admin'),
+        "signer_name": contract.get('tenant_name', ''),
+        "client_ip": client_ip,
+    }
+
+    update = {
+        "signature": signature_record,
+        "signature_status": "signed",
+        "signed_at": now,
+        "updated_at": now,
+    }
+
+    # Auto-activate if draft
+    if contract.get('status') == 'draft':
+        update['status'] = 'active'
+        await get_db().properties.update_one(
+            {"_id": ObjectId(contract['property_id'])},
+            {"$set": {"status": "rented", "current_tenant_id": contract['tenant_id'], "current_contract_id": contract_id, "updated_at": now}}
+        )
+        await get_db().tenants.update_one(
+            {"_id": ObjectId(contract['tenant_id'])},
+            {"$set": {"current_property_id": contract['property_id'], "updated_at": now}}
+        )
+
+    await get_db().rental_contracts.update_one({"_id": ObjectId(contract_id)}, {"$set": update})
+    return {"success": True, "message": "Contrato firmado exitosamente", "hash": sig_hash}
+
+
+# ─── Office Signature (In-Person Signing) ─────────────────────────────────
+@router.post('/admin/rental-contracts/{contract_id}/office-sign')
+async def office_sign_contract(contract_id: str, request: Request):
+    """
+    Capture in-office signature for a rental contract.
+    Supports both Canvas (touch) and Topaz Pad signatures.
+    """
+    import hashlib
+    user = await auth_admin(request)
+    data = await request.json()
+
+    contract = await get_db().rental_contracts.find_one({"_id": ObjectId(contract_id)})
+    if not contract:
+        raise HTTPException(status_code=404, detail="Contrato no encontrado")
+
+    sig_type = data.get('type', 'canvas')  # 'canvas' or 'topaz' or 'saved'
+    signature_data = data.get('signature', '')  # base64 image
+    signer_name = data.get('signer_name', '')
+    signer_role = data.get('signer_role', 'tenant')  # 'tenant' or 'admin'
+    use_saved_admin = bool(data.get('use_saved_admin'))
+    auto_admin = bool(data.get('auto_admin'))  # al firmar el inquilino, aplicar también la firma guardada del admin
+
+    # Firma guardada del admin (configurada una sola vez en Configuración → Firma Admin)
+    if signer_role == 'admin' and use_saved_admin and not signature_data:
+        saved = await get_db().admin_signatures.find_one({"type": "landlord_default"})
+        if not saved or not saved.get('image_data'):
+            raise HTTPException(status_code=400, detail="No hay firma guardada — configúrala en Configuración → Firma Admin")
+        signature_data = saved['image_data']
+        sig_type = 'saved'
         if not signer_name:
             signer_name = user.get('name') or user.get('email', 'Administrador')
 
