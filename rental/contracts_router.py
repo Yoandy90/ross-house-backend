@@ -227,13 +227,6 @@ async def _email_signed_lease_pdf(contract: dict):
 
     # ── 2) Generate the PDF ──
     config = await db.rental_config.find_one({"type": "company"}) or {}
-    if not _signature_has_image(contract.get("admin_signature")):
-        try:
-            saved_admin_sig = await db.admin_signatures.find_one({"type": "landlord_default"})
-            if saved_admin_sig and saved_admin_sig.get("image_data"):
-                config["saved_admin_signature"] = saved_admin_sig
-        except Exception:
-            pass
     tenant_photo_url = None
     if contract.get("tenant_id"):
         try:
@@ -1202,16 +1195,6 @@ async def generate_contract_pdf(contract_id: str, request: Request):
     if not config:
         config = {}
 
-    # Fetch saved admin signature if not already in contract
-    if not _signature_has_image(contract.get('admin_signature')):
-        try:
-            saved_admin_sig = await get_db().admin_signatures.find_one({"type": "landlord_default"})
-            if saved_admin_sig and saved_admin_sig.get('image_data'):
-                config['saved_admin_signature'] = saved_admin_sig
-                logging.info("Including saved admin signature for PDF generation")
-        except Exception as e:
-            logging.warning(f"Could not fetch saved admin signature: {e}")
-
     # Look up tenant photo for inclusion in contract
     tenant_photo_url = None
     if contract.get('tenant_id'):
@@ -1305,15 +1288,8 @@ async def tenant_download_lease_pdf(lease_id: str, request: Request):
     if not (is_tenant or is_landlord or is_admin):
         raise HTTPException(status_code=403, detail="No tienes acceso a este contrato")
 
-    # Load company config + landlord signature so the PDF is identical to admin export
+    # Load company details; signature evidence comes from this contract only
     config = await db.rental_config.find_one({"type": "company"}) or {}
-    if not _signature_has_image(contract.get("admin_signature")):
-        try:
-            saved_admin_sig = await db.admin_signatures.find_one({"type": "landlord_default"})
-            if saved_admin_sig and saved_admin_sig.get("image_data"):
-                config["saved_admin_signature"] = saved_admin_sig
-        except Exception:
-            pass
 
     # Pull tenant photo if available
     tenant_photo_url = None

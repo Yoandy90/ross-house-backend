@@ -9,7 +9,8 @@ import io
 import os
 import base64
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.units import inch
@@ -202,29 +203,29 @@ def _get_initials(name: str) -> str:
 
 
 def _format_signature_date(date_val) -> str:
-    """Format signature date from various input formats"""
+    """Persisted timestamps are UTC; show signing dates in the Texas office zone.
+
+    Historical date-only values retain their original calendar day.
+    Missing/invalid evidence never acquires today's date.
+    """
     if not date_val:
         return "____________"
     try:
-        if isinstance(date_val, str):
-            # Handle ISO format strings
-            if 'T' in date_val:
-                date_val = date_val.split('T')[0]
-            # Try to parse and reformat
-            from datetime import datetime as dt
-            if '-' in date_val:
-                parsed = dt.strptime(date_val[:10], '%Y-%m-%d')
-            elif '/' in date_val:
-                parsed = dt.strptime(date_val, '%m/%d/%Y')
-            else:
-                return date_val[:10]
-            return parsed.strftime('%m/%d/%Y')
-        elif hasattr(date_val, 'strftime'):
-            return date_val.strftime('%m/%d/%Y')
+        if isinstance(date_val, datetime):
+            parsed = date_val
+        elif isinstance(date_val, str):
+            value = date_val.strip()
+            if len(value) == 10:
+                pattern = '%m/%d/%Y' if '/' in value else '%Y-%m-%d'
+                return datetime.strptime(value, pattern).strftime('%m/%d/%Y')
+            parsed = datetime.fromisoformat(value.replace('Z', '+00:00'))
         else:
-            return str(date_val)[:10]
-    except Exception:
-        return str(date_val)[:10] if date_val else "____________"
+            return "____________"
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(ZoneInfo('America/Chicago')).strftime('%m/%d/%Y')
+    except (ValueError, TypeError):
+        return "____________"
 
 
 def _build_initials_line(tenant_name: str, signature_data: dict, styles) -> str:
@@ -243,7 +244,7 @@ def _build_initials_line(tenant_name: str, signature_data: dict, styles) -> str:
                     signature_data.get('admin_signed_at') or
                     signature_data.get('updated_at'))
     
-    date_str = _format_signature_date(sig_date) if sig_date else datetime.utcnow().strftime('%m/%d/%Y')
+    date_str = _format_signature_date(sig_date)
     
     # If contract is signed, show actual initials and date
     if signature_data and (signature_data.get('image_data') or signature_data.get('signed_at')):
@@ -350,19 +351,16 @@ def generate_rental_contract_pdf(contract: dict, config: dict = None, tenant_pho
         contract.get('signed_at'),
     )
     
-    # Get admin/landlord signature from contract or from saved signature in config
+    # Only evidence explicitly attached to THIS contract may appear in exports.
     admin_sig = _normalize_signature_record(
         contract.get('admin_signature') or contract.get('landlord_signature')
     )
-    if not admin_sig.get('image_data') and config:
-        admin_sig = _normalize_signature_record(config.get('saved_admin_signature'))
     admin_sig = _signature_with_date(
         admin_sig,
         contract.get('admin_signed_at'),
         contract.get('admin_signature_date'),
         contract.get('landlord_signed_at'),
         contract.get('landlord_signature_date'),
-        contract.get('signed_at'),
     )
     
     # Get landlord/company name for initials
@@ -414,7 +412,7 @@ def generate_rental_contract_pdf(contract: dict, config: dict = None, tenant_pho
         styles['DocSubtitle']
     ))
     elements.append(Paragraph(
-        f"Date / Fecha: {datetime.utcnow().strftime('%m/%d/%Y')}",
+        f"Date / Fecha: {datetime.now(ZoneInfo('America/Chicago')).strftime('%m/%d/%Y')}",
         styles['DocSubtitle']
     ))
     elements.append(HRFlowable(width="100%", thickness=1, color=BORDER_GRAY))
@@ -476,7 +474,7 @@ def generate_rental_contract_pdf(contract: dict, config: dict = None, tenant_pho
                     f"<b>{contract.get('tenant_name', 'N/A')}</b><br/>"
                     f"Photo taken at Ross House Rentals office<br/>"
                     f"Foto tomada en la oficina de Ross House Rentals<br/>"
-                    f"Date / Fecha: {datetime.utcnow().strftime('%m/%d/%Y')}",
+                    f"Date / Fecha: {datetime.now(ZoneInfo('America/Chicago')).strftime('%m/%d/%Y')}",
                     styles['BodySmall']
                 )],
             ]
@@ -1212,17 +1210,7 @@ def generate_rental_contract_pdf(contract: dict, config: dict = None, tenant_pho
             logger.warning(f"Could not process tenant signature: {e}")
             tenant_sig_cell = '_' * 40
 
-    # Admin/Landlord signature (from contract or from saved admin signature in config)
-    # First try to get from contract, if not found, use the saved_admin_signature from config
-    if not admin_sig or not admin_sig.get('image_data'):
-        # Check if saved admin signature was passed via config
-        saved_admin_sig = _normalize_signature_record(
-            config.get('saved_admin_signature') if config else None
-        )
-        if saved_admin_sig.get('image_data'):
-            admin_sig = saved_admin_sig
-            logger.info("Using saved admin signature from config for contract PDF")
-    
+    # Render only the contract-bound admin/landlord evidence resolved above.
     if admin_sig and admin_sig.get('image_data'):
         try:
             admin_img_data = admin_sig['image_data']
@@ -1235,8 +1223,6 @@ def generate_rental_contract_pdf(contract: dict, config: dict = None, tenant_pho
             admin_signed_at = admin_sig.get('signed_at') or admin_sig.get('updated_at')
             if admin_signed_at:
                 landlord_signed_date_str = _format_signature_date(admin_signed_at)
-            else:
-                landlord_signed_date_str = tenant_signed_date_str  # Use tenant date if admin date not available
         except Exception as e:
             logger.warning(f"Could not process admin signature: {e}")
             landlord_sig_cell = '_' * 40
@@ -1282,7 +1268,7 @@ def generate_rental_contract_pdf(contract: dict, config: dict = None, tenant_pho
     elements.append(HRFlowable(width="100%", thickness=1, color=BLUE))
     elements.append(Spacer(1, 6))
     elements.append(Paragraph(
-        f"Document generated electronically on {datetime.utcnow().strftime('%m/%d/%Y %H:%M')} UTC — {co['name']}",
+        f"Document generated electronically on {datetime.now(ZoneInfo('America/Chicago')).strftime('%m/%d/%Y %H:%M %Z')} — {co['name']}",
         styles['Footer']
     ))
     elements.append(Paragraph(
