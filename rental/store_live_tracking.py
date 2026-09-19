@@ -11,6 +11,7 @@ from fastapi import APIRouter, HTTPException, Request, Response
 from pydantic import Field, AwareDatetime
 from pymongo.errors import DuplicateKeyError
 from rental import resident_store as s, store_delivery as d
+from rental.store_routing import road_route
 
 router = APIRouter()
 FRESH_SECONDS = 30
@@ -195,6 +196,10 @@ async def snapshot(order, state):
     result['state'] = 'live' if age <= FRESH_SECONDS else 'stale'
     result['position'] = {k: doc[k] for k in ('latitude', 'longitude', 'accuracy', 'heading')}
     result['position'].update(captured_at=date(doc['captured_at']).isoformat(), age_seconds=age)
+    # Road geometry is ephemeral and best-effort. Never persist route history or
+    # make live GPS visibility depend on the external routing provider.
+    if result['destination']:
+        result['route'] = await road_route(result['position'], result['destination'])
     return result
 
 
