@@ -151,3 +151,20 @@ async def test_late_stop_cannot_cancel_new_session(delivery):
     await c.post(f'/store/driver/orders/{oid}/tracking/stop', json={'session_id': old})
     assert (await s.read_state())['orders'][oid]['_live']['id'] == current
     assert (await c.post(f'/store/driver/orders/{oid}/tracking/position', json=fix(current))).status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_driver_live_snapshot_requires_same_assigned_driver(delivery, monkeypatch):
+    db, c, oid, uid = delivery
+    sid = await start(c, oid)
+    assert (await c.post(f'/store/driver/orders/{oid}/tracking/position', json=fix(sid))).status_code == 200
+    result = await c.get(f'/store/driver/orders/{oid}/tracking/live')
+    assert result.status_code == 200
+    assert result.headers['cache-control'] == 'private, no-store'
+    assert result.json()['state'] == 'live'
+    assert result.json()['position']['latitude'] == 35.85
+    other = str(ObjectId())
+    await db.app_users.insert_one({'_id': ObjectId(other), 'name': 'Other Driver', 'email': 'other@example.invalid'})
+    await db.resident_store.update_one({'_id': s.KEY}, {'$set': {f'drivers.{other}': {'active': True}}})
+    monkeypatch.setattr(s, 'auth_marketplace', AsyncMock(return_value={'id': other}))
+    assert (await c.get(f'/store/driver/orders/{oid}/tracking/live')).status_code == 404
