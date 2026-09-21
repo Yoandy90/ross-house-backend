@@ -203,6 +203,15 @@ async def snapshot(order, state):
     return result
 
 
+@router.get('/store/driver/orders/{oid}/tracking/live')
+async def driver_tracking(oid: str, request: Request, response: Response):
+    uid = await d.courier(request)
+    state = await s.read_state()
+    order = assigned(state, oid, uid)
+    response.headers['Cache-Control'] = 'private, no-store'
+    return await snapshot(order, state)
+
+
 @router.get('/store/orders/{oid}/tracking/live')
 async def customer_tracking(oid: str, request: Request, response: Response):
     user = await s.auth_marketplace(request)
