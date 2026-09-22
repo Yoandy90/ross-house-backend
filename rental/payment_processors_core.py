@@ -37,7 +37,6 @@ from bson import ObjectId
 from fastapi import APIRouter, HTTPException, Request
 
 from .shared import get_db, auth_admin, auth_tenant_flex
-from .vault_router import encrypt as vault_encrypt, decrypt as vault_decrypt
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -139,6 +138,7 @@ def _decode_secret_value(value: str) -> str:
     if not raw.startswith(_SECRET_PREFIX):
         # Legacy plaintext remains readable so deployment is backwards compatible.
         return raw
+    from .vault_router import decrypt as vault_decrypt
     clear = vault_decrypt(raw[len(_SECRET_PREFIX):])
     if not clear:
         raise HTTPException(
@@ -154,6 +154,7 @@ def _encode_secret_value(value: str) -> str:
         return ""
     if raw.startswith(_SECRET_PREFIX):
         return raw
+    from .vault_router import encrypt as vault_encrypt
     return _SECRET_PREFIX + vault_encrypt(raw)
 
 
