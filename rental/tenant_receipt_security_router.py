@@ -28,6 +28,23 @@ async def secure_tenant_payment_receipt(payment_id: str, request: Request):
     if not payment:
         raise HTTPException(status_code=404, detail="receipt_payment_not_found")
 
+    # A receipt is proof of settlement, not an invoice/attempt document.
+    # Fail closed unless the canonical rent ledger explicitly records payment.
+    status = str(payment.get("status") or "").strip().lower()
+    settled = status in {"completed", "paid"}
+    if (
+        not settled
+        or payment.get("record_type") == "checkout_attempt"
+        or bool(payment.get("invoice_id"))
+    ):
+        raise HTTPException(status_code=409, detail="receipt_payment_not_settled")
+
+    from rental.manual_payment_confirmation import recorded_paid_amount
+    # recorded_paid_amount intentionally supports legacy settled receipts that
+    # predate total_paid/paid while never inferring late fees from amount due.
+    if recorded_paid_amount(payment) <= 0:
+        raise HTTPException(status_code=409, detail="receipt_paid_amount_invalid")
+
     tenant_id = str(tenant["_id"])
     if str(payment.get("tenant_id") or "") != tenant_id:
         raise HTTPException(status_code=403, detail="receipt_payment_tenant_mismatch")
@@ -52,9 +69,10 @@ async def secure_tenant_payment_receipt(payment_id: str, request: Request):
         contract=serialize(contract),
         tenant=serialize(tenant),
     )
-    receipt_num = payment.get("receipt_number") or payment_id
+    receipt_num = str(payment.get("receipt_number") or payment_id)
+    safe_receipt_num = "".join(ch for ch in receipt_num if ch.isalnum() or ch in "-_")[:80] or payment_id
     return {
         "success": True,
         "pdf_base64": pdf_b64,
-        "filename": f"Receipt_{receipt_num}.pdf",
+        "filename": f"Receipt_{safe_receipt_num}.pdf",
     }
