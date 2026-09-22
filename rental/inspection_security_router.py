@@ -162,6 +162,12 @@ async def update_inspection(inspection_id: str, request: Request):
         raise HTTPException(status_code=409, detail="inspection_status_transition_invalid")
     update["status"] = target
     if target == "completed":
+        signatures = current.get("signatures") or {}
+        if not signatures.get("admin") or not signatures.get("tenant"):
+            raise HTTPException(
+                status_code=409,
+                detail="inspection_completion_requires_admin_and_tenant_signatures",
+            )
         update["completed_at"] = update["updated_at"]
     result = await db.inspections.update_one(
         {"_id": oid, "status": current.get("status"), "archived_at": {"$exists": False}}, {"$set": update}
