@@ -188,11 +188,16 @@ async def _build_t12(db, end_date: datetime) -> Dict[str, Any]:
     start_window = months[0][0]
     end_window = months[-1][1]
 
+    # Legacy rows may store payment_date as an ISO string while current rows
+    # use BSON datetime. Query by settlement state, then normalize the date in
+    # Python so the T-12 does not silently omit valid historical receipts.
     async for p in db.rental_payments.find({
         "status": {"$in": list(PAID_STATUSES)},
-        "payment_date": {"$gte": start_window, "$lt": end_window},
     }):
-        idx = month_idx(_safe_dt(p.get("payment_date")))
+        payment_dt = _safe_dt(p.get("payment_date") or p.get("paid_at") or p.get("completed_at"))
+        if payment_dt is None or not (start_window <= payment_dt < end_window):
+            continue
+        idx = month_idx(payment_dt)
         if idx is None:
             continue
         base = float(p.get("amount", 0) or 0)
