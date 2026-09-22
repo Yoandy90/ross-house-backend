@@ -283,6 +283,7 @@ def _masked_view(doc: dict) -> dict:
         cfg = doc["processors"].get(p, {})
         env = cfg.get("environment", "sandbox")
         view: dict = {"environment": env, "enabled": bool(cfg.get("enabled", False)),
+                      "activation_blocked": p in BLOCKED_PROCESSOR_ACTIVATIONS,
                       "capabilities": PROVIDER_REGISTRY[p]["capabilities"], "credentials": {}}
         for e in ENVS:
             creds = cfg.get("credentials", {}).get(e, {})
@@ -463,6 +464,11 @@ async def set_processor_enabled(name: str, request: Request):
     enabled = bool(data.get("enabled", False))
     doc = await _get_doc()
     if not enabled:
+        if doc.get("active_processor") == name:
+            raise HTTPException(
+                status_code=409,
+                detail="Selecciona otro procesador principal antes de desactivar este módulo",
+            )
         routed = [cap for cap, provider in doc.get("capability_routing", {}).items() if provider == name]
         if routed:
             raise HTTPException(
