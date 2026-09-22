@@ -128,6 +128,42 @@ REQUIRED_TO_ACTIVATE = {
 }
 # 3D Secure por defecto ACTIVO (obligatorio) — responsabilidad de fraude al banco emisor
 DEFAULT_3DS = {"stripe": True, "square": True}
+_SECRET_PREFIX = "enc:v1:"
+
+
+def _decode_secret_value(value: str) -> str:
+    raw = str(value or "")
+    if not raw:
+        return ""
+    if not raw.startswith(_SECRET_PREFIX):
+        # Legacy plaintext remains readable so deployment is backwards compatible.
+        return raw
+    from .vault_router import decrypt as vault_decrypt
+    clear = vault_decrypt(raw[len(_SECRET_PREFIX):])
+    if not clear:
+        raise HTTPException(
+            status_code=503,
+            detail="No se pudo descifrar una credencial del procesador de pago.",
+        )
+    return clear
+
+
+def _encode_secret_value(value: str) -> str:
+    raw = str(value or "")
+    if not raw:
+        return ""
+    if raw.startswith(_SECRET_PREFIX):
+        return raw
+    from .vault_router import encrypt as vault_encrypt
+    return _SECRET_PREFIX + vault_encrypt(raw)
+
+
+def _encrypted_credentials(processor: str, creds: dict) -> dict:
+    stored = dict(creds)
+    for field in SECRET_FIELDS[processor]:
+        if stored.get(field):
+            stored[field] = _encode_secret_value(stored[field])
+    return stored
 
 
 def _mask(value: str) -> str:
@@ -216,6 +252,11 @@ async def _get_doc() -> dict:
                 cfg["credentials"][env].setdefault(f, val)
         cfg.setdefault("environment", "production" if p == "stripe" else "sandbox")
         cfg.setdefault("enabled", p == doc.get("active_processor", "helcim"))
+        for env_name in ENVS:
+            env_creds = cfg["credentials"].setdefault(env_name, {})
+            for field in SECRET_FIELDS[p]:
+                if field in env_creds:
+                    env_creds[field] = _decode_secret_value(env_creds.get(field))
     # Stripe production: hereda claves del config legacy (type=company) si faltan
     sp = doc["processors"]["stripe"]["credentials"]["production"]
     if not sp.get("secret_key"):
@@ -429,9 +470,10 @@ async def save_processor(name: str, request: Request):
         else:
             creds[field] = val
 
+    stored_creds = _encrypted_credentials(name, creds)
     await get_db().rental_config.update_one(
         {"type": "payment_processors"},
-        {"$set": {f"processors.{name}.credentials.{target_env}": creds,
+        {"$set": {f"processors.{name}.credentials.{target_env}": stored_creds,
                   f"processors.{name}.environment": cfg.get("environment", target_env),
                   "updated_at": datetime.now(timezone.utc)}},
         upsert=True,
