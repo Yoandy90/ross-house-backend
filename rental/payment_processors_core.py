@@ -360,6 +360,52 @@ async def list_processors(request: Request):
     return {"success": True, **_masked_view(doc)}
 
 
+@router.post("/admin/payment-processors/migrate-secrets")
+async def migrate_processor_secrets(request: Request):
+    """One-time/idempotent migration of legacy plaintext provider secrets."""
+    admin = await auth_admin(request)
+    db = get_db()
+    raw = await db.rental_config.find_one({"type": "payment_processors"}) or {}
+    processors = raw.get("processors") or {}
+    updates = {}
+    migrated = 0
+
+    for name in PROCESSORS:
+        cfg = processors.get(name) or {}
+        credentials = cfg.get("credentials") or {}
+        for env_name in ENVS:
+            env_creds = credentials.get(env_name) or {}
+            for field in SECRET_FIELDS[name]:
+                value = str(env_creds.get(field) or "")
+                if not value or value.startswith(_SECRET_PREFIX):
+                    continue
+                updates[f"processors.{name}.credentials.{env_name}.{field}"] = _encode_secret_value(value)
+                migrated += 1
+
+    if updates:
+        updates["updated_at"] = datetime.now(timezone.utc)
+        await db.rental_config.update_one(
+            {"type": "payment_processors"},
+            {"$set": updates},
+            upsert=False,
+        )
+
+    from rental.security import audit_log
+    await audit_log(
+        admin_user_id=admin.get("_id", admin.get("id", "")),
+        action="processor_secrets_migrated",
+        resource_type="payment_config",
+        resource_id="payment_processors",
+        request=request,
+        metadata={"migrated_fields": migrated},
+    )
+    return {
+        "success": True,
+        "migrated_fields": migrated,
+        "already_encrypted": migrated == 0,
+    }
+
+
 @router.get("/admin/payment-processors/fee-comparison")
 async def fee_comparison(request: Request):
     """Compara comisiones estimadas de Stripe/Square/Clover con el volumen REAL de rentas (últimos 12 meses)."""
