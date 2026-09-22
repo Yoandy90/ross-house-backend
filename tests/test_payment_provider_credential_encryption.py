@@ -3,7 +3,8 @@ from pathlib import Path
 src = Path("rental/payment_processors_core.py").read_text()
 
 for needle in [
-    'from .vault_router import encrypt as vault_encrypt, decrypt as vault_decrypt',
+    'from .vault_router import decrypt as vault_decrypt',
+    'from .vault_router import encrypt as vault_encrypt',
     '_SECRET_PREFIX = "enc:v1:"',
     'def _decode_secret_value',
     'def _encode_secret_value',
