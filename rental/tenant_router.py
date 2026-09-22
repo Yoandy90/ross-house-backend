@@ -727,17 +727,18 @@ async def admin_delete_app_user(user_id: str, request: Request):
             ),
         )
 
-    # If force and linked tenant exists, check for active contracts before nuking
+    # A formal tenant with ANY contract history is financial/legal evidence and
+    # must not be hard-deleted through an app-user cleanup, even with force.
     if linked_tenant and force:
         tid = str(linked_tenant["_id"])
-        active_contract = await db.rental_contracts.find_one({
-            "tenant_id": tid,
-            "status": "active",
-        })
-        if active_contract:
+        historical_contract = await db.rental_contracts.find_one({"tenant_id": tid})
+        if historical_contract:
             raise HTTPException(
-                status_code=400,
-                detail="No se puede eliminar: el inquilino vinculado tiene un contrato activo.",
+                status_code=409,
+                detail=(
+                    "No se puede eliminar el inquilino vinculado porque tiene historial contractual. "
+                    "Conserva el registro y desactiva el acceso de la app por separado."
+                ),
             )
         try:
             await db.tenants.delete_one({"_id": linked_tenant["_id"]})
@@ -1057,21 +1058,36 @@ async def use_app_photo_as_official(tenant_id: str, request: Request):
 
 @router.delete('/admin/tenants/{tenant_id}')
 async def delete_tenant(tenant_id: str, request: Request):
-    """Delete a tenant"""
+    """Hard-delete only a tenant with no contractual history."""
     user = await auth_admin(request)
-    tenant = await get_db().tenants.find_one({"_id": ObjectId(tenant_id)})
+    db = get_db()
+    tenant = await db.tenants.find_one({"_id": ObjectId(tenant_id)})
     if not tenant:
         raise HTTPException(status_code=404, detail="Inquilino no encontrado")
 
-    active_contract = await get_db().rental_contracts.find_one({"tenant_id": tenant_id, "status": "active"})
-    if active_contract:
-        from urllib.parse import parse_qs
-        params = parse_qs(str(request.url.query))
-        force = params.get('force', ['false'])[0].lower() == 'true'
-        if not force:
-            raise HTTPException(status_code=400, detail="El inquilino tiene un contrato activo. Use ?force=true")
+    contract = await db.rental_contracts.find_one({"tenant_id": tenant_id})
+    if contract:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Este inquilino tiene historial contractual y no se puede eliminar. "
+                "Conserva el registro y cambia su estado si ya no está activo."
+            ),
+        )
 
-    await get_db().tenants.delete_one({"_id": ObjectId(tenant_id)})
+    result = await db.tenants.delete_one({"_id": ObjectId(tenant_id)})
+    if result.deleted_count != 1:
+        raise HTTPException(status_code=409, detail="El inquilino cambió antes de eliminarse. Actualiza la lista.")
+
+    from rental.security import audit_log
+    await audit_log(
+        admin_user_id=user.get("_id", user.get("id", "")),
+        action="tenant_without_contract_history_deleted",
+        resource_type="tenant",
+        resource_id=tenant_id,
+        request=request,
+        metadata={"tenant_number": tenant.get("tenant_number", "")},
+    )
     return {"success": True, "message": f"Inquilino {tenant.get('tenant_number', '')} eliminado"}
 
 
