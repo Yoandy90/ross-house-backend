@@ -47,6 +47,9 @@ def assess_production_readiness(
         "tenant_jwt_secret_is_stable_and_strong": _strong_secret(
             environ.get("TENANT_JWT_SECRET", "")
         ),
+        "vault_encryption_key_is_present": bool(
+            str(environ.get("VAULT_ENCRYPTION_KEY", "")).strip()
+        ),
         "staging_fixtures_are_disabled": not _is_true(
             environ, "STAGING_FIXTURES_ENABLED"
         ),
