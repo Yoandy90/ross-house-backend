@@ -1769,15 +1769,69 @@ async def update_rental_payment(payment_id: str, request: Request):
 
 @router.delete('/admin/rental-payments/{payment_id}')
 async def delete_rental_payment(payment_id: str, request: Request):
-    """Delete a rental payment"""
-    user = await auth_admin(request)
+    """Hard-delete only a clean unpaid invoice.
 
-    existing = await get_db().rental_payments.find_one({"_id": ObjectId(payment_id)})
+    Paid/partially-paid/provider-linked records are financial evidence and must
+    remain in the ledger. Corrections to those records use cancellation,
+    reconciliation or explicit adjustment workflows instead of deletion.
+    """
+    user = await auth_admin(request)
+    db = get_db()
+
+    existing = await db.rental_payments.find_one({"_id": ObjectId(payment_id)})
     if not existing:
         raise HTTPException(status_code=404, detail="Pago no encontrado")
 
-    await get_db().rental_payments.delete_one({"_id": ObjectId(payment_id)})
-    return {"success": True, "message": "Pago eliminado exitosamente"}
+    status = str(existing.get("status") or "").lower()
+    total_paid = float(existing.get("total_paid") or 0)
+    protected = (
+        existing.get("paid") is True
+        or status in {"paid", "completed", "partial"}
+        or total_paid > 0
+        or bool(existing.get("receipt_number"))
+        or bool(existing.get("reference_number"))
+        or bool(existing.get("transaction_id"))
+        or bool(existing.get("charge_attempt"))
+        or bool(existing.get("manual_confirmation_history"))
+        or bool(existing.get("confirmation_source"))
+        or existing.get("record_type") == "checkout_attempt"
+        or bool(existing.get("invoice_id"))
+    )
+    if protected:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Este registro contiene evidencia financiera y no se puede eliminar. "
+                "Usa cancelación, conciliación o un ajuste contable."
+            ),
+        )
+    if status not in {"pending", "late", "cancelled", ""}:
+        raise HTTPException(
+            status_code=409,
+            detail="Solo se puede eliminar una factura sin pago ni evidencia financiera.",
+        )
+
+    result = await db.rental_payments.delete_one({
+        "_id": ObjectId(payment_id),
+        "paid": {"$ne": True},
+        "$or": [{"total_paid": {"$exists": False}}, {"total_paid": {"$lte": 0}}],
+    })
+    if result.deleted_count != 1:
+        raise HTTPException(
+            status_code=409,
+            detail="La factura cambió antes de eliminarse. Actualiza y revisa su estado.",
+        )
+
+    from rental.security import audit_log
+    await audit_log(
+        admin_user_id=user.get("_id", user.get("id", "")),
+        action="unpaid_invoice_deleted",
+        resource_type="rental_payment",
+        resource_id=payment_id,
+        request=request,
+        metadata={"previous_status": status},
+    )
+    return {"success": True, "message": "Factura sin pago eliminada exitosamente"}
 
 
 @router.post('/admin/rental-payments/generate-monthly')
