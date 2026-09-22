@@ -250,56 +250,23 @@ async def tenant_invoices_history(
 
 @router.get("/tenant/invoices/{invoice_id}/pdf")
 async def tenant_invoice_pdf(invoice_id: str, request: Request):
-    """Download the PDF for a specific invoice. Currently supports rent payments
-    (uses existing rental_pdf_service). Utility bills will be supported in Fase 2."""
-    user = await auth_marketplace(request)
-    db = get_db()
-    tenant_ids = await _resolve_tenant_ids_for_user(user)
-
-    # Try rental_payments first
-    payment = None
+    """Download a canonical settled rent receipt (utilities remain separate)."""
+    # Rent receipts have one authorization/integrity implementation. Reuse it
+    # here so the mobile invoices endpoint cannot drift from the direct receipt
+    # endpoint on tenant, contract, property, settlement or amount checks.
     try:
-        payment = await db.rental_payments.find_one({"_id": ObjectId(invoice_id)})
-    except Exception:
-        pass
-
-    if payment:
-        if payment.get("tenant_id") not in tenant_ids:
-            raise HTTPException(status_code=403, detail="No autorizado")
-
-        contract = None
-        if payment.get("contract_id"):
-            try:
-                contract = await db.rental_contracts.find_one({"_id": ObjectId(payment["contract_id"])})
-            except Exception:
-                pass
-
-        # Find the tenant doc for the PDF
-        tenant_doc = None
-        for tid in tenant_ids:
-            try:
-                t = await db.tenants.find_one({"_id": ObjectId(tid)})
-                if t:
-                    tenant_doc = t
-                    break
-            except Exception:
-                continue
-        if not tenant_doc:
-            tenant_doc = user  # fall back to user shape
-
-        from rental_pdf_service import generate_rental_receipt_pdf
-        pdf_b64 = generate_rental_receipt_pdf(
-            payment=serialize(payment),
-            contract=serialize(contract) if contract else None,
-            tenant=serialize(tenant_doc),
+        from rental.tenant_receipt_security_router import secure_tenant_payment_receipt
+        result = await secure_tenant_payment_receipt(invoice_id, request)
+        result["filename"] = result.get("filename", f"Receipt_{invoice_id}.pdf").replace(
+            "Receipt_", "Recibo_Renta_", 1
         )
-        receipt_num = payment.get("receipt_number", invoice_id)
-        return {
-            "success": True,
-            "pdf_base64": pdf_b64,
-            "filename": f"Recibo_Renta_{receipt_num}.pdf",
-            "type": "rent",
-        }
+        result["type"] = "rent"
+        return result
+    except HTTPException as exc:
+        # Only a genuine "not found" falls through to the utility lookup.
+        # Authorization/integrity failures must remain fail-closed.
+        if exc.status_code != 404:
+            raise
 
     # Utility bill case (PDF generation not yet implemented for utilities)
     try:
