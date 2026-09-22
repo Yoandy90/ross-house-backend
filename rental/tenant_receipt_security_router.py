@@ -31,9 +31,7 @@ async def secure_tenant_payment_receipt(payment_id: str, request: Request):
     # A receipt is proof of settlement, not an invoice/attempt document.
     # Fail closed unless the canonical rent ledger explicitly records payment.
     status = str(payment.get("status") or "").strip().lower()
-    settled = status in {"completed", "paid"} and (
-        payment.get("paid") is True or float(payment.get("total_paid") or 0) > 0
-    )
+    settled = status in {"completed", "paid"}
     if (
         not settled
         or payment.get("record_type") == "checkout_attempt"
@@ -42,6 +40,8 @@ async def secure_tenant_payment_receipt(payment_id: str, request: Request):
         raise HTTPException(status_code=409, detail="receipt_payment_not_settled")
 
     from rental.manual_payment_confirmation import recorded_paid_amount
+    # recorded_paid_amount intentionally supports legacy settled receipts that
+    # predate total_paid/paid while never inferring late fees from amount due.
     if recorded_paid_amount(payment) <= 0:
         raise HTTPException(status_code=409, detail="receipt_paid_amount_invalid")
 
