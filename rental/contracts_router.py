@@ -2954,6 +2954,11 @@ async def get_rental_config(request: Request):
         }
     else:
         config = serialize(config)
+        # Legacy Stripe credentials may still exist for compatibility with old
+        # flows, but the general Settings endpoint must never return them.
+        if config.get("stripe_secret_key"):
+            config["stripe_secret_key_masked"] = "••••" + str(config["stripe_secret_key"])[-4:]
+        config.pop("stripe_secret_key", None)
 
     return {"success": True, "config": config}
 
@@ -2969,9 +2974,9 @@ async def update_rental_config(request: Request):
         'name', 'address', 'phone', 'email', 'website', 'state', 'county',
         'legal_name', 'ein', 'business_hours', 'description',
         'facebook_url', 'instagram_url', 'tiktok_url', 'internal_notes', 'dnc_pin',
-        'late_fee_default', 'grace_days_default',
-        'lease_clauses', 'pet_defaults', 'notices',
-        'stripe_secret_key', 'stripe_publishable_key', 'stripe_enabled',
+        'late_fee_default', 'grace_days_default', 'default_deposit',
+        'lease_clauses', 'pet_defaults', 'notices', 'notifications',
+        # Processor credentials are managed only through /admin/payment-processors.
         'payment_methods',
         'commission_rate', 'connect_enabled',
     ]
