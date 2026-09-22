@@ -171,7 +171,7 @@ async def exchange_token(request: Request):
 async def list_accounts(request: Request):
     await auth_admin(request)
     items = []
-    async for it in get_db().plaid_items.find({}, {"access_token": 0}):
+    async for it in get_db().plaid_items.find({"status": {"$ne": "unlinked"}}, {"access_token": 0}):
         it["_id"] = str(it["_id"])
         items.append(it)
     return {"success": True, "items": items,
@@ -180,19 +180,52 @@ async def list_accounts(request: Request):
 
 @router.delete('/admin/plaid/items/{item_id}')
 async def unlink_item(item_id: str, request: Request):
-    await auth_admin(request)
+    """Disconnect Plaid but preserve imported bank evidence for audit/reconciliation."""
+    admin = await auth_admin(request)
     db = get_db()
     it = await db.plaid_items.find_one({"item_id": item_id})
     if not it:
         raise HTTPException(status_code=404, detail="Cuenta no encontrada")
+    now = datetime.utcnow()
+    provider_removed = False
     try:
         from plaid.model.item_remove_request import ItemRemoveRequest
         _plaid().item_remove(ItemRemoveRequest(access_token=it["access_token"]))
+        provider_removed = True
     except Exception as e:
         logger.warning(f"[plaid] item_remove: {e}")
-    await db.plaid_items.delete_one({"item_id": item_id})
-    await db.bank_transactions.delete_many({"item_id": item_id})
-    return {"success": True, "message": "Cuenta desvinculada"}
+
+    # Do not erase financial evidence. Remove the reusable access credential,
+    # archive the connection, and retain imported transaction/match history.
+    await db.plaid_items.update_one(
+        {"item_id": item_id},
+        {"$set": {
+            "status": "unlinked",
+            "unlinked_at": now,
+            "unlinked_by": admin.get("email", ""),
+            "provider_remove_confirmed": provider_removed,
+            "updated_at": now,
+        }, "$unset": {"access_token": "", "cursor": ""}},
+    )
+    await db.bank_transactions.update_many(
+        {"item_id": item_id},
+        {"$set": {"item_unlinked": True, "item_unlinked_at": now}},
+    )
+
+    from rental.security import audit_log
+    await audit_log(
+        admin_user_id=admin.get("_id", admin.get("id", "")),
+        action="plaid_item_unlinked",
+        resource_type="bank_connection",
+        resource_id=item_id,
+        request=request,
+        metadata={"provider_remove_confirmed": provider_removed},
+    )
+    return {
+        "success": True,
+        "message": "Cuenta desvinculada; el historial importado se conservó para auditoría",
+        "provider_remove_confirmed": provider_removed,
+    }
 
 
 async def run_full_sync() -> dict:
@@ -201,7 +234,10 @@ async def run_full_sync() -> dict:
     from plaid.model.transactions_sync_request import TransactionsSyncRequest
     client = _plaid()
     total_added = total_removed = 0
-    async for it in db.plaid_items.find({}):
+    async for it in db.plaid_items.find({
+        "status": {"$ne": "unlinked"},
+        "access_token": {"$exists": True, "$ne": ""},
+    }):
         cursor = it.get("cursor")
         added, removed = [], []
         try:
@@ -237,7 +273,12 @@ async def run_full_sync() -> dict:
                  "$setOnInsert": {"match": {"status": "unmatched"}, "created_at": now}},
                 upsert=True)
         for t in removed:
-            await db.bank_transactions.delete_one({"transaction_id": t["transaction_id"]})
+            # Plaid removal means "no longer in provider feed", not "erase the
+            # reconciliation evidence". Preserve the row and its match history.
+            await db.bank_transactions.update_one(
+                {"transaction_id": t["transaction_id"]},
+                {"$set": {"source_removed": True, "source_removed_at": now}},
+            )
         await db.plaid_items.update_one(
             {"_id": it["_id"]},
             {"$set": {"cursor": cursor, "last_synced_at": now}})
