@@ -13,6 +13,7 @@ Reglas:
 - Sin datos bancarios sensibles: solo referencia/número de money order.
 """
 import logging
+import uuid
 from datetime import datetime, timezone
 from bson import ObjectId
 from fastapi import APIRouter, HTTPException, Request
@@ -210,9 +211,50 @@ async def admin_approve(cid: str, request: Request):
         raise HTTPException(status_code=404, detail="No encontrado")
     if s["status"] == "approved":
         return {"success": True, "already": True,
-                "payment_id": s.get("rental_payment_id", "")}
+                "payment_id": s.get("rental_payment_id", ""),
+                "receipt_number": s.get("receipt_number", "")}
     if s["status"] == "rejected":
         raise HTTPException(status_code=400, detail="Confirmación ya rechazada")
+
+    # Recover a prior approval whose invoice write succeeded but whose
+    # confirmation-document finalization did not.
+    linked = await db.rental_payments.find_one({
+        "manual_confirmation_id": cid,
+        "status": {"$in": ["completed", "paid"]},
+        "paid": True,
+    })
+    if linked:
+        now = datetime.now(timezone.utc)
+        await db.manual_payment_confirmations.update_one(
+            {"_id": s["_id"], "status": {"$ne": "approved"}},
+            {"$set": {
+                "status": "approved",
+                "reviewed_by": admin.get("email", "admin"),
+                "reviewed_at": now,
+                "receipt_number": linked.get("receipt_number", ""),
+                "rental_payment_id": str(linked["_id"]),
+                "updated_at": now,
+            }, "$unset": {"approval_claim": ""}},
+        )
+        return {"success": True, "already": True,
+                "payment_id": str(linked["_id"]),
+                "receipt_number": linked.get("receipt_number", "")}
+
+    if s.get("status") == "approving":
+        raise HTTPException(
+            status_code=409,
+            detail="La confirmación quedó en revisión de integridad. Verifica el ledger antes de reintentar.",
+        )
+
+    claim_id = uuid.uuid4().hex
+    claimed = await db.manual_payment_confirmations.update_one(
+        {"_id": s["_id"], "status": {"$in": ["submitted", "under_review"]}},
+        {"$set": {"status": "approving", "approval_claim": claim_id,
+                  "approval_started_at": datetime.now(timezone.utc),
+                  "updated_at": datetime.now(timezone.utc)}},
+    )
+    if claimed.modified_count != 1:
+        raise HTTPException(status_code=409, detail="La confirmación está siendo procesada. Actualiza la lista.")
 
     contract = await db.rental_contracts.find_one({"_id": ObjectId(s["contract_id"])})
     if not contract or contract.get("status") not in ("active", "activo"):
@@ -253,8 +295,12 @@ async def admin_approve(cid: str, request: Request):
     result = await db.rental_payments.update_one(invoice_query, {"$set": {
         "status": "completed", "paid": True, "payment_method": s["method"],
         "receipt_number": receipt, "reference_number": s.get("reference", ""),
-        "total_paid": charge["total_due"], "payment_date": now.isoformat(),
-        "updated_at": now,
+        "manual_confirmation_id": cid,
+        "confirmation_source": "tenant_manual_confirmation",
+        "confirmed_by": admin.get("email", "admin"),
+        "confirmed_at": now,
+        "total_due": charge["total_due"], "total_paid": charge["total_due"],
+        "payment_date": now, "updated_at": now,
     }})
     if result.modified_count != 1:
         fresh = await db.manual_payment_confirmations.find_one({"_id": s["_id"]})
@@ -267,12 +313,17 @@ async def admin_approve(cid: str, request: Request):
 
     # Idempotencia dura: solo transiciona si sigue sin aprobar (doble click seguro)
     upd = await db.manual_payment_confirmations.update_one(
-        {"_id": s["_id"], "status": {"$ne": "approved"}},
+        {"_id": s["_id"], "status": "approving", "approval_claim": claim_id},
         {"$set": {"status": "approved", "reviewed_by": admin.get("email", "admin"),
                   "reviewed_at": now, "receipt_number": receipt,
-                  "rental_payment_id": payment_id, "updated_at": now}})
+                  "rental_payment_id": payment_id, "updated_at": now},
+         "$unset": {"approval_claim": ""}})
     if not upd.modified_count:
-        return {"success": True, "already": True, "payment_id": payment_id}
+        logger.error("Manual payment ledger settled but confirmation finalization failed: %s", cid)
+        raise HTTPException(
+            status_code=409,
+            detail="El pago quedó registrado pero la confirmación requiere revisión. No vuelvas a aprobarla.",
+        )
 
     from rental.security import audit_log
     await audit_log(admin_user_id=admin.get("_id", admin.get("id", "")),
