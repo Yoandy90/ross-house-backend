@@ -104,8 +104,8 @@ async def _build_rent_roll(db, as_of: datetime) -> Dict[str, Any]:
     for c in contracts:
         start_d = _safe_dt(c.get("start_date"))
         end_d = _safe_dt(c.get("end_date"))
-        rent = float(c.get("monthly_rent", 0) or 0)
-        deposit = float(c.get("security_deposit", 0) or 0)
+        rent = float(c.get("rent_amount", c.get("monthly_rent", 0)) or 0)
+        deposit = float(c.get("deposit_amount", c.get("security_deposit", 0)) or 0)
         late_fee = float(c.get("late_fee_amount", 0) or 0)
         prop = properties.get(str(c.get("property_id", "")), {}) if c.get("property_id") else {}
         address = c.get("property_address") or prop.get("address") or prop.get("street") or "—"
@@ -121,7 +121,10 @@ async def _build_rent_roll(db, as_of: datetime) -> Dict[str, Any]:
                 "contract_id": str(c["_id"]),
                 "status": {"$in": list(PENDING_STATUSES)},
             }):
-                outstanding += float(pay.get("amount", 0) or 0) + float(pay.get("late_fee", 0) or 0)
+                total_due = float(pay.get("total_due") or
+                                  (float(pay.get("amount", 0) or 0) + float(pay.get("late_fee", 0) or 0)))
+                total_paid = float(pay.get("total_paid") or 0)
+                outstanding += max(0.0, total_due - total_paid)
         except Exception:
             pass
 
@@ -192,8 +195,15 @@ async def _build_t12(db, end_date: datetime) -> Dict[str, Any]:
         idx = month_idx(_safe_dt(p.get("payment_date")))
         if idx is None:
             continue
-        income_by_month[idx] += float(p.get("amount", 0) or 0)
-        late_fees_by_month[idx] += float(p.get("late_fee", 0) or 0)
+        base = float(p.get("amount", 0) or 0)
+        late = float(p.get("late_fee", 0) or 0)
+        recorded = float(p.get("total_paid") or (base + late))
+        # Keep paid cash basis tied to what was actually recorded. Allocate
+        # late fee first up to its documented amount; the remainder is rent.
+        recorded_late = min(max(recorded, 0.0), max(late, 0.0))
+        recorded_rent = max(0.0, recorded - recorded_late)
+        income_by_month[idx] += recorded_rent
+        late_fees_by_month[idx] += recorded_late
 
     # ── EXPENSES: property_expenses by date (fallback created_at) ──
     expense_total = 0.0
