@@ -42,6 +42,34 @@ router = APIRouter()
 logger = logging.getLogger(__name__)
 
 PROCESSORS = ("stripe", "square", "clover", "bofa", "helcim")
+
+# Provider modules advertise capabilities independently from Core accounting.
+# Routing is stored in rental_config and can later be scoped by organization_id
+# without changing invoice/payment records.
+PROVIDER_REGISTRY = {
+    "stripe": {
+        "label": "Stripe",
+        "capabilities": ["card_checkout", "saved_card", "autopay", "hosted_checkout", "refunds", "webhooks", "transaction_lookup"],
+    },
+    "square": {
+        "label": "Square",
+        "capabilities": ["card_checkout", "hosted_checkout", "cash_app_pay", "apple_pay", "google_pay", "refunds", "webhooks", "transaction_lookup"],
+    },
+    "clover": {
+        "label": "Clover",
+        "capabilities": ["card_checkout", "hosted_checkout", "refunds", "webhooks", "transaction_lookup"],
+    },
+    "bofa": {
+        "label": "Bank of America",
+        "capabilities": ["card_checkout", "hosted_checkout", "refunds", "webhooks", "transaction_lookup"],
+    },
+    "helcim": {
+        "label": "Helcim",
+        "capabilities": ["card_checkout", "ach_checkout", "saved_card", "saved_ach", "autopay", "hosted_checkout", "refunds", "webhooks", "transaction_lookup"],
+    },
+}
+CAPABILITIES = tuple(sorted({cap for meta in PROVIDER_REGISTRY.values() for cap in meta["capabilities"]}))
+
 # Ross House conserva la configuración histórica de Stripe, pero Helcim es el
 # único procesador aprobado actualmente. Este bloqueo evita reactivaciones
 # accidentales desde cualquier cliente administrativo o llamada directa.
@@ -170,6 +198,7 @@ async def _get_doc() -> dict:
     doc = await get_db().rental_config.find_one({"type": "payment_processors"}) or {}
     doc.setdefault("active_processor", "helcim")
     doc.setdefault("processors", {})
+    doc.setdefault("capability_routing", {})
     doc.setdefault("three_ds", dict(DEFAULT_3DS))
     for k, v in DEFAULT_3DS.items():
         doc["three_ds"].setdefault(k, v)
@@ -186,6 +215,7 @@ async def _get_doc() -> dict:
             for f, val in flat.items():
                 cfg["credentials"][env].setdefault(f, val)
         cfg.setdefault("environment", "production" if p == "stripe" else "sandbox")
+        cfg.setdefault("enabled", p == doc.get("active_processor", "helcim"))
     # Stripe production: hereda claves del config legacy (type=company) si faltan
     sp = doc["processors"]["stripe"]["credentials"]["production"]
     if not sp.get("secret_key"):
@@ -206,10 +236,32 @@ def _active_creds(cfg: dict) -> dict:
 
 
 async def get_active_processor() -> tuple[str, dict]:
-    """Helper para otros routers: (nombre, credenciales del entorno activo + environment)."""
+    """Legacy/global default processor helper kept for backward compatibility."""
     doc = await _get_doc()
     name = doc.get("active_processor", "helcim")
     cfg = doc["processors"].get(name, {})
+    creds = dict(_active_creds(cfg))
+    creds["environment"] = cfg.get("environment", "sandbox")
+    return name, creds
+
+
+async def get_processor_for_capability(capability: str) -> tuple[str, dict]:
+    """Resolve one enabled provider for a payment capability.
+
+    Capability routing is optional. When no explicit route exists we preserve
+    the legacy active_processor behavior, so existing Ross House flows do not
+    change during migration.
+    """
+    if capability not in CAPABILITIES:
+        raise HTTPException(status_code=400, detail="Capacidad de pago desconocida")
+    doc = await _get_doc()
+    routed = str(doc.get("capability_routing", {}).get(capability) or "").strip()
+    name = routed or doc.get("active_processor", "helcim")
+    if name not in PROCESSORS or capability not in PROVIDER_REGISTRY[name]["capabilities"]:
+        raise HTTPException(status_code=409, detail=f"No hay proveedor válido para {capability}")
+    cfg = doc["processors"].get(name, {})
+    if routed and not cfg.get("enabled", False):
+        raise HTTPException(status_code=409, detail=f"{PROVIDER_REGISTRY[name]['label']} está desactivado")
     creds = dict(_active_creds(cfg))
     creds["environment"] = cfg.get("environment", "sandbox")
     return name, creds
@@ -222,12 +274,17 @@ async def get_three_ds_settings() -> dict:
 
 def _masked_view(doc: dict) -> dict:
     out = {"active_processor": doc.get("active_processor", "helcim"),
+           "capability_routing": doc.get("capability_routing", {}),
+           "provider_registry": PROVIDER_REGISTRY,
+           "capabilities": list(CAPABILITIES),
            "three_ds": doc.get("three_ds", dict(DEFAULT_3DS)), "processors": {}}
     base = _public_base_url()
     for p in PROCESSORS:
         cfg = doc["processors"].get(p, {})
         env = cfg.get("environment", "sandbox")
-        view: dict = {"environment": env, "credentials": {}}
+        view: dict = {"environment": env, "enabled": bool(cfg.get("enabled", False)),
+                      "activation_blocked": p in BLOCKED_PROCESSOR_ACTIVATIONS,
+                      "capabilities": PROVIDER_REGISTRY[p]["capabilities"], "credentials": {}}
         for e in ENVS:
             creds = cfg.get("credentials", {}).get(e, {})
             cv = {}
@@ -397,6 +454,85 @@ async def save_processor(name: str, request: Request):
             **_masked_view(fresh)}
 
 
+@router.post("/admin/payment-processors/{name}/enabled")
+async def set_processor_enabled(name: str, request: Request):
+    """Enable/disable a provider module without deleting credentials or history."""
+    admin = await auth_admin(request)
+    if name not in PROCESSORS:
+        raise HTTPException(status_code=404, detail="Procesador desconocido")
+    data = await request.json()
+    enabled = bool(data.get("enabled", False))
+    doc = await _get_doc()
+    if not enabled:
+        if doc.get("active_processor") == name:
+            raise HTTPException(
+                status_code=409,
+                detail="Selecciona otro procesador principal antes de desactivar este módulo",
+            )
+        routed = [cap for cap, provider in doc.get("capability_routing", {}).items() if provider == name]
+        if routed:
+            raise HTTPException(
+                status_code=409,
+                detail="No puedes desactivar este proveedor mientras tenga capacidades asignadas: " + ", ".join(routed),
+            )
+    elif name in BLOCKED_PROCESSOR_ACTIVATIONS:
+        raise HTTPException(status_code=409, detail=f"{name.title()} está deshabilitado para esta organización")
+
+    await get_db().rental_config.update_one(
+        {"type": "payment_processors"},
+        {"$set": {f"processors.{name}.enabled": enabled,
+                  "updated_at": datetime.now(timezone.utc)}},
+        upsert=True,
+    )
+    from rental.security import audit_log
+    await audit_log(admin_user_id=admin.get("_id", admin.get("id", "")),
+                    action="processor_module_enabled" if enabled else "processor_module_disabled",
+                    resource_type="payment_config", resource_id=name, request=request)
+    fresh = await _get_doc()
+    return {"success": True, "message": f"{name.title()} {'activado' if enabled else 'desactivado'} como módulo",
+            **_masked_view(fresh)}
+
+
+@router.put("/admin/payment-processors/capability-routing")
+async def set_capability_routing(request: Request):
+    """Assign preferred enabled provider per payment capability."""
+    admin = await auth_admin(request)
+    data = await request.json()
+    routing = data.get("routing")
+    if not isinstance(routing, dict):
+        raise HTTPException(status_code=400, detail="routing debe ser un objeto")
+    doc = await _get_doc()
+    normalized = dict(doc.get("capability_routing", {}))
+    for capability, provider in routing.items():
+        capability = str(capability)
+        provider = str(provider or "")
+        if capability not in CAPABILITIES:
+            raise HTTPException(status_code=400, detail=f"Capacidad desconocida: {capability}")
+        if not provider:
+            normalized.pop(capability, None)
+            continue
+        if provider not in PROCESSORS:
+            raise HTTPException(status_code=400, detail=f"Proveedor desconocido: {provider}")
+        if capability not in PROVIDER_REGISTRY[provider]["capabilities"]:
+            raise HTTPException(status_code=400, detail=f"{provider.title()} no soporta {capability}")
+        if not doc["processors"].get(provider, {}).get("enabled", False):
+            raise HTTPException(status_code=409, detail=f"{provider.title()} debe estar activado primero")
+
+    await get_db().rental_config.update_one(
+        {"type": "payment_processors"},
+        {"$set": {"capability_routing": normalized,
+                  "updated_at": datetime.now(timezone.utc),
+                  "capability_routing_updated_by": admin.get("email", "")}},
+        upsert=True,
+    )
+    from rental.security import audit_log
+    await audit_log(admin_user_id=admin.get("_id", admin.get("id", "")),
+                    action="processor_capability_routing_updated",
+                    resource_type="payment_config", resource_id="capability_routing", request=request)
+    fresh = await _get_doc()
+    return {"success": True, "message": "Ruteo de capacidades actualizado", **_masked_view(fresh)}
+
+
 @router.post("/admin/payment-processors/{name}/environment")
 async def switch_environment(name: str, request: Request):
     """Cambiar el entorno activo (sandbox ↔ production) de un procesador."""
@@ -490,6 +626,7 @@ async def activate_processor(name: str, request: Request):
     await get_db().rental_config.update_one(
         {"type": "payment_processors"},
         {"$set": {"active_processor": name,
+                  f"processors.{name}.enabled": True,
                   "activated_at": datetime.now(timezone.utc),
                   "activated_by": admin.get("email", "")}},
         upsert=True,
