@@ -519,7 +519,7 @@ async def admin_update_owner(owner_id: str, request: Request):
 @router.delete('/admin/owners/{owner_id}')
 async def admin_delete_owner(owner_id: str, request: Request):
     """Soft-delete owner. Properties are NOT deleted but unassigned (owner_id removed)."""
-    await auth_admin(request)
+    admin = await auth_admin(request)
     if not ObjectId.is_valid(owner_id):
         raise HTTPException(status_code=400, detail="ID inválido")
     db = get_db()
@@ -527,19 +527,55 @@ async def admin_delete_owner(owner_id: str, request: Request):
     if not user:
         raise HTTPException(status_code=404, detail="Propietario no encontrado")
 
-    # Soft-delete user
-    await db.app_users.update_one(
-        {"_id": ObjectId(owner_id)},
-        {"$set": {"deleted": True, "deleted_at": datetime.utcnow(), "status": "deleted"}},
+    owned_property_ids = []
+    async for prop in db.properties.find(
+        {"$or": [{"owner_id": owner_id}, {"owner_id": ObjectId(owner_id)}]},
+        {"_id": 1},
+    ):
+        owned_property_ids.append(str(prop["_id"]))
+
+    if owned_property_ids:
+        active_contract = await db.rental_contracts.find_one({
+            "property_id": {"$in": owned_property_ids},
+            "status": "active",
+        })
+        if active_contract:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "No se puede desactivar este propietario mientras una de sus propiedades "
+                    "tenga un contrato activo. Reasigna la propiedad primero."
+                ),
+            )
+
+    now = datetime.utcnow()
+    result = await db.app_users.update_one(
+        {"_id": ObjectId(owner_id), "status": {"$ne": "deleted"}},
+        {"$set": {"deleted": True, "deleted_at": now, "status": "deleted"}},
     )
-    # Unassign properties (so they show "Sin Propietario" instead of phantom owner)
+    if result.matched_count != 1:
+        raise HTTPException(status_code=409, detail="El propietario cambió antes de desactivarse. Actualiza la lista.")
+
+    # Only unassign properties after confirming there is no active contractual
+    # relationship that would lose its ownership context.
     unassign_count = await db.properties.update_many(
         {"$or": [{"owner_id": owner_id}, {"owner_id": ObjectId(owner_id)}]},
-        {"$set": {"owner_id": None, "owner_name": "", "owner_email": "", "owner_phone": ""}},
+        {"$set": {"owner_id": None, "owner_name": "", "owner_email": "", "owner_phone": "", "updated_at": now}},
     )
+
+    from rental.security import audit_log
+    await audit_log(
+        admin_user_id=admin.get("_id", admin.get("id", "")),
+        action="owner_deactivated",
+        resource_type="owner",
+        resource_id=owner_id,
+        request=request,
+        metadata={"properties_unassigned": unassign_count.modified_count},
+    )
+
     return {
         "success": True,
-        "message": "Propietario eliminado",
+        "message": "Propietario desactivado",
         "properties_unassigned": unassign_count.modified_count,
     }
 
