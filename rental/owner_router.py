@@ -519,7 +519,7 @@ async def admin_update_owner(owner_id: str, request: Request):
 @router.delete('/admin/owners/{owner_id}')
 async def admin_delete_owner(owner_id: str, request: Request):
     """Soft-delete owner. Properties are NOT deleted but unassigned (owner_id removed)."""
-    await auth_admin(request)
+    admin = await auth_admin(request)
     if not ObjectId.is_valid(owner_id):
         raise HTTPException(status_code=400, detail="ID inválido")
     db = get_db()
@@ -565,7 +565,7 @@ async def admin_delete_owner(owner_id: str, request: Request):
 
     from rental.security import audit_log
     await audit_log(
-        admin_user_id="admin",
+        admin_user_id=admin.get("_id", admin.get("id", "")),
         action="owner_deactivated",
         resource_type="owner",
         resource_id=owner_id,
