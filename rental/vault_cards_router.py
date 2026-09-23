@@ -339,7 +339,7 @@ async def charge_saved_method(request: Request):
     """
     admin = await auth_admin(request)
     from rental.vault_router import _require_vault_session
-    await _require_vault_session(request)
+    await _require_vault_session(request, admin)
 
     from rental.payment_processors_core import get_processor_for_capability
     provider, _ = await get_processor_for_capability("saved_card")
