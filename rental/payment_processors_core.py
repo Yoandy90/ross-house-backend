@@ -276,6 +276,11 @@ def _active_creds(cfg: dict) -> dict:
     return cfg.get("credentials", {}).get(env, {})
 
 
+def _missing_required_credentials(name: str, cfg: dict) -> list[str]:
+    creds = _active_creds(cfg)
+    return [field for field in REQUIRED_TO_ACTIVATE[name] if not creds.get(field)]
+
+
 async def get_active_processor() -> tuple[str, dict]:
     """Legacy/global default processor helper kept for backward compatibility."""
     doc = await _get_doc()
@@ -301,8 +306,14 @@ async def get_processor_for_capability(capability: str) -> tuple[str, dict]:
     if name not in PROCESSORS or capability not in PROVIDER_REGISTRY[name]["capabilities"]:
         raise HTTPException(status_code=409, detail=f"No hay proveedor válido para {capability}")
     cfg = doc["processors"].get(name, {})
-    if routed and not cfg.get("enabled", False):
+    if not cfg.get("enabled", False):
         raise HTTPException(status_code=409, detail=f"{PROVIDER_REGISTRY[name]['label']} está desactivado")
+    missing = _missing_required_credentials(name, cfg)
+    if missing:
+        raise HTTPException(
+            status_code=409,
+            detail=f"{PROVIDER_REGISTRY[name]['label']} no está configurado en su entorno activo",
+        )
     creds = dict(_active_creds(cfg))
     creds["environment"] = cfg.get("environment", "sandbox")
     return name, creds
@@ -565,6 +576,11 @@ async def set_processor_enabled(name: str, request: Request):
             )
     elif name in BLOCKED_PROCESSOR_ACTIVATIONS:
         raise HTTPException(status_code=409, detail=f"{name.title()} está deshabilitado para esta organización")
+    elif _missing_required_credentials(name, doc["processors"].get(name, {})):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Configura primero las credenciales del entorno activo de {name.title()}",
+        )
 
     await get_db().rental_config.update_one(
         {"type": "payment_processors"},
@@ -603,8 +619,14 @@ async def set_capability_routing(request: Request):
             raise HTTPException(status_code=400, detail=f"Proveedor desconocido: {provider}")
         if capability not in PROVIDER_REGISTRY[provider]["capabilities"]:
             raise HTTPException(status_code=400, detail=f"{provider.title()} no soporta {capability}")
-        if not doc["processors"].get(provider, {}).get("enabled", False):
+        provider_cfg = doc["processors"].get(provider, {})
+        if not provider_cfg.get("enabled", False):
             raise HTTPException(status_code=409, detail=f"{provider.title()} debe estar activado primero")
+        if _missing_required_credentials(provider, provider_cfg):
+            raise HTTPException(
+                status_code=409,
+                detail=f"{provider.title()} no está configurado en su entorno activo",
+            )
 
     await get_db().rental_config.update_one(
         {"type": "payment_processors"},
