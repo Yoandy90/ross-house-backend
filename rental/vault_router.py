@@ -103,8 +103,8 @@ async def _audit(db, admin_email: str, action: str, target: str = "", meta: Opti
         logger.warning(f"vault audit failed: {e}")
 
 
-async def _require_vault_session(request: Request):
-    """Validates the X-Vault-Token header (issued by /admin/vault/unlock)."""
+async def _require_vault_session(request: Request, admin: Optional[dict] = None):
+    """Validate a vault token and, when supplied, bind it to the current admin."""
     token = request.headers.get("X-Vault-Token") or request.query_params.get("vault_token")
     if not token:
         raise HTTPException(status_code=403, detail="Vault session required. Unlock with PIN first.")
@@ -112,6 +112,16 @@ async def _require_vault_session(request: Request):
         payload = jwt.decode(token, VAULT_JWT_SECRET, algorithms=["HS256"])
         if not payload.get("vault_unlocked"):
             raise HTTPException(status_code=403, detail="Invalid vault token")
+        if admin is not None:
+            token_admin_id = str(payload.get("admin_id") or "")
+            current_admin_id = str(admin.get("_id") or admin.get("id") or "")
+            token_email = str(payload.get("admin_email") or "").strip().lower()
+            current_email = str(admin.get("email") or "").strip().lower()
+
+            id_matches = bool(token_admin_id and current_admin_id and token_admin_id == current_admin_id)
+            email_matches = bool(token_email and current_email and token_email == current_email)
+            if not id_matches and not email_matches:
+                raise HTTPException(status_code=403, detail="vault_session_admin_mismatch")
         return payload
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=403, detail="Vault session expired — re-enter PIN")
@@ -290,7 +300,7 @@ async def vault_list_payment_methods(request: Request):
 async def vault_reveal_method(method_id: str, request: Request):
     """Reveal only current Ross House encrypted banking fields."""
     admin = await auth_admin(request)
-    session = await _require_vault_session(request)
+    session = await _require_vault_session(request, admin)
     db = get_db()
 
     pm = await db.payment_methods.find_one({"_id": ObjectId(method_id)})
