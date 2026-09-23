@@ -217,8 +217,13 @@ async def save_api_key(key_name: str, request: Request):
 async def reveal_api_key(key_name: str, request: Request):
     """Reveal the full current value of a key (audited)."""
     admin = await auth_admin(request)
-    if key_name not in _REGISTRY_MAP:
+    entry = _REGISTRY_MAP.get(key_name)
+    if not entry:
         raise HTTPException(status_code=404, detail=f"Key desconocida: {key_name}")
+    if entry.get("secret"):
+        # Secret material is write-only from the Admin Panel. Normal admin
+        # authentication may rotate/delete it, but cannot recover plaintext.
+        raise HTTPException(status_code=403, detail="api_key_secret_reveal_disabled")
 
     db = get_db()
     doc = await db.admin_config.find_one({"type": CONFIG_TYPE}) or {}
