@@ -73,7 +73,7 @@ async def admin_list_autopay_configs(request: Request):
     """Admin: List ALL autopay configs across tenants with stats."""
     await auth_admin(request)
     items = []
-    cursor = get_db().autopay_config.find({}).sort("updated_at", -1)
+    cursor = get_db().autopay_config.find({"archived_at": {"$exists": False}}).sort("updated_at", -1)
     async for c in cursor:
         items.append({
             "id": str(c["_id"]),
@@ -147,6 +147,11 @@ async def admin_create_autopay(request: Request):
     user = await get_db().app_users.find_one({"_id": ObjectId(user_id)})
     if not user:
         raise HTTPException(status_code=404, detail="Inquilino no encontrado")
+    if data.get("enabled") is True:
+        raise HTTPException(
+            status_code=409,
+            detail="El administrador no puede activar autopago sin autorización expresa del inquilino.",
+        )
     now = datetime.utcnow()
     await get_db().autopay_config.update_one(
         {"user_id": user_id},
@@ -154,47 +159,95 @@ async def admin_create_autopay(request: Request):
             "user_id": user_id,
             "user_name": user.get("name", ""),
             "user_email": user.get("email", ""),
-            "enabled": bool(data.get("enabled", True)),
+            "enabled": False,
             "payment_method_id": pm,
             "day_of_month": day,
             "updated_at": now,
             "created_by_admin": True,
-        }, "$setOnInsert": {"created_at": now}},
+            "admin_draft": True,
+        }, "$unset": {"archived_at": "", "archived_by": ""},
+           "$setOnInsert": {"created_at": now}},
         upsert=True)
-    return {"success": True, "message": "Autopago creado"}
+    return {
+        "success": True,
+        "message": "Configuración guardada como borrador. El inquilino debe autorizar el autopago.",
+        "enabled": False,
+    }
 
 
 @router.put('/admin/autopay/configs/{config_id}')
 async def admin_update_autopay(request: Request, config_id: str):
-    """Admin: editar día/tarjeta o activar/cancelar un autopago."""
-    await auth_admin(request)
+    """Admin may pause autopay or edit a disabled draft; tenant consent owns activation."""
+    admin = await auth_admin(request)
     data = await request.json()
     from bson import ObjectId
+    db = get_db()
+    current = await db.autopay_config.find_one({
+        "_id": ObjectId(config_id),
+        "archived_at": {"$exists": False},
+    })
+    if not current:
+        raise HTTPException(status_code=404, detail="Autopago no encontrado")
+
+    if data.get("enabled") is True:
+        raise HTTPException(
+            status_code=409,
+            detail="El administrador no puede reactivar autopago. El inquilino debe autorizarlo nuevamente.",
+        )
+
+    current_enabled = bool(current.get("enabled", False))
+    changing_terms = "day_of_month" in data or bool(data.get("payment_method_id"))
+    if current_enabled and changing_terms:
+        raise HTTPException(
+            status_code=409,
+            detail="Pausa el autopago antes de cambiar día o método; luego el inquilino debe reautorizar.",
+        )
+
     upd = {"updated_at": datetime.utcnow()}
-    if "enabled" in data:
-        upd["enabled"] = bool(data["enabled"])
+    if "enabled" in data and data.get("enabled") is False:
+        upd.update({
+            "enabled": False,
+            "paused_by_admin": True,
+            "paused_at": datetime.utcnow(),
+            "paused_by": admin.get("email", ""),
+        })
     if "day_of_month" in data:
         day = int(data["day_of_month"])
         if day < 1 or day > 28:
             raise HTTPException(status_code=400, detail="El día debe ser entre 1 y 28")
         upd["day_of_month"] = day
+        upd["admin_draft"] = True
     if data.get("payment_method_id"):
         upd["payment_method_id"] = data["payment_method_id"].strip()
-    r = await get_db().autopay_config.update_one({"_id": ObjectId(config_id)}, {"$set": upd})
+        upd["admin_draft"] = True
+
+    r = await db.autopay_config.update_one(
+        {"_id": ObjectId(config_id), "updated_at": current.get("updated_at")},
+        {"$set": upd},
+    )
     if r.matched_count == 0:
-        raise HTTPException(status_code=404, detail="Autopago no encontrado")
-    return {"success": True, "message": "Autopago actualizado"}
+        raise HTTPException(status_code=409, detail="El autopago cambió antes de guardar. Actualiza la lista.")
+    return {"success": True, "message": "Autopago actualizado", "enabled": bool(upd.get("enabled", current_enabled))}
 
 
 @router.delete('/admin/autopay/configs/{config_id}')
 async def admin_delete_autopay(request: Request, config_id: str):
-    """Admin: eliminar un autopago por completo."""
-    await auth_admin(request)
+    """Archive an autopay configuration while preserving authorization history."""
+    admin = await auth_admin(request)
     from bson import ObjectId
-    r = await get_db().autopay_config.delete_one({"_id": ObjectId(config_id)})
-    if r.deleted_count == 0:
+    now = datetime.utcnow()
+    r = await get_db().autopay_config.update_one(
+        {"_id": ObjectId(config_id), "archived_at": {"$exists": False}},
+        {"$set": {
+            "enabled": False,
+            "archived_at": now,
+            "archived_by": admin.get("email", ""),
+            "updated_at": now,
+        }},
+    )
+    if r.matched_count == 0:
         raise HTTPException(status_code=404, detail="Autopago no encontrado")
-    return {"success": True, "message": "Autopago eliminado"}
+    return {"success": True, "message": "Autopago archivado; historial de autorización conservado"}
 
 
 @router.post('/admin/autopay/run-now')
