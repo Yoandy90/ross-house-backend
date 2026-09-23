@@ -196,6 +196,13 @@ async def create_card_save_link(request: Request):
     Body: {tenant_id?, customer_email?, customer_name?}
     """
     admin = await auth_admin(request)
+    from rental.payment_processors_core import get_processor_for_capability
+    provider, _ = await get_processor_for_capability("saved_card")
+    if provider != "stripe":
+        raise HTTPException(
+            status_code=409,
+            detail="legacy_stripe_card_save_disabled_use_active_provider",
+        )
     data = await request.json()
     db = get_db()
 
@@ -331,6 +338,17 @@ async def charge_saved_method(request: Request):
     Body: {payment_method_id, amount, description?}
     """
     admin = await auth_admin(request)
+    from rental.vault_router import _require_vault_session
+    await _require_vault_session(request)
+
+    from rental.payment_processors_core import get_processor_for_capability
+    provider, _ = await get_processor_for_capability("saved_card")
+    if provider != "stripe":
+        raise HTTPException(
+            status_code=409,
+            detail="legacy_stripe_vault_charge_disabled_use_active_provider",
+        )
+
     data = await request.json()
     pm_id = (data.get("payment_method_id") or "").strip()
     try:
