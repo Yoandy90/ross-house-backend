@@ -50,6 +50,9 @@ def assess_production_readiness(
         "vault_encryption_key_is_present": bool(
             str(environ.get("VAULT_ENCRYPTION_KEY", "")).strip()
         ),
+        "vault_jwt_secret_is_stable_and_strong": _strong_secret(
+            environ.get("VAULT_JWT_SECRET", "")
+        ),
         "staging_fixtures_are_disabled": not _is_true(
             environ, "STAGING_FIXTURES_ENABLED"
         ),
@@ -103,6 +106,7 @@ def assess_staging_readiness(environ: Mapping[str, str], *, database_name: str) 
         "background_jobs_are_disabled": should_disable_background_jobs(environ),
         "tenant_jwt_secret_is_stable_and_strong": _strong_secret(environ.get("TENANT_JWT_SECRET", "")),
         "vault_encryption_key_is_present": bool(str(environ.get("VAULT_ENCRYPTION_KEY", "")).strip()),
+        "vault_jwt_secret_is_stable_and_strong": _strong_secret(environ.get("VAULT_JWT_SECRET", "")),
         "refresh_tokens_are_enabled": _is_true(environ, "REFRESH_TOKENS_ENABLED"),
         "legacy_sessions_are_disabled": _is_false(environ, "ALLOW_LEGACY_USER_SESSIONS"),
         "session_sid_is_required": _is_true(environ, "REQUIRE_SESSION_SID"),
