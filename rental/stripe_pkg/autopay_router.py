@@ -254,8 +254,11 @@ async def admin_delete_autopay(request: Request, config_id: str):
 async def admin_trigger_autopay(request: Request):
     """Admin: Manually trigger autopay only after an explicit high-signal confirmation."""
     admin = await auth_admin(request)
-    data = await request.json()
-    if str(data.get("confirmation") or "").strip() != "RUN_AUTOPAY_NOW":
+    try:
+        data = await request.json()
+    except (ValueError, UnicodeDecodeError):
+        raise HTTPException(status_code=400, detail="Envía una confirmación válida en formato JSON.")
+    if not isinstance(data, dict) or data.get("confirmation") != "RUN_AUTOPAY_NOW":
         raise HTTPException(
             status_code=400,
             detail="Confirma explícitamente la ejecución manual de autopagos.",
@@ -285,6 +288,17 @@ async def admin_trigger_autopay(request: Request):
             },
         )
         return {"success": True, "message": "Autopago ejecutado", "stats": stats}
-    except Exception as e:
+    except Exception:
         logging.exception("Autopay manual run failed")
-        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+        await audit_log(
+            admin_user_id=admin.get("_id", admin.get("id", "")),
+            action="autopay_manual_run_failed",
+            resource_type="autopay",
+            resource_id="run-now",
+            result="error",
+            request=request,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="No se pudo completar la ejecución. Revisa el historial de autopagos antes de volver a intentar.",
+        )
