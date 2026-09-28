@@ -753,3 +753,16 @@ async def admin_assign_property_owner(property_id: str, request: Request):
     return {"success": True, "message": f"Asignada a {owner.get('name', '')}", "owner_id": str(owner.get("_id"))}
 
 
+
+
+@router.get('/admin/operations/legacy-credential-summary')
+async def admin_legacy_credential_summary(request: Request):
+    """Read-only counts; never fetch identities, password hashes or password values."""
+    await auth_admin(request)
+    from rental.credential_inventory import legacy_credential_summary
+    try:
+        return await legacy_credential_summary(get_db())
+    except Exception:
+        # Do not log database exception text, which may contain sensitive data.
+        logging.warning('Legacy credential summary unavailable')
+        raise HTTPException(status_code=503, detail='No se pudo completar la revisión de credenciales. Reintenta más tarde.')
