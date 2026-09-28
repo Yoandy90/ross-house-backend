@@ -7,7 +7,7 @@ for needle in [
   'owned_property_ids = []',
   '"status": "active"',
   'No se puede desactivar este propietario',
-  '"status": {"$ne": "deleted"}',
+  '_owner_account_filter(owner_id)',
   'owner_deactivated',
   '"message": "Propietario desactivado"',
 ]:

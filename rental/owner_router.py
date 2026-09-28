@@ -3,6 +3,8 @@ Rental Owner Router
 ====================
 """
 import logging
+import re
+import secrets
 from datetime import datetime, timedelta
 from typing import Optional, List
 from bson import ObjectId
@@ -436,6 +438,55 @@ async def admin_list_owners(request: Request):
     return {"success": True, "owners": out, "total": len(out)}
 
 
+_OWNER_PROFILE_LIMITS = {
+    "name": 200, "email": 254, "phone": 40, "company": 200,
+    "tax_id": 64, "address": 300, "city": 100, "state": 2, "zip_code": 20,
+}
+
+
+def _owner_account_filter(owner_id: str) -> dict:
+    return {
+        "_id": ObjectId(owner_id),
+        "role": {"$in": ["landlord", "owner"]},
+        "deleted": {"$ne": True},
+        "status": {"$ne": "deleted"},
+    }
+
+
+async def _owner_profile_input(request: Request, *, creating: bool) -> dict:
+    try:
+        data = await request.json()
+    except (ValueError, UnicodeDecodeError):
+        raise HTTPException(status_code=400, detail="Envía un perfil válido en formato JSON.")
+    allowed = set(_OWNER_PROFILE_LIMITS) | ({"password"} if creating else {"status", "kyc_status"})
+    if not isinstance(data, dict) or set(data) - allowed:
+        raise HTTPException(status_code=400, detail="El perfil contiene campos no permitidos.")
+    clean = {}
+    for field, value in data.items():
+        if value is None and field not in {"name", "email", "status", "kyc_status"}:
+            value = ""
+        if not isinstance(value, str):
+            raise HTTPException(status_code=400, detail=f"El campo {field} debe ser texto.")
+        value = value.strip()
+        if field == "password":
+            if value and (len(value) < 6 or len(value.encode("utf-8")) > 72):
+                raise HTTPException(status_code=400, detail="Password: mínimo 6 caracteres y máximo 72 bytes.")
+        elif len(value) > _OWNER_PROFILE_LIMITS.get(field, 30):
+            raise HTTPException(status_code=400, detail=f"El campo {field} es demasiado largo.")
+        clean[field] = value
+    if creating or "name" in clean:
+        if not clean.get("name"):
+            raise HTTPException(status_code=400, detail="Nombre es requerido.")
+    if creating or "email" in clean:
+        email = clean.get("email", "").lower()
+        if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email):
+            raise HTTPException(status_code=400, detail="Email inválido.")
+        clean["email"] = email
+    if "kyc_status" in clean and clean["kyc_status"] not in {"pending", "approved", "rejected"}:
+        raise HTTPException(status_code=400, detail="Estado de verificación inválido.")
+    return clean
+
+
 @router.post('/admin/owners')
 async def admin_create_owner(request: Request):
     """Create a new owner/landlord directly (without public landlord-register flow).
@@ -443,21 +494,21 @@ async def admin_create_owner(request: Request):
     Password is optional — if not provided, generates a temporary one.
     """
     await auth_admin(request)
-    data = await request.json()
+    data = await _owner_profile_input(request, creating=True)
     name = (data.get("name") or "").strip()
     email = (data.get("email") or "").strip().lower()
     if not name or not email:
         raise HTTPException(status_code=400, detail="Nombre y email son requeridos")
 
     db = get_db()
-    existing = await db.app_users.find_one({"email": email})
+    existing = await db.app_users.find_one({"email": {"$regex": f"^{re.escape(email)}$", "$options": "i"}})
     if existing:
         raise HTTPException(status_code=409, detail="Ya existe un usuario con ese email")
 
     pw = (data.get("password") or "").strip()
     is_temp = False
     if not pw:
-        pw = f"Lord{datetime.utcnow().strftime('%y%m%d%H%M')}"
+        pw = secrets.token_urlsafe(24)
         is_temp = True
     elif len(pw) < 6:
         raise HTTPException(status_code=400, detail="Password mínimo 6 caracteres")
@@ -477,7 +528,6 @@ async def admin_create_owner(request: Request):
         "status": "active",
         "kyc_status": "approved",  # Admin-created owners are pre-approved
         "password_hash": _hash_password(pw),
-        "_temp_password": pw if is_temp else "",
         "created_at": now,
         "updated_at": now,
         "created_by_admin": True,
@@ -498,21 +548,30 @@ async def admin_update_owner(owner_id: str, request: Request):
     await auth_admin(request)
     if not ObjectId.is_valid(owner_id):
         raise HTTPException(status_code=400, detail="ID inválido")
+    data = await _owner_profile_input(request, creating=False)
     db = get_db()
-    user = await db.app_users.find_one({"_id": ObjectId(owner_id)})
+    user = await db.app_users.find_one(_owner_account_filter(owner_id))
     if not user:
         raise HTTPException(status_code=404, detail="Propietario no encontrado")
 
-    data = await request.json()
+    if "email" in data and data["email"] != str(user.get("email") or "").strip().lower():
+        raise HTTPException(status_code=409, detail="El email de acceso no se puede cambiar desde el perfil.")
+    if "status" in data and data["status"] != user.get("status", "active"):
+        raise HTTPException(status_code=409, detail="Usa la acción de desactivación para cambiar el estado del propietario.")
     update = {}
-    for f in ["name", "email", "phone", "tax_id", "address", "city", "state", "zip_code", "status", "kyc_status"]:
+    for f in ["name", "phone", "tax_id", "address", "city", "state", "zip_code", "kyc_status"]:
         if f in data:
             update[f] = data[f]
     if "company" in data:
         update["business_name"] = data["company"]
     update["updated_at"] = datetime.utcnow()
 
-    await db.app_users.update_one({"_id": ObjectId(owner_id)}, {"$set": update})
+    result = await db.app_users.update_one(
+        {**_owner_account_filter(owner_id), "updated_at": user.get("updated_at")},
+        {"$set": update},
+    )
+    if result.matched_count != 1:
+        raise HTTPException(status_code=409, detail="El propietario cambió antes de guardar. Actualiza la lista.")
     return {"success": True, "message": "Propietario actualizado"}
 
 
@@ -523,7 +582,7 @@ async def admin_delete_owner(owner_id: str, request: Request):
     if not ObjectId.is_valid(owner_id):
         raise HTTPException(status_code=400, detail="ID inválido")
     db = get_db()
-    user = await db.app_users.find_one({"_id": ObjectId(owner_id)})
+    user = await db.app_users.find_one(_owner_account_filter(owner_id))
     if not user:
         raise HTTPException(status_code=404, detail="Propietario no encontrado")
 
@@ -550,7 +609,7 @@ async def admin_delete_owner(owner_id: str, request: Request):
 
     now = datetime.utcnow()
     result = await db.app_users.update_one(
-        {"_id": ObjectId(owner_id), "status": {"$ne": "deleted"}},
+        _owner_account_filter(owner_id),
         {"$set": {"deleted": True, "deleted_at": now, "status": "deleted"}},
     )
     if result.matched_count != 1:
@@ -587,7 +646,7 @@ async def admin_get_owner_detail(owner_id: str, request: Request):
     if not ObjectId.is_valid(owner_id):
         raise HTTPException(status_code=400, detail="ID inválido")
     db = get_db()
-    user = await db.app_users.find_one({"_id": ObjectId(owner_id)})
+    user = await db.app_users.find_one(_owner_account_filter(owner_id))
     if not user:
         raise HTTPException(status_code=404, detail="Propietario no encontrado")
 
