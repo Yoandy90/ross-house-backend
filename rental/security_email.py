@@ -19,6 +19,33 @@ SPANISH_MONTHS = (
     "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre",
 )
 
+_MAINTENANCE_CATEGORY_LABELS = {
+    "es": {
+        "plumbing": "Plomería", "electrical": "Eléctrico",
+        "appliance": "Electrodoméstico", "hvac": "A/C - Calefacción",
+        "structural": "Estructura", "pest": "Plagas",
+        "cleaning": "Limpieza", "other": "Otro", "general": "General",
+    },
+    "en": {
+        "plumbing": "Plumbing", "electrical": "Electrical",
+        "appliance": "Appliance", "hvac": "HVAC",
+        "structural": "Structural", "pest": "Pest control",
+        "cleaning": "Cleaning", "other": "Other", "general": "General",
+    },
+}
+_MAINTENANCE_PRIORITY_LABELS = {
+    "es": {"low": "Baja", "normal": "Normal", "medium": "Media",
+           "high": "Alta", "urgent": "Urgente"},
+    "en": {"low": "Low", "normal": "Normal", "medium": "Medium",
+           "high": "High", "urgent": "Urgent"},
+}
+
+
+def _localized_maintenance_label(labels: dict, value: str, locale: str,
+                                  fallback: str) -> str:
+    key = " ".join(str(value or "").split()).lower() or fallback
+    return labels[locale].get(key, key.replace("_", " ").title())
+
 
 def _normalize_locale(locale: str) -> str:
     return "en" if str(locale or "").strip().lower().startswith("en") else "es"
@@ -186,8 +213,12 @@ def build_maintenance_received_message(
     safe_title = escape(" ".join(str(title or "").split()))
     missing_address = "Not provided" if locale == "en" else "No indicada"
     safe_address = escape(" ".join(str(property_address or "").split()) or missing_address)
-    safe_category = escape(" ".join(str(category or "").split()) or "general")
-    safe_priority = escape(" ".join(str(priority or "").split()) or "normal")
+    raw_category = _localized_maintenance_label(
+        _MAINTENANCE_CATEGORY_LABELS, category, locale, "general")
+    raw_priority = _localized_maintenance_label(
+        _MAINTENANCE_PRIORITY_LABELS, priority, locale, "normal")
+    safe_category = escape(raw_category)
+    safe_priority = escape(raw_priority)
     safe_photo_count = max(0, min(int(photo_count or 0), 5))
     timestamp = _format_changed_at(submitted_at, locale)
     raw_name = " ".join(str(name or "").split()) or fallback_name
@@ -201,8 +232,8 @@ def build_maintenance_received_message(
             f"Request number: {request_id}\n"
             f"Title: {raw_title}\n"
             f"Property: {raw_address}\n"
-            f"Category: {' '.join(str(category or '').split()) or 'general'}\n"
-            f"Priority: {' '.join(str(priority or '').split()) or 'normal'}\n"
+            f"Category: {raw_category}\n"
+            f"Priority: {raw_priority}\n"
             f"Photos received: {safe_photo_count}\n"
             f"Date: {timestamp}\n\n"
             "Keep this number for tracking. We will notify you when the status changes.\n\n"
@@ -235,8 +266,8 @@ def build_maintenance_received_message(
         f"Número de solicitud: {request_id}\n"
         f"Título: {' '.join(str(title or '').split())}\n"
         f"Propiedad: {raw_address}\n"
-        f"Categoría: {' '.join(str(category or '').split()) or 'general'}\n"
-        f"Prioridad: {' '.join(str(priority or '').split()) or 'normal'}\n"
+        f"Categoría: {raw_category}\n"
+        f"Prioridad: {raw_priority}\n"
         f"Fotos recibidas: {safe_photo_count}\n"
         f"Fecha: {timestamp}\n\n"
         "Conserva este número para dar seguimiento. Te avisaremos cuando cambie el estado.\n\n"
