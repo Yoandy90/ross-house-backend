@@ -52,6 +52,29 @@ def _id_values(value):
     return values
 
 
+_SAFE_COMMAND_FAILURE_REASONS = {
+    'climate_provider_rejected',
+    'climate_provider_unavailable',
+    'climate_reconnect_required',
+    'climate_provider_invalid_redirect',
+    'climate_provider_invalid',
+    'climate_busy',
+}
+
+
+def _safe_command_failure_reason(exc: HTTPException) -> str:
+    detail = exc.detail if isinstance(exc.detail, str) else ''
+    return detail if detail in _SAFE_COMMAND_FAILURE_REASONS else 'climate_command_unconfirmed'
+
+
+def _command_result(document: dict) -> dict:
+    result = {'status': document.get('status', 'unknown')}
+    reason = document.get('failure_reason')
+    if result['status'] == 'unknown' and reason in _SAFE_COMMAND_FAILURE_REASONS | {'climate_command_unconfirmed'}:
+        result['reason'] = reason
+    return result
+
+
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra='forbid', allow_inf_nan=False)
 
@@ -344,7 +367,7 @@ async def issue_command(binding, user, body):
     if previous:
         if previous['device_id'] != binding['_id'] or previous['digest'] != digest:
             raise HTTPException(409, 'climate_request_conflict')
-        return {'status': previous['status']}
+        return _command_result(previous)
     # Per-device lease serializes commands across API workers.
     locked = await db.climate_bindings.find_one_and_update({'_id': binding['_id'], '$or': [
         {'busy_until': {'$exists': False}}, {'busy_until': {'$lt': provider.now()}}]},
@@ -365,13 +388,26 @@ async def issue_command(binding, user, body):
         observed = await provider.device(db, binding)
         observed_state = snapshot(observed)
         status = 'confirmed' if all(observed.get('changeableValues', {}).get(k) == v for k, v in values.items()) else 'pending'
-        await db.climate_commands.update_one({'_id': key}, {'$set': {'status': status}})
+        await db.climate_commands.update_one(
+            {'_id': key},
+            {'$set': {'status': status, 'finished_at': provider.now()},
+             '$unset': {'failure_reason': '', 'failure_http_status': ''}},
+        )
         await climate_monitor.record_snapshot(db, binding, observed_state, source='command')
         return {'status': status}
-    except HTTPException:
+    except HTTPException as exc:
         if inserted:
-            await db.climate_commands.update_one({'_id': key}, {'$set': {'status': 'unknown'}})
-            return {'status': 'unknown'}
+            reason = _safe_command_failure_reason(exc)
+            await db.climate_commands.update_one(
+                {'_id': key},
+                {'$set': {
+                    'status': 'unknown',
+                    'failure_reason': reason,
+                    'failure_http_status': int(exc.status_code),
+                    'finished_at': provider.now(),
+                }},
+            )
+            return {'status': 'unknown', 'reason': reason}
         raise
     finally:
         await db.climate_bindings.update_one({'_id': binding['_id'], 'command_lock': key}, {'$unset': {'busy_until': '', 'command_lock': ''}})
@@ -388,7 +424,7 @@ async def issue_feature_command(binding, user, request_id, kind, requested):
     if previous:
         if previous['device_id'] != binding['_id'] or previous['digest'] != digest:
             raise HTTPException(409, 'climate_request_conflict')
-        return {'status': previous['status']}
+        return _command_result(previous)
     locked = await db.climate_bindings.find_one_and_update({'_id': binding['_id'], '$or': [
         {'busy_until': {'$exists': False}}, {'busy_until': {'$lt': provider.now()}}]},
         {'$set': {'busy_until': provider.now() + timedelta(seconds=180), 'command_lock': key}})
@@ -425,7 +461,11 @@ async def issue_feature_command(binding, user, request_id, kind, requested):
             else observed.get('holdStatus') == requested['mode']
         )
         status = 'confirmed' if confirmed else 'pending'
-        await db.climate_commands.update_one({'_id': key}, {'$set': {'status': status}})
+        await db.climate_commands.update_one(
+            {'_id': key},
+            {'$set': {'status': status, 'finished_at': provider.now()},
+             '$unset': {'failure_reason': '', 'failure_http_status': ''}},
+        )
         if kind == 'hold' and status == 'confirmed':
             await db.climate_bindings.update_one(
                 {'_id': binding['_id']},
@@ -437,10 +477,19 @@ async def issue_feature_command(binding, user, request_id, kind, requested):
             )
         await climate_monitor.record_snapshot(db, binding, observed, source=kind)
         return {'status': status}
-    except HTTPException:
+    except HTTPException as exc:
         if inserted:
-            await db.climate_commands.update_one({'_id': key}, {'$set': {'status': 'unknown'}})
-            return {'status': 'unknown'}
+            reason = _safe_command_failure_reason(exc)
+            await db.climate_commands.update_one(
+                {'_id': key},
+                {'$set': {
+                    'status': 'unknown',
+                    'failure_reason': reason,
+                    'failure_http_status': int(exc.status_code),
+                    'finished_at': provider.now(),
+                }},
+            )
+            return {'status': 'unknown', 'reason': reason}
         raise
     finally:
         await db.climate_bindings.update_one(
@@ -464,6 +513,30 @@ async def tenant_binding(device_id: str, request: Request):
     if not binding:
         raise HTTPException(404, 'climate_device_not_found')
     return user, binding
+
+
+@router.get('/admin/climate/devices/{device_id}/commands')
+async def admin_climate_command_history(device_id: str, request: Request):
+    await admin_binding(device_id, request)
+    rows = await get_db().climate_commands.find(
+        {'device_id': device_id},
+        {
+            '_id': 0,
+            'device_id': 0,
+            'actor': 0,
+            'digest': 0,
+        },
+    ).sort('created_at', -1).limit(25).to_list(25)
+    return {
+        'commands': [
+            {
+                **row,
+                'created_at': row.get('created_at').isoformat() if row.get('created_at') else None,
+                'finished_at': row.get('finished_at').isoformat() if row.get('finished_at') else None,
+            }
+            for row in rows
+        ]
+    }
 
 
 @router.get('/admin/climate/devices/{device_id}/weather')
