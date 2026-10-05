@@ -56,6 +56,10 @@ COPY = {
         "es": ("Ventilador funcionando por mucho tiempo", "El ventilador lleva un período prolongado funcionando."),
         "en": ("Fan running for a long time", "The fan has been running for an extended period."),
     },
+    "emergency_heat_extended": {
+        "es": ("Emergency Heat prolongado", "La calefacción de emergencia lleva un período prolongado activa. Revisa el sistema y el consumo."),
+        "en": ("Extended emergency heat", "Emergency heat has been active for an extended period. Review the system and energy use."),
+    },
     "command_unconfirmed": {
         "es": ("Cambio de clima sin confirmar", "Un comando al termostato no pudo confirmarse. Actualiza antes de repetirlo."),
         "en": ("Climate change unconfirmed", "A thermostat command could not be confirmed. Refresh before retrying it."),
