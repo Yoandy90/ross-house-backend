@@ -403,3 +403,56 @@ def test_health_score_distinguishes_low_data_availability():
     )
     assert early["score"] == 100
     assert all(item["type"] != "low_data_availability" for item in early["reasons"])
+
+
+def test_offline_failure_count_dedupes_same_telemetry_bucket():
+    from datetime import datetime, timedelta, timezone
+
+    start = datetime(2026, 10, 5, 21, 0, 10, tzinfo=timezone.utc)
+    first, failures, alert = climate_monitor._failure_progress(None, start)
+    assert first == start
+    assert failures == 1
+    assert alert is False
+
+    health = {
+        "first_failure_at": first,
+        "last_failure_at": start,
+        "failure_count": failures,
+    }
+    _, failures_same_bucket, alert_same_bucket = climate_monitor._failure_progress(
+        health, start + timedelta(minutes=2)
+    )
+    assert failures_same_bucket == 1
+    assert alert_same_bucket is False
+
+    health["last_failure_at"] = start + timedelta(minutes=2)
+    health["failure_count"] = failures_same_bucket
+    _, failures_next_bucket, alert_next_bucket = climate_monitor._failure_progress(
+        health, start + timedelta(minutes=5)
+    )
+    assert failures_next_bucket == 2
+    assert alert_next_bucket is False
+
+    health["last_failure_at"] = start + timedelta(minutes=5)
+    health["failure_count"] = failures_next_bucket
+    _, failures_third_bucket, alert_third_bucket = climate_monitor._failure_progress(
+        health, start + timedelta(minutes=10)
+    )
+    assert failures_third_bucket == 3
+    assert alert_third_bucket is True
+
+
+def test_offline_alert_can_mature_by_elapsed_time_without_request_storm():
+    from datetime import datetime, timedelta, timezone
+
+    start = datetime(2026, 10, 5, 21, 0, 0, tzinfo=timezone.utc)
+    health = {
+        "first_failure_at": start,
+        "last_failure_at": start + timedelta(minutes=10),
+        "failure_count": 2,
+    }
+    _, failures, alert = climate_monitor._failure_progress(
+        health, start + timedelta(minutes=16)
+    )
+    assert failures == 3
+    assert alert is True
