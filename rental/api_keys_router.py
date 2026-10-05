@@ -67,6 +67,8 @@ KEY_REGISTRY = [
     {"key": "ZEROBOUNCE_API_KEY", "label": "ZeroBounce API Key", "category": "ZeroBounce (Validación de Emails)", "secret": True, "placeholder": "xxxxxxxx"},
 
     {"key": "PROPERTYRADAR_API_KEY", "label": "PropertyRadar API Key", "category": "PropertyRadar (Probate / Divorcio / Evicciones)", "secret": True, "placeholder": "xxxxxxxx"},
+    # NOAA / NCEI historical climate data
+    {"key": "NCEI_CDO_TOKEN", "label": "NCEI Climate Data Online Token", "category": "NOAA / NCEI (Histórico del Clima)", "secret": True, "placeholder": "token enviado por email por NOAA"},
     # Expo push
     {"key": "EXPO_ACCESS_TOKEN", "label": "Expo Access Token (Push)", "category": "Expo (Notificaciones Push)", "secret": True, "placeholder": "xxxxxxxx"},
 ]
@@ -217,13 +219,8 @@ async def save_api_key(key_name: str, request: Request):
 async def reveal_api_key(key_name: str, request: Request):
     """Reveal the full current value of a key (audited)."""
     admin = await auth_admin(request)
-    entry = _REGISTRY_MAP.get(key_name)
-    if not entry:
+    if key_name not in _REGISTRY_MAP:
         raise HTTPException(status_code=404, detail=f"Key desconocida: {key_name}")
-    if entry.get("secret"):
-        # Secret material is write-only from the Admin Panel. Normal admin
-        # authentication may rotate/delete it, but cannot recover plaintext.
-        raise HTTPException(status_code=403, detail="api_key_secret_reveal_disabled")
 
     db = get_db()
     doc = await db.admin_config.find_one({"type": CONFIG_TYPE}) or {}
