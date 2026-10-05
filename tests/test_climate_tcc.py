@@ -13,8 +13,14 @@ from rental import climate_tcc as tcc, climate_provider as provider, climate_rou
 from rental.climate_policy import validate_change
 
 RESPONSE = {'success': True, 'deviceLive': True, 'communicationLost': False,
-    'latestData': {'uiData': {'DisplayUnits': 'F', 'DispTemperature': 73,
+    'latestData': {'hasFan': True,
+        'fanData': {'fanMode': 0, 'fanIsRunning': False, 'fanModeAutoAllowed': True,
+                    'fanModeOnAllowed': True, 'fanModeCirculateAllowed': True},
+        'uiData': {'DisplayUnits': 'F', 'DispTemperature': 73,
         'IndoorHumidity': 39, 'IndoorHumiditySensorAvailable': True, 'IndoorHumiditySensorNotFault': True,
+        'OutdoorTemperatureAvailable': True, 'OutdoorTemperature': 54,
+        'OutdoorHumidityAvailable': True, 'OutdoorHumidity': 92,
+        'StatusHeat': 2, 'StatusCool': 2,
         'SystemSwitchPosition': 4, 'EquipmentOutputStatus': 1, 'HeatSetpoint': 68, 'CoolSetpoint': 74,
         'SwitchOffAllowed': True, 'SwitchHeatAllowed': True, 'SwitchCoolAllowed': True, 'SwitchAutoAllowed': True,
         'HeatLowerSetptLimit': 40, 'HeatUpperSetptLimit': 90,
@@ -26,6 +32,10 @@ def test_normalization_and_limits():
     assert raw['indoorTemperature'] == 73 and raw['indoorHumidity'] == 39
     assert raw['units'] == 'Fahrenheit' and raw['isAlive'] is True
     assert raw['activity'] == 'heating'
+    assert raw['outdoorTemperature'] == 54 and raw['displayedOutdoorHumidity'] == 92
+    assert raw['fan']['supported'] is True and raw['fan']['allowedModes'] == ['Auto', 'On', 'Circulate']
+    assert raw['fan']['mode'] == 'Auto' and raw['fan']['running'] is False
+    assert raw['holdStatus'] == 'permanent'
     with pytest.raises(HTTPException):
         validate_change(raw, {'heatSetpoint': 73})
     for key in ('Deadband', 'HeatLowerSetptLimit'):
@@ -137,3 +147,50 @@ def test_timeout_clears_session_and_releases_account_lock(monkeypatch):
     updates = [call.args[1] for call in collection.update_one.call_args_list]
     assert 'session' in updates[0]['$unset'] and 'retry_after' in updates[0]['$set']
     assert 'session_lock' in updates[-1]['$unset']
+
+
+def test_fan_control_uses_advertised_mode_once(monkeypatch):
+    client = SimpleNamespace(
+        get_thermostat_data=AsyncMock(return_value=RESPONSE),
+        set_thermostat_settings=AsyncMock(),
+    )
+    @asynccontextmanager
+    async def fake_account(*args): yield client
+    monkeypatch.setattr(tcc, 'account', fake_account)
+    asyncio.run(tcc.change_fan(None, {'connection_id':'a', 'provider_device_id':'123'}, 'Circulate'))
+    client.set_thermostat_settings.assert_awaited_once_with('123', {'FanMode': 2})
+
+
+def test_fan_control_rejects_unadvertised_mode(monkeypatch):
+    response = deepcopy(RESPONSE)
+    response['latestData']['fanData']['fanModeCirculateAllowed'] = False
+    client = SimpleNamespace(
+        get_thermostat_data=AsyncMock(return_value=response),
+        set_thermostat_settings=AsyncMock(),
+    )
+    @asynccontextmanager
+    async def fake_account(*args): yield client
+    monkeypatch.setattr(tcc, 'account', fake_account)
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(tcc.change_fan(None, {'connection_id':'a', 'provider_device_id':'123'}, 'Circulate'))
+    assert exc.value.status_code == 422
+    client.set_thermostat_settings.assert_not_awaited()
+
+
+def test_hold_resume_and_permanent_are_separate_commands(monkeypatch):
+    client = SimpleNamespace(
+        get_thermostat_data=AsyncMock(return_value=RESPONSE),
+        set_thermostat_settings=AsyncMock(),
+    )
+    @asynccontextmanager
+    async def fake_account(*args): yield client
+    monkeypatch.setattr(tcc, 'account', fake_account)
+    asyncio.run(tcc.change_hold(None, {'connection_id':'a', 'provider_device_id':'123'}, 'schedule'))
+    client.set_thermostat_settings.assert_awaited_once_with('123', {'StatusHeat': 0, 'StatusCool': 0})
+    client.set_thermostat_settings.reset_mock()
+    response = deepcopy(RESPONSE)
+    response['latestData']['uiData']['StatusHeat'] = 0
+    response['latestData']['uiData']['StatusCool'] = 0
+    client.get_thermostat_data.return_value = response
+    asyncio.run(tcc.change_hold(None, {'connection_id':'a', 'provider_device_id':'123'}, 'permanent'))
+    client.set_thermostat_settings.assert_awaited_once_with('123', {'StatusHeat': 2, 'StatusCool': 2})
