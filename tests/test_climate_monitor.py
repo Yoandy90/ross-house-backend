@@ -151,3 +151,49 @@ def test_schedule_rejects_duplicate_day_time():
             {'days': [0, 1], 'time': '06:00', 'mode': 'Heat', 'heatSetpoint': 70},
             {'days': [1, 2], 'time': '06:00', 'mode': 'Heat', 'heatSetpoint': 68},
         ], RAW)
+
+
+def test_emergency_heat_schedule_requires_provider_capability_and_heat_target():
+    raw = dict(RAW)
+    raw['allowedModes'] = [*RAW['allowedModes'], 'EmergencyHeat']
+    period = climate_monitor.validate_period({
+        'days': [0],
+        'time': '05:30',
+        'mode': 'EmergencyHeat',
+        'heatSetpoint': 68,
+    }, raw)
+    assert period == {'mode': 'EmergencyHeat', 'heatSetpoint': 68}
+
+    with pytest.raises(HTTPException):
+        climate_monitor.validate_period({
+            'days': [0],
+            'time': '05:30',
+            'mode': 'EmergencyHeat',
+        }, raw)
+
+    with pytest.raises(HTTPException):
+        climate_monitor.validate_period({
+            'days': [0],
+            'time': '05:30',
+            'mode': 'EmergencyHeat',
+            'heatSetpoint': 68,
+        }, RAW)
+
+
+def test_health_score_penalizes_new_predictive_signals():
+    result = climate_intelligence.score_from_alerts(
+        ['stale_telemetry', 'schedule_missed', 'thermal_envelope_degradation', 'emergency_heat_extended'],
+        {},
+    )
+    assert result['score'] <= 55
+    names = {reason['type'] for reason in result['reasons']}
+    assert 'stale_telemetry' in names
+    assert 'thermal_envelope_degradation' in names
+
+
+def test_advanced_rules_have_safe_defaults():
+    rules = climate_intelligence.DEFAULT_RULES
+    assert rules['stale_reading_minutes'] > 0
+    assert rules['schedule_grace_minutes'] > 0
+    assert rules['thermal_degradation_ratio'] >= 1
+    assert rules['emergency_heat_minutes'] > 0
