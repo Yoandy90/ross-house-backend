@@ -134,6 +134,21 @@ async def lifespan(app: FastAPI):
         logger.info("🏠 Ross House Rentals API stopped.")
         return
 
+    # Climate telemetry/schedule worker is side-effecting when schedules are due.
+    # It is opt-in and starts only after the environment-wide background-job gate,
+    # so staging never executes autonomous thermostat commands.
+    climate_monitor_task = None
+    try:
+        import asyncio
+        from rental.climate_monitor import monitor_enabled, monitor_loop
+        if monitor_enabled():
+            climate_monitor_task = asyncio.create_task(monitor_loop(db))
+            logger.info("   ✅ Climate telemetry + schedule worker scheduled")
+        else:
+            logger.info("   ⏸️ Climate monitor disabled (explicit opt-in required)")
+    except Exception as e:
+        logger.warning(f"   ⚠️ Climate monitor not started: {e}")
+
     # Inspection emails are side-effecting: require an explicit opt-in even when
     # the environment-wide background-job policy permits autonomous work.
     inspection_delivery_task = None
@@ -293,6 +308,13 @@ async def lifespan(app: FastAPI):
     yield
 
     # Graceful shutdown of autonomous workers and cron jobs.
+    if climate_monitor_task and not climate_monitor_task.done():
+        climate_monitor_task.cancel()
+        try:
+            await climate_monitor_task
+        except asyncio.CancelledError:
+            pass
+
     if inspection_delivery_task and not inspection_delivery_task.done():
         inspection_delivery_task.cancel()
         try:
