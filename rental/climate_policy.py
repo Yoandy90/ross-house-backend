@@ -56,7 +56,7 @@ def snapshot(raw):
         'mode': values.get('mode'), 'heatSetpoint': values.get('heatSetpoint'),
         'coolSetpoint': values.get('coolSetpoint'),
         'activity': activity,
-        'modes': [x for x in raw.get('allowedModes', []) if x in ('Off', 'Heat', 'Cool', 'Auto')],
+        'modes': [x for x in raw.get('allowedModes', []) if x in ('Off', 'Heat', 'Cool', 'Auto', 'EmergencyHeat')],
         'fanModes': fan_modes,
         'fanMode': fan.get('mode') or fan_values.get('mode'),
         'fanRunning': fan.get('running') if 'running' in fan else (
