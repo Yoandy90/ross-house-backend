@@ -116,6 +116,7 @@ async def _record_transitions(db, binding: dict, reading: dict):
                 "field": public_name,
                 "before": before,
                 "after": after,
+                "source": reading.get("source"),
                 "created_at": reading["observed_at"],
             })
     if events:
