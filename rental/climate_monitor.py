@@ -349,6 +349,54 @@ async def analytics(db, device_id: str, range_name: str = "7d") -> dict:
     }
 
 
+async def nearest_reading(db, device_id: str, at_value: str) -> dict:
+    try:
+        target = datetime.fromisoformat(at_value.replace("Z", "+00:00"))
+    except (ValueError, TypeError, AttributeError):
+        raise HTTPException(422, "climate_reading_time_invalid")
+    if target.tzinfo is None:
+        target = target.replace(tzinfo=timezone.utc)
+    else:
+        target = target.astimezone(timezone.utc)
+    before = await db.climate_readings.find_one(
+        {"device_id": device_id, "observed_at": {"$lte": target}},
+        sort=[("observed_at", -1)],
+    )
+    after = await db.climate_readings.find_one(
+        {"device_id": device_id, "observed_at": {"$gte": target}},
+        sort=[("observed_at", 1)],
+    )
+    candidates = [row for row in (before, after) if row]
+    if not candidates:
+        raise HTTPException(404, "climate_reading_not_found")
+    row = min(
+        candidates,
+        key=lambda item: abs((item["observed_at"].replace(tzinfo=timezone.utc)
+                              if item["observed_at"].tzinfo is None
+                              else item["observed_at"].astimezone(timezone.utc)) - target),
+    )
+    return {
+        "at": row["observed_at"].isoformat(),
+        "distance_seconds": abs((row["observed_at"].replace(tzinfo=timezone.utc)
+                                 if row["observed_at"].tzinfo is None
+                                 else row["observed_at"].astimezone(timezone.utc)) - target).total_seconds(),
+        "online": row.get("online"),
+        "units": row.get("units"),
+        "temperature": row.get("temperature"),
+        "humidity": row.get("humidity"),
+        "outdoor_temperature": row.get("outdoor_temperature"),
+        "outdoor_humidity": row.get("outdoor_humidity"),
+        "mode": row.get("mode"),
+        "heat_setpoint": row.get("heat_setpoint"),
+        "cool_setpoint": row.get("cool_setpoint"),
+        "activity": row.get("activity"),
+        "fan_mode": row.get("fan_mode"),
+        "fan_running": row.get("fan_running"),
+        "hold_status": row.get("hold_status"),
+        "source": row.get("source"),
+    }
+
+
 def validate_timezone(name: str) -> str:
     try:
         ZoneInfo(name)
