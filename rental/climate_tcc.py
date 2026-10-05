@@ -13,6 +13,7 @@ from datetime import timedelta
 
 import aiohttp
 from aiosomecomfort import AIOSomeComfort, SomeComfortError
+from aiosomecomfort.exceptions import APIError
 from fastapi import HTTPException
 from yarl import URL
 
@@ -80,6 +81,7 @@ def normalize(response):
         'minHeatSetpoint': ui.get('HeatLowerSetptLimit'), 'maxHeatSetpoint': ui.get('HeatUpperSetptLimit'),
         'minCoolSetpoint': ui.get('CoolLowerSetptLimit'), 'maxCoolSetpoint': ui.get('CoolUpperSetptLimit'),
         'deadband': ui.get('Deadband'),
+        'activity': {0: 'idle', 1: 'heating', 2: 'cooling'}.get(ui.get('EquipmentOutputStatus')),
     }
 
 
@@ -167,10 +169,42 @@ async def change(db, binding, values):
         settings = {}
         if 'mode' in command:
             settings['SystemSwitch'] = {'Heat': 1, 'Off': 2, 'Cool': 3, 'Auto': 4}[command['mode']]
-        for name in ('Heat', 'Cool'):
-            key = name.lower() + 'Setpoint'
-            if key in command:
-                settings[name + 'Setpoint'] = command[key]
-                settings.update(StatusHeat=2, StatusCool=2)
+
+        # TCC expects the heat/cool pair to remain internally consistent when either
+        # setpoint changes. Mirror the provider client's own Device behavior: preserve
+        # the untouched setpoint and move it only when required by the native deadband.
+        if 'heatSetpoint' in command or 'coolSetpoint' in command:
+            current = raw['changeableValues']
+            heat = command.get('heatSetpoint', current.get('heatSetpoint'))
+            cool = command.get('coolSetpoint', current.get('coolSetpoint'))
+            band = raw.get('deadband')
+            limits = (
+                raw.get('minHeatSetpoint'), raw.get('maxHeatSetpoint'),
+                raw.get('minCoolSetpoint'), raw.get('maxCoolSetpoint'),
+            )
+            if not all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in (heat, cool, band, *limits)):
+                raise HTTPException(409, 'climate_capabilities_unknown')
+            min_heat, max_heat, min_cool, max_cool = limits
+            if band > 0 and cool - heat < band:
+                if 'heatSetpoint' in command and 'coolSetpoint' not in command:
+                    cool = heat + band
+                elif 'coolSetpoint' in command and 'heatSetpoint' not in command:
+                    heat = cool - band
+                else:
+                    raise HTTPException(422, 'climate_deadband_invalid')
+            if not (min_heat <= heat <= max_heat and min_cool <= cool <= max_cool):
+                raise HTTPException(422, 'climate_temperature_out_of_range')
+            settings.update(
+                HeatSetpoint=heat,
+                CoolSetpoint=cool,
+                StatusHeat=2,
+                StatusCool=2,
+            )
+
         # Exactly one physical command; no retry, including after a timeout.
-        await client.set_thermostat_settings(binding['provider_device_id'], settings)
+        try:
+            await client.set_thermostat_settings(binding['provider_device_id'], settings)
+        except APIError:
+            # The provider explicitly rejected the request; this is not an ambiguous
+            # timeout and should not invalidate the authenticated account session.
+            raise HTTPException(409, 'climate_provider_rejected') from None
