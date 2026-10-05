@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock
 import pytest
 from cryptography.fernet import Fernet
 from fastapi import HTTPException
+from aiosomecomfort.exceptions import APIError
 from yarl import URL
 from rental import climate_tcc as tcc, climate_provider as provider, climate_router as routes
 from rental.climate_policy import validate_change
@@ -14,7 +15,7 @@ from rental.climate_policy import validate_change
 RESPONSE = {'success': True, 'deviceLive': True, 'communicationLost': False,
     'latestData': {'uiData': {'DisplayUnits': 'F', 'DispTemperature': 73,
         'IndoorHumidity': 39, 'IndoorHumiditySensorAvailable': True, 'IndoorHumiditySensorNotFault': True,
-        'SystemSwitchPosition': 4, 'HeatSetpoint': 68, 'CoolSetpoint': 74,
+        'SystemSwitchPosition': 4, 'EquipmentOutputStatus': 1, 'HeatSetpoint': 68, 'CoolSetpoint': 74,
         'SwitchOffAllowed': True, 'SwitchHeatAllowed': True, 'SwitchCoolAllowed': True, 'SwitchAutoAllowed': True,
         'HeatLowerSetptLimit': 40, 'HeatUpperSetptLimit': 90,
         'CoolLowerSetptLimit': 50, 'CoolUpperSetptLimit': 99, 'Deadband': 3}}}
@@ -24,6 +25,7 @@ def test_normalization_and_limits():
     raw = tcc.normalize(RESPONSE)
     assert raw['indoorTemperature'] == 73 and raw['indoorHumidity'] == 39
     assert raw['units'] == 'Fahrenheit' and raw['isAlive'] is True
+    assert raw['activity'] == 'heating'
     with pytest.raises(HTTPException):
         validate_change(raw, {'heatSetpoint': 73})
     for key in ('Deadband', 'HeatLowerSetptLimit'):
@@ -70,7 +72,38 @@ def test_single_atomic_command_and_no_retry(monkeypatch):
     with pytest.raises(TimeoutError):
         asyncio.run(tcc.change(None, {'connection_id':'a', 'provider_device_id':'123'}, values))
     client.set_thermostat_settings.assert_awaited_once_with('123', {
-        'SystemSwitch': 3, 'CoolSetpoint': 75, 'StatusCool': 2, 'StatusHeat': 2})
+        'SystemSwitch': 3, 'HeatSetpoint': 68, 'CoolSetpoint': 75,
+        'StatusCool': 2, 'StatusHeat': 2})
+
+
+def test_heat_change_preserves_pair_and_expands_deadband(monkeypatch):
+    response = deepcopy(RESPONSE)
+    ui = response['latestData']['uiData']
+    ui.update(SystemSwitchPosition=1, HeatSetpoint=71, CoolSetpoint=72, Deadband=3)
+    client = SimpleNamespace(get_thermostat_data=AsyncMock(return_value=response),
+                             set_thermostat_settings=AsyncMock())
+    @asynccontextmanager
+    async def fake_account(*args): yield client
+    monkeypatch.setattr(tcc, 'account', fake_account)
+    values = validate_change(tcc.normalize(response), {'heatSetpoint': 72})
+    asyncio.run(tcc.change(None, {'connection_id':'a', 'provider_device_id':'123'}, values))
+    client.set_thermostat_settings.assert_awaited_once_with('123', {
+        'HeatSetpoint': 72, 'CoolSetpoint': 75, 'StatusCool': 2, 'StatusHeat': 2})
+
+
+def test_provider_rejection_is_explicit_not_timeout(monkeypatch):
+    response = deepcopy(RESPONSE)
+    response['latestData']['uiData']['SystemSwitchPosition'] = 1
+    client = SimpleNamespace(get_thermostat_data=AsyncMock(return_value=response),
+                             set_thermostat_settings=AsyncMock(side_effect=APIError('rejected')))
+    @asynccontextmanager
+    async def fake_account(*args): yield client
+    monkeypatch.setattr(tcc, 'account', fake_account)
+    values = validate_change(tcc.normalize(response), {'heatSetpoint': 69})
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(tcc.change(None, {'connection_id':'a', 'provider_device_id':'123'}, values))
+    assert exc.value.status_code == 409 and exc.value.detail == 'climate_provider_rejected'
+    assert client.set_thermostat_settings.await_count == 1
 
 
 def test_external_redirect_blocked():
