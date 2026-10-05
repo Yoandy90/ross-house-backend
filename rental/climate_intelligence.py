@@ -7,6 +7,7 @@ are stored in climate_alert_rules and fall back to conservative defaults.
 from __future__ import annotations
 
 import math
+import os
 from datetime import datetime, timedelta, timezone
 from statistics import median
 
@@ -27,8 +28,14 @@ DEFAULT_RULES = {
     "excessive_runtime_window_minutes": 180,
     "excessive_runtime_pct": 90.0,
     "fan_continuous_minutes": 240,
+    "emergency_heat_minutes": 60,
     "stale_reading_minutes": 20,
     "schedule_grace_minutes": 20,
+    "unexpected_change_window_minutes": 30,
+    "thermal_recent_days": 7,
+    "thermal_baseline_days": 28,
+    "thermal_degradation_ratio": 1.6,
+    "thermal_min_drift_f_per_hour": 0.75,
     "efficiency_recent_days": 7,
     "efficiency_baseline_days": 28,
     "efficiency_degradation_ratio": 1.5,
@@ -74,13 +81,19 @@ async def set_rules(db, binding: dict, values: dict, actor: str) -> dict:
         raise HTTPException(422, "climate_alert_temperature_thresholds_invalid")
     if merged["humidity_low"] >= merged["humidity_high"] or merged["humidity_high"] > 100:
         raise HTTPException(422, "climate_alert_humidity_thresholds_invalid")
-    if merged["excessive_runtime_pct"] > 100 or merged["efficiency_degradation_ratio"] < 1:
+    if (
+        merged["excessive_runtime_pct"] > 100
+        or merged["efficiency_degradation_ratio"] < 1
+        or merged["thermal_degradation_ratio"] < 1
+    ):
         raise HTTPException(422, "climate_alert_rule_invalid")
     for key in (
         "humidity_sustain_minutes", "rapid_humidity_window_minutes",
         "no_progress_window_minutes", "short_cycle_window_minutes",
         "excessive_runtime_window_minutes", "fan_continuous_minutes",
-        "stale_reading_minutes", "schedule_grace_minutes",
+        "emergency_heat_minutes", "stale_reading_minutes", "schedule_grace_minutes",
+        "unexpected_change_window_minutes", "thermal_recent_days",
+        "thermal_baseline_days", "thermal_min_drift_f_per_hour",
         "efficiency_recent_days", "efficiency_baseline_days",
         "filter_runtime_hours",
     ):
@@ -304,6 +317,23 @@ async def predictive_conditions(db, binding: dict, state: dict, rules: dict, sam
             "Indoor humidity rose rapidly and should be reviewed.",
         )
 
+    # Emergency heat left active for an extended period. This alert is only
+    # possible on equipment that actually reports EmergencyHeat as its current mode.
+    emergency_rows = await _recent_readings(
+        db, device_id, int(rules["emergency_heat_minutes"])
+    )
+    emergency_active = [
+        r for r in emergency_rows if r.get("mode") == "EmergencyHeat"
+    ]
+    result["emergency_heat_extended"] = (
+        bool(
+            len(emergency_rows) >= 3
+            and len(emergency_active) / len(emergency_rows) >= 0.9
+        ),
+        "warning",
+        "Emergency heat has remained active for an extended period.",
+    )
+
     # Fan left running for a long interval.
     fan_rows = await _recent_readings(db, device_id, int(rules["fan_continuous_minutes"]))
     fan_active = [r for r in fan_rows if r.get("fan_running") is True or r.get("fan_mode") == "On"]
@@ -311,6 +341,92 @@ async def predictive_conditions(db, binding: dict, state: dict, rules: dict, sam
         bool(len(fan_rows) >= 6 and len(fan_active) / len(fan_rows) >= 0.9),
         "info",
         "Fan has been running continuously for an extended period.",
+    )
+
+    # Stale telemetry. This is distinct from provider-offline: an otherwise
+    # healthy integration can stop producing fresh samples and should be reviewed.
+    latest_online = await db.climate_readings.find_one(
+        {"device_id": device_id, "online": True},
+        {"observed_at": 1},
+        sort=[("observed_at", -1)],
+    )
+    latest_online_at = (latest_online or {}).get("observed_at")
+    stale = False
+    if state.get("online") is not True and isinstance(latest_online_at, datetime):
+        if latest_online_at.tzinfo is None:
+            latest_online_at = latest_online_at.replace(tzinfo=timezone.utc)
+        stale_minutes = max(0, (now() - latest_online_at).total_seconds() / 60)
+        stale = stale_minutes >= rules["stale_reading_minutes"]
+    result["stale_telemetry"] = (
+        stale,
+        "warning",
+        "Thermostat telemetry is older than the configured freshness threshold.",
+    )
+
+    # Ross House schedule missed: only meaningful when autonomous climate
+    # monitoring is explicitly enabled. Staging keeps this off by policy.
+    schedule_missed = False
+    if os.getenv("CLIMATE_MONITOR_ENABLED") == "true":
+        schedules = await db.climate_schedules.find(
+            {"device_id": device_id, "enabled": True}
+        ).limit(20).to_list(20)
+        current_utc = now()
+        for schedule in schedules:
+            try:
+                from zoneinfo import ZoneInfo
+                local = current_utc.astimezone(ZoneInfo(schedule.get("timezone") or "America/Chicago"))
+            except Exception:
+                continue
+            for index, period in enumerate(schedule.get("periods") or []):
+                if local.weekday() not in period.get("days", []):
+                    continue
+                try:
+                    hour, minute = [int(x) for x in str(period.get("time") or "").split(":", 1)]
+                    scheduled = local.replace(hour=hour, minute=minute, second=0, microsecond=0)
+                except Exception:
+                    continue
+                delay = local - scheduled
+                grace = timedelta(minutes=rules["schedule_grace_minutes"])
+                if delay < grace or delay > timedelta(hours=6):
+                    continue
+                run_key = f"{schedule['_id']}:{index}:{local.date().isoformat()}:{period.get('time')}"
+                run = await db.climate_schedule_runs.find_one({"_id": run_key}, {"status": 1})
+                if not run or run.get("status") not in ("confirmed", "pending"):
+                    schedule_missed = True
+                    break
+            if schedule_missed:
+                break
+    result["schedule_missed"] = (
+        schedule_missed,
+        "warning",
+        "A Ross House climate schedule was due but no successful execution was recorded.",
+    )
+
+    # Unexpected manual/provider-side change while a Ross House schedule exists.
+    # We only inspect transitions that record their source and ignore expected
+    # schedule windows, preventing routine scheduled changes from becoming alerts.
+    unexpected_change = False
+    schedules_exist = await db.climate_schedules.find_one(
+        {"device_id": device_id, "enabled": True}, {"_id": 1}
+    )
+    if schedules_exist:
+        cutoff = now() - timedelta(minutes=rules["unexpected_change_window_minutes"])
+        event = await db.climate_events.find_one(
+            {
+                "device_id": device_id,
+                "type": "state_change",
+                "field": {"$in": ["mode", "heatSetpoint", "coolSetpoint"]},
+                "created_at": {"$gte": cutoff},
+                "source": {"$nin": ["schedule", "monitor"]},
+            },
+            {"_id": 1},
+            sort=[("created_at", -1)],
+        )
+        unexpected_change = bool(event)
+    result["unexpected_change"] = (
+        unexpected_change,
+        "info",
+        "A thermostat mode or setpoint changed outside a Ross House schedule execution.",
     )
 
     # Recent ambiguous command or schedule execution.
@@ -345,6 +461,52 @@ async def predictive_conditions(db, binding: dict, state: dict, rules: dict, sam
         runtime_hours >= rules["filter_runtime_hours"],
         "info",
         "Estimated HVAC/fan runtime has reached the configured filter-service interval.",
+    )
+
+    # Building thermal-envelope drift. Compare idle temperature drift against
+    # this property's own older baseline; this can indicate insulation/air-leak
+    # changes but is intentionally phrased as a review signal, not a diagnosis.
+    thermal_recent_days = int(rules["thermal_recent_days"])
+    thermal_baseline_days = int(rules["thermal_baseline_days"])
+    thermal_start = now() - timedelta(days=thermal_baseline_days)
+    thermal_rows = await db.climate_readings.find(
+        {
+            "device_id": device_id,
+            "observed_at": {"$gte": thermal_start},
+            "activity": "idle",
+        },
+        {"temperature": 1, "observed_at": 1},
+    ).sort("observed_at", 1).limit(100000).to_list(100000)
+    recent_rates, baseline_rates = [], []
+    recent_cutoff = now() - timedelta(days=thermal_recent_days)
+    for first, second in zip(thermal_rows, thermal_rows[1:]):
+        if not finite(first.get("temperature")) or not finite(second.get("temperature")):
+            continue
+        first_at, second_at = first.get("observed_at"), second.get("observed_at")
+        if not isinstance(first_at, datetime) or not isinstance(second_at, datetime):
+            continue
+        if first_at.tzinfo is None:
+            first_at = first_at.replace(tzinfo=timezone.utc)
+        if second_at.tzinfo is None:
+            second_at = second_at.replace(tzinfo=timezone.utc)
+        hours = (second_at - first_at).total_seconds() / 3600
+        if hours <= 0 or hours > 2:
+            continue
+        rate = abs(second["temperature"] - first["temperature"]) / hours
+        (recent_rates if second_at >= recent_cutoff else baseline_rates).append(rate)
+    recent_drift = median(recent_rates) if len(recent_rates) >= 10 else None
+    baseline_drift = median(baseline_rates) if len(baseline_rates) >= 30 else None
+    min_drift = native_delta(rules["thermal_min_drift_f_per_hour"], units)
+    thermal_degraded = bool(
+        recent_drift is not None
+        and baseline_drift is not None
+        and recent_drift >= min_drift
+        and recent_drift > baseline_drift * rules["thermal_degradation_ratio"]
+    )
+    result["thermal_envelope_degradation"] = (
+        thermal_degraded,
+        "warning",
+        "Indoor temperature is drifting faster while HVAC is idle than this property's historical baseline.",
     )
 
     # Efficiency degradation compared with the property's own baseline.
@@ -397,7 +559,12 @@ ALERT_WEIGHTS = {
     "humidity_low_sustained": 8,
     "humidity_rising_fast": 10,
     "schedule_unconfirmed": 10,
+    "schedule_missed": 12,
     "command_unconfirmed": 10,
+    "stale_telemetry": 12,
+    "unexpected_change": 4,
+    "thermal_envelope_degradation": 12,
+    "emergency_heat_extended": 12,
     "fan_extended": 5,
     "filter_runtime": 5,
     "humidity_low": 5,
