@@ -283,3 +283,66 @@ def test_schedule_loop_does_not_collect_telemetry(monkeypatch):
         asyncio.run(climate_monitor.schedule_loop(object()))
 
     assert calls == {"sample": 0, "schedule": 1}
+
+
+def test_weather_fallback_requires_known_thermostat_units():
+    binding = {"_id": "device-1", "property_id": "property-1", "name": "Test"}
+    weather = {
+        "status": "ok",
+        "current": {
+            "temperature_f": 75.2,
+            "humidity": 50.0,
+            "station": "KDUX",
+            "description": "Mostly Clear",
+        },
+        "hourly": [],
+        "alerts": [],
+    }
+    from datetime import datetime, timezone
+    observed = datetime(2026, 10, 5, tzinfo=timezone.utc)
+
+    unknown = climate_monitor._reading_doc(
+        binding,
+        {"online": False, "units": None},
+        observed,
+        "monitor",
+        weather,
+    )
+    assert unknown["nws_temperature_f"] == 75.2
+    assert unknown["outdoor_temperature"] is None
+    assert unknown["outdoor_source"] is None
+
+    fahrenheit = climate_monitor._reading_doc(
+        binding,
+        {"online": True, "units": "Fahrenheit"},
+        observed,
+        "monitor",
+        weather,
+    )
+    assert fahrenheit["outdoor_temperature"] == 75.2
+    assert fahrenheit["outdoor_source"] == "nws"
+
+    celsius = climate_monitor._reading_doc(
+        binding,
+        {"online": True, "units": "Celsius"},
+        observed,
+        "monitor",
+        weather,
+    )
+    assert celsius["outdoor_temperature"] == pytest.approx(24.0, abs=0.01)
+    assert celsius["outdoor_source"] == "nws"
+
+
+def test_online_bucket_is_preserved_from_transient_offline_sample():
+    assert climate_monitor._preserve_existing_bucket(
+        {"online": True},
+        {"online": False},
+    ) is True
+    assert climate_monitor._preserve_existing_bucket(
+        {"online": False},
+        {"online": True},
+    ) is False
+    assert climate_monitor._preserve_existing_bucket(
+        None,
+        {"online": False},
+    ) is False
