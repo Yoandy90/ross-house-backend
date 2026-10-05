@@ -13,6 +13,7 @@ from .tenant_integrity import resolve_authenticated_tenant, find_active_contract
 from . import climate_provider as provider
 from .climate_policy import scope_for_contract, snapshot, validate_change
 from . import climate_monitor
+from . import climate_intelligence
 
 router = APIRouter(tags=['climate'])
 
@@ -82,6 +83,29 @@ class FanCommand(StrictModel):
 class HoldCommand(StrictModel):
     request_id: UUID
     mode: str = Field(min_length=3, max_length=30)
+
+
+class AlertRules(StrictModel):
+    temperature_low_f: float | None = None
+    temperature_high_f: float | None = None
+    humidity_low: float | None = None
+    humidity_high: float | None = None
+    humidity_sustain_minutes: float | None = None
+    rapid_humidity_window_minutes: float | None = None
+    rapid_humidity_delta: float | None = None
+    no_progress_window_minutes: float | None = None
+    no_progress_min_delta_f: float | None = None
+    short_cycle_window_minutes: float | None = None
+    short_cycle_max_starts: float | None = None
+    excessive_runtime_window_minutes: float | None = None
+    excessive_runtime_pct: float | None = None
+    fan_continuous_minutes: float | None = None
+    stale_reading_minutes: float | None = None
+    schedule_grace_minutes: float | None = None
+    efficiency_recent_days: float | None = None
+    efficiency_baseline_days: float | None = None
+    efficiency_degradation_ratio: float | None = None
+    filter_runtime_hours: float | None = None
 
 
 class SchedulePeriod(StrictModel):
@@ -340,6 +364,66 @@ async def tenant_binding(device_id: str, request: Request):
     if not binding:
         raise HTTPException(404, 'climate_device_not_found')
     return user, binding
+
+
+@router.get('/admin/climate/fleet')
+async def admin_climate_fleet(request: Request):
+    await auth_admin(request)
+    return await climate_intelligence.fleet_overview(
+        get_db(),
+        climate_monitor.analytics,
+        sample_minutes=climate_monitor._sample_minutes(),
+    )
+
+
+@router.post('/admin/climate/collect-now')
+async def admin_climate_collect_now(request: Request):
+    await auth_admin(request)
+    require_enabled()
+    return await climate_monitor.sample_all(get_db())
+
+
+@router.get('/admin/climate/devices/{device_id}/health')
+async def admin_climate_health(device_id: str, request: Request):
+    _, binding = await admin_binding(device_id, request)
+    return await climate_intelligence.health_score(
+        get_db(),
+        binding,
+        climate_monitor.analytics,
+        sample_minutes=climate_monitor._sample_minutes(),
+    )
+
+
+@router.get('/tenant/climate/devices/{device_id}/health')
+async def tenant_climate_health(device_id: str, request: Request):
+    _, binding = await tenant_binding(device_id, request)
+    return await climate_intelligence.health_score(
+        get_db(),
+        binding,
+        climate_monitor.analytics,
+        sample_minutes=climate_monitor._sample_minutes(),
+    )
+
+
+@router.get('/admin/climate/devices/{device_id}/alert-rules')
+async def admin_climate_alert_rules(device_id: str, request: Request):
+    _, binding = await admin_binding(device_id, request)
+    return {'rules': await climate_intelligence.get_rules(get_db(), binding)}
+
+
+@router.put('/admin/climate/devices/{device_id}/alert-rules')
+async def admin_update_climate_alert_rules(device_id: str, body: AlertRules, request: Request):
+    user, binding = await admin_binding(device_id, request)
+    values = body.model_dump(exclude_none=True)
+    return {'rules': await climate_intelligence.set_rules(
+        get_db(), binding, values, actor_id(user)
+    )}
+
+
+@router.post('/admin/climate/devices/{device_id}/filter-reset')
+async def admin_climate_filter_reset(device_id: str, request: Request):
+    user, binding = await admin_binding(device_id, request)
+    return await climate_intelligence.reset_filter(get_db(), binding, actor_id(user))
 
 
 @router.get('/admin/climate/devices/{device_id}/analytics')
