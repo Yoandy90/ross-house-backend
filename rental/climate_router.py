@@ -6,7 +6,7 @@ from datetime import timedelta
 from uuid import UUID, uuid4
 from bson import ObjectId
 from fastapi import APIRouter, HTTPException, Request
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, SecretStr
 from pymongo.errors import DuplicateKeyError
 from .shared import auth_admin, auth_marketplace, get_db
 from .tenant_integrity import resolve_authenticated_tenant, find_active_contract_for_tenant
@@ -49,6 +49,11 @@ class StrictModel(BaseModel):
 class OAuthComplete(StrictModel):
     state: str = Field(min_length=20, max_length=200)
     code: str = Field(min_length=1, max_length=4096)
+
+
+class TCCConnect(StrictModel):
+    username: str = Field(min_length=3, max_length=254)
+    password: SecretStr = Field(min_length=1, max_length=512)
 
 
 class Binding(StrictModel):
@@ -96,10 +101,12 @@ async def admin_list(request: Request):
     await auth_admin(request)
     db = get_db()
     bindings = await db.climate_bindings.find({}).limit(200).to_list(200)
-    connections = await db.climate_connections.find({}, {'_id': 1}).limit(100).to_list(100)
+    connections = await db.climate_connections.find({}, {'_id': 1, 'provider': 1}).limit(100).to_list(100)
     properties = await db.properties.find({}, {'address': 1}).limit(500).to_list(500)
     units = await db.property_units.find({}, {'property_id': 1, 'unit_name': 1}).limit(2000).to_list(2000)
     return {'enabled': enabled(), 'configured': provider.configured(), 'control_enabled': control(),
+            'providers': {'first_alert': provider.configured(), 'tcc_us': provider.tcc_configured()},
+            'connection_details': [{'id': str(c['_id']), 'provider': c.get('provider', 'first_alert')} for c in connections],
             'devices': [await read_binding(b) for b in bindings],
             'connections': [str(c['_id']) for c in connections],
             'properties': [{'id': str(p['_id']), 'name': str(p.get('address') or p['_id'])} for p in properties],
@@ -127,14 +134,20 @@ async def oauth_complete(body: OAuthComplete, request: Request):
     return {'connection_id': await provider.finish_oauth(get_db(), actor_id(user), body.state, body.code)}
 
 
+@router.post('/admin/climate/tcc/connect')
+async def tcc_connect(body: TCCConnect, request: Request):
+    user = await auth_admin(request)
+    require_enabled()
+    from . import climate_tcc
+    return {'connection_id': await climate_tcc.connect(
+        get_db(), actor_id(user), body.username.strip(), body.password.get_secret_value())}
+
+
 @router.get('/admin/climate/discover/{connection_id}')
 async def discover(connection_id: str, request: Request):
     await auth_admin(request)
     require_enabled()
-    locations = await provider.api(get_db(), connection_id, 'GET', '/locations')
-    return {'devices': [{'location_id': str(l['locationID']), 'provider_device_id': str(d['deviceID']),
-                         'name': d.get('userDefinedDeviceName') or d.get('name') or d['deviceID']}
-                        for l in locations for d in l.get('devices', []) if d.get('deviceID') and d.get('deviceClass') == 'Thermostat']}
+    return {'devices': await provider.discover(get_db(), connection_id)}
 
 
 @router.post('/admin/climate/bindings')
@@ -154,9 +167,11 @@ async def bind(body: Binding, request: Request):
     if not any(d['provider_device_id'] == body.provider_device_id and d['location_id'] == body.location_id for d in devices):
         raise HTTPException(422, 'climate_device_invalid')
     # Global device identity prevents assignment of one thermostat to two homes, even after reauthorization.
-    identifier = hashlib.sha256(body.provider_device_id.encode()).hexdigest()
+    kind = await provider.connection_kind(db, body.connection_id)
+    identity = body.provider_device_id if kind == 'first_alert' else kind + ':' + body.provider_device_id
+    identifier = hashlib.sha256(identity.encode()).hexdigest()
     record = body.model_dump()
-    record.update(_id=identifier, created_by=actor_id(user), created_at=provider.now())
+    record.update(_id=identifier, provider=kind, created_by=actor_id(user), created_at=provider.now())
     try:
         await db.climate_bindings.insert_one(record)
     except DuplicateKeyError:
@@ -180,7 +195,7 @@ async def issue_command(binding, user, body):
     # Per-device lease serializes commands across API workers.
     locked = await db.climate_bindings.find_one_and_update({'_id': binding['_id'], '$or': [
         {'busy_until': {'$exists': False}}, {'busy_until': {'$lt': provider.now()}}]},
-        {'$set': {'busy_until': provider.now() + timedelta(seconds=90), 'command_lock': key}})
+        {'$set': {'busy_until': provider.now() + timedelta(seconds=180), 'command_lock': key}})
     if not locked:
         raise HTTPException(409, 'climate_busy')
     inserted = False

@@ -39,13 +39,28 @@ def configured():
         return False
 
 
+def cipher():
+    try:
+        return Fernet(os.environ['CLIMATE_TOKEN_KEY'].encode())
+    except (KeyError, ValueError, TypeError):
+        raise HTTPException(503, 'climate_not_configured')
+
+
+def tcc_configured():
+    try:
+        cipher()
+        return True
+    except HTTPException:
+        return False
+
+
 def seal(value):
-    return Fernet(config()[2].encode()).encrypt(json.dumps(value).encode()).decode()
+    return cipher().encrypt(json.dumps(value).encode()).decode()
 
 
 def unseal(value):
     try:
-        return json.loads(Fernet(config()[2].encode()).decrypt(value.encode()))
+        return json.loads(cipher().decrypt(value.encode()))
     except (InvalidToken, ValueError, TypeError):
         raise HTTPException(503, 'climate_reconnect_required')
 
@@ -90,7 +105,7 @@ async def finish_oauth(db, actor, state, code):
                                   'redirect_uri': config()[3]})
     connection_id = secrets.token_hex(16)
     await db.climate_connections.insert_one({
-        '_id': connection_id, 'tokens': seal(result), 'created_by': actor,
+        '_id': connection_id, 'provider': 'first_alert', 'tokens': seal(result), 'created_by': actor,
         'created_at': now(), 'expires_at': now() + timedelta(seconds=int(result.get('expires_in', 600))),
     })
     return connection_id
@@ -150,13 +165,40 @@ async def api(db, connection_id, method, path, location_id=None, body=None):
         raise HTTPException(503, 'climate_provider_unavailable')
 
 
+async def connection_kind(db, connection_id):
+    record = await db.climate_connections.find_one({'_id': connection_id})
+    if not record:
+        raise HTTPException(503, 'climate_reconnect_required')
+    kind = record.get('provider', 'first_alert')
+    if kind not in ('first_alert', 'tcc_us'):
+        raise HTTPException(503, 'climate_provider_unsupported')
+    return kind
+
+
+async def discover(db, connection_id):
+    if await connection_kind(db, connection_id) == 'tcc_us':
+        from . import climate_tcc
+        return await climate_tcc.discover(db, connection_id)
+    locations = await api(db, connection_id, 'GET', '/locations')
+    return [{'location_id': str(l['locationID']), 'provider_device_id': str(d['deviceID']),
+             'name': d.get('userDefinedDeviceName') or d.get('name') or str(d['deviceID'])}
+            for l in locations for d in l.get('devices', [])
+            if d.get('deviceID') and d.get('deviceClass') == 'Thermostat']
+
+
 async def device(db, binding):
+    if await connection_kind(db, binding['connection_id']) == 'tcc_us':
+        from . import climate_tcc
+        return await climate_tcc.device(db, binding)
     return await api(db, binding['connection_id'], 'GET',
                      '/devices/thermostats/' + quote(binding['provider_device_id'], safe=''),
                      binding['location_id'])
 
 
 async def change(db, binding, values):
+    if await connection_kind(db, binding['connection_id']) == 'tcc_us':
+        from . import climate_tcc
+        return await climate_tcc.change(db, binding, values)
     await api(db, binding['connection_id'], 'POST',
               '/devices/thermostats/' + quote(binding['provider_device_id'], safe=''),
               binding['location_id'], values)

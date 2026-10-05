@@ -24,3 +24,6 @@ emergentintegrations>=0.2.0
 Pillow>=10.0.0
 plaid-python==37.1.0
 qrcode==8.2
+
+# TCC US protocol client; audited single-submit control, isolated cookies.
+AIOSomecomfort==0.0.38
