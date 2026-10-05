@@ -85,6 +85,13 @@ class HoldCommand(StrictModel):
     mode: str = Field(min_length=3, max_length=30)
 
 
+class EnergyConfig(StrictModel):
+    heat_kw: float
+    cool_kw: float
+    fan_kw: float
+    electric_rate: float
+
+
 class AlertRules(StrictModel):
     temperature_low_f: float | None = None
     temperature_high_f: float | None = None
@@ -417,6 +424,20 @@ async def admin_update_climate_alert_rules(device_id: str, body: AlertRules, req
     values = body.model_dump(exclude_none=True)
     return {'rules': await climate_intelligence.set_rules(
         get_db(), binding, values, actor_id(user)
+    )}
+
+
+@router.get('/admin/climate/devices/{device_id}/energy-config')
+async def admin_climate_energy_config(device_id: str, request: Request):
+    _, binding = await admin_binding(device_id, request)
+    return {'config': await climate_intelligence.get_energy_config(get_db(), binding)}
+
+
+@router.put('/admin/climate/devices/{device_id}/energy-config')
+async def admin_update_climate_energy_config(device_id: str, body: EnergyConfig, request: Request):
+    user, binding = await admin_binding(device_id, request)
+    return {'config': await climate_intelligence.set_energy_config(
+        get_db(), binding, body.model_dump(), actor_id(user)
     )}
 
 
