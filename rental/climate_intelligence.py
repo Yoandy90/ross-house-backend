@@ -28,6 +28,7 @@ DEFAULT_RULES = {
     "excessive_runtime_window_minutes": 180,
     "excessive_runtime_pct": 90.0,
     "fan_continuous_minutes": 240,
+    "emergency_heat_minutes": 60,
     "stale_reading_minutes": 20,
     "schedule_grace_minutes": 20,
     "unexpected_change_window_minutes": 30,
@@ -90,7 +91,7 @@ async def set_rules(db, binding: dict, values: dict, actor: str) -> dict:
         "humidity_sustain_minutes", "rapid_humidity_window_minutes",
         "no_progress_window_minutes", "short_cycle_window_minutes",
         "excessive_runtime_window_minutes", "fan_continuous_minutes",
-        "stale_reading_minutes", "schedule_grace_minutes",
+        "emergency_heat_minutes", "stale_reading_minutes", "schedule_grace_minutes",
         "unexpected_change_window_minutes", "thermal_recent_days",
         "thermal_baseline_days", "thermal_min_drift_f_per_hour",
         "efficiency_recent_days", "efficiency_baseline_days",
@@ -315,6 +316,23 @@ async def predictive_conditions(db, binding: dict, state: dict, rules: dict, sam
             "warning",
             "Indoor humidity rose rapidly and should be reviewed.",
         )
+
+    # Emergency heat left active for an extended period. This alert is only
+    # possible on equipment that actually reports EmergencyHeat as its current mode.
+    emergency_rows = await _recent_readings(
+        db, device_id, int(rules["emergency_heat_minutes"])
+    )
+    emergency_active = [
+        r for r in emergency_rows if r.get("mode") == "EmergencyHeat"
+    ]
+    result["emergency_heat_extended"] = (
+        bool(
+            len(emergency_rows) >= 3
+            and len(emergency_active) / len(emergency_rows) >= 0.9
+        ),
+        "warning",
+        "Emergency heat has remained active for an extended period.",
+    )
 
     # Fan left running for a long interval.
     fan_rows = await _recent_readings(db, device_id, int(rules["fan_continuous_minutes"]))
@@ -544,6 +562,7 @@ ALERT_WEIGHTS = {
     "stale_telemetry": 12,
     "unexpected_change": 4,
     "thermal_envelope_degradation": 12,
+    "emergency_heat_extended": 12,
     "fan_extended": 5,
     "filter_runtime": 5,
     "humidity_low": 5,
