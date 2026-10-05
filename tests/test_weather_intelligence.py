@@ -170,3 +170,53 @@ def test_weather_context_never_creates_hvac_command_payload():
     serialized = repr(advice).lower()
     for forbidden in ("heatsetpoint", "coolsetpoint", "request_id", "provider.change"):
         assert forbidden not in serialized
+
+
+def test_comfort_setpoint_suggestions_are_structured_and_never_automatic():
+    cases = [
+        (
+            {
+                "status": "ok",
+                "current": {"temperature_f": 25},
+                "hourly": [{"temperature_f": 22}, {"temperature_f": 28}],
+                "alerts": [],
+            },
+            "Heat",
+            [68, 70],
+            "cold_forecast",
+        ),
+        (
+            {
+                "status": "ok",
+                "current": {"temperature_f": 98},
+                "hourly": [{"temperature_f": 96}, {"temperature_f": 101}],
+                "alerts": [],
+            },
+            "Cool",
+            [74, 76],
+            "extreme_heat_forecast",
+        ),
+        (
+            {
+                "status": "ok",
+                "current": {"temperature_f": 70},
+                "hourly": [{"temperature_f": 60}, {"temperature_f": 74}],
+                "alerts": [],
+            },
+            "Auto",
+            [68, 76],
+            "mild_forecast",
+        ),
+    ]
+    for weather, mode, expected_range, basis in cases:
+        suggestion = weather_intelligence.comfort_setpoint_suggestion(
+            {"units": "Fahrenheit", "temperature": 72, "activity": "idle"},
+            weather,
+        )
+        assert suggestion["suggested_mode"] == mode
+        assert suggestion["range_f"] == expected_range
+        assert suggestion["basis"] == basis
+        assert suggestion["automatic"] is False
+        assert "request_id" not in suggestion
+        assert "heatSetpoint" not in suggestion
+        assert "coolSetpoint" not in suggestion
