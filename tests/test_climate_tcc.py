@@ -194,3 +194,35 @@ def test_hold_resume_and_permanent_are_separate_commands(monkeypatch):
     client.get_thermostat_data.return_value = response
     asyncio.run(tcc.change_hold(None, {'connection_id':'a', 'provider_device_id':'123'}, 'permanent'))
     client.set_thermostat_settings.assert_awaited_once_with('123', {'StatusHeat': 2, 'StatusCool': 2})
+
+
+def test_emergency_heat_is_capability_gated_and_uses_native_switch(monkeypatch):
+    response = deepcopy(RESPONSE)
+    ui = response['latestData']['uiData']
+    ui.update(SystemSwitchPosition=0, SwitchEmergencyHeatAllowed=True)
+    raw = tcc.normalize(response)
+    assert raw['changeableValues']['mode'] == 'EmergencyHeat'
+    assert 'EmergencyHeat' in raw['allowedModes']
+
+    client = SimpleNamespace(
+        get_thermostat_data=AsyncMock(return_value=response),
+        set_thermostat_settings=AsyncMock(),
+    )
+    @asynccontextmanager
+    async def fake_account(*args): yield client
+    monkeypatch.setattr(tcc, 'account', fake_account)
+
+    # Move away first so the provider actually receives a command.
+    response2 = deepcopy(response)
+    response2['latestData']['uiData']['SystemSwitchPosition'] = 1
+    client.get_thermostat_data.return_value = response2
+    values = validate_change(tcc.normalize(response2), {'mode': 'EmergencyHeat'})
+    asyncio.run(tcc.change(None, {'connection_id':'a', 'provider_device_id':'123'}, values))
+    client.set_thermostat_settings.assert_awaited_once_with('123', {'SystemSwitch': 0})
+
+
+def test_emergency_heat_not_advertised_is_rejected():
+    raw = tcc.normalize(RESPONSE)
+    assert 'EmergencyHeat' not in raw['allowedModes']
+    with pytest.raises(HTTPException):
+        validate_change(raw, {'mode': 'EmergencyHeat'})
