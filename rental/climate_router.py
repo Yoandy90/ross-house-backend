@@ -14,6 +14,7 @@ from . import climate_provider as provider
 from .climate_policy import scope_for_contract, snapshot, validate_change
 from . import climate_monitor
 from . import climate_intelligence
+from . import weather_intelligence
 
 router = APIRouter(tags=['climate'])
 
@@ -103,6 +104,12 @@ class ClimateNotificationPreferences(StrictModel):
     temperature: bool = True
     humidity: bool = True
     predictive: bool = True
+    weather: bool = True
+
+
+class WeatherLocation(StrictModel):
+    latitude: float = Field(ge=-90, le=90)
+    longitude: float = Field(ge=-180, le=180)
 
 
 class AlertRules(StrictModel):
@@ -174,7 +181,23 @@ async def read_binding(binding):
             state = snapshot(await provider.device(get_db(), binding))
             result.update(state)
             result['observed_at'] = provider.now().isoformat()
-            await climate_monitor.record_snapshot(get_db(), binding, state, source='read')
+            reading = await climate_monitor.record_snapshot(get_db(), binding, state, source='read')
+            if reading.get('outdoor_source') and reading.get('outdoor_temperature') is not None:
+                result['outdoorTemperature'] = reading.get('outdoor_temperature')
+                result['outdoorHumidity'] = reading.get('outdoor_humidity')
+                result['outdoorSource'] = reading.get('outdoor_source')
+            result['weatherSummary'] = {
+                'source': 'NWS' if reading.get('nws_temperature_f') is not None else None,
+                'temperature_f': reading.get('nws_temperature_f'),
+                'humidity': reading.get('nws_humidity'),
+                'wind_speed_mph': reading.get('nws_wind_speed_mph'),
+                'wind_gust_mph': reading.get('nws_wind_gust_mph'),
+                'condition': reading.get('nws_condition'),
+                'station': reading.get('nws_station'),
+                'alert_count': reading.get('nws_alert_count') or 0,
+                'forecast_min_12h': reading.get('nws_forecast_min_12h'),
+                'forecast_max_12h': reading.get('nws_forecast_max_12h'),
+            }
         except HTTPException:
             result['error'] = 'climate_device_unavailable'
             await climate_monitor.record_unavailable(get_db(), binding, source='read')
@@ -222,6 +245,7 @@ async def tenant_climate_notification_preferences(request: Request):
         'temperature': prefs.get('temperature', True),
         'humidity': prefs.get('humidity', True),
         'predictive': prefs.get('predictive', True),
+        'weather': prefs.get('weather', True),
     }
 
 
@@ -435,6 +459,54 @@ async def tenant_binding(device_id: str, request: Request):
     if not binding:
         raise HTTPException(404, 'climate_device_not_found')
     return user, binding
+
+
+@router.get('/admin/climate/devices/{device_id}/weather')
+async def admin_climate_weather(device_id: str, request: Request, refresh: bool = False):
+    _, binding = await admin_binding(device_id, request)
+    weather = await weather_intelligence.weather_for_binding(get_db(), binding, force=refresh)
+    if weather.get('status') == 'ok':
+        try:
+            raw = snapshot(await provider.device(get_db(), binding)) if enabled() else {}
+        except Exception:
+            raw = {}
+        weather = {**weather, 'advice': weather_intelligence.weather_advice(raw, weather)}
+    return weather
+
+
+@router.get('/tenant/climate/devices/{device_id}/weather')
+async def tenant_climate_weather(device_id: str, request: Request, refresh: bool = False):
+    _, binding = await tenant_binding(device_id, request)
+    weather = await weather_intelligence.weather_for_binding(get_db(), binding, force=refresh)
+    if weather.get('status') == 'ok':
+        try:
+            raw = snapshot(await provider.device(get_db(), binding)) if enabled() else {}
+        except Exception:
+            raw = {}
+        weather = {**weather, 'advice': weather_intelligence.weather_advice(raw, weather)}
+    return weather
+
+
+@router.put('/admin/climate/properties/{property_id}/weather-location')
+async def admin_set_weather_location(property_id: str, body: WeatherLocation, request: Request):
+    user = await auth_admin(request)
+    db = get_db()
+    if ObjectId.is_valid(property_id):
+        property_ids = [property_id, ObjectId(property_id)]
+    else:
+        property_ids = [property_id]
+    exists = await db.properties.find_one({'_id': {'$in': property_ids}}, {'_id': 1})
+    if not exists:
+        raise HTTPException(404, 'climate_property_invalid')
+    return await weather_intelligence.set_manual_location(
+        db, property_id, body.latitude, body.longitude, actor_id(user)
+    )
+
+
+@router.post('/admin/climate/properties/{property_id}/weather-refresh')
+async def admin_refresh_property_weather(property_id: str, request: Request):
+    await auth_admin(request)
+    return await weather_intelligence.weather_for_property(get_db(), property_id, force=True)
 
 
 @router.get('/admin/climate/fleet')
