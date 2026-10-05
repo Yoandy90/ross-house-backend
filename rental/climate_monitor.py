@@ -16,6 +16,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import HTTPException
 from pymongo import ReturnDocument
+from pymongo.errors import DuplicateKeyError
 
 from . import climate_provider as provider
 from .climate_policy import snapshot, validate_change
@@ -121,7 +122,7 @@ def _alert_conditions(state: dict) -> dict[str, tuple[bool, str, str]]:
     conditions: dict[str, tuple[bool, str, str]] = {}
     online = state.get("online") is True
     conditions["offline"] = (
-        not online,
+        state.get("offline_alert") is True,
         "critical",
         "Thermostat is not reporting live data.",
     )
@@ -199,6 +200,9 @@ async def _evaluate_alerts(db, binding: dict, state: dict, observed_at: datetime
 
 async def record_snapshot(db, binding: dict, state: dict, source: str = "read"):
     observed_at = now()
+    if state.get("online") is True:
+        state = {**state, "offline_alert": False}
+        await db.climate_device_health.delete_one({"_id": binding["_id"]})
     reading = _reading_doc(binding, state, observed_at, source)
     bucket = _floor_time(observed_at, _sample_minutes())
     reading["_id"] = f"{binding['_id']}:{bucket.isoformat()}"
@@ -210,8 +214,25 @@ async def record_snapshot(db, binding: dict, state: dict, source: str = "read"):
 
 
 async def record_unavailable(db, binding: dict, source: str = "read"):
+    observed_at = now()
+    health = await db.climate_device_health.find_one({"_id": binding["_id"]})
+    first = health.get("first_failure_at") if health else observed_at
+    if first.tzinfo is None:
+        first = first.replace(tzinfo=timezone.utc)
+    failures = int((health or {}).get("failure_count") or 0) + 1
+    offline_alert = failures >= 3 or observed_at - first >= timedelta(minutes=15)
+    await db.climate_device_health.update_one(
+        {"_id": binding["_id"]},
+        {"$set": {
+            "first_failure_at": first,
+            "last_failure_at": observed_at,
+            "failure_count": failures,
+        }},
+        upsert=True,
+    )
     state = {
         "online": False,
+        "offline_alert": offline_alert,
         "units": None,
         "temperature": None,
         "humidity": None,
@@ -435,13 +456,23 @@ def validate_period(period: dict, raw: dict | None = None):
     return command
 
 
+def _validate_schedule_periods(periods: list[dict]):
+    if not periods or len(periods) > 56:
+        raise HTTPException(422, "climate_schedule_periods_invalid")
+    seen: set[tuple[int, str]] = set()
+    for period in periods:
+        validate_period(period)
+        for day in period.get("days") or []:
+            key = (day, period.get("time"))
+            if key in seen:
+                raise HTTPException(422, "climate_schedule_overlap")
+            seen.add(key)
+
+
 async def create_schedule(db, binding: dict, actor: str, payload: dict):
     timezone_name = validate_timezone(payload.get("timezone") or "America/Chicago")
     periods = payload.get("periods") or []
-    if not periods or len(periods) > 56:
-        raise HTTPException(422, "climate_schedule_periods_invalid")
-    for period in periods:
-        validate_period(period)
+    _validate_schedule_periods(periods)
     schedule_id = str(uuid4())
     doc = {
         "_id": schedule_id,
@@ -536,15 +567,19 @@ async def _execute_schedule_period(db, binding: dict, schedule: dict, period: di
         return "busy"
     status = "unknown"
     try:
-        await db.climate_schedule_runs.insert_one({
-            "_id": run_key,
-            "schedule_id": schedule["_id"],
-            "device_id": binding["_id"],
-            "period": period,
-            "started_at": now(),
-            "status": "pending",
-            "actor": actor,
-        })
+        try:
+            await db.climate_schedule_runs.insert_one({
+                "_id": run_key,
+                "schedule_id": schedule["_id"],
+                "device_id": binding["_id"],
+                "period": period,
+                "started_at": now(),
+                "status": "pending",
+                "actor": actor,
+            })
+        except DuplicateKeyError:
+            previous = await db.climate_schedule_runs.find_one({"_id": run_key})
+            return (previous or {}).get("status", "pending")
         raw = await provider.device(db, binding)
         command = validate_period(period, raw)
         payload = validate_change(raw, command)
@@ -602,7 +637,16 @@ async def run_due_schedules(db):
         for index, period in enumerate(schedule.get("periods") or []):
             if local.weekday() not in period.get("days", []):
                 continue
-            if period.get("time") != local.strftime("%H:%M"):
+            try:
+                scheduled_hour, scheduled_minute = [int(x) for x in period.get("time", "").split(":", 1)]
+                scheduled_local = local.replace(
+                    hour=scheduled_hour, minute=scheduled_minute, second=0, microsecond=0
+                )
+            except (TypeError, ValueError):
+                continue
+            delay = local - scheduled_local
+            due_window = timedelta(minutes=max(10, _sample_minutes() * 2))
+            if delay < timedelta(0) or delay >= due_window:
                 continue
             run_key = f"{schedule['_id']}:{index}:{local.date().isoformat()}:{period.get('time')}"
             binding = await db.climate_bindings.find_one({"_id": schedule["device_id"]})
