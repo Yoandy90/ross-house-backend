@@ -12,6 +12,7 @@ from .shared import auth_admin, auth_marketplace, get_db
 from .tenant_integrity import resolve_authenticated_tenant, find_active_contract_for_tenant
 from . import climate_provider as provider
 from .climate_policy import scope_for_contract, snapshot, validate_change
+from . import climate_monitor
 
 router = APIRouter(tags=['climate'])
 
@@ -19,6 +20,7 @@ async def ensure_indexes(db):
     await db.climate_oauth_states.create_index('expires_at', expireAfterSeconds=0)
     await db.climate_bindings.create_index([('property_id', 1), ('unit_id', 1)])
     await db.climate_commands.create_index([('device_id', 1), ('created_at', -1)])
+    await climate_monitor.ensure_indexes(db)
 
 
 
@@ -82,6 +84,25 @@ class HoldCommand(StrictModel):
     mode: str = Field(min_length=3, max_length=30)
 
 
+class SchedulePeriod(StrictModel):
+    days: list[int] = Field(min_length=1, max_length=7)
+    time: str = Field(min_length=5, max_length=5)
+    mode: str = Field(min_length=3, max_length=10)
+    heatSetpoint: float | None = None
+    coolSetpoint: float | None = None
+
+
+class ScheduleBody(StrictModel):
+    name: str = Field(min_length=1, max_length=80)
+    enabled: bool = True
+    timezone: str = Field(default='America/Chicago', min_length=1, max_length=80)
+    periods: list[SchedulePeriod] = Field(min_length=1, max_length=56)
+
+
+class ScheduleRun(StrictModel):
+    period_index: int = Field(ge=0, le=55)
+
+
 async def tenant_scope(request):
     user = await auth_marketplace(request)
     if user.get('role') != 'tenant':
@@ -99,10 +120,13 @@ async def read_binding(binding):
               'online': False, 'control_enabled': control()}
     if enabled():
         try:
-            result.update(snapshot(await provider.device(get_db(), binding)))
+            state = snapshot(await provider.device(get_db(), binding))
+            result.update(state)
             result['observed_at'] = provider.now().isoformat()
+            await climate_monitor.record_snapshot(get_db(), binding, state, source='read')
         except HTTPException:
             result['error'] = 'climate_device_unavailable'
+            await climate_monitor.record_unavailable(get_db(), binding, source='read')
     return result
 
 
@@ -115,6 +139,8 @@ async def admin_list(request: Request):
     properties = await db.properties.find({}, {'address': 1}).limit(500).to_list(500)
     units = await db.property_units.find({}, {'property_id': 1, 'unit_name': 1}).limit(2000).to_list(2000)
     return {'enabled': enabled(), 'configured': provider.configured(), 'control_enabled': control(),
+            'monitor_enabled': climate_monitor.monitor_enabled(),
+            'history_bucket_minutes': climate_monitor._sample_minutes(),
             'providers': {'first_alert': provider.configured(), 'tcc_us': provider.tcc_configured()},
             'connection_details': [{'id': str(c['_id']), 'provider': c.get('provider', 'first_alert')} for c in connections],
             'devices': [await read_binding(b) for b in bindings],
@@ -127,7 +153,9 @@ async def admin_list(request: Request):
 async def tenant_list(request: Request):
     _, scope = await tenant_scope(request)
     bindings = await get_db().climate_bindings.find(scope).limit(20).to_list(20)
-    return {'enabled': enabled(), 'devices': [await read_binding(b) for b in bindings]}
+    return {'enabled': enabled(), 'monitor_enabled': climate_monitor.monitor_enabled(),
+            'history_bucket_minutes': climate_monitor._sample_minutes(),
+            'devices': [await read_binding(b) for b in bindings]}
 
 
 @router.post('/admin/climate/oauth/start')
@@ -220,8 +248,10 @@ async def issue_command(binding, user, body):
             return {'status': 'pending'}
         await provider.change(db, binding, payload)
         observed = await provider.device(db, binding)
+        observed_state = snapshot(observed)
         status = 'confirmed' if all(observed.get('changeableValues', {}).get(k) == v for k, v in values.items()) else 'pending'
         await db.climate_commands.update_one({'_id': key}, {'$set': {'status': status}})
+        await climate_monitor.record_snapshot(db, binding, observed_state, source='command')
         return {'status': status}
     except HTTPException:
         if inserted:
@@ -281,6 +311,7 @@ async def issue_feature_command(binding, user, request_id, kind, requested):
         )
         status = 'confirmed' if confirmed else 'pending'
         await db.climate_commands.update_one({'_id': key}, {'$set': {'status': status}})
+        await climate_monitor.record_snapshot(db, binding, observed, source=kind)
         return {'status': status}
     except HTTPException:
         if inserted:
@@ -292,6 +323,131 @@ async def issue_feature_command(binding, user, request_id, kind, requested):
             {'_id': binding['_id'], 'command_lock': key},
             {'$unset': {'busy_until': '', 'command_lock': ''}},
         )
+
+
+
+async def admin_binding(device_id: str, request: Request):
+    user = await auth_admin(request)
+    binding = await get_db().climate_bindings.find_one({'_id': device_id})
+    if not binding:
+        raise HTTPException(404, 'climate_device_not_found')
+    return user, binding
+
+
+async def tenant_binding(device_id: str, request: Request):
+    user, scope = await tenant_scope(request)
+    binding = await get_db().climate_bindings.find_one({'_id': device_id, **scope})
+    if not binding:
+        raise HTTPException(404, 'climate_device_not_found')
+    return user, binding
+
+
+@router.get('/admin/climate/devices/{device_id}/analytics')
+async def admin_analytics(device_id: str, request: Request, range: str = '7d'):
+    _, binding = await admin_binding(device_id, request)
+    return await climate_monitor.analytics(get_db(), binding['_id'], range)
+
+
+@router.get('/tenant/climate/devices/{device_id}/analytics')
+async def tenant_analytics(device_id: str, request: Request, range: str = '7d'):
+    _, binding = await tenant_binding(device_id, request)
+    return await climate_monitor.analytics(get_db(), binding['_id'], range)
+
+
+@router.get('/admin/climate/devices/{device_id}/reading')
+async def admin_reading_at(device_id: str, request: Request, at: str):
+    _, binding = await admin_binding(device_id, request)
+    return await climate_monitor.nearest_reading(get_db(), binding['_id'], at)
+
+
+@router.get('/tenant/climate/devices/{device_id}/reading')
+async def tenant_reading_at(device_id: str, request: Request, at: str):
+    _, binding = await tenant_binding(device_id, request)
+    return await climate_monitor.nearest_reading(get_db(), binding['_id'], at)
+
+
+@router.get('/admin/climate/devices/{device_id}/alerts')
+async def admin_alerts(device_id: str, request: Request):
+    _, binding = await admin_binding(device_id, request)
+    return {'alerts': await climate_monitor.active_alerts(get_db(), binding)}
+
+
+@router.get('/tenant/climate/devices/{device_id}/alerts')
+async def tenant_alerts(device_id: str, request: Request):
+    _, binding = await tenant_binding(device_id, request)
+    return {'alerts': await climate_monitor.active_alerts(get_db(), binding)}
+
+
+@router.get('/admin/climate/devices/{device_id}/schedules')
+async def admin_schedules(device_id: str, request: Request):
+    _, binding = await admin_binding(device_id, request)
+    return {'schedules': await climate_monitor.list_schedules(get_db(), binding)}
+
+
+@router.get('/tenant/climate/devices/{device_id}/schedules')
+async def tenant_schedules(device_id: str, request: Request):
+    _, binding = await tenant_binding(device_id, request)
+    return {'schedules': await climate_monitor.list_schedules(get_db(), binding)}
+
+
+@router.post('/admin/climate/devices/{device_id}/schedules')
+async def admin_create_schedule(device_id: str, body: ScheduleBody, request: Request):
+    user, binding = await admin_binding(device_id, request)
+    doc = await climate_monitor.create_schedule(get_db(), binding, actor_id(user), body.model_dump())
+    return climate_monitor.public_schedule(doc)
+
+
+@router.post('/tenant/climate/devices/{device_id}/schedules')
+async def tenant_create_schedule(device_id: str, body: ScheduleBody, request: Request):
+    user, binding = await tenant_binding(device_id, request)
+    doc = await climate_monitor.create_schedule(get_db(), binding, actor_id(user), body.model_dump())
+    return climate_monitor.public_schedule(doc)
+
+
+@router.put('/admin/climate/devices/{device_id}/schedules/{schedule_id}')
+async def admin_update_schedule(device_id: str, schedule_id: str, body: ScheduleBody, request: Request):
+    user, binding = await admin_binding(device_id, request)
+    doc = await climate_monitor.update_schedule(get_db(), binding, schedule_id, actor_id(user), body.model_dump())
+    return climate_monitor.public_schedule(doc)
+
+
+@router.put('/tenant/climate/devices/{device_id}/schedules/{schedule_id}')
+async def tenant_update_schedule(device_id: str, schedule_id: str, body: ScheduleBody, request: Request):
+    user, binding = await tenant_binding(device_id, request)
+    doc = await climate_monitor.update_schedule(get_db(), binding, schedule_id, actor_id(user), body.model_dump())
+    return climate_monitor.public_schedule(doc)
+
+
+@router.delete('/admin/climate/devices/{device_id}/schedules/{schedule_id}')
+async def admin_delete_schedule(device_id: str, schedule_id: str, request: Request):
+    _, binding = await admin_binding(device_id, request)
+    await climate_monitor.delete_schedule(get_db(), binding, schedule_id)
+    return {'success': True}
+
+
+@router.delete('/tenant/climate/devices/{device_id}/schedules/{schedule_id}')
+async def tenant_delete_schedule(device_id: str, schedule_id: str, request: Request):
+    _, binding = await tenant_binding(device_id, request)
+    await climate_monitor.delete_schedule(get_db(), binding, schedule_id)
+    return {'success': True}
+
+
+@router.post('/admin/climate/devices/{device_id}/schedules/{schedule_id}/run-now')
+async def admin_run_schedule(device_id: str, schedule_id: str, body: ScheduleRun, request: Request):
+    user, binding = await admin_binding(device_id, request)
+    if not control():
+        raise HTTPException(503, 'climate_control_disabled')
+    return {'status': await climate_monitor.run_schedule_now(
+        get_db(), binding, schedule_id, body.period_index, actor_id(user))}
+
+
+@router.post('/tenant/climate/devices/{device_id}/schedules/{schedule_id}/run-now')
+async def tenant_run_schedule(device_id: str, schedule_id: str, body: ScheduleRun, request: Request):
+    user, binding = await tenant_binding(device_id, request)
+    if not control():
+        raise HTTPException(503, 'climate_control_disabled')
+    return {'status': await climate_monitor.run_schedule_now(
+        get_db(), binding, schedule_id, body.period_index, actor_id(user))}
 
 
 @router.patch('/admin/climate/devices/{device_id}')
@@ -334,15 +490,6 @@ async def tenant_fan_command(device_id: str, body: FanCommand, request: Request)
 async def admin_hold_command(device_id: str, body: HoldCommand, request: Request):
     user = await auth_admin(request)
     binding = await get_db().climate_bindings.find_one({'_id': device_id})
-    if not binding:
-        raise HTTPException(404, 'climate_device_not_found')
-    return await issue_feature_command(binding, user, body.request_id, 'hold', {'mode': body.mode})
-
-
-@router.patch('/tenant/climate/devices/{device_id}/hold')
-async def tenant_hold_command(device_id: str, body: HoldCommand, request: Request):
-    user, scope = await tenant_scope(request)
-    binding = await get_db().climate_bindings.find_one({'_id': device_id, **scope})
     if not binding:
         raise HTTPException(404, 'climate_device_not_found')
     return await issue_feature_command(binding, user, body.request_id, 'hold', {'mode': body.mode})
