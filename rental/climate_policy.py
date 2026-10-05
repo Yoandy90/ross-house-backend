@@ -25,14 +25,53 @@ def finite(value):
 
 def snapshot(raw):
     values = raw.get('changeableValues') or {}
+    settings = raw.get('settings') or {}
+    fan = raw.get('fan') or settings.get('fan') or {}
+    fan_values = fan.get('changeableValues') or {}
+    fan_modes = [x for x in fan.get('allowedModes', []) if x in ('Auto', 'On', 'Circulate', 'FollowSchedule')]
+    operation = raw.get('operationStatus') or {}
+    activity = raw.get('activity')
+    if activity not in ('heating', 'cooling', 'idle'):
+        activity = {
+            'Heating': 'heating',
+            'Cooling': 'cooling',
+            'EquipmentOff': 'idle',
+        }.get(operation.get('mode'))
+    hold = raw.get('holdStatus') or values.get('thermostatSetpointStatus')
+    if hold in ('NoHold', 'Schedule'):
+        hold = 'schedule'
+    elif hold in ('PermanentHold', 'Permanent'):
+        hold = 'permanent'
+    elif hold in ('TemporaryHold', 'HoldUntil', 'Temporary'):
+        hold = 'temporary'
+    schedule_capabilities = raw.get('scheduleCapabilities') or {}
+    available_schedules = schedule_capabilities.get('availableScheduleTypes') or []
+    current_period = raw.get('currentSchedulePeriod')
     return {
         'online': raw.get('isAlive') is True and not raw.get('isUpgrading', False),
         'units': raw.get('units'), 'temperature': raw.get('indoorTemperature'),
         'humidity': raw.get('indoorHumidity'),
+        'outdoorTemperature': raw.get('outdoorTemperature'),
+        'outdoorHumidity': raw.get('displayedOutdoorHumidity'),
         'mode': values.get('mode'), 'heatSetpoint': values.get('heatSetpoint'),
         'coolSetpoint': values.get('coolSetpoint'),
-        'activity': raw.get('activity') if raw.get('activity') in ('heating', 'cooling', 'idle') else None,
+        'activity': activity,
         'modes': [x for x in raw.get('allowedModes', []) if x in ('Off', 'Heat', 'Cool', 'Auto')],
+        'fanModes': fan_modes,
+        'fanMode': fan.get('mode') or fan_values.get('mode'),
+        'fanRunning': fan.get('running') if 'running' in fan else (
+            operation.get('fanRequest') or operation.get('circulationFanRequest')
+            if operation else None),
+        'holdStatus': hold,
+        'scheduleStatus': raw.get('scheduleStatus'),
+        'currentSchedulePeriod': current_period if isinstance(current_period, dict) else None,
+        'capabilities': {
+            'fan': bool(fan.get('supported', bool(fan_modes))),
+            'hold': hold is not None,
+            'schedule': any(x not in ('None', None) for x in available_schedules),
+            'scheduleFan': schedule_capabilities.get('schedulableFan') is True,
+            'outdoor': raw.get('outdoorTemperature') is not None or raw.get('displayedOutdoorHumidity') is not None,
+        },
         **{k: raw.get(k) for k in ('minHeatSetpoint', 'maxHeatSetpoint', 'minCoolSetpoint', 'maxCoolSetpoint', 'deadband')},
     }
 
