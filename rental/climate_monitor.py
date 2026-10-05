@@ -20,6 +20,7 @@ from pymongo.errors import DuplicateKeyError
 
 from . import climate_provider as provider
 from .climate_policy import snapshot, validate_change
+from . import climate_intelligence
 
 
 def now() -> datetime:
@@ -51,6 +52,9 @@ async def ensure_indexes(db):
     await db.climate_alert_state.create_index([("device_id", 1), ("active", 1), ("updated_at", -1)])
     await db.climate_schedules.create_index([("device_id", 1), ("enabled", 1)])
     await db.climate_schedule_runs.create_index([("device_id", 1), ("started_at", -1)])
+    await db.climate_alert_rules.create_index([("property_id", 1)])
+    await db.climate_alert_deliveries.create_index([("device_id", 1), ("created_at", -1)])
+    await db.climate_maintenance.create_index([("property_id", 1)])
 
 
 def _reading_doc(binding: dict, state: dict, observed_at: datetime, source: str) -> dict:
@@ -118,50 +122,40 @@ async def _record_transitions(db, binding: dict, reading: dict):
         await db.climate_events.insert_many(events)
 
 
-def _alert_conditions(state: dict) -> dict[str, tuple[bool, str, str]]:
-    conditions: dict[str, tuple[bool, str, str]] = {}
-    online = state.get("online") is True
-    conditions["offline"] = (
-        state.get("offline_alert") is True,
-        "critical",
-        "Thermostat is not reporting live data.",
+def _alert_conditions(state: dict, rules: dict | None = None) -> dict[str, tuple[bool, str, str]]:
+    return climate_intelligence.basic_conditions(
+        state,
+        rules or climate_intelligence.DEFAULT_RULES,
     )
-    units = state.get("units")
-    temp = state.get("temperature")
-    if _finite(temp) and units in ("Fahrenheit", "Celsius"):
-        low = 50 if units == "Fahrenheit" else 10
-        high = 85 if units == "Fahrenheit" else 29.5
-        conditions["temperature_low"] = (
-            temp <= low,
-            "critical",
-            "Indoor temperature is below the configured protection threshold.",
-        )
-        conditions["temperature_high"] = (
-            temp >= high,
-            "critical",
-            "Indoor temperature is above the configured protection threshold.",
-        )
-    humidity = state.get("humidity")
-    if _finite(humidity):
-        conditions["humidity_low"] = (
-            humidity <= 25,
-            "warning",
-            "Indoor humidity is unusually low.",
-        )
-        conditions["humidity_high"] = (
-            humidity >= 65,
-            "warning",
-            "Indoor humidity is unusually high.",
-        )
-    return conditions
 
 
 async def _evaluate_alerts(db, binding: dict, state: dict, observed_at: datetime):
-    active_types = set()
-    for alert_type, (active, severity, message) in _alert_conditions(state).items():
+    rules = await climate_intelligence.get_rules(db, binding)
+    conditions = _alert_conditions(state, rules)
+    try:
+        conditions.update(
+            await climate_intelligence.predictive_conditions(
+                db,
+                binding,
+                state,
+                rules,
+                sample_minutes=_sample_minutes(),
+            )
+        )
+    except Exception:
+        # Predictive heuristics must never block raw telemetry collection.
+        pass
+
+    for alert_type, (active, severity, message) in conditions.items():
         alert_id = f"{binding['_id']}:{alert_type}"
+        current = await db.climate_alert_state.find_one({"_id": alert_id})
+        was_active = bool(current and current.get("active") is True)
         if active:
-            active_types.add(alert_type)
+            triggered_at = (
+                current.get("triggered_at")
+                if was_active and isinstance(current.get("triggered_at"), datetime)
+                else observed_at
+            )
             await db.climate_alert_state.update_one(
                 {"_id": alert_id},
                 {
@@ -173,29 +167,57 @@ async def _evaluate_alerts(db, binding: dict, state: dict, observed_at: datetime
                         "severity": severity,
                         "message": message,
                         "active": True,
+                        "triggered_at": triggered_at,
                         "updated_at": observed_at,
                     },
-                    "$setOnInsert": {"triggered_at": observed_at},
                     "$unset": {"resolved_at": ""},
                 },
                 upsert=True,
             )
-        else:
-            current = await db.climate_alert_state.find_one({"_id": alert_id, "active": True})
-            if current:
-                await db.climate_alert_state.update_one(
-                    {"_id": alert_id},
-                    {"$set": {"active": False, "resolved_at": observed_at, "updated_at": observed_at}},
-                )
+            if not was_active:
                 await db.climate_events.insert_one({
                     "_id": str(uuid4()),
                     "device_id": binding["_id"],
                     "property_id": binding.get("property_id", ""),
                     "unit_id": binding.get("unit_id", ""),
-                    "type": "alert_resolved",
+                    "type": "alert_triggered",
                     "field": alert_type,
+                    "severity": severity,
                     "created_at": observed_at,
                 })
+                try:
+                    from .climate_notifications import notify_transition
+                    await notify_transition(
+                        db, binding, alert_type, severity, True, observed_at
+                    )
+                except Exception:
+                    pass
+        elif was_active:
+            await db.climate_alert_state.update_one(
+                {"_id": alert_id},
+                {"$set": {"active": False, "resolved_at": observed_at, "updated_at": observed_at}},
+            )
+            await db.climate_events.insert_one({
+                "_id": str(uuid4()),
+                "device_id": binding["_id"],
+                "property_id": binding.get("property_id", ""),
+                "unit_id": binding.get("unit_id", ""),
+                "type": "alert_resolved",
+                "field": alert_type,
+                "created_at": observed_at,
+            })
+            try:
+                from .climate_notifications import notify_transition
+                await notify_transition(
+                    db,
+                    binding,
+                    alert_type,
+                    current.get("severity") or severity,
+                    False,
+                    observed_at,
+                )
+            except Exception:
+                pass
 
 
 async def record_snapshot(db, binding: dict, state: dict, source: str = "read"):
