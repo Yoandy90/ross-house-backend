@@ -616,10 +616,9 @@ def weather_advice(state: dict, weather: dict | None):
     activity = state.get("activity")
     advice = []
 
-    comfort = comfort_setpoint_suggestion(state, weather)
-    if comfort:
-        advice.append(comfort)
-
+    # Life-safety / official severe weather must outrank comfort optimization.
+    # Keep the NWS warning first so every client can render the advice list in
+    # server priority order without duplicating alert-sorting logic.
     severe_alerts = [
         item for item in weather.get("alerts") or []
         if str(item.get("severity") or "").lower() in ("severe", "extreme")
@@ -634,6 +633,10 @@ def weather_advice(state: dict, weather: dict | None):
             "body_es": f"{event}. Revisa la alerta del National Weather Service para esta propiedad.",
             "body_en": f"{event}. Review the National Weather Service alert for this property.",
         })
+
+    comfort = comfort_setpoint_suggestion(state, weather)
+    if comfort:
+        advice.append(comfort)
 
     if _finite(outdoor) and outdoor <= 45 and activity == "cooling":
         advice.append({
