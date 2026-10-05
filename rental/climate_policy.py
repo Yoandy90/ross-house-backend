@@ -31,6 +31,7 @@ def snapshot(raw):
         'humidity': raw.get('indoorHumidity'),
         'mode': values.get('mode'), 'heatSetpoint': values.get('heatSetpoint'),
         'coolSetpoint': values.get('coolSetpoint'),
+        'activity': raw.get('activity') if raw.get('activity') in ('heating', 'cooling', 'idle') else None,
         'modes': [x for x in raw.get('allowedModes', []) if x in ('Off', 'Heat', 'Cool', 'Auto')],
         **{k: raw.get(k) for k in ('minHeatSetpoint', 'maxHeatSetpoint', 'minCoolSetpoint', 'maxCoolSetpoint', 'deadband')},
     }
