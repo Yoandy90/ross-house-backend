@@ -265,6 +265,36 @@ def _preserve_existing_bucket(existing: dict | None, reading: dict) -> bool:
     )
 
 
+def _failure_progress(health: dict | None, observed_at: datetime) -> tuple[datetime, int, bool]:
+    """Advance outage state at most once per telemetry bucket.
+
+    Multiple failed API requests inside the same sampling window (monitor, app refresh,
+    health request, etc.) represent one outage observation, not multiple consecutive
+    failures.
+    """
+    health = health or {}
+    first = health.get("first_failure_at") or observed_at
+    if first.tzinfo is None:
+        first = first.replace(tzinfo=timezone.utc)
+    else:
+        first = first.astimezone(timezone.utc)
+
+    last = health.get("last_failure_at")
+    if isinstance(last, datetime):
+        last = last.replace(tzinfo=timezone.utc) if last.tzinfo is None else last.astimezone(timezone.utc)
+
+    failures = int(health.get("failure_count") or 0)
+    same_bucket = bool(
+        last
+        and _floor_time(last, _sample_minutes()) == _floor_time(observed_at, _sample_minutes())
+    )
+    if not same_bucket:
+        failures += 1
+
+    offline_alert = failures >= 3 or observed_at - first >= timedelta(minutes=15)
+    return first, failures, offline_alert
+
+
 async def record_snapshot(db, binding: dict, state: dict, source: str = "read"):
     observed_at = now()
     weather = None
@@ -278,13 +308,10 @@ async def record_snapshot(db, binding: dict, state: dict, source: str = "read"):
         await db.climate_device_health.delete_one({"_id": binding["_id"]})
     elif "offline_alert" not in state:
         health = await db.climate_device_health.find_one({"_id": binding["_id"]})
-        first = health.get("first_failure_at") if health else observed_at
-        if first.tzinfo is None:
-            first = first.replace(tzinfo=timezone.utc)
-        failures = int((health or {}).get("failure_count") or 0) + 1
+        first, failures, offline_alert = _failure_progress(health, observed_at)
         state = {
             **state,
-            "offline_alert": failures >= 3 or observed_at - first >= timedelta(minutes=15),
+            "offline_alert": offline_alert,
         }
         await db.climate_device_health.update_one(
             {"_id": binding["_id"]},
@@ -318,11 +345,7 @@ async def record_snapshot(db, binding: dict, state: dict, source: str = "read"):
 async def record_unavailable(db, binding: dict, source: str = "read"):
     observed_at = now()
     health = await db.climate_device_health.find_one({"_id": binding["_id"]})
-    first = health.get("first_failure_at") if health else observed_at
-    if first.tzinfo is None:
-        first = first.replace(tzinfo=timezone.utc)
-    failures = int((health or {}).get("failure_count") or 0) + 1
-    offline_alert = failures >= 3 or observed_at - first >= timedelta(minutes=15)
+    first, failures, offline_alert = _failure_progress(health, observed_at)
     await db.climate_device_health.update_one(
         {"_id": binding["_id"]},
         {"$set": {
