@@ -15,6 +15,7 @@ from uuid import uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import HTTPException
+from pymongo import ReturnDocument
 
 from . import climate_provider as provider
 from .climate_policy import snapshot, validate_change
@@ -428,7 +429,7 @@ async def update_schedule(db, binding: dict, schedule_id: str, actor: str, paylo
             "updated_by": actor,
             "updated_at": now(),
         }},
-        return_document=True,
+        return_document=ReturnDocument.AFTER,
     )
     if not result:
         raise HTTPException(404, "climate_schedule_not_found")
