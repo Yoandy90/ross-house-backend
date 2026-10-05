@@ -203,6 +203,25 @@ async def record_snapshot(db, binding: dict, state: dict, source: str = "read"):
     if state.get("online") is True:
         state = {**state, "offline_alert": False}
         await db.climate_device_health.delete_one({"_id": binding["_id"]})
+    elif "offline_alert" not in state:
+        health = await db.climate_device_health.find_one({"_id": binding["_id"]})
+        first = health.get("first_failure_at") if health else observed_at
+        if first.tzinfo is None:
+            first = first.replace(tzinfo=timezone.utc)
+        failures = int((health or {}).get("failure_count") or 0) + 1
+        state = {
+            **state,
+            "offline_alert": failures >= 3 or observed_at - first >= timedelta(minutes=15),
+        }
+        await db.climate_device_health.update_one(
+            {"_id": binding["_id"]},
+            {"$set": {
+                "first_failure_at": first,
+                "last_failure_at": observed_at,
+                "failure_count": failures,
+            }},
+            upsert=True,
+        )
     reading = _reading_doc(binding, state, observed_at, source)
     bucket = _floor_time(observed_at, _sample_minutes())
     reading["_id"] = f"{binding['_id']}:{bucket.isoformat()}"
@@ -579,7 +598,8 @@ async def _execute_schedule_period(db, binding: dict, schedule: dict, period: di
             })
         except DuplicateKeyError:
             previous = await db.climate_schedule_runs.find_one({"_id": run_key})
-            return (previous or {}).get("status", "pending")
+            status = (previous or {}).get("status", "pending")
+            return status
         raw = await provider.device(db, binding)
         command = validate_period(period, raw)
         payload = validate_change(raw, command)
