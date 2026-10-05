@@ -358,12 +358,64 @@ async def analytics(db, device_id: str, range_name: str = "7d") -> dict:
                 "temperature_min": {"$min": "$temperature"},
                 "temperature_max": {"$max": "$temperature"},
                 "humidity_avg": {"$avg": "$humidity"},
+                "humidity_min": {"$min": "$humidity"},
+                "humidity_max": {"$max": "$humidity"},
                 "outdoor_avg": {"$avg": "$outdoor_temperature"},
+                "units": {"$last": "$units"},
                 "samples": {"$sum": 1},
             }
         },
     ]).to_list(1)
     summary = summary_rows[0] if summary_rows else {}
+
+    activity_events = await db.climate_events.find(
+        {
+            "device_id": device_id,
+            "created_at": {"$gte": start},
+            "type": "state_change",
+            "field": {"$in": ["activity", "mode"]},
+        },
+        {"_id": 0},
+    ).sort("created_at", 1).limit(10000).to_list(10000)
+    heating_cycles = sum(
+        1 for event in activity_events
+        if event.get("field") == "activity" and event.get("after") == "heating"
+    )
+    cooling_cycles = sum(
+        1 for event in activity_events
+        if event.get("field") == "activity" and event.get("after") == "cooling"
+    )
+    mode_changes = sum(1 for event in activity_events if event.get("field") == "mode")
+
+    sample_minutes = _sample_minutes()
+    heating_minutes = heating * sample_minutes
+    cooling_minutes = cooling * sample_minutes
+
+    target_errors = []
+    comfort_samples = 0
+    for point in points:
+        temp = point.get("temperature")
+        mode = point.get("mode")
+        if not _finite(temp):
+            continue
+        error = None
+        if mode == "Heat" and _finite(point.get("heat_setpoint")):
+            error = abs(temp - point["heat_setpoint"])
+        elif mode == "Cool" and _finite(point.get("cool_setpoint")):
+            error = abs(temp - point["cool_setpoint"])
+        elif mode == "Auto" and _finite(point.get("heat_setpoint")) and _finite(point.get("cool_setpoint")):
+            if temp < point["heat_setpoint"]:
+                error = point["heat_setpoint"] - temp
+            elif temp > point["cool_setpoint"]:
+                error = temp - point["cool_setpoint"]
+            else:
+                error = 0
+        if error is not None:
+            target_errors.append(error)
+            tolerance = 2 if summary.get("units") == "Fahrenheit" else 1.1
+            if error <= tolerance:
+                comfort_samples += 1
+
     events = await db.climate_events.find(
         {"device_id": device_id, "created_at": {"$gte": start}},
         {"_id": 0},
@@ -371,6 +423,11 @@ async def analytics(db, device_id: str, range_name: str = "7d") -> dict:
     for event in events:
         if isinstance(event.get("created_at"), datetime):
             event["created_at"] = event["created_at"].isoformat()
+
+    temperature_span = None
+    if _finite(summary.get("temperature_min")) and _finite(summary.get("temperature_max")):
+        temperature_span = summary["temperature_max"] - summary["temperature_min"]
+
     return {
         "range": range_name,
         "bucket": {"unit": unit, "size": bin_size},
@@ -378,11 +435,22 @@ async def analytics(db, device_id: str, range_name: str = "7d") -> dict:
             "temperature_avg": summary.get("temperature_avg"),
             "temperature_min": summary.get("temperature_min"),
             "temperature_max": summary.get("temperature_max"),
+            "temperature_span": temperature_span,
             "humidity_avg": summary.get("humidity_avg"),
+            "humidity_min": summary.get("humidity_min"),
+            "humidity_max": summary.get("humidity_max"),
             "outdoor_avg": summary.get("outdoor_avg"),
+            "units": summary.get("units"),
             "samples": int(summary.get("samples") or 0),
             "heating_pct": round(heating / total_samples * 100, 1) if total_samples else 0,
             "cooling_pct": round(cooling / total_samples * 100, 1) if total_samples else 0,
+            "heating_minutes_est": heating_minutes,
+            "cooling_minutes_est": cooling_minutes,
+            "heating_cycles": heating_cycles,
+            "cooling_cycles": cooling_cycles,
+            "mode_changes": mode_changes,
+            "mean_target_error": round(sum(target_errors) / len(target_errors), 2) if target_errors else None,
+            "comfort_pct": round(comfort_samples / len(target_errors) * 100, 1) if target_errors else None,
         },
         "points": points,
         "events": events,
