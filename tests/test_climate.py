@@ -30,10 +30,22 @@ def test_preserves_provider_fields_and_hold():
     assert RAW['changeableValues']['heatSetpoint'] == 68
 
 
-@pytest.mark.parametrize('command', [{'heatSetpoint': float('nan')}, {'coolSetpoint': float('inf')}, {'heatSetpoint': 100}, {'heatSetpoint': 73}, {'mode': 'EmergencyHeat'}, {'fan': 'On'}, {}])
+@pytest.mark.parametrize('command', [{'heatSetpoint': float('nan')}, {'coolSetpoint': float('inf')}, {'heatSetpoint': 100}, {'heatSetpoint': 73}, {'fan': 'On'}, {}])
 def test_invalid_commands(command):
     with pytest.raises(HTTPException):
         validate_change(RAW, command)
+
+
+def test_emergency_heat_is_capability_gated():
+    # This fixture explicitly advertises EmergencyHeat, so the command is valid.
+    accepted = validate_change(RAW, {'mode': 'EmergencyHeat'})
+    assert accepted['mode'] == 'EmergencyHeat'
+
+    # Never expose/accept EmergencyHeat on a device that did not advertise it.
+    without_emergency = deepcopy(RAW)
+    without_emergency['allowedModes'] = ['Off', 'Heat', 'Cool', 'Auto']
+    with pytest.raises(HTTPException):
+        validate_change(without_emergency, {'mode': 'EmergencyHeat'})
 
 
 def test_offline_and_unknown_units_blocked():
