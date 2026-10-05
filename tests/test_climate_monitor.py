@@ -3,7 +3,7 @@ import os
 import pytest
 from fastapi import HTTPException
 
-from rental import climate_monitor
+from rental import climate_monitor, climate_intelligence
 
 
 RAW = {
@@ -108,3 +108,46 @@ def test_offline_condition_respects_grace_flag():
     })
     assert early['offline'][0] is False
     assert mature['offline'][0] is True
+
+
+def test_alert_thresholds_can_be_overridden():
+    rules = dict(climate_intelligence.DEFAULT_RULES)
+    rules.update(temperature_low_f=55, temperature_high_f=80, humidity_low=30, humidity_high=60)
+    alerts = climate_monitor._alert_conditions({
+        'online': True,
+        'offline_alert': False,
+        'units': 'Fahrenheit',
+        'temperature': 82,
+        'humidity': 62,
+    }, rules)
+    assert alerts['temperature_high'][0] is True
+    assert alerts['humidity_high'][0] is True
+
+
+def test_health_score_penalizes_predictive_alerts():
+    result = climate_intelligence.score_from_alerts(
+        ['no_progress', 'short_cycling', 'filter_runtime'],
+        {'mean_target_error': 4.0, 'comfort_pct': 60},
+    )
+    assert result['score'] < 50
+    assert result['label'] in ('attention', 'critical')
+    assert any(reason['type'] == 'no_progress' for reason in result['reasons'])
+
+
+def test_temperature_rate_estimation():
+    from datetime import datetime, timedelta, timezone
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    rows = [
+        {'observed_at': start, 'temperature': 68, 'activity': 'heating'},
+        {'observed_at': start + timedelta(minutes=30), 'temperature': 69, 'activity': 'heating'},
+        {'observed_at': start + timedelta(minutes=60), 'temperature': 70, 'activity': 'heating'},
+    ]
+    assert climate_intelligence.estimate_rate(rows, 'heating') == pytest.approx(2.0)
+
+
+def test_schedule_rejects_duplicate_day_time():
+    with pytest.raises(HTTPException):
+        climate_monitor._validate_schedule_periods([
+            {'days': [0, 1], 'time': '06:00', 'mode': 'Heat', 'heatSetpoint': 70},
+            {'days': [1, 2], 'time': '06:00', 'mode': 'Heat', 'heatSetpoint': 68},
+        ], RAW)
