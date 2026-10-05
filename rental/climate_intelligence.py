@@ -446,3 +446,81 @@ async def health_score(db, binding: dict, analytics_fn, sample_minutes=5):
         "filter_runtime_hours_est": round(filter_hours, 1),
         "analytics": analytics.get("summary") or {},
     }
+
+
+async def fleet_overview(db, analytics_fn, sample_minutes=5):
+    bindings = await db.climate_bindings.find({}).limit(200).to_list(200)
+    property_ids = [b.get("property_id") for b in bindings if b.get("property_id")]
+    properties = {}
+    if property_ids:
+        from bson import ObjectId
+        ids = []
+        for value in property_ids:
+            if ObjectId.is_valid(str(value)):
+                ids.append(ObjectId(str(value)))
+        async for prop in db.properties.find(
+            {"_id": {"$in": ids}},
+            {"address": 1, "city": 1, "state": 1},
+        ):
+            properties[str(prop["_id"])] = prop
+
+    devices = []
+    totals = {"excellent": 0, "good": 0, "watch": 0, "attention": 0, "critical": 0}
+    alert_total = 0
+    for binding in bindings:
+        latest = await db.climate_readings.find_one(
+            {"device_id": binding["_id"]},
+            sort=[("observed_at", -1)],
+        )
+        health = await health_score(
+            db,
+            binding,
+            analytics_fn,
+            sample_minutes=sample_minutes,
+        )
+        label = health["label"]
+        totals[label] = totals.get(label, 0) + 1
+        alert_total += len(health.get("active_alerts") or [])
+        prop = properties.get(str(binding.get("property_id", ""))) or {}
+        observed_at = (latest or {}).get("observed_at")
+        if isinstance(observed_at, datetime):
+            if observed_at.tzinfo is None:
+                observed_at = observed_at.replace(tzinfo=timezone.utc)
+            observed_text = observed_at.isoformat()
+            age_minutes = max(0, (now() - observed_at).total_seconds() / 60)
+        else:
+            observed_text = None
+            age_minutes = None
+        devices.append({
+            "device_id": binding["_id"],
+            "name": binding.get("name", ""),
+            "property_id": str(binding.get("property_id", "")),
+            "property": prop.get("address") or binding.get("name", ""),
+            "city": prop.get("city", ""),
+            "score": health["score"],
+            "health": health["label"],
+            "active_alerts": health.get("active_alerts") or [],
+            "estimated_rate_per_hour": health.get("estimated_rate_per_hour"),
+            "estimated_minutes_to_target": health.get("estimated_minutes_to_target"),
+            "filter_runtime_hours_est": health.get("filter_runtime_hours_est"),
+            "temperature": (latest or {}).get("temperature"),
+            "humidity": (latest or {}).get("humidity"),
+            "outdoor_temperature": (latest or {}).get("outdoor_temperature"),
+            "mode": (latest or {}).get("mode"),
+            "activity": (latest or {}).get("activity"),
+            "heat_setpoint": (latest or {}).get("heat_setpoint"),
+            "cool_setpoint": (latest or {}).get("cool_setpoint"),
+            "units": (latest or {}).get("units"),
+            "online": (latest or {}).get("online"),
+            "observed_at": observed_text,
+            "age_minutes": round(age_minutes, 1) if finite(age_minutes) else None,
+        })
+    devices.sort(key=lambda row: (row["score"], row["property"]))
+    return {
+        "summary": {
+            "devices": len(devices),
+            "active_alerts": alert_total,
+            **totals,
+        },
+        "devices": devices,
+    }
