@@ -839,6 +839,21 @@ async def run_due_schedules(db):
             run_key = f"{schedule['_id']}:{index}:{local.date().isoformat()}:{period.get('time')}"
             binding = await db.climate_bindings.find_one({"_id": schedule["device_id"]})
             if binding:
+                if binding.get("ross_schedule_paused") is True:
+                    try:
+                        await db.climate_schedule_runs.insert_one({
+                            "_id": run_key,
+                            "schedule_id": schedule["_id"],
+                            "device_id": binding["_id"],
+                            "period": period,
+                            "started_at": now(),
+                            "finished_at": now(),
+                            "status": "skipped_hold",
+                            "actor": "climate_scheduler",
+                        })
+                    except DuplicateKeyError:
+                        pass
+                    continue
                 await _execute_schedule_period(db, binding, schedule, period, run_key, "climate_scheduler")
 
 
