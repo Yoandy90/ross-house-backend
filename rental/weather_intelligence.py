@@ -117,7 +117,7 @@ async def _nws_json(url: str):
         "User-Agent": _nws_user_agent(),
         "Accept": "application/geo+json, application/ld+json, application/json",
     }
-    async with httpx.AsyncClient(timeout=12.0, follow_redirects=True, headers=headers) as client:
+    async with httpx.AsyncClient(timeout=12.0, follow_redirects=False, headers=headers) as client:
         response = await client.get(url)
         response.raise_for_status()
         return response.json()
