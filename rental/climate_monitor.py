@@ -604,14 +604,14 @@ def validate_period(period: dict, raw: dict | None = None):
     if hour < 0 or hour > 23 or minute < 0 or minute > 59:
         raise HTTPException(422, "climate_schedule_time_invalid")
     mode = period.get("mode")
-    if mode not in ("Off", "Heat", "Cool", "Auto"):
+    if mode not in ("Off", "Heat", "Cool", "Auto", "EmergencyHeat"):
         raise HTTPException(422, "climate_mode_unsupported")
     command = {"mode": mode}
-    if mode in ("Heat", "Auto") and period.get("heatSetpoint") is not None:
+    if mode in ("Heat", "Auto", "EmergencyHeat") and period.get("heatSetpoint") is not None:
         command["heatSetpoint"] = period["heatSetpoint"]
     if mode in ("Cool", "Auto") and period.get("coolSetpoint") is not None:
         command["coolSetpoint"] = period["coolSetpoint"]
-    if mode == "Heat" and "heatSetpoint" not in command:
+    if mode in ("Heat", "EmergencyHeat") and "heatSetpoint" not in command:
         raise HTTPException(422, "climate_schedule_temperature_required")
     if mode == "Cool" and "coolSetpoint" not in command:
         raise HTTPException(422, "climate_schedule_temperature_required")
