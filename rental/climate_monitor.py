@@ -361,6 +361,12 @@ _RANGE_MAP = {
 }
 
 
+def _availability_pct(online_samples: int, total_samples: int) -> float:
+    if total_samples <= 0:
+        return 0.0
+    return round(max(0, online_samples) / total_samples * 100, 1)
+
+
 def _bucket_for_range(range_name: str):
     if range_name == "24h":
         return ("minute", 15)
@@ -615,9 +621,9 @@ async def analytics(db, device_id: str, range_name: str = "7d") -> dict:
             "samples": int(summary.get("samples") or 0),
             "online_samples": int(summary.get("online_samples") or 0),
             "offline_samples": int(summary.get("offline_samples") or 0),
-            "data_availability_pct": (
-                round(int(summary.get("online_samples") or 0) / int(summary.get("samples") or 0) * 100, 1)
-                if int(summary.get("samples") or 0) else 0
+            "data_availability_pct": _availability_pct(
+                int(summary.get("online_samples") or 0),
+                int(summary.get("samples") or 0),
             ),
             "heating_pct": round(heating / total_samples * 100, 1) if total_samples else 0,
             "cooling_pct": round(cooling / total_samples * 100, 1) if total_samples else 0,
