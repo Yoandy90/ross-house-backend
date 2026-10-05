@@ -463,8 +463,9 @@ async def analytics(db, device_id: str, range_name: str = "7d") -> dict:
                 "outdoor_avg": {"$avg": "$outdoor_temperature"},
                 "outdoor_min": {"$min": "$outdoor_temperature"},
                 "outdoor_max": {"$max": "$outdoor_temperature"},
+                "nws_outdoor_avg_f": {"$avg": "$nws_temperature_f"},
                 "nws_wind_speed_avg_mph": {"$avg": "$nws_wind_speed_mph"},
-                "weather_samples": {"$sum": {"$cond": [{"$eq": ["$outdoor_source", "nws"]}, 1, 0]}},
+                "weather_samples": {"$sum": {"$cond": [{"$ne": ["$nws_temperature_f", None]}, 1, 0]}},
                 "units": {"$last": "$units"},
                 "samples": {"$sum": 1},
             }
@@ -595,6 +596,7 @@ async def analytics(db, device_id: str, range_name: str = "7d") -> dict:
             "outdoor_avg": summary.get("outdoor_avg"),
             "outdoor_min": summary.get("outdoor_min"),
             "outdoor_max": summary.get("outdoor_max"),
+            "nws_outdoor_avg_f": summary.get("nws_outdoor_avg_f"),
             "nws_wind_speed_avg_mph": summary.get("nws_wind_speed_avg_mph"),
             "weather_samples": int(summary.get("weather_samples") or 0),
             "heating_degree_hours": round(heating_degree_hours, 2),
