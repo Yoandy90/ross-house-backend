@@ -202,3 +202,53 @@ async def change(db, binding, values):
     await api(db, binding['connection_id'], 'POST',
               '/devices/thermostats/' + quote(binding['provider_device_id'], safe=''),
               binding['location_id'], values)
+
+
+async def change_fan(db, binding, mode):
+    if await connection_kind(db, binding['connection_id']) == 'tcc_us':
+        from . import climate_tcc
+        return await climate_tcc.change_fan(db, binding, mode)
+    raw = await api(
+        db,
+        binding['connection_id'],
+        'GET',
+        '/devices/thermostats/' + quote(binding['provider_device_id'], safe='') + '/fan',
+        binding['location_id'],
+    )
+    allowed = [x for x in raw.get('allowedModes', []) if x in ('Auto', 'On', 'Circulate')]
+    if mode not in allowed:
+        raise HTTPException(422, 'climate_fan_mode_unsupported')
+    await api(
+        db,
+        binding['connection_id'],
+        'POST',
+        '/devices/thermostats/' + quote(binding['provider_device_id'], safe='') + '/fan',
+        binding['location_id'],
+        {'mode': mode},
+    )
+
+
+async def change_hold(db, binding, mode):
+    if await connection_kind(db, binding['connection_id']) == 'tcc_us':
+        from . import climate_tcc
+        return await climate_tcc.change_hold(db, binding, mode)
+    if mode not in ('schedule', 'permanent'):
+        raise HTTPException(422, 'climate_hold_mode_unsupported')
+    raw = await device(db, binding)
+    values = raw.get('changeableValues') or {}
+    body = {
+        'mode': values.get('mode'),
+        'heatSetpoint': values.get('heatSetpoint'),
+        'coolSetpoint': values.get('coolSetpoint'),
+        'thermostatSetpointStatus': 'NoHold' if mode == 'schedule' else 'PermanentHold',
+    }
+    if not body['mode']:
+        raise HTTPException(409, 'climate_capabilities_unknown')
+    await api(
+        db,
+        binding['connection_id'],
+        'POST',
+        '/devices/thermostats/' + quote(binding['provider_device_id'], safe=''),
+        binding['location_id'],
+        body,
+    )
