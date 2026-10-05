@@ -161,7 +161,8 @@ async def tenant_scope(request):
 async def read_binding(binding):
     result = {'id': binding['_id'], 'request_id': str(uuid4()), 'name': binding['name'],
               'property_id': binding['property_id'], 'unit_id': binding.get('unit_id', ''),
-              'online': False, 'control_enabled': control()}
+              'online': False, 'control_enabled': control(),
+              'ross_schedule_paused': binding.get('ross_schedule_paused') is True}
     if enabled():
         try:
             state = snapshot(await provider.device(get_db(), binding))
