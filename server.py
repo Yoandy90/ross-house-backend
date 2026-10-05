@@ -130,28 +130,48 @@ async def lifespan(app: FastAPI):
         from rental.climate_router import ensure_indexes as climate_indexes
         await climate_indexes(db)
 
-    # Staging must never execute autonomous jobs (payments, messages, or syncs).
+    # Read-only climate telemetry is isolated from the general autonomous-job gate.
+    # It may run in staging because it only reads thermostat/weather providers and
+    # persists history/alert state; it never sends thermostat commands.
+    climate_telemetry_task = None
+    try:
+        import asyncio
+        from rental.climate_monitor import telemetry_enabled, telemetry_loop
+        if telemetry_enabled():
+            climate_telemetry_task = asyncio.create_task(telemetry_loop(db))
+            logger.info("   ✅ Climate read-only telemetry worker scheduled")
+        else:
+            logger.info("   ⏸️ Climate telemetry disabled (explicit opt-in required)")
+    except Exception as e:
+        logger.warning(f"   ⚠️ Climate telemetry not started: {e}")
+
+    # Staging must never execute general autonomous jobs (payments, messages, or syncs).
     # DISABLE_BACKGROUND_JOBS also provides an explicit kill switch elsewhere.
     if should_disable_background_jobs():
-        logger.warning("   ⏸️ Background jobs disabled for this environment")
+        logger.warning("   ⏸️ General background jobs disabled for this environment")
         yield
+        if climate_telemetry_task and not climate_telemetry_task.done():
+            climate_telemetry_task.cancel()
+            try:
+                await climate_telemetry_task
+            except asyncio.CancelledError:
+                pass
         client.close()
         logger.info("🏠 Ross House Rentals API stopped.")
         return
 
-    # Climate telemetry + Ross House schedules are autonomous and therefore
-    # start only after the global background-job safety gate.
-    climate_monitor_task = None
+    # Automatic schedule execution can write to physical thermostats. It remains
+    # behind the global job safety gate plus its dedicated write-capable flag.
+    climate_schedule_task = None
     try:
-        import asyncio
-        from rental.climate_monitor import monitor_enabled, monitor_loop
-        if monitor_enabled():
-            climate_monitor_task = asyncio.create_task(monitor_loop(db))
-            logger.info("   ✅ Climate telemetry + schedule worker scheduled")
+        from rental.climate_monitor import schedule_worker_enabled, schedule_loop
+        if schedule_worker_enabled():
+            climate_schedule_task = asyncio.create_task(schedule_loop(db))
+            logger.info("   ✅ Climate schedule execution worker scheduled")
         else:
-            logger.info("   ⏸️ Climate monitor disabled (explicit opt-in required)")
+            logger.info("   ⏸️ Climate schedule worker disabled (explicit write opt-in required)")
     except Exception as e:
-        logger.warning(f"   ⚠️ Climate monitor not started: {e}")
+        logger.warning(f"   ⚠️ Climate schedule worker not started: {e}")
 
     # Inspection emails are side-effecting: require an explicit opt-in even when
     # the environment-wide background-job policy permits autonomous work.
@@ -315,10 +335,17 @@ async def lifespan(app: FastAPI):
     yield
 
     # Graceful shutdown of autonomous workers and cron jobs.
-    if climate_monitor_task and not climate_monitor_task.done():
-        climate_monitor_task.cancel()
+    if climate_telemetry_task and not climate_telemetry_task.done():
+        climate_telemetry_task.cancel()
         try:
-            await climate_monitor_task
+            await climate_telemetry_task
+        except asyncio.CancelledError:
+            pass
+
+    if climate_schedule_task and not climate_schedule_task.done():
+        climate_schedule_task.cancel()
+        try:
+            await climate_schedule_task
         except asyncio.CancelledError:
             pass
 
