@@ -130,11 +130,15 @@ def test_timeout_is_unknown_and_never_retried(monkeypatch):
     monkeypatch.setenv('CLIMATE_ENABLED','true'); monkeypatch.setenv('CLIMATE_CONTROL_ENABLED','true')
     db=command_db(); monkeypatch.setattr(routes,'get_db',lambda:db)
     monkeypatch.setattr(provider,'device',AsyncMock(return_value=deepcopy(RAW)))
-    change=AsyncMock(side_effect=HTTPException(503,'unavailable'));monkeypatch.setattr(provider,'change',change)
+    change=AsyncMock(side_effect=HTTPException(503,'climate_provider_unavailable'));monkeypatch.setattr(provider,'change',change)
     result=run(routes.issue_command({'_id':'device'}, {'id':'admin'},routes.Command(request_id=uuid4(),mode='Off')))
-    assert result == {'status':'unknown'}
+    assert result == {'status':'unknown', 'reason':'climate_provider_unavailable'}
     assert change.await_count == 1
-    assert db.climate_commands.update_one.call_args.args[1]['$set']['status']=='unknown'
+    saved = db.climate_commands.update_one.call_args.args[1]['$set']
+    assert saved['status']=='unknown'
+    assert saved['failure_reason']=='climate_provider_unavailable'
+    assert saved['failure_http_status']==503
+    assert saved.get('finished_at') is not None
 
 
 def test_duplicate_request_does_not_reissue(monkeypatch):
@@ -146,3 +150,29 @@ def test_duplicate_request_does_not_reissue(monkeypatch):
     assert run(routes.issue_command({'_id':'device'},{'id':'admin'},routes.Command(request_id=uuid4(),mode='Off'))) == {'status':'confirmed'}
     change.assert_not_awaited()
     db.climate_bindings.find_one_and_update.assert_not_awaited()
+
+
+
+def test_command_failure_detail_is_sanitized(monkeypatch):
+    monkeypatch.setenv('CLIMATE_ENABLED','true'); monkeypatch.setenv('CLIMATE_CONTROL_ENABLED','true')
+    db=command_db(); monkeypatch.setattr(routes,'get_db',lambda:db)
+    monkeypatch.setattr(provider,'device',AsyncMock(return_value=deepcopy(RAW)))
+    secret_detail='upstream cookie=super-secret'
+    monkeypatch.setattr(provider,'change',AsyncMock(side_effect=HTTPException(503,secret_detail)))
+    result=run(routes.issue_command({'_id':'device'}, {'id':'admin'},routes.Command(request_id=uuid4(),mode='Off')))
+    assert result == {'status':'unknown', 'reason':'climate_command_unconfirmed'}
+    saved = db.climate_commands.update_one.call_args.args[1]['$set']
+    assert saved['failure_reason']=='climate_command_unconfirmed'
+    assert secret_detail not in repr(saved)
+
+
+def test_duplicate_unknown_command_returns_safe_reason_without_reissue(monkeypatch):
+    import hashlib, json
+    monkeypatch.setenv('CLIMATE_ENABLED','true');monkeypatch.setenv('CLIMATE_CONTROL_ENABLED','true')
+    digest=hashlib.sha256(json.dumps({'mode':'Off'},sort_keys=True).encode()).hexdigest()
+    previous={'device_id':'device','digest':digest,'status':'unknown','failure_reason':'climate_provider_rejected'}
+    db=command_db(previous);monkeypatch.setattr(routes,'get_db',lambda:db)
+    change=AsyncMock();monkeypatch.setattr(provider,'change',change)
+    result=run(routes.issue_command({'_id':'device'},{'id':'admin'},routes.Command(request_id=uuid4(),mode='Off')))
+    assert result == {'status':'unknown', 'reason':'climate_provider_rejected'}
+    change.assert_not_awaited()
