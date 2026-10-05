@@ -14,7 +14,6 @@ from . import climate_provider as provider
 from .climate_policy import scope_for_contract, snapshot, validate_change
 from . import climate_monitor
 from . import climate_intelligence
-from .notification_identity import id_values
 
 router = APIRouter(tags=['climate'])
 
@@ -44,6 +43,12 @@ def actor_id(user):
     if not value:
         raise HTTPException(401, 'climate_identity_required')
     return value
+
+def _id_values(value):
+    values = [str(value)]
+    if ObjectId.is_valid(str(value)):
+        values.append(ObjectId(str(value)))
+    return values
 
 
 class StrictModel(BaseModel):
@@ -201,7 +206,7 @@ async def tenant_list(request: Request):
 async def tenant_climate_notification_preferences(request: Request):
     user, _ = await tenant_scope(request)
     account = await get_db().app_users.find_one(
-        {'_id': {'$in': id_values(actor_id(user))}},
+        {'_id': {'$in': _id_values(actor_id(user))}},
         {'climate_alert_preferences': 1},
     )
     prefs = (account or {}).get('climate_alert_preferences') or {}
@@ -221,7 +226,7 @@ async def update_tenant_climate_notification_preferences(
     user, _ = await tenant_scope(request)
     values = body.model_dump()
     result = await get_db().app_users.update_one(
-        {'_id': {'$in': id_values(actor_id(user))}},
+        {'_id': {'$in': _id_values(actor_id(user))}},
         {'$set': {
             'climate_alert_preferences': values,
             'notification_preferences.climate': any(values.values()),
