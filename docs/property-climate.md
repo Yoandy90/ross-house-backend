@@ -111,3 +111,28 @@ P3 — model-specific enhancements:
 - Never render unsupported controls merely because another thermostat model supports them.
 
 Public capability references reviewed on 2026-10-05: Resideo Honeywell Home thermostat GET/change-setting, fan, schedule, thermostat-configuration, room-priority and First Alert integration documentation; AIOSomecomfort's current TCC client capabilities. Keep provider-specific writes behind hardware validation before production.
+
+
+## Weather Intelligence
+
+Ross House now has an optional official-weather context layer backed by US Government services.
+
+- `CLIMATE_WEATHER_ENABLED=true` enables the weather layer. It is independent from thermostat write control.
+- `NWS_USER_AGENT` identifies Ross House to the National Weather Service API. No NWS API key is required.
+- `CLIMATE_WEATHER_CACHE_MINUTES` controls shared MongoDB caching and defaults to 10 minutes.
+- Property coordinates are resolved from saved latitude/longitude when available, otherwise through the US Census Geocoder from the property's address. Administrators can set a manual coordinate override when an address cannot be geocoded.
+- The NWS `/points` mapping is cached and periodically refreshed. Ross House retrieves the nearest observation station, hourly and multi-period forecasts, and active alerts for the property point.
+- Official weather is stored as context, not represented as a sensor physically installed at the property. Provider-reported outdoor sensors take precedence for the generic outdoor-temperature field; NWS remains separately traceable.
+- Climate telemetry stores NWS temperature, humidity, wind, gusts, condition, station, alert count, and 12-hour forecast range alongside thermostat state.
+- Analytics calculate outdoor averages/ranges, heating/cooling degree-hours and weather-normalized runtime metrics.
+- Explainable rules can flag cooling during unusually cold outdoor conditions, heating during unusually warm conditions, forecast freeze risk, and severe/extreme NWS alerts.
+- These rules are advisory. Ross House does not automatically shut down HVAC solely because of an NWS condition.
+- Tenant and admin weather endpoints are scoped through the same property/lease authorization as thermostat access.
+
+Routes:
+- `GET /api/tenant/climate/devices/{device_id}/weather`
+- `GET /api/admin/climate/devices/{device_id}/weather`
+- `PUT /api/admin/climate/properties/{property_id}/weather-location`
+- `POST /api/admin/climate/properties/{property_id}/weather-refresh`
+
+The current implementation builds its own historical weather context from ongoing NWS observations. Optional NCEI historical backfill can be added later if a token is configured; it is not required for normal operation.
