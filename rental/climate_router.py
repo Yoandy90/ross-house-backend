@@ -161,7 +161,8 @@ async def tenant_scope(request):
 async def read_binding(binding):
     result = {'id': binding['_id'], 'request_id': str(uuid4()), 'name': binding['name'],
               'property_id': binding['property_id'], 'unit_id': binding.get('unit_id', ''),
-              'online': False, 'control_enabled': control()}
+              'online': False, 'control_enabled': control(),
+              'ross_schedule_paused': binding.get('ross_schedule_paused') is True}
     if enabled():
         try:
             state = snapshot(await provider.device(get_db(), binding))
@@ -390,6 +391,15 @@ async def issue_feature_command(binding, user, request_id, kind, requested):
         )
         status = 'confirmed' if confirmed else 'pending'
         await db.climate_commands.update_one({'_id': key}, {'$set': {'status': status}})
+        if kind == 'hold' and status == 'confirmed':
+            await db.climate_bindings.update_one(
+                {'_id': binding['_id']},
+                {'$set': {
+                    'ross_schedule_paused': requested['mode'] == 'permanent',
+                    'ross_schedule_pause_updated_at': provider.now(),
+                    'ross_schedule_pause_updated_by': actor_id(user),
+                }},
+            )
         await climate_monitor.record_snapshot(db, binding, observed, source=kind)
         return {'status': status}
     except HTTPException:
