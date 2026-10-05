@@ -948,22 +948,84 @@ async def sample_all(db):
     return {"sampled": sampled, "failed": failed}
 
 
-def monitor_enabled() -> bool:
+def telemetry_enabled() -> bool:
+    """Read-only climate sampling can run independently of all other cron jobs.
+
+    CLIMATE_MONITOR_ENABLED remains a backwards-compatible telemetry opt-in only.
+    It no longer implies permission to execute thermostat schedules.
+    """
     return (
         os.getenv("CLIMATE_ENABLED") == "true"
-        and os.getenv("CLIMATE_MONITOR_ENABLED") == "true"
+        and (
+            os.getenv("CLIMATE_TELEMETRY_ENABLED") == "true"
+            or os.getenv("CLIMATE_MONITOR_ENABLED") == "true"
+        )
     )
 
 
-async def monitor_loop(db):
-    """Production worker: sample devices and execute due Ross House schedules."""
-    interval = max(60, min(int(os.getenv("CLIMATE_MONITOR_INTERVAL_SECONDS", "300")), 3600))
+def schedule_worker_enabled() -> bool:
+    """Automatic thermostat schedule writes require three explicit gates."""
+    return (
+        os.getenv("CLIMATE_ENABLED") == "true"
+        and os.getenv("CLIMATE_CONTROL_ENABLED") == "true"
+        and os.getenv("CLIMATE_SCHEDULE_WORKER_ENABLED") == "true"
+    )
+
+
+def monitor_enabled() -> bool:
+    """Compatibility alias used by existing clients to mean history collection."""
+    return telemetry_enabled()
+
+
+def _telemetry_interval_seconds() -> int:
+    raw = os.getenv(
+        "CLIMATE_TELEMETRY_INTERVAL_SECONDS",
+        os.getenv("CLIMATE_MONITOR_INTERVAL_SECONDS", "300"),
+    )
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        value = 300
+    return max(60, min(value, 3600))
+
+
+def _schedule_interval_seconds() -> int:
+    try:
+        value = int(os.getenv("CLIMATE_SCHEDULE_INTERVAL_SECONDS", "60"))
+    except (TypeError, ValueError):
+        value = 60
+    return max(60, min(value, 900))
+
+
+async def telemetry_loop(db):
+    """Read providers and persist history. Never sends thermostat commands."""
     while True:
         try:
             await sample_all(db)
+        except Exception:
+            # A provider/network failure must not terminate the sampling worker.
+            pass
+        await asyncio.sleep(_telemetry_interval_seconds())
+
+
+async def schedule_loop(db):
+    """Execute due Ross House schedules only behind the dedicated write gate."""
+    while True:
+        try:
             await run_due_schedules(db)
         except Exception:
-            # Worker errors must not terminate the API; the next interval retries the
-            # read loop but physical commands themselves remain idempotent by run key.
+            # Individual physical writes remain idempotent by schedule run key.
             pass
-        await asyncio.sleep(interval)
+        await asyncio.sleep(_schedule_interval_seconds())
+
+
+async def monitor_loop(db):
+    """Legacy combined loop retained for compatibility, with writes separately gated."""
+    while True:
+        try:
+            await sample_all(db)
+            if schedule_worker_enabled():
+                await run_due_schedules(db)
+        except Exception:
+            pass
+        await asyncio.sleep(_telemetry_interval_seconds())
