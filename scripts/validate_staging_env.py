@@ -18,6 +18,8 @@ REQUIRED = {
     "REFRESH_TOKENS_ENABLED", "ALLOW_LEGACY_USER_SESSIONS",
     "REQUIRE_SESSION_SID",
     "RENEWAL_TERM_MONTHS", "DISABLE_BACKGROUND_JOBS", "STAGING_FIXTURES_ENABLED",
+    "CLIMATE_TELEMETRY_ENABLED", "CLIMATE_SCHEDULE_WORKER_ENABLED",
+    "CLIMATE_ALERT_NOTIFICATIONS_ENABLED", "CLIMATE_ALERT_PUSH_ENABLED",
 }
 SECRET_KEYS = {
     "TENANT_JWT_SECRET", "JWT_SECRET_KEY", "REFRESH_DERIVE_KEY",
@@ -77,6 +79,15 @@ def validate(values: dict[str, str], template: bool) -> list[str]:
         errors.append("DISABLE_BACKGROUND_JOBS must be true in staging")
     if values.get("STAGING_FIXTURES_ENABLED", "").lower() not in {"true", "false"}:
         errors.append("STAGING_FIXTURES_ENABLED must be true or false")
+
+    if values.get("CLIMATE_TELEMETRY_ENABLED", "").lower() not in {"true", "false"}:
+        errors.append("CLIMATE_TELEMETRY_ENABLED must be true or false")
+    if values.get("CLIMATE_SCHEDULE_WORKER_ENABLED", "").lower() != "false":
+        errors.append("CLIMATE_SCHEDULE_WORKER_ENABLED must be false in staging")
+    if values.get("CLIMATE_ALERT_NOTIFICATIONS_ENABLED", "").lower() != "false":
+        errors.append("CLIMATE_ALERT_NOTIFICATIONS_ENABLED must be false in staging")
+    if values.get("CLIMATE_ALERT_PUSH_ENABLED", "").lower() != "false":
+        errors.append("CLIMATE_ALERT_PUSH_ENABLED must be false in staging")
 
     if values.get("REFRESH_TOKENS_ENABLED", "").lower() != "true":
         errors.append("REFRESH_TOKENS_ENABLED must be true")
