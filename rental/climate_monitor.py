@@ -20,6 +20,7 @@ from pymongo.errors import DuplicateKeyError
 
 from . import climate_provider as provider
 from .climate_policy import snapshot, validate_change
+from . import climate_intelligence
 
 
 def now() -> datetime:
@@ -51,6 +52,9 @@ async def ensure_indexes(db):
     await db.climate_alert_state.create_index([("device_id", 1), ("active", 1), ("updated_at", -1)])
     await db.climate_schedules.create_index([("device_id", 1), ("enabled", 1)])
     await db.climate_schedule_runs.create_index([("device_id", 1), ("started_at", -1)])
+    await db.climate_alert_rules.create_index([("property_id", 1)])
+    await db.climate_alert_deliveries.create_index([("device_id", 1), ("created_at", -1)])
+    await db.climate_maintenance.create_index([("property_id", 1)])
 
 
 def _reading_doc(binding: dict, state: dict, observed_at: datetime, source: str) -> dict:
@@ -118,50 +122,40 @@ async def _record_transitions(db, binding: dict, reading: dict):
         await db.climate_events.insert_many(events)
 
 
-def _alert_conditions(state: dict) -> dict[str, tuple[bool, str, str]]:
-    conditions: dict[str, tuple[bool, str, str]] = {}
-    online = state.get("online") is True
-    conditions["offline"] = (
-        state.get("offline_alert") is True,
-        "critical",
-        "Thermostat is not reporting live data.",
+def _alert_conditions(state: dict, rules: dict | None = None) -> dict[str, tuple[bool, str, str]]:
+    return climate_intelligence.basic_conditions(
+        state,
+        rules or climate_intelligence.DEFAULT_RULES,
     )
-    units = state.get("units")
-    temp = state.get("temperature")
-    if _finite(temp) and units in ("Fahrenheit", "Celsius"):
-        low = 50 if units == "Fahrenheit" else 10
-        high = 85 if units == "Fahrenheit" else 29.5
-        conditions["temperature_low"] = (
-            temp <= low,
-            "critical",
-            "Indoor temperature is below the configured protection threshold.",
-        )
-        conditions["temperature_high"] = (
-            temp >= high,
-            "critical",
-            "Indoor temperature is above the configured protection threshold.",
-        )
-    humidity = state.get("humidity")
-    if _finite(humidity):
-        conditions["humidity_low"] = (
-            humidity <= 25,
-            "warning",
-            "Indoor humidity is unusually low.",
-        )
-        conditions["humidity_high"] = (
-            humidity >= 65,
-            "warning",
-            "Indoor humidity is unusually high.",
-        )
-    return conditions
 
 
 async def _evaluate_alerts(db, binding: dict, state: dict, observed_at: datetime):
-    active_types = set()
-    for alert_type, (active, severity, message) in _alert_conditions(state).items():
+    rules = await climate_intelligence.get_rules(db, binding)
+    conditions = _alert_conditions(state, rules)
+    try:
+        conditions.update(
+            await climate_intelligence.predictive_conditions(
+                db,
+                binding,
+                state,
+                rules,
+                sample_minutes=_sample_minutes(),
+            )
+        )
+    except Exception:
+        # Predictive heuristics must never block raw telemetry collection.
+        pass
+
+    for alert_type, (active, severity, message) in conditions.items():
         alert_id = f"{binding['_id']}:{alert_type}"
+        current = await db.climate_alert_state.find_one({"_id": alert_id})
+        was_active = bool(current and current.get("active") is True)
         if active:
-            active_types.add(alert_type)
+            triggered_at = (
+                current.get("triggered_at")
+                if was_active and isinstance(current.get("triggered_at"), datetime)
+                else observed_at
+            )
             await db.climate_alert_state.update_one(
                 {"_id": alert_id},
                 {
@@ -173,29 +167,57 @@ async def _evaluate_alerts(db, binding: dict, state: dict, observed_at: datetime
                         "severity": severity,
                         "message": message,
                         "active": True,
+                        "triggered_at": triggered_at,
                         "updated_at": observed_at,
                     },
-                    "$setOnInsert": {"triggered_at": observed_at},
                     "$unset": {"resolved_at": ""},
                 },
                 upsert=True,
             )
-        else:
-            current = await db.climate_alert_state.find_one({"_id": alert_id, "active": True})
-            if current:
-                await db.climate_alert_state.update_one(
-                    {"_id": alert_id},
-                    {"$set": {"active": False, "resolved_at": observed_at, "updated_at": observed_at}},
-                )
+            if not was_active:
                 await db.climate_events.insert_one({
                     "_id": str(uuid4()),
                     "device_id": binding["_id"],
                     "property_id": binding.get("property_id", ""),
                     "unit_id": binding.get("unit_id", ""),
-                    "type": "alert_resolved",
+                    "type": "alert_triggered",
                     "field": alert_type,
+                    "severity": severity,
                     "created_at": observed_at,
                 })
+                try:
+                    from .climate_notifications import notify_transition
+                    await notify_transition(
+                        db, binding, alert_type, severity, True, observed_at
+                    )
+                except Exception:
+                    pass
+        elif was_active:
+            await db.climate_alert_state.update_one(
+                {"_id": alert_id},
+                {"$set": {"active": False, "resolved_at": observed_at, "updated_at": observed_at}},
+            )
+            await db.climate_events.insert_one({
+                "_id": str(uuid4()),
+                "device_id": binding["_id"],
+                "property_id": binding.get("property_id", ""),
+                "unit_id": binding.get("unit_id", ""),
+                "type": "alert_resolved",
+                "field": alert_type,
+                "created_at": observed_at,
+            })
+            try:
+                from .climate_notifications import notify_transition
+                await notify_transition(
+                    db,
+                    binding,
+                    alert_type,
+                    current.get("severity") or severity,
+                    False,
+                    observed_at,
+                )
+            except Exception:
+                pass
 
 
 async def record_snapshot(db, binding: dict, state: dict, source: str = "read"):
@@ -321,6 +343,14 @@ async def analytics(db, device_id: str, range_name: str = "7d") -> dict:
                 "cool_setpoint": {"$avg": "$cool_setpoint"},
                 "heating_samples": {"$sum": {"$cond": [{"$eq": ["$activity", "heating"]}, 1, 0]}},
                 "cooling_samples": {"$sum": {"$cond": [{"$eq": ["$activity", "cooling"]}, 1, 0]}},
+                "fan_only_samples": {"$sum": {"$cond": [
+                    {"$and": [
+                        {"$eq": ["$fan_running", True]},
+                        {"$eq": ["$activity", "idle"]},
+                    ]},
+                    1,
+                    0,
+                ]}},
                 "samples": {"$sum": 1},
                 "mode": {"$last": "$mode"},
                 "activity": {"$last": "$activity"},
@@ -330,12 +360,13 @@ async def analytics(db, device_id: str, range_name: str = "7d") -> dict:
     ]
     rows = await db.climate_readings.aggregate(pipeline).to_list(5000)
     points = []
-    total_samples = heating = cooling = 0
+    total_samples = heating = cooling = fan_only = 0
     for row in rows:
         count = int(row.get("samples") or 0)
         total_samples += count
         heating += int(row.get("heating_samples") or 0)
         cooling += int(row.get("cooling_samples") or 0)
+        fan_only += int(row.get("fan_only_samples") or 0)
         points.append({
             "at": row["_id"].isoformat(),
             "temperature": row.get("temperature"),
@@ -416,6 +447,46 @@ async def analytics(db, device_id: str, range_name: str = "7d") -> dict:
             if error <= tolerance:
                 comfort_samples += 1
 
+    heat_rates = []
+    cool_rates = []
+    idle_drift_rates = []
+    indoor_outdoor_deltas = []
+    for first, second in zip(points, points[1:]):
+        try:
+            t1 = datetime.fromisoformat(first["at"])
+            t2 = datetime.fromisoformat(second["at"])
+        except (ValueError, TypeError):
+            continue
+        hours = (t2 - t1).total_seconds() / 3600
+        if hours <= 0 or not _finite(first.get("temperature")) or not _finite(second.get("temperature")):
+            continue
+        delta = second["temperature"] - first["temperature"]
+        if first.get("activity") == second.get("activity") == "heating" and delta > 0:
+            heat_rates.append(delta / hours)
+        elif first.get("activity") == second.get("activity") == "cooling" and delta < 0:
+            cool_rates.append(-delta / hours)
+        elif first.get("activity") == second.get("activity") == "idle":
+            idle_drift_rates.append(abs(delta) / hours)
+        if _finite(first.get("outdoor_temperature")):
+            indoor_outdoor_deltas.append(abs(first["temperature"] - first["outdoor_temperature"]))
+
+    def mean_or_none(values):
+        return sum(values) / len(values) if values else None
+
+    energy = await db.climate_energy_config.find_one({"_id": device_id}) or {}
+    heating_minutes_est = heating * _sample_minutes()
+    cooling_minutes_est = cooling * _sample_minutes()
+    fan_only_minutes_est = fan_only * _sample_minutes()
+    energy_kwh = None
+    energy_cost = None
+    if all(_finite(energy.get(key)) for key in ("heat_kw", "cool_kw", "fan_kw", "electric_rate")):
+        energy_kwh = (
+            heating_minutes_est / 60 * energy["heat_kw"]
+            + cooling_minutes_est / 60 * energy["cool_kw"]
+            + fan_only_minutes_est / 60 * energy["fan_kw"]
+        )
+        energy_cost = energy_kwh * energy["electric_rate"]
+
     events = await db.climate_events.find(
         {"device_id": device_id, "created_at": {"$gte": start}},
         {"_id": 0},
@@ -444,13 +515,20 @@ async def analytics(db, device_id: str, range_name: str = "7d") -> dict:
             "samples": int(summary.get("samples") or 0),
             "heating_pct": round(heating / total_samples * 100, 1) if total_samples else 0,
             "cooling_pct": round(cooling / total_samples * 100, 1) if total_samples else 0,
-            "heating_minutes_est": heating_minutes,
-            "cooling_minutes_est": cooling_minutes,
+            "heating_minutes_est": heating_minutes_est,
+            "cooling_minutes_est": cooling_minutes_est,
+            "fan_only_minutes_est": fan_only_minutes_est,
             "heating_cycles": heating_cycles,
             "cooling_cycles": cooling_cycles,
             "mode_changes": mode_changes,
             "mean_target_error": round(sum(target_errors) / len(target_errors), 2) if target_errors else None,
             "comfort_pct": round(comfort_samples / len(target_errors) * 100, 1) if target_errors else None,
+            "heating_recovery_rate_per_hour": round(mean_or_none(heat_rates), 3) if heat_rates else None,
+            "cooling_recovery_rate_per_hour": round(mean_or_none(cool_rates), 3) if cool_rates else None,
+            "idle_drift_rate_per_hour": round(mean_or_none(idle_drift_rates), 3) if idle_drift_rates else None,
+            "indoor_outdoor_delta_avg": round(mean_or_none(indoor_outdoor_deltas), 2) if indoor_outdoor_deltas else None,
+            "energy_estimate_kwh": round(energy_kwh, 2) if _finite(energy_kwh) else None,
+            "energy_estimate_cost": round(energy_cost, 2) if _finite(energy_cost) else None,
         },
         "points": points,
         "events": events,
@@ -543,12 +621,12 @@ def validate_period(period: dict, raw: dict | None = None):
     return command
 
 
-def _validate_schedule_periods(periods: list[dict]):
+def _validate_schedule_periods(periods: list[dict], raw: dict | None = None):
     if not periods or len(periods) > 56:
         raise HTTPException(422, "climate_schedule_periods_invalid")
     seen: set[tuple[int, str]] = set()
     for period in periods:
-        validate_period(period)
+        validate_period(period, raw)
         for day in period.get("days") or []:
             key = (day, period.get("time"))
             if key in seen:
@@ -556,10 +634,32 @@ def _validate_schedule_periods(periods: list[dict]):
             seen.add(key)
 
 
+async def _ensure_no_schedule_conflicts(db, binding: dict, periods: list[dict], exclude_id: str | None = None):
+    desired = {
+        (day, period.get("time"))
+        for period in periods
+        for day in (period.get("days") or [])
+    }
+    query = {"device_id": binding["_id"], "enabled": True}
+    if exclude_id:
+        query["_id"] = {"$ne": exclude_id}
+    async for schedule in db.climate_schedules.find(query, {"periods": 1}):
+        existing = {
+            (day, period.get("time"))
+            for period in (schedule.get("periods") or [])
+            for day in (period.get("days") or [])
+        }
+        if desired & existing:
+            raise HTTPException(409, "climate_schedule_conflict")
+
+
 async def create_schedule(db, binding: dict, actor: str, payload: dict):
     timezone_name = validate_timezone(payload.get("timezone") or "America/Chicago")
     periods = payload.get("periods") or []
-    _validate_schedule_periods(periods)
+    raw = await provider.device(db, binding)
+    _validate_schedule_periods(periods, raw)
+    if bool(payload.get("enabled", True)):
+        await _ensure_no_schedule_conflicts(db, binding, periods)
     schedule_id = str(uuid4())
     doc = {
         "_id": schedule_id,
@@ -581,10 +681,10 @@ async def create_schedule(db, binding: dict, actor: str, payload: dict):
 async def update_schedule(db, binding: dict, schedule_id: str, actor: str, payload: dict):
     timezone_name = validate_timezone(payload.get("timezone") or "America/Chicago")
     periods = payload.get("periods") or []
-    if not periods or len(periods) > 56:
-        raise HTTPException(422, "climate_schedule_periods_invalid")
-    for period in periods:
-        validate_period(period)
+    raw = await provider.device(db, binding)
+    _validate_schedule_periods(periods, raw)
+    if bool(payload.get("enabled", True)):
+        await _ensure_no_schedule_conflicts(db, binding, periods, exclude_id=schedule_id)
     result = await db.climate_schedules.find_one_and_update(
         {"_id": schedule_id, "device_id": binding["_id"]},
         {"$set": {
@@ -744,12 +844,16 @@ async def run_due_schedules(db):
 
 async def sample_all(db):
     bindings = await db.climate_bindings.find({}).limit(500).to_list(500)
+    sampled = failed = 0
     for binding in bindings:
         try:
             raw = await provider.device(db, binding)
             await record_snapshot(db, binding, snapshot(raw), source="monitor")
+            sampled += 1
         except HTTPException:
             await record_unavailable(db, binding, source="monitor")
+            failed += 1
+    return {"sampled": sampled, "failed": failed}
 
 
 def monitor_enabled() -> bool:
