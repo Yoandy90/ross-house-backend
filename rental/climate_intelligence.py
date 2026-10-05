@@ -592,6 +592,16 @@ def score_from_alerts(alert_types: list[str], analytics_summary: dict | None = N
     if finite(comfort) and comfort < 75:
         score -= 8
         reasons.append({"type": "low_comfort", "penalty": 8})
+    availability = summary.get("data_availability_pct")
+    sample_count = summary.get("samples")
+    if finite(availability) and finite(sample_count) and sample_count >= 6 and availability < 80:
+        penalty = 15 if availability < 50 else 8
+        score -= penalty
+        reasons.append({
+            "type": "low_data_availability",
+            "penalty": penalty,
+            "availability_pct": round(availability, 1),
+        })
     score = max(0, min(100, int(round(score))))
     label = (
         "excellent" if score >= 90 else
@@ -654,6 +664,15 @@ async def fleet_overview(db, analytics_fn, sample_minutes=5):
     devices = []
     totals = {"excellent": 0, "good": 0, "watch": 0, "attention": 0, "critical": 0}
     alert_total = 0
+    weather_risk_devices = 0
+    offline_devices = 0
+    low_availability_devices = 0
+    weather_types = {
+        "cooling_in_cold_weather",
+        "heating_in_hot_weather",
+        "forecast_freeze_risk",
+        "nws_severe_weather",
+    }
     for binding in bindings:
         latest = await db.climate_readings.find_one(
             {"device_id": binding["_id"]},
@@ -667,7 +686,20 @@ async def fleet_overview(db, analytics_fn, sample_minutes=5):
         )
         label = health["label"]
         totals[label] = totals.get(label, 0) + 1
-        alert_total += len(health.get("active_alerts") or [])
+        active_alerts = health.get("active_alerts") or []
+        alert_total += len(active_alerts)
+        weather_risks = sorted({
+            alert.get("type") for alert in active_alerts
+            if alert.get("type") in weather_types
+        })
+        if weather_risks:
+            weather_risk_devices += 1
+        analytics_summary = health.get("analytics") or {}
+        availability_pct = analytics_summary.get("data_availability_pct")
+        if finite(availability_pct) and availability_pct < 80:
+            low_availability_devices += 1
+        if (latest or {}).get("online") is not True:
+            offline_devices += 1
         prop = properties.get(str(binding.get("property_id", ""))) or {}
         observed_at = (latest or {}).get("observed_at")
         if isinstance(observed_at, datetime):
@@ -686,13 +718,19 @@ async def fleet_overview(db, analytics_fn, sample_minutes=5):
             "city": prop.get("city", ""),
             "score": health["score"],
             "health": health["label"],
-            "active_alerts": health.get("active_alerts") or [],
+            "active_alerts": active_alerts,
+            "weather_risks": weather_risks,
+            "data_availability_pct": availability_pct,
             "estimated_rate_per_hour": health.get("estimated_rate_per_hour"),
             "estimated_minutes_to_target": health.get("estimated_minutes_to_target"),
             "filter_runtime_hours_est": health.get("filter_runtime_hours_est"),
             "temperature": (latest or {}).get("temperature"),
             "humidity": (latest or {}).get("humidity"),
             "outdoor_temperature": (latest or {}).get("outdoor_temperature"),
+            "outdoor_source": (latest or {}).get("outdoor_source"),
+            "nws_temperature_f": (latest or {}).get("nws_temperature_f"),
+            "nws_condition": (latest or {}).get("nws_condition"),
+            "nws_alert_count": int((latest or {}).get("nws_alert_count") or 0),
             "mode": (latest or {}).get("mode"),
             "activity": (latest or {}).get("activity"),
             "heat_setpoint": (latest or {}).get("heat_setpoint"),
@@ -707,6 +745,9 @@ async def fleet_overview(db, analytics_fn, sample_minutes=5):
         "summary": {
             "devices": len(devices),
             "active_alerts": alert_total,
+            "weather_risk_devices": weather_risk_devices,
+            "offline_devices": offline_devices,
+            "low_data_availability_devices": low_availability_devices,
             **totals,
         },
         "devices": devices,
