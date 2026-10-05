@@ -76,6 +76,22 @@ COPY = {
         "es": ("Telemetría climática atrasada", "Las lecturas del termostato están más antiguas de lo esperado."),
         "en": ("Climate telemetry stale", "Thermostat readings are older than expected."),
     },
+    "cooling_in_cold_weather": {
+        "es": ("Enfriamiento con frío exterior", "El aire acondicionado está enfriando mientras la temperatura oficial exterior es inusualmente baja."),
+        "en": ("Cooling in cold weather", "Cooling is active while the official outdoor temperature is unusually low."),
+    },
+    "heating_in_hot_weather": {
+        "es": ("Calefacción con calor exterior", "La calefacción está activa mientras la temperatura oficial exterior es inusualmente alta."),
+        "en": ("Heating in warm weather", "Heating is active while the official outdoor temperature is unusually warm."),
+    },
+    "forecast_freeze_risk": {
+        "es": ("Riesgo de congelación", "Se pronostica congelación y la temperatura interior está acercándose al rango de protección."),
+        "en": ("Freeze risk", "Freezing weather is forecast and indoor temperature is approaching the protection range."),
+    },
+    "nws_severe_weather": {
+        "es": ("Alerta meteorológica oficial", "El National Weather Service tiene una alerta severa o extrema activa para esta propiedad."),
+        "en": ("Official severe weather alert", "The National Weather Service has an active severe or extreme alert for this property."),
+    },
     "schedule_missed": {
         "es": ("Schedule no ejecutado", "Un horario de Ross House debía ejecutarse y no encontramos una ejecución exitosa."),
         "en": ("Schedule missed", "A Ross House climate schedule was due and no successful execution was recorded."),
@@ -134,6 +150,13 @@ def alert_category(alert_type: str) -> str:
         return "temperature"
     if alert_type.startswith("humidity_"):
         return "humidity"
+    if alert_type in {
+        "cooling_in_cold_weather",
+        "heating_in_hot_weather",
+        "forecast_freeze_risk",
+        "nws_severe_weather",
+    }:
+        return "weather"
     return "predictive"
 
 
