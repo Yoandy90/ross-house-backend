@@ -14,6 +14,7 @@ from . import climate_provider as provider
 from .climate_policy import scope_for_contract, snapshot, validate_change
 from . import climate_monitor
 from . import climate_intelligence
+from .notification_identity import id_values
 
 router = APIRouter(tags=['climate'])
 
@@ -90,6 +91,13 @@ class EnergyConfig(StrictModel):
     cool_kw: float
     fan_kw: float
     electric_rate: float
+
+
+class ClimateNotificationPreferences(StrictModel):
+    offline: bool = True
+    temperature: bool = True
+    humidity: bool = True
+    predictive: bool = True
 
 
 class AlertRules(StrictModel):
@@ -187,6 +195,41 @@ async def tenant_list(request: Request):
     return {'enabled': enabled(), 'monitor_enabled': climate_monitor.monitor_enabled(),
             'history_bucket_minutes': climate_monitor._sample_minutes(),
             'devices': [await read_binding(b) for b in bindings]}
+
+
+@router.get('/tenant/climate/notification-preferences')
+async def tenant_climate_notification_preferences(request: Request):
+    user, _ = await tenant_scope(request)
+    account = await get_db().app_users.find_one(
+        {'_id': {'$in': id_values(actor_id(user))}},
+        {'climate_alert_preferences': 1},
+    )
+    prefs = (account or {}).get('climate_alert_preferences') or {}
+    return {
+        'offline': prefs.get('offline', True),
+        'temperature': prefs.get('temperature', True),
+        'humidity': prefs.get('humidity', True),
+        'predictive': prefs.get('predictive', True),
+    }
+
+
+@router.put('/tenant/climate/notification-preferences')
+async def update_tenant_climate_notification_preferences(
+    body: ClimateNotificationPreferences,
+    request: Request,
+):
+    user, _ = await tenant_scope(request)
+    values = body.model_dump()
+    result = await get_db().app_users.update_one(
+        {'_id': {'$in': id_values(actor_id(user))}},
+        {'$set': {
+            'climate_alert_preferences': values,
+            'notification_preferences.climate': any(values.values()),
+        }},
+    )
+    if not result.matched_count:
+        raise HTTPException(404, 'climate_notification_account_not_found')
+    return values
 
 
 @router.post('/admin/climate/oauth/start')
