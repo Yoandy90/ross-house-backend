@@ -68,6 +68,22 @@ COPY = {
         "es": ("Revisar filtro HVAC", "El tiempo estimado de funcionamiento alcanzó el intervalo configurado para revisar/cambiar el filtro."),
         "en": ("Check HVAC filter", "Estimated runtime reached the configured filter service interval."),
     },
+    "stale_telemetry": {
+        "es": ("Telemetría climática atrasada", "Las lecturas del termostato están más antiguas de lo esperado."),
+        "en": ("Climate telemetry stale", "Thermostat readings are older than expected."),
+    },
+    "schedule_missed": {
+        "es": ("Schedule no ejecutado", "Un horario de Ross House debía ejecutarse y no encontramos una ejecución exitosa."),
+        "en": ("Schedule missed", "A Ross House climate schedule was due and no successful execution was recorded."),
+    },
+    "unexpected_change": {
+        "es": ("Cambio fuera del horario", "Detectamos un cambio de modo o temperatura fuera de una ejecución del Schedule de Ross House."),
+        "en": ("Change outside schedule", "A mode or temperature change was detected outside a Ross House schedule execution."),
+    },
+    "thermal_envelope_degradation": {
+        "es": ("Posible pérdida térmica mayor", "La temperatura interior está variando más rápido con el HVAC en espera que en el historial de esta propiedad."),
+        "en": ("Possible thermal drift increase", "Indoor temperature is drifting faster while HVAC is idle than this property's historical baseline."),
+    },
 }
 
 RESOLVED = {
