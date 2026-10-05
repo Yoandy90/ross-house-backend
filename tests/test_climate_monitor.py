@@ -346,3 +346,42 @@ def test_online_bucket_is_preserved_from_transient_offline_sample():
         None,
         {"online": False},
     ) is False
+
+
+def test_read_retry_helpers_are_bounded(monkeypatch):
+    monkeypatch.setenv("CLIMATE_READ_RETRY_COUNT", "9")
+    monkeypatch.setenv("CLIMATE_READ_RETRY_DELAY_SECONDS", "99")
+    assert climate_monitor._read_retry_count() == 2
+    assert climate_monitor._read_retry_delay_seconds() == 5.0
+
+    monkeypatch.setenv("CLIMATE_READ_RETRY_COUNT", "-1")
+    monkeypatch.setenv("CLIMATE_READ_RETRY_DELAY_SECONDS", "0")
+    assert climate_monitor._read_retry_count() == 0
+    assert climate_monitor._read_retry_delay_seconds() == 0.1
+
+
+def test_read_retry_recovers_before_marking_device_unavailable(monkeypatch):
+    calls = {"read": 0, "sleep": 0}
+
+    async def flaky_device(db, binding):
+        calls["read"] += 1
+        if calls["read"] == 1:
+            raise HTTPException(503, "temporary")
+        return RAW
+
+    async def fake_sleep(seconds):
+        calls["sleep"] += 1
+
+    monkeypatch.setenv("CLIMATE_READ_RETRY_COUNT", "1")
+    monkeypatch.setattr(climate_monitor.provider, "device", flaky_device)
+    monkeypatch.setattr(climate_monitor.asyncio, "sleep", fake_sleep)
+
+    result = asyncio.run(climate_monitor._read_provider_with_retry(object(), {"_id": "device-1"}))
+    assert result == RAW
+    assert calls == {"read": 2, "sleep": 1}
+
+
+def test_telemetry_availability_percentage():
+    assert climate_monitor._availability_pct(9, 10) == 90.0
+    assert climate_monitor._availability_pct(0, 0) == 0.0
+    assert climate_monitor._availability_pct(10, 10) == 100.0
