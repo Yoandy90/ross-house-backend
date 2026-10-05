@@ -343,6 +343,14 @@ async def analytics(db, device_id: str, range_name: str = "7d") -> dict:
                 "cool_setpoint": {"$avg": "$cool_setpoint"},
                 "heating_samples": {"$sum": {"$cond": [{"$eq": ["$activity", "heating"]}, 1, 0]}},
                 "cooling_samples": {"$sum": {"$cond": [{"$eq": ["$activity", "cooling"]}, 1, 0]}},
+                "fan_only_samples": {"$sum": {"$cond": [
+                    {"$and": [
+                        {"$eq": ["$fan_running", True]},
+                        {"$eq": ["$activity", "idle"]},
+                    ]},
+                    1,
+                    0,
+                ]}},
                 "samples": {"$sum": 1},
                 "mode": {"$last": "$mode"},
                 "activity": {"$last": "$activity"},
@@ -352,12 +360,13 @@ async def analytics(db, device_id: str, range_name: str = "7d") -> dict:
     ]
     rows = await db.climate_readings.aggregate(pipeline).to_list(5000)
     points = []
-    total_samples = heating = cooling = 0
+    total_samples = heating = cooling = fan_only = 0
     for row in rows:
         count = int(row.get("samples") or 0)
         total_samples += count
         heating += int(row.get("heating_samples") or 0)
         cooling += int(row.get("cooling_samples") or 0)
+        fan_only += int(row.get("fan_only_samples") or 0)
         points.append({
             "at": row["_id"].isoformat(),
             "temperature": row.get("temperature"),
@@ -438,6 +447,46 @@ async def analytics(db, device_id: str, range_name: str = "7d") -> dict:
             if error <= tolerance:
                 comfort_samples += 1
 
+    heat_rates = []
+    cool_rates = []
+    idle_drift_rates = []
+    indoor_outdoor_deltas = []
+    for first, second in zip(points, points[1:]):
+        try:
+            t1 = datetime.fromisoformat(first["at"])
+            t2 = datetime.fromisoformat(second["at"])
+        except (ValueError, TypeError):
+            continue
+        hours = (t2 - t1).total_seconds() / 3600
+        if hours <= 0 or not _finite(first.get("temperature")) or not _finite(second.get("temperature")):
+            continue
+        delta = second["temperature"] - first["temperature"]
+        if first.get("activity") == second.get("activity") == "heating" and delta > 0:
+            heat_rates.append(delta / hours)
+        elif first.get("activity") == second.get("activity") == "cooling" and delta < 0:
+            cool_rates.append(-delta / hours)
+        elif first.get("activity") == second.get("activity") == "idle":
+            idle_drift_rates.append(abs(delta) / hours)
+        if _finite(first.get("outdoor_temperature")):
+            indoor_outdoor_deltas.append(abs(first["temperature"] - first["outdoor_temperature"]))
+
+    def mean_or_none(values):
+        return sum(values) / len(values) if values else None
+
+    energy = await db.climate_energy_config.find_one({"_id": device_id}) or {}
+    heating_minutes_est = heating * _sample_minutes()
+    cooling_minutes_est = cooling * _sample_minutes()
+    fan_only_minutes_est = fan_only * _sample_minutes()
+    energy_kwh = None
+    energy_cost = None
+    if all(_finite(energy.get(key)) for key in ("heat_kw", "cool_kw", "fan_kw", "electric_rate")):
+        energy_kwh = (
+            heating_minutes_est / 60 * energy["heat_kw"]
+            + cooling_minutes_est / 60 * energy["cool_kw"]
+            + fan_only_minutes_est / 60 * energy["fan_kw"]
+        )
+        energy_cost = energy_kwh * energy["electric_rate"]
+
     events = await db.climate_events.find(
         {"device_id": device_id, "created_at": {"$gte": start}},
         {"_id": 0},
@@ -466,13 +515,20 @@ async def analytics(db, device_id: str, range_name: str = "7d") -> dict:
             "samples": int(summary.get("samples") or 0),
             "heating_pct": round(heating / total_samples * 100, 1) if total_samples else 0,
             "cooling_pct": round(cooling / total_samples * 100, 1) if total_samples else 0,
-            "heating_minutes_est": heating_minutes,
-            "cooling_minutes_est": cooling_minutes,
+            "heating_minutes_est": heating_minutes_est,
+            "cooling_minutes_est": cooling_minutes_est,
+            "fan_only_minutes_est": fan_only_minutes_est,
             "heating_cycles": heating_cycles,
             "cooling_cycles": cooling_cycles,
             "mode_changes": mode_changes,
             "mean_target_error": round(sum(target_errors) / len(target_errors), 2) if target_errors else None,
             "comfort_pct": round(comfort_samples / len(target_errors) * 100, 1) if target_errors else None,
+            "heating_recovery_rate_per_hour": round(mean_or_none(heat_rates), 3) if heat_rates else None,
+            "cooling_recovery_rate_per_hour": round(mean_or_none(cool_rates), 3) if cool_rates else None,
+            "idle_drift_rate_per_hour": round(mean_or_none(idle_drift_rates), 3) if idle_drift_rates else None,
+            "indoor_outdoor_delta_avg": round(mean_or_none(indoor_outdoor_deltas), 2) if indoor_outdoor_deltas else None,
+            "energy_estimate_kwh": round(energy_kwh, 2) if _finite(energy_kwh) else None,
+            "energy_estimate_cost": round(energy_cost, 2) if _finite(energy_cost) else None,
         },
         "points": points,
         "events": events,
