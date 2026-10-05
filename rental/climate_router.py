@@ -213,7 +213,9 @@ async def admin_list(request: Request):
     properties = await db.properties.find({}, {'address': 1}).limit(500).to_list(500)
     units = await db.property_units.find({}, {'property_id': 1, 'unit_name': 1}).limit(2000).to_list(2000)
     return {'enabled': enabled(), 'configured': provider.configured(), 'control_enabled': control(),
-            'monitor_enabled': climate_monitor.monitor_enabled(),
+            'monitor_enabled': climate_monitor.telemetry_enabled(),
+            'telemetry_enabled': climate_monitor.telemetry_enabled(),
+            'schedule_worker_enabled': climate_monitor.schedule_worker_enabled(),
             'history_bucket_minutes': climate_monitor._sample_minutes(),
             'providers': {'first_alert': provider.configured(), 'tcc_us': provider.tcc_configured()},
             'connection_details': [{'id': str(c['_id']), 'provider': c.get('provider', 'first_alert')} for c in connections],
@@ -227,7 +229,10 @@ async def admin_list(request: Request):
 async def tenant_list(request: Request):
     _, scope = await tenant_scope(request)
     bindings = await get_db().climate_bindings.find(scope).limit(20).to_list(20)
-    return {'enabled': enabled(), 'monitor_enabled': climate_monitor.monitor_enabled(),
+    return {'enabled': enabled(),
+            'monitor_enabled': climate_monitor.telemetry_enabled(),
+            'telemetry_enabled': climate_monitor.telemetry_enabled(),
+            'schedule_worker_enabled': climate_monitor.schedule_worker_enabled(),
             'history_bucket_minutes': climate_monitor._sample_minutes(),
             'devices': [await read_binding(b) for b in bindings]}
 
