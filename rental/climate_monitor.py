@@ -21,6 +21,7 @@ from pymongo.errors import DuplicateKeyError
 from . import climate_provider as provider
 from .climate_policy import snapshot, validate_change
 from . import climate_intelligence
+from . import weather_intelligence
 
 
 def now() -> datetime:
@@ -55,9 +56,27 @@ async def ensure_indexes(db):
     await db.climate_alert_rules.create_index([("property_id", 1)])
     await db.climate_alert_deliveries.create_index([("device_id", 1), ("created_at", -1)])
     await db.climate_maintenance.create_index([("property_id", 1)])
+    await weather_intelligence.ensure_indexes(db)
 
 
-def _reading_doc(binding: dict, state: dict, observed_at: datetime, source: str) -> dict:
+def _reading_doc(binding: dict, state: dict, observed_at: datetime, source: str, weather: dict | None = None) -> dict:
+    weather_context = weather_intelligence.reading_context(state, weather)
+    provider_outdoor = state.get("outdoorTemperature")
+    nws_f = weather_context.get("nws_temperature")
+    nws_native = None
+    if _finite(nws_f):
+        nws_native = nws_f if state.get("units") == "Fahrenheit" else (nws_f - 32) * 5 / 9
+    outdoor_temperature = provider_outdoor if _finite(provider_outdoor) else nws_native
+    outdoor_humidity = state.get("outdoorHumidity")
+    if not _finite(outdoor_humidity):
+        outdoor_humidity = weather_context.get("nws_humidity")
+    outdoor_source = (
+        "thermostat"
+        if _finite(provider_outdoor)
+        else "nws"
+        if _finite(nws_f)
+        else None
+    )
     return {
         "device_id": binding["_id"],
         "property_id": binding.get("property_id", ""),
@@ -69,8 +88,19 @@ def _reading_doc(binding: dict, state: dict, observed_at: datetime, source: str)
         "units": state.get("units"),
         "temperature": state.get("temperature"),
         "humidity": state.get("humidity"),
-        "outdoor_temperature": state.get("outdoorTemperature"),
-        "outdoor_humidity": state.get("outdoorHumidity"),
+        "outdoor_temperature": outdoor_temperature,
+        "outdoor_humidity": outdoor_humidity,
+        "outdoor_source": outdoor_source,
+        "nws_temperature_f": nws_f,
+        "nws_humidity": weather_context.get("nws_humidity"),
+        "nws_wind_speed_mph": weather_context.get("nws_wind_speed_mph"),
+        "nws_wind_gust_mph": weather_context.get("nws_wind_gust_mph"),
+        "nws_condition": weather_context.get("nws_condition"),
+        "nws_observed_at": weather_context.get("nws_observed_at"),
+        "nws_station": weather_context.get("nws_station"),
+        "nws_alert_count": weather_context.get("nws_alert_count"),
+        "nws_forecast_min_12h": weather_context.get("nws_forecast_min_12h"),
+        "nws_forecast_max_12h": weather_context.get("nws_forecast_max_12h"),
         "mode": state.get("mode"),
         "heat_setpoint": state.get("heatSetpoint"),
         "cool_setpoint": state.get("coolSetpoint"),
@@ -130,7 +160,7 @@ def _alert_conditions(state: dict, rules: dict | None = None) -> dict[str, tuple
     )
 
 
-async def _evaluate_alerts(db, binding: dict, state: dict, observed_at: datetime):
+async def _evaluate_alerts(db, binding: dict, state: dict, observed_at: datetime, weather: dict | None = None):
     rules = await climate_intelligence.get_rules(db, binding)
     conditions = _alert_conditions(state, rules)
     try:
@@ -145,6 +175,11 @@ async def _evaluate_alerts(db, binding: dict, state: dict, observed_at: datetime
         )
     except Exception:
         # Predictive heuristics must never block raw telemetry collection.
+        pass
+    try:
+        conditions.update(weather_intelligence.alert_conditions(state, weather))
+    except Exception:
+        # Official-weather context is advisory and must never block HVAC telemetry.
         pass
 
     for alert_type, (active, severity, message) in conditions.items():
@@ -223,6 +258,12 @@ async def _evaluate_alerts(db, binding: dict, state: dict, observed_at: datetime
 
 async def record_snapshot(db, binding: dict, state: dict, source: str = "read"):
     observed_at = now()
+    weather = None
+    if weather_intelligence.enabled():
+        try:
+            weather = await weather_intelligence.weather_for_binding(db, binding)
+        except Exception:
+            weather = None
     if state.get("online") is True:
         state = {**state, "offline_alert": False}
         await db.climate_device_health.delete_one({"_id": binding["_id"]})
@@ -245,13 +286,13 @@ async def record_snapshot(db, binding: dict, state: dict, source: str = "read"):
             }},
             upsert=True,
         )
-    reading = _reading_doc(binding, state, observed_at, source)
+    reading = _reading_doc(binding, state, observed_at, source, weather)
     bucket = _floor_time(observed_at, _sample_minutes())
     reading["_id"] = f"{binding['_id']}:{bucket.isoformat()}"
     reading["bucket_at"] = bucket
     await db.climate_readings.replace_one({"_id": reading["_id"]}, reading, upsert=True)
     await _record_transitions(db, binding, reading)
-    await _evaluate_alerts(db, binding, state, observed_at)
+    await _evaluate_alerts(db, binding, state, observed_at, weather)
     return reading
 
 
@@ -340,6 +381,10 @@ async def analytics(db, device_id: str, range_name: str = "7d") -> dict:
                 "temperature_max": {"$max": "$temperature"},
                 "humidity": {"$avg": "$humidity"},
                 "outdoor_temperature": {"$avg": "$outdoor_temperature"},
+                "nws_temperature_f": {"$avg": "$nws_temperature_f"},
+                "nws_wind_speed_mph": {"$avg": "$nws_wind_speed_mph"},
+                "nws_alert_count": {"$max": "$nws_alert_count"},
+                "outdoor_source": {"$last": "$outdoor_source"},
                 "heat_setpoint": {"$avg": "$heat_setpoint"},
                 "cool_setpoint": {"$avg": "$cool_setpoint"},
                 "heating_samples": {"$sum": {"$cond": [{"$eq": ["$activity", "heating"]}, 1, 0]}},
@@ -375,6 +420,10 @@ async def analytics(db, device_id: str, range_name: str = "7d") -> dict:
             "temperature_max": row.get("temperature_max"),
             "humidity": row.get("humidity"),
             "outdoor_temperature": row.get("outdoor_temperature"),
+            "nws_temperature_f": row.get("nws_temperature_f"),
+            "nws_wind_speed_mph": row.get("nws_wind_speed_mph"),
+            "nws_alert_count": row.get("nws_alert_count"),
+            "outdoor_source": row.get("outdoor_source"),
             "heat_setpoint": row.get("heat_setpoint"),
             "cool_setpoint": row.get("cool_setpoint"),
             "mode": row.get("mode"),
@@ -393,6 +442,10 @@ async def analytics(db, device_id: str, range_name: str = "7d") -> dict:
                 "humidity_min": {"$min": "$humidity"},
                 "humidity_max": {"$max": "$humidity"},
                 "outdoor_avg": {"$avg": "$outdoor_temperature"},
+                "outdoor_min": {"$min": "$outdoor_temperature"},
+                "outdoor_max": {"$max": "$outdoor_temperature"},
+                "nws_wind_speed_avg_mph": {"$avg": "$nws_wind_speed_mph"},
+                "weather_samples": {"$sum": {"$cond": [{"$eq": ["$outdoor_source", "nws"]}, 1, 0]}},
                 "units": {"$last": "$units"},
                 "samples": {"$sum": 1},
             }
@@ -425,6 +478,8 @@ async def analytics(db, device_id: str, range_name: str = "7d") -> dict:
 
     target_errors = []
     comfort_samples = 0
+    heating_degree_hours = 0.0
+    cooling_degree_hours = 0.0
     for point in points:
         temp = point.get("temperature")
         mode = point.get("mode")
@@ -447,6 +502,13 @@ async def analytics(db, device_id: str, range_name: str = "7d") -> dict:
             tolerance = 2 if summary.get("units") == "Fahrenheit" else 1.1
             if error <= tolerance:
                 comfort_samples += 1
+        outdoor = point.get("outdoor_temperature")
+        sample_hours = _sample_minutes() / 60
+        if _finite(outdoor):
+            if _finite(point.get("heat_setpoint")):
+                heating_degree_hours += max(0, point["heat_setpoint"] - outdoor) * sample_hours
+            if _finite(point.get("cool_setpoint")):
+                cooling_degree_hours += max(0, outdoor - point["cool_setpoint"]) * sample_hours
 
     heat_rates = []
     cool_rates = []
@@ -512,6 +574,14 @@ async def analytics(db, device_id: str, range_name: str = "7d") -> dict:
             "humidity_min": summary.get("humidity_min"),
             "humidity_max": summary.get("humidity_max"),
             "outdoor_avg": summary.get("outdoor_avg"),
+            "outdoor_min": summary.get("outdoor_min"),
+            "outdoor_max": summary.get("outdoor_max"),
+            "nws_wind_speed_avg_mph": summary.get("nws_wind_speed_avg_mph"),
+            "weather_samples": int(summary.get("weather_samples") or 0),
+            "heating_degree_hours": round(heating_degree_hours, 2),
+            "cooling_degree_hours": round(cooling_degree_hours, 2),
+            "heating_runtime_minutes_per_degree_hour": round(heating_minutes_est / heating_degree_hours, 3) if heating_degree_hours > 0 else None,
+            "cooling_runtime_minutes_per_degree_hour": round(cooling_minutes_est / cooling_degree_hours, 3) if cooling_degree_hours > 0 else None,
             "units": summary.get("units"),
             "samples": int(summary.get("samples") or 0),
             "heating_pct": round(heating / total_samples * 100, 1) if total_samples else 0,
@@ -573,6 +643,12 @@ async def nearest_reading(db, device_id: str, at_value: str) -> dict:
         "humidity": row.get("humidity"),
         "outdoor_temperature": row.get("outdoor_temperature"),
         "outdoor_humidity": row.get("outdoor_humidity"),
+        "outdoor_source": row.get("outdoor_source"),
+        "nws_temperature_f": row.get("nws_temperature_f"),
+        "nws_wind_speed_mph": row.get("nws_wind_speed_mph"),
+        "nws_wind_gust_mph": row.get("nws_wind_gust_mph"),
+        "nws_condition": row.get("nws_condition"),
+        "nws_alert_count": row.get("nws_alert_count"),
         "mode": row.get("mode"),
         "heat_setpoint": row.get("heat_setpoint"),
         "cool_setpoint": row.get("cool_setpoint"),
