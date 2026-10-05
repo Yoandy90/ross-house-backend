@@ -540,3 +540,41 @@ async def fleet_overview(db, analytics_fn, sample_minutes=5):
         },
         "devices": devices,
     }
+
+
+async def get_energy_config(db, binding: dict):
+    doc = await db.climate_energy_config.find_one({"_id": binding["_id"]}) or {}
+    return {
+        "heat_kw": doc.get("heat_kw"),
+        "cool_kw": doc.get("cool_kw"),
+        "fan_kw": doc.get("fan_kw"),
+        "electric_rate": doc.get("electric_rate"),
+        "updated_at": doc.get("updated_at").isoformat() if isinstance(doc.get("updated_at"), datetime) else None,
+    }
+
+
+async def set_energy_config(db, binding: dict, values: dict, actor: str):
+    clean = {}
+    limits = {
+        "heat_kw": (0, 50),
+        "cool_kw": (0, 50),
+        "fan_kw": (0, 10),
+        "electric_rate": (0, 5),
+    }
+    for key, (low, high) in limits.items():
+        value = values.get(key)
+        if not finite(value) or value < low or value > high:
+            raise HTTPException(422, "climate_energy_config_invalid")
+        clean[key] = float(value)
+    clean.update({
+        "device_id": binding["_id"],
+        "property_id": binding.get("property_id", ""),
+        "updated_by": actor,
+        "updated_at": now(),
+    })
+    await db.climate_energy_config.update_one(
+        {"_id": binding["_id"]},
+        {"$set": clean, "$setOnInsert": {"created_at": now()}},
+        upsert=True,
+    )
+    return await get_energy_config(db, binding)
