@@ -63,6 +63,7 @@ def test_schedule_rejects_bad_days_time_and_deadband():
 def test_alert_conditions_cover_offline_temperature_and_humidity():
     alerts = climate_monitor._alert_conditions({
         'online': False,
+        'offline_alert': True,
         'units': 'Fahrenheit',
         'temperature': 45,
         'humidity': 70,
@@ -94,3 +95,16 @@ def test_timezone_validation():
     assert climate_monitor.validate_timezone('America/Chicago') == 'America/Chicago'
     with pytest.raises(HTTPException):
         climate_monitor.validate_timezone('Not/A_Timezone')
+
+
+def test_offline_condition_respects_grace_flag():
+    early = climate_monitor._alert_conditions({
+        'online': False,
+        'offline_alert': False,
+    })
+    mature = climate_monitor._alert_conditions({
+        'online': False,
+        'offline_alert': True,
+    })
+    assert early['offline'][0] is False
+    assert mature['offline'][0] is True
