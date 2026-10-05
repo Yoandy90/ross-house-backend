@@ -23,7 +23,7 @@ from .climate_policy import validate_change
 # Upstream debug logging includes authentication cookies and response bodies.
 logging.getLogger('somecomfort').disabled = True
 ORIGIN = URL('https://mytotalconnectcomfort.com')
-MODES = {1: 'Heat', 2: 'Off', 3: 'Cool', 4: 'Auto', 5: 'Auto'}
+MODES = {0: 'EmergencyHeat', 1: 'Heat', 2: 'Off', 3: 'Cool', 4: 'Auto', 5: 'Auto'}
 
 
 async def safe_redirect(session, context, params):
@@ -93,7 +93,10 @@ def normalize(response):
         'indoorHumidity': ui.get('IndoorHumidity') if ui.get('IndoorHumiditySensorAvailable') and ui.get('IndoorHumiditySensorNotFault') else None,
         'outdoorTemperature': ui.get('OutdoorTemperature') if ui.get('OutdoorTemperatureAvailable') else None,
         'displayedOutdoorHumidity': ui.get('OutdoorHumidity') if ui.get('OutdoorHumidityAvailable') else None,
-        'allowedModes': [m for m in ('Off', 'Heat', 'Cool', 'Auto') if ui.get('Switch' + m + 'Allowed') in (True, 1)],
+        'allowedModes': (
+            (['EmergencyHeat'] if ui.get('SwitchEmergencyHeatAllowed') in (True, 1) else [])
+            + [m for m in ('Off', 'Heat', 'Cool', 'Auto') if ui.get('Switch' + m + 'Allowed') in (True, 1)]
+        ),
         'changeableValues': {'mode': MODES.get(ui.get('SystemSwitchPosition')),
                              'heatSetpoint': ui.get('HeatSetpoint'), 'coolSetpoint': ui.get('CoolSetpoint')},
         'minHeatSetpoint': ui.get('HeatLowerSetptLimit'), 'maxHeatSetpoint': ui.get('HeatUpperSetptLimit'),
@@ -195,7 +198,7 @@ async def change(db, binding, values):
         validate_change(raw, command)
         settings = {}
         if 'mode' in command:
-            settings['SystemSwitch'] = {'Heat': 1, 'Off': 2, 'Cool': 3, 'Auto': 4}[command['mode']]
+            settings['SystemSwitch'] = {'EmergencyHeat': 0, 'Heat': 1, 'Off': 2, 'Cool': 3, 'Auto': 4}[command['mode']]
 
         # TCC expects the heat/cool pair to remain internally consistent when either
         # setpoint changes. Mirror the provider client's own Device behavior: preserve
