@@ -64,7 +64,7 @@ def _reading_doc(binding: dict, state: dict, observed_at: datetime, source: str,
     provider_outdoor = state.get("outdoorTemperature")
     nws_f = weather_context.get("nws_temperature")
     nws_native = None
-    if _finite(nws_f):
+    if _finite(nws_f) and state.get("units") in ("Fahrenheit", "Celsius"):
         nws_native = nws_f if state.get("units") == "Fahrenheit" else (nws_f - 32) * 5 / 9
     outdoor_temperature = provider_outdoor if _finite(provider_outdoor) else nws_native
     outdoor_humidity = state.get("outdoorHumidity")
@@ -74,7 +74,7 @@ def _reading_doc(binding: dict, state: dict, observed_at: datetime, source: str,
         "thermostat"
         if _finite(provider_outdoor)
         else "nws"
-        if _finite(nws_f)
+        if _finite(nws_native)
         else None
     )
     return {
@@ -256,6 +256,15 @@ async def _evaluate_alerts(db, binding: dict, state: dict, observed_at: datetime
                 pass
 
 
+def _preserve_existing_bucket(existing: dict | None, reading: dict) -> bool:
+    """Never let a transient offline sample overwrite an online sample in one bucket."""
+    return bool(
+        existing
+        and existing.get("online") is True
+        and reading.get("online") is not True
+    )
+
+
 async def record_snapshot(db, binding: dict, state: dict, source: str = "read"):
     observed_at = now()
     weather = None
@@ -290,9 +299,19 @@ async def record_snapshot(db, binding: dict, state: dict, source: str = "read"):
     bucket = _floor_time(observed_at, _sample_minutes())
     reading["_id"] = f"{binding['_id']}:{bucket.isoformat()}"
     reading["bucket_at"] = bucket
-    await db.climate_readings.replace_one({"_id": reading["_id"]}, reading, upsert=True)
-    await _record_transitions(db, binding, reading)
+    existing = await db.climate_readings.find_one(
+        {"_id": reading["_id"]},
+        {"online": 1, "observed_at": 1},
+    )
+    preserve_existing = _preserve_existing_bucket(existing, reading)
+    if not preserve_existing:
+        await db.climate_readings.replace_one({"_id": reading["_id"]}, reading, upsert=True)
+    if reading.get("online") is True:
+        await _record_transitions(db, binding, reading)
     await _evaluate_alerts(db, binding, state, observed_at, weather)
+    if preserve_existing:
+        preserved = await db.climate_readings.find_one({"_id": reading["_id"]})
+        return preserved or reading
     return reading
 
 
