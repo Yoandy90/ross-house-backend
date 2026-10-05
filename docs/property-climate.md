@@ -15,6 +15,12 @@ All values are server-side secrets/environment settings. Never put them in EXPO_
 
 - `CLIMATE_ENABLED=true`: enable connection and reads (default off).
 - `CLIMATE_CONTROL_ENABLED=true`: permit thermostat commands (default off).
+- `CLIMATE_MONITOR_ENABLED=true`: enable automatic telemetry sampling and Ross House schedule execution (default off).
+- `CLIMATE_HISTORY_BUCKET_MINUTES`: historical telemetry bucket size; defaults to 5 minutes.
+- `CLIMATE_MONITOR_INTERVAL_SECONDS`: monitor loop interval, clamped to 60–3600 seconds; defaults to 300.
+- `CLIMATE_ALERT_NOTIFICATIONS_ENABLED=true`: create Ross House inbox notifications for climate alert transitions.
+- `CLIMATE_ALERT_PUSH_ENABLED=true`: additionally send climate push notifications when alert notifications are enabled.
+- `CLIMATE_ALERT_NOTIFY_ADMINS=true`: optionally include admins in climate alert delivery.
 - For First Alert only: `CLIMATE_RESIDEO_CLIENT_ID`, `CLIMATE_RESIDEO_CLIENT_SECRET`: registered Resideo app credentials.
 - `CLIMATE_TOKEN_KEY`: Fernet key, generated securely and retained with the deployment secrets. Losing or replacing it requires reconnecting all accounts.
 - For First Alert only: `CLIMATE_REDIRECT_URI`: exact HTTPS callback registered with Resideo, e.g. the staging site's `/admin/climatizacion`. OAuth is initiated/completed by the authenticated administrator. State is single-use, expires after 10 minutes, and is bound to that administrator.
@@ -25,7 +31,7 @@ TCC requires only `CLIMATE_TOKEN_KEY` and `CLIMATE_ENABLED=true` to connect/read
 
 Admin connection → discover device → choose property and optionally unit → link. Whole-home bindings use an empty unit ID. A tenant lease with a unit ID never inherits a whole-building thermostat. Each tenant request re-resolves canonical identity and one active lease and validates both lease dates. This deliberately denies malformed or expired leases until the lease record is corrected.
 
-Only mode (Off/Heat/Cool/Auto as advertised) and heat/cool setpoints are exposed in v1. The server fetches fresh provider capabilities before every command, enforces native bounds and automatic-mode deadband, and preserves other provider changeableValues. Changing a setpoint requests PermanentHold. Fan, scheduling, emergency heat and usage reporting are not implemented.
+Climate controls are capability-driven. The server exposes supported mode/setpoint changes, fan modes and hold controls when the provider reports them, and EmergencyHeat only when `allowedModes` explicitly advertises it. It also stores historical telemetry, calculates analytics/health/predictive alerts, and supports Ross House-managed weekly schedules. The server fetches fresh provider capabilities before every command, enforces native bounds and automatic-mode deadband, preserves other provider changeableValues, journals commands, and never automatically retries an ambiguous write. Automatic sampling/schedule execution and outbound notifications remain disabled unless their feature flags are enabled.
 
 ## Validation and activation
 
@@ -35,7 +41,7 @@ Only mode (Off/Heat/Cool/Auto as advertised) and heat/cool setpoints are exposed
 4. Enable control in staging for that test thermostat only. Verify Heat/Cool/Off/Auto where supported, real bounds/deadband, PermanentHold behavior and read-after-write confirmation. Compare both physical screen and official app. Test timeout handling without repeated commands.
 5. Record hardware/firmware/account region, results and API approval/quota details. Only then consider production activation.
 
-Web routes: `/admin/climatizacion`, `/tenant/dashboard/climate`. Mobile route: `/climate` from tenant profile. UI has EN/ES, theme support, F/C, honest empty/offline/pending/unknown states. No simulated temperatures are shipped. Read refresh is manual (no background polling).
+Web routes: `/admin/climatizacion`, `/tenant/dashboard/climate`. Mobile route: `/climate` from tenant profile. UI has EN/ES, theme support, F/C, honest empty/offline/pending/unknown states, Schedule/Analytics/AI surfaces and climate alert preferences. No simulated temperatures are shipped. Client refresh can remain manual while the server-side monitor, when explicitly enabled, records periodic telemetry for history, analytics, prediction and schedule execution.
 
 Operational limitations: no self-service removal/reassignment or connection revocation screen in this first increment; coordinate those changes with an administrator/developer after reviewing active leases. At present the admin list is capped at 200 bindings; discovery should remain a small portfolio operation. No provider quota, latency or physical-device test has been performed. Reauthorize once per account, avoiding duplicate connections. If an existing connection must be replaced, update its binding explicitly server-side after review; do not assign duplicate devices to tenants.
 
