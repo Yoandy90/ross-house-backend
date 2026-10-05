@@ -214,23 +214,8 @@ async def save_api_key(key_name: str, request: Request):
         "source": "db",
     }
 
-
-@router.get("/admin/api-keys/{key_name}/reveal")
-async def reveal_api_key(key_name: str, request: Request):
-    """Reveal the full current value of a key (audited)."""
-    admin = await auth_admin(request)
-    if key_name not in _REGISTRY_MAP:
-        raise HTTPException(status_code=404, detail=f"Key desconocida: {key_name}")
-
-    db = get_db()
-    doc = await db.admin_config.find_one({"type": CONFIG_TYPE}) or {}
-    enc = (doc.get("keys") or {}).get(key_name)
-    value = decrypt(enc) if enc else (_ORIGINAL_ENV.get(key_name) or "")
-    if not value:
-        raise HTTPException(status_code=404, detail="Esta key no está configurada")
-
-    await _audit(db, admin.get("email", ""), "api_key_revealed", target=key_name)
-    return {"success": True, "key": key_name, "value": value}
+# Secret values are intentionally write-only from the Admin API.
+# GET/list endpoints return only masked metadata; full plaintext is never exposed.
 
 
 @router.delete("/admin/api-keys/{key_name}")
