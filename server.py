@@ -125,6 +125,11 @@ async def lifespan(app: FastAPI):
     from rental.store_notifications import ensure_indexes as store_notification_indexes
     await store_notification_indexes(db)
 
+    # Initialize climate indexes only after explicit provider activation.
+    if os.getenv('CLIMATE_ENABLED') == 'true':
+        from rental.climate_router import ensure_indexes as climate_indexes
+        await climate_indexes(db)
+
     # Staging must never execute autonomous jobs (payments, messages, or syncs).
     # DISABLE_BACKGROUND_JOBS also provides an explicit kill switch elsewhere.
     if should_disable_background_jobs():
@@ -569,6 +574,8 @@ try:
     app.include_router(maintenance_technician_router, prefix="/api")
     app.include_router(property_taxes_router, prefix="/api")
     app.include_router(admin_nav_router, prefix="/api")
+    from rental.climate_router import router as climate_router
+    app.include_router(climate_router, prefix="/api")
     # Synthetic fixture routes do not exist outside the explicit staging environment.
     if _ENV == "staging":
         from rental.staging_renewal_fixture_router import router as staging_fixture_router
