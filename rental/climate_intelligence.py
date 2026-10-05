@@ -7,6 +7,7 @@ are stored in climate_alert_rules and fall back to conservative defaults.
 from __future__ import annotations
 
 import math
+import os
 from datetime import datetime, timedelta, timezone
 from statistics import median
 
