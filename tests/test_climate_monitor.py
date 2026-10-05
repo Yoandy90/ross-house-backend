@@ -83,12 +83,44 @@ def test_range_buckets_scale_for_long_term_history():
     assert climate_monitor._bucket_for_range('all') == ('month', 1)
 
 
-def test_monitor_requires_explicit_opt_in(monkeypatch):
+def test_telemetry_and_schedule_workers_have_independent_gates(monkeypatch):
     monkeypatch.setenv('CLIMATE_ENABLED', 'true')
     monkeypatch.delenv('CLIMATE_MONITOR_ENABLED', raising=False)
+    monkeypatch.delenv('CLIMATE_TELEMETRY_ENABLED', raising=False)
+    monkeypatch.delenv('CLIMATE_SCHEDULE_WORKER_ENABLED', raising=False)
+    monkeypatch.delenv('CLIMATE_CONTROL_ENABLED', raising=False)
+
+    assert climate_monitor.telemetry_enabled() is False
     assert climate_monitor.monitor_enabled() is False
-    monkeypatch.setenv('CLIMATE_MONITOR_ENABLED', 'true')
+    assert climate_monitor.schedule_worker_enabled() is False
+
+    monkeypatch.setenv('CLIMATE_TELEMETRY_ENABLED', 'true')
+    assert climate_monitor.telemetry_enabled() is True
     assert climate_monitor.monitor_enabled() is True
+    assert climate_monitor.schedule_worker_enabled() is False
+
+    monkeypatch.setenv('CLIMATE_CONTROL_ENABLED', 'true')
+    assert climate_monitor.schedule_worker_enabled() is False
+    monkeypatch.setenv('CLIMATE_SCHEDULE_WORKER_ENABLED', 'true')
+    assert climate_monitor.schedule_worker_enabled() is True
+
+
+def test_legacy_monitor_flag_is_telemetry_only(monkeypatch):
+    monkeypatch.setenv('CLIMATE_ENABLED', 'true')
+    monkeypatch.setenv('CLIMATE_MONITOR_ENABLED', 'true')
+    monkeypatch.delenv('CLIMATE_TELEMETRY_ENABLED', raising=False)
+    monkeypatch.delenv('CLIMATE_SCHEDULE_WORKER_ENABLED', raising=False)
+    monkeypatch.setenv('CLIMATE_CONTROL_ENABLED', 'true')
+
+    assert climate_monitor.telemetry_enabled() is True
+    assert climate_monitor.schedule_worker_enabled() is False
+
+
+def test_worker_intervals_are_bounded(monkeypatch):
+    monkeypatch.setenv('CLIMATE_TELEMETRY_INTERVAL_SECONDS', '5')
+    monkeypatch.setenv('CLIMATE_SCHEDULE_INTERVAL_SECONDS', '5000')
+    assert climate_monitor._telemetry_interval_seconds() == 60
+    assert climate_monitor._schedule_interval_seconds() == 900
 
 
 def test_timezone_validation():
