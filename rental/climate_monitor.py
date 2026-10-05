@@ -565,12 +565,12 @@ def validate_period(period: dict, raw: dict | None = None):
     return command
 
 
-def _validate_schedule_periods(periods: list[dict]):
+def _validate_schedule_periods(periods: list[dict], raw: dict | None = None):
     if not periods or len(periods) > 56:
         raise HTTPException(422, "climate_schedule_periods_invalid")
     seen: set[tuple[int, str]] = set()
     for period in periods:
-        validate_period(period)
+        validate_period(period, raw)
         for day in period.get("days") or []:
             key = (day, period.get("time"))
             if key in seen:
@@ -578,10 +578,32 @@ def _validate_schedule_periods(periods: list[dict]):
             seen.add(key)
 
 
+async def _ensure_no_schedule_conflicts(db, binding: dict, periods: list[dict], exclude_id: str | None = None):
+    desired = {
+        (day, period.get("time"))
+        for period in periods
+        for day in (period.get("days") or [])
+    }
+    query = {"device_id": binding["_id"], "enabled": True}
+    if exclude_id:
+        query["_id"] = {"$ne": exclude_id}
+    async for schedule in db.climate_schedules.find(query, {"periods": 1}):
+        existing = {
+            (day, period.get("time"))
+            for period in (schedule.get("periods") or [])
+            for day in (period.get("days") or [])
+        }
+        if desired & existing:
+            raise HTTPException(409, "climate_schedule_conflict")
+
+
 async def create_schedule(db, binding: dict, actor: str, payload: dict):
     timezone_name = validate_timezone(payload.get("timezone") or "America/Chicago")
     periods = payload.get("periods") or []
-    _validate_schedule_periods(periods)
+    raw = await provider.device(db, binding)
+    _validate_schedule_periods(periods, raw)
+    if bool(payload.get("enabled", True)):
+        await _ensure_no_schedule_conflicts(db, binding, periods)
     schedule_id = str(uuid4())
     doc = {
         "_id": schedule_id,
@@ -603,10 +625,10 @@ async def create_schedule(db, binding: dict, actor: str, payload: dict):
 async def update_schedule(db, binding: dict, schedule_id: str, actor: str, payload: dict):
     timezone_name = validate_timezone(payload.get("timezone") or "America/Chicago")
     periods = payload.get("periods") or []
-    if not periods or len(periods) > 56:
-        raise HTTPException(422, "climate_schedule_periods_invalid")
-    for period in periods:
-        validate_period(period)
+    raw = await provider.device(db, binding)
+    _validate_schedule_periods(periods, raw)
+    if bool(payload.get("enabled", True)):
+        await _ensure_no_schedule_conflicts(db, binding, periods, exclude_id=schedule_id)
     result = await db.climate_schedules.find_one_and_update(
         {"_id": schedule_id, "device_id": binding["_id"]},
         {"$set": {
