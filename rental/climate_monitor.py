@@ -361,6 +361,7 @@ async def analytics(db, device_id: str, range_name: str = "7d") -> dict:
                 "humidity_min": {"$min": "$humidity"},
                 "humidity_max": {"$max": "$humidity"},
                 "outdoor_avg": {"$avg": "$outdoor_temperature"},
+                "units": {"$last": "$units"},
                 "samples": {"$sum": 1},
             }
         },
@@ -411,7 +412,7 @@ async def analytics(db, device_id: str, range_name: str = "7d") -> dict:
                 error = 0
         if error is not None:
             target_errors.append(error)
-            tolerance = 2 if summary.get("temperature_avg") is None or summary.get("temperature_avg", 0) > 45 else 1.1
+            tolerance = 2 if summary.get("units") == "Fahrenheit" else 1.1
             if error <= tolerance:
                 comfort_samples += 1
 
@@ -439,6 +440,7 @@ async def analytics(db, device_id: str, range_name: str = "7d") -> dict:
             "humidity_min": summary.get("humidity_min"),
             "humidity_max": summary.get("humidity_max"),
             "outdoor_avg": summary.get("outdoor_avg"),
+            "units": summary.get("units"),
             "samples": int(summary.get("samples") or 0),
             "heating_pct": round(heating / total_samples * 100, 1) if total_samples else 0,
             "cooling_pct": round(cooling / total_samples * 100, 1) if total_samples else 0,
