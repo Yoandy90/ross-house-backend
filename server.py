@@ -120,6 +120,13 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"   ⚠️ Inspection indexes deferred: {e}")
 
+    try:
+        from rental.ncei_history import ensure_indexes as _ncei_ix
+        await _ncei_ix(db)
+        logger.info("   ✅ NCEI historical weather indexes ready")
+    except Exception as e:
+        logger.warning(f"   ⚠️ NCEI historical weather indexes deferred: {e}")
+
     from rental.notification_center import ensure_indexes as notification_indexes
     await notification_indexes(db)
     from rental.store_notifications import ensure_indexes as store_notification_indexes
@@ -537,6 +544,7 @@ try:
     from rental.contact_enrichment_router import router as contact_enrichment_router
     from rental.drip_router import router as drip_router
     from rental.api_keys_router import router as api_keys_router
+    from rental.ncei_history_router import router as ncei_history_router
     from rental.newsletter_pro_router import router as newsletter_pro_router
     from rental.zelle_router import router as zelle_router
     from rental.client_radar_router import router as client_radar_router
@@ -613,6 +621,7 @@ try:
     app.include_router(contact_enrichment_router, prefix="/api")
     app.include_router(drip_router, prefix="/api")
     app.include_router(api_keys_router, prefix="/api")
+    app.include_router(ncei_history_router, prefix="/api")
     app.include_router(newsletter_pro_router, prefix="/api")
     app.include_router(zelle_router, prefix="/api")
     app.include_router(client_radar_router, prefix="/api")
