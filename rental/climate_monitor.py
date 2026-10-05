@@ -766,12 +766,16 @@ async def run_due_schedules(db):
 
 async def sample_all(db):
     bindings = await db.climate_bindings.find({}).limit(500).to_list(500)
+    sampled = failed = 0
     for binding in bindings:
         try:
             raw = await provider.device(db, binding)
             await record_snapshot(db, binding, snapshot(raw), source="monitor")
+            sampled += 1
         except HTTPException:
             await record_unavailable(db, binding, source="monitor")
+            failed += 1
+    return {"sampled": sampled, "failed": failed}
 
 
 def monitor_enabled() -> bool:
