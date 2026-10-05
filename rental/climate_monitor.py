@@ -361,6 +361,12 @@ _RANGE_MAP = {
 }
 
 
+def _availability_pct(online_samples: int, total_samples: int) -> float:
+    if total_samples <= 0:
+        return 0.0
+    return round(max(0, online_samples) / total_samples * 100, 1)
+
+
 def _bucket_for_range(range_name: str):
     if range_name == "24h":
         return ("minute", 15)
@@ -417,6 +423,8 @@ async def analytics(db, device_id: str, range_name: str = "7d") -> dict:
                     0,
                 ]}},
                 "samples": {"$sum": 1},
+                "online_samples": {"$sum": {"$cond": [{"$eq": ["$online", True]}, 1, 0]}},
+                "offline_samples": {"$sum": {"$cond": [{"$eq": ["$online", True]}, 0, 1]}},
                 "mode": {"$last": "$mode"},
                 "activity": {"$last": "$activity"},
             }
@@ -427,7 +435,9 @@ async def analytics(db, device_id: str, range_name: str = "7d") -> dict:
     points = []
     total_samples = heating = cooling = fan_only = 0
     for row in rows:
-        count = int(row.get("samples") or 0)
+        count = int(row.get("online_samples") or 0)
+        offline_count = int(row.get("offline_samples") or 0)
+        total_count = int(row.get("samples") or 0)
         total_samples += count
         heating += int(row.get("heating_samples") or 0)
         cooling += int(row.get("cooling_samples") or 0)
@@ -447,7 +457,9 @@ async def analytics(db, device_id: str, range_name: str = "7d") -> dict:
             "cool_setpoint": row.get("cool_setpoint"),
             "mode": row.get("mode"),
             "activity": row.get("activity"),
-            "samples": count,
+            "samples": total_count,
+            "online_samples": count,
+            "offline_samples": offline_count,
         })
     summary_rows = await db.climate_readings.aggregate([
         {"$match": match},
@@ -468,6 +480,8 @@ async def analytics(db, device_id: str, range_name: str = "7d") -> dict:
                 "weather_samples": {"$sum": {"$cond": [{"$ne": ["$nws_temperature_f", None]}, 1, 0]}},
                 "units": {"$last": "$units"},
                 "samples": {"$sum": 1},
+                "online_samples": {"$sum": {"$cond": [{"$eq": ["$online", True]}, 1, 0]}},
+                "offline_samples": {"$sum": {"$cond": [{"$eq": ["$online", True]}, 0, 1]}},
             }
         },
     ]).to_list(1)
@@ -605,6 +619,12 @@ async def analytics(db, device_id: str, range_name: str = "7d") -> dict:
             "cooling_runtime_minutes_per_degree_hour": round(cooling_minutes_est / cooling_degree_hours, 3) if cooling_degree_hours > 0 else None,
             "units": summary.get("units"),
             "samples": int(summary.get("samples") or 0),
+            "online_samples": int(summary.get("online_samples") or 0),
+            "offline_samples": int(summary.get("offline_samples") or 0),
+            "data_availability_pct": _availability_pct(
+                int(summary.get("online_samples") or 0),
+                int(summary.get("samples") or 0),
+            ),
             "heating_pct": round(heating / total_samples * 100, 1) if total_samples else 0,
             "cooling_pct": round(cooling / total_samples * 100, 1) if total_samples else 0,
             "heating_minutes_est": heating_minutes_est,
@@ -955,12 +975,42 @@ async def run_due_schedules(db):
                 await _execute_schedule_period(db, binding, schedule, period, run_key, "climate_scheduler")
 
 
+def _read_retry_count() -> int:
+    try:
+        value = int(os.getenv("CLIMATE_READ_RETRY_COUNT", "1"))
+    except (TypeError, ValueError):
+        value = 1
+    return max(0, min(value, 2))
+
+
+def _read_retry_delay_seconds() -> float:
+    try:
+        value = float(os.getenv("CLIMATE_READ_RETRY_DELAY_SECONDS", "1"))
+    except (TypeError, ValueError):
+        value = 1.0
+    return max(0.1, min(value, 5.0))
+
+
+async def _read_provider_with_retry(db, binding: dict):
+    attempts = 1 + _read_retry_count()
+    last_error = None
+    for attempt in range(attempts):
+        try:
+            return await provider.device(db, binding)
+        except HTTPException as exc:
+            last_error = exc
+            if attempt + 1 >= attempts:
+                break
+            await asyncio.sleep(_read_retry_delay_seconds())
+    raise last_error or HTTPException(503, "climate_device_unavailable")
+
+
 async def sample_all(db):
     bindings = await db.climate_bindings.find({}).limit(500).to_list(500)
     sampled = failed = 0
     for binding in bindings:
         try:
-            raw = await provider.device(db, binding)
+            raw = await _read_provider_with_retry(db, binding)
             await record_snapshot(db, binding, snapshot(raw), source="monitor")
             sampled += 1
         except HTTPException:
@@ -1024,6 +1074,7 @@ async def telemetry_loop(db):
         try:
             await sample_all(db)
         except Exception:
+            # A provider/network failure must not terminate the sampling worker.
             pass
         await asyncio.sleep(_telemetry_interval_seconds())
 
@@ -1034,6 +1085,7 @@ async def schedule_loop(db):
         try:
             await run_due_schedules(db)
         except Exception:
+            # Individual physical writes remain idempotent by schedule run key.
             pass
         await asyncio.sleep(_schedule_interval_seconds())
 
