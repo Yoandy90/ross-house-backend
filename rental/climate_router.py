@@ -86,7 +86,22 @@ class HoldCommand(StrictModel):
 
 class SchedulePeriod(StrictModel):
     days: list[int] = Field(min_length=1, max_length=7)
-    time: str = Field(pattern=r'^([01]\d|2[0-3]):[0-5]\d
+    time: str = Field(min_length=5, max_length=5)
+    mode: str = Field(min_length=3, max_length=10)
+    heatSetpoint: float | None = None
+    coolSetpoint: float | None = None
+
+
+class ScheduleBody(StrictModel):
+    name: str = Field(min_length=1, max_length=80)
+    enabled: bool = True
+    timezone: str = Field(default='America/Chicago', min_length=1, max_length=80)
+    periods: list[SchedulePeriod] = Field(min_length=1, max_length=56)
+
+
+class ScheduleRun(StrictModel):
+    period_index: int = Field(ge=0, le=55)
+
 
 async def tenant_scope(request):
     user = await auth_marketplace(request)
