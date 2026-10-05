@@ -569,6 +569,10 @@ ALERT_WEIGHTS = {
     "filter_runtime": 5,
     "humidity_low": 5,
     "humidity_high": 5,
+    "cooling_in_cold_weather": 12,
+    "heating_in_hot_weather": 8,
+    "forecast_freeze_risk": 18,
+    "nws_severe_weather": 6,
 }
 
 
