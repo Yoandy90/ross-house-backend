@@ -65,11 +65,27 @@ async def set_rules(db, binding: dict, values: dict, actor: str) -> dict:
         if key not in values:
             continue
         value = values[key]
-        if not finite(value):
-            raise HTTPException(422, "climate_alert_rule_invalid")
-        if value < 0:
+        if not finite(value) or value < 0:
             raise HTTPException(422, "climate_alert_rule_invalid")
         clean[key] = value
+    merged = await get_rules(db, binding)
+    merged.update(clean)
+    if merged["temperature_low_f"] >= merged["temperature_high_f"]:
+        raise HTTPException(422, "climate_alert_temperature_thresholds_invalid")
+    if merged["humidity_low"] >= merged["humidity_high"] or merged["humidity_high"] > 100:
+        raise HTTPException(422, "climate_alert_humidity_thresholds_invalid")
+    if merged["excessive_runtime_pct"] > 100 or merged["efficiency_degradation_ratio"] < 1:
+        raise HTTPException(422, "climate_alert_rule_invalid")
+    for key in (
+        "humidity_sustain_minutes", "rapid_humidity_window_minutes",
+        "no_progress_window_minutes", "short_cycle_window_minutes",
+        "excessive_runtime_window_minutes", "fan_continuous_minutes",
+        "stale_reading_minutes", "schedule_grace_minutes",
+        "efficiency_recent_days", "efficiency_baseline_days",
+        "filter_runtime_hours",
+    ):
+        if merged[key] <= 0:
+            raise HTTPException(422, "climate_alert_rule_invalid")
     clean.update(
         device_id=binding["_id"],
         property_id=binding.get("property_id", ""),
