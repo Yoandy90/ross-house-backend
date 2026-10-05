@@ -385,3 +385,21 @@ def test_telemetry_availability_percentage():
     assert climate_monitor._availability_pct(9, 10) == 90.0
     assert climate_monitor._availability_pct(0, 0) == 0.0
     assert climate_monitor._availability_pct(10, 10) == 100.0
+
+
+def test_health_score_distinguishes_low_data_availability():
+    degraded = climate_intelligence.score_from_alerts(
+        [],
+        {"samples": 20, "data_availability_pct": 45.0},
+    )
+    assert degraded["score"] == 85
+    reason = next(item for item in degraded["reasons"] if item["type"] == "low_data_availability")
+    assert reason["availability_pct"] == 45.0
+    assert reason["penalty"] == 15
+
+    early = climate_intelligence.score_from_alerts(
+        [],
+        {"samples": 3, "data_availability_pct": 33.3},
+    )
+    assert early["score"] == 100
+    assert all(item["type"] != "low_data_availability" for item in early["reasons"])
