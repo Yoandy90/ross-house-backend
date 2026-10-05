@@ -345,21 +345,23 @@ async def predictive_conditions(db, binding: dict, state: dict, rules: dict, sam
 
     # Stale telemetry. This is distinct from provider-offline: an otherwise
     # healthy integration can stop producing fresh samples and should be reviewed.
-    latest = await db.climate_readings.find_one(
-        {"device_id": device_id},
-        {"observed_at": 1, "online": 1},
+    latest_online = await db.climate_readings.find_one(
+        {"device_id": device_id, "online": True},
+        {"observed_at": 1},
         sort=[("observed_at", -1)],
     )
-    latest_at = (latest or {}).get("observed_at")
-    if isinstance(latest_at, datetime):
-        if latest_at.tzinfo is None:
-            latest_at = latest_at.replace(tzinfo=timezone.utc)
-        stale_minutes = max(0, (now() - latest_at).total_seconds() / 60)
-        result["stale_telemetry"] = (
-            stale_minutes >= rules["stale_reading_minutes"],
-            "warning",
-            "Thermostat telemetry is older than the configured freshness threshold.",
-        )
+    latest_online_at = (latest_online or {}).get("observed_at")
+    stale = False
+    if state.get("online") is not True and isinstance(latest_online_at, datetime):
+        if latest_online_at.tzinfo is None:
+            latest_online_at = latest_online_at.replace(tzinfo=timezone.utc)
+        stale_minutes = max(0, (now() - latest_online_at).total_seconds() / 60)
+        stale = stale_minutes >= rules["stale_reading_minutes"]
+    result["stale_telemetry"] = (
+        stale,
+        "warning",
+        "Thermostat telemetry is older than the configured freshness threshold.",
+    )
 
     # Ross House schedule missed: only meaningful when autonomous climate
     # monitoring is explicitly enabled. Staging keeps this off by policy.
