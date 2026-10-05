@@ -532,6 +532,80 @@ def alert_conditions(state: dict, weather: dict | None):
     return result
 
 
+def comfort_setpoint_suggestion(state: dict, weather: dict | None):
+    """Return general, advisory-only comfort guidance from official weather context.
+
+    The range is intentionally broad and never becomes a thermostat command.
+    Historical/property-specific optimization can refine this later.
+    """
+    if not weather or weather.get("status") != "ok":
+        return None
+    current = weather.get("current") or {}
+    forecast = _forecast_temperatures(weather, 12)
+    outdoor = current.get("temperature_f")
+    low = min(forecast) if forecast else outdoor
+    high = max(forecast) if forecast else outdoor
+    if not (_finite(low) or _finite(high)):
+        return None
+
+    if _finite(low) and low <= 32:
+        return {
+            "type": "comfort_setpoint_suggestion",
+            "severity": "info",
+            "suggested_mode": "Heat",
+            "range_f": [68, 70],
+            "automatic": False,
+            "basis": "cold_forecast",
+            "title_es": "Rango sugerido por clima",
+            "title_en": "Weather-based comfort range",
+            "body_es": "Como punto de partida general, considera Heat alrededor de 68–70°F mientras vigilas el confort y la respuesta de esta vivienda. Ross House no cambiará el termostato automáticamente.",
+            "body_en": "As a general starting point, consider Heat around 68–70°F while monitoring comfort and this home's response. Ross House will not change the thermostat automatically.",
+        }
+
+    if _finite(high) and high >= 95:
+        return {
+            "type": "comfort_setpoint_suggestion",
+            "severity": "info",
+            "suggested_mode": "Cool",
+            "range_f": [74, 76],
+            "automatic": False,
+            "basis": "extreme_heat_forecast",
+            "title_es": "Rango sugerido por clima",
+            "title_en": "Weather-based comfort range",
+            "body_es": "Como punto de partida general durante calor fuerte, considera Cool alrededor de 74–76°F y ajusta según confort. Ross House no cambiará el termostato automáticamente.",
+            "body_en": "As a general starting point during high heat, consider Cool around 74–76°F and adjust for comfort. Ross House will not change the thermostat automatically.",
+        }
+
+    if _finite(high) and high >= 85:
+        return {
+            "type": "comfort_setpoint_suggestion",
+            "severity": "info",
+            "suggested_mode": "Cool",
+            "range_f": [74, 78],
+            "automatic": False,
+            "basis": "warm_forecast",
+            "title_es": "Rango sugerido por clima",
+            "title_en": "Weather-based comfort range",
+            "body_es": "Con clima cálido, un rango general de 74–78°F en Cool puede servir como punto de partida. Ajusta según confort; Ross House no hará cambios automáticamente.",
+            "body_en": "In warm weather, a general 74–78°F Cool range can be a starting point. Adjust for comfort; Ross House will not make changes automatically.",
+        }
+
+    if _finite(low) and _finite(high) and low >= 55 and high <= 78:
+        return {
+            "type": "comfort_setpoint_suggestion",
+            "severity": "info",
+            "suggested_mode": "Auto",
+            "range_f": [68, 76],
+            "automatic": False,
+            "basis": "mild_forecast",
+            "title_es": "Clima exterior moderado",
+            "title_en": "Mild outdoor weather",
+            "body_es": "Con condiciones moderadas, Auto con una banda amplia cercana a 68–76°F puede reducir cambios innecesarios de modo. Ajusta según confort y humedad interior.",
+            "body_en": "With mild conditions, Auto with a broad band near 68–76°F can reduce unnecessary mode changes. Adjust for comfort and indoor humidity.",
+        }
+    return None
+
+
 def weather_advice(state: dict, weather: dict | None):
     if not weather or weather.get("status") != "ok":
         return []
@@ -541,6 +615,10 @@ def weather_advice(state: dict, weather: dict | None):
     indoor = _indoor_f(state)
     activity = state.get("activity")
     advice = []
+
+    comfort = comfort_setpoint_suggestion(state, weather)
+    if comfort:
+        advice.append(comfort)
 
     severe_alerts = [
         item for item in weather.get("alerts") or []
