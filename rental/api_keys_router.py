@@ -67,6 +67,8 @@ KEY_REGISTRY = [
     {"key": "ZEROBOUNCE_API_KEY", "label": "ZeroBounce API Key", "category": "ZeroBounce (Validación de Emails)", "secret": True, "placeholder": "xxxxxxxx"},
 
     {"key": "PROPERTYRADAR_API_KEY", "label": "PropertyRadar API Key", "category": "PropertyRadar (Probate / Divorcio / Evicciones)", "secret": True, "placeholder": "xxxxxxxx"},
+    # NOAA / NCEI historical climate data
+    {"key": "NCEI_CDO_TOKEN", "label": "NCEI Climate Data Online Token", "category": "NOAA / NCEI (Histórico del Clima)", "secret": True, "placeholder": "token enviado por email por NOAA"},
     # Expo push
     {"key": "EXPO_ACCESS_TOKEN", "label": "Expo Access Token (Push)", "category": "Expo (Notificaciones Push)", "secret": True, "placeholder": "xxxxxxxx"},
 ]
