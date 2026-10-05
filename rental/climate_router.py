@@ -72,6 +72,16 @@ class Command(StrictModel):
     coolSetpoint: float | None = None
 
 
+class FanCommand(StrictModel):
+    request_id: UUID
+    mode: str = Field(min_length=2, max_length=30)
+
+
+class HoldCommand(StrictModel):
+    request_id: UUID
+    mode: str = Field(min_length=3, max_length=30)
+
+
 async def tenant_scope(request):
     user = await auth_marketplace(request)
     if user.get('role') != 'tenant':
@@ -222,6 +232,68 @@ async def issue_command(binding, user, body):
         await db.climate_bindings.update_one({'_id': binding['_id'], 'command_lock': key}, {'$unset': {'busy_until': '', 'command_lock': ''}})
 
 
+async def issue_feature_command(binding, user, request_id, kind, requested):
+    require_enabled()
+    if not control():
+        raise HTTPException(503, 'climate_control_disabled')
+    db = get_db()
+    digest = hashlib.sha256(json.dumps(requested, sort_keys=True).encode()).hexdigest()
+    key = hashlib.sha256((actor_id(user) + str(request_id) + kind).encode()).hexdigest()
+    previous = await db.climate_commands.find_one({'_id': key})
+    if previous:
+        if previous['device_id'] != binding['_id'] or previous['digest'] != digest:
+            raise HTTPException(409, 'climate_request_conflict')
+        return {'status': previous['status']}
+    locked = await db.climate_bindings.find_one_and_update({'_id': binding['_id'], '$or': [
+        {'busy_until': {'$exists': False}}, {'busy_until': {'$lt': provider.now()}}]},
+        {'$set': {'busy_until': provider.now() + timedelta(seconds=180), 'command_lock': key}})
+    if not locked:
+        raise HTTPException(409, 'climate_busy')
+    inserted = False
+    try:
+        current = snapshot(await provider.device(db, binding))
+        if kind == 'fan':
+            if not current.get('capabilities', {}).get('fan') or requested['mode'] not in current.get('fanModes', []):
+                raise HTTPException(422, 'climate_fan_mode_unsupported')
+        elif kind == 'hold':
+            if not current.get('capabilities', {}).get('hold') or requested['mode'] not in ('schedule', 'permanent'):
+                raise HTTPException(422, 'climate_hold_mode_unsupported')
+        else:
+            raise HTTPException(422, 'climate_command_unsupported')
+        try:
+            await db.climate_commands.insert_one({
+                '_id': key, 'device_id': binding['_id'], 'actor': actor_id(user),
+                'kind': kind, 'digest': digest, 'requested': requested,
+                'created_at': provider.now(), 'status': 'pending',
+            })
+            inserted = True
+        except DuplicateKeyError:
+            return {'status': 'pending'}
+        if kind == 'fan':
+            await provider.change_fan(db, binding, requested['mode'])
+        else:
+            await provider.change_hold(db, binding, requested['mode'])
+        observed = snapshot(await provider.device(db, binding))
+        confirmed = (
+            observed.get('fanMode') == requested['mode']
+            if kind == 'fan'
+            else observed.get('holdStatus') == requested['mode']
+        )
+        status = 'confirmed' if confirmed else 'pending'
+        await db.climate_commands.update_one({'_id': key}, {'$set': {'status': status}})
+        return {'status': status}
+    except HTTPException:
+        if inserted:
+            await db.climate_commands.update_one({'_id': key}, {'$set': {'status': 'unknown'}})
+            return {'status': 'unknown'}
+        raise
+    finally:
+        await db.climate_bindings.update_one(
+            {'_id': binding['_id'], 'command_lock': key},
+            {'$unset': {'busy_until': '', 'command_lock': ''}},
+        )
+
+
 @router.patch('/admin/climate/devices/{device_id}')
 async def admin_command(device_id: str, body: Command, request: Request):
     user = await auth_admin(request)
@@ -238,3 +310,39 @@ async def tenant_command(device_id: str, body: Command, request: Request):
     if not binding:
         raise HTTPException(404, 'climate_device_not_found')
     return await issue_command(binding, user, body)
+
+
+@router.patch('/admin/climate/devices/{device_id}/fan')
+async def admin_fan_command(device_id: str, body: FanCommand, request: Request):
+    user = await auth_admin(request)
+    binding = await get_db().climate_bindings.find_one({'_id': device_id})
+    if not binding:
+        raise HTTPException(404, 'climate_device_not_found')
+    return await issue_feature_command(binding, user, body.request_id, 'fan', {'mode': body.mode})
+
+
+@router.patch('/tenant/climate/devices/{device_id}/fan')
+async def tenant_fan_command(device_id: str, body: FanCommand, request: Request):
+    user, scope = await tenant_scope(request)
+    binding = await get_db().climate_bindings.find_one({'_id': device_id, **scope})
+    if not binding:
+        raise HTTPException(404, 'climate_device_not_found')
+    return await issue_feature_command(binding, user, body.request_id, 'fan', {'mode': body.mode})
+
+
+@router.patch('/admin/climate/devices/{device_id}/hold')
+async def admin_hold_command(device_id: str, body: HoldCommand, request: Request):
+    user = await auth_admin(request)
+    binding = await get_db().climate_bindings.find_one({'_id': device_id})
+    if not binding:
+        raise HTTPException(404, 'climate_device_not_found')
+    return await issue_feature_command(binding, user, body.request_id, 'hold', {'mode': body.mode})
+
+
+@router.patch('/tenant/climate/devices/{device_id}/hold')
+async def tenant_hold_command(device_id: str, body: HoldCommand, request: Request):
+    user, scope = await tenant_scope(request)
+    binding = await get_db().climate_bindings.find_one({'_id': device_id, **scope})
+    if not binding:
+        raise HTTPException(404, 'climate_device_not_found')
+    return await issue_feature_command(binding, user, body.request_id, 'hold', {'mode': body.mode})
