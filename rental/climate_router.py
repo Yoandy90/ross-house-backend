@@ -390,6 +390,15 @@ async def issue_feature_command(binding, user, request_id, kind, requested):
         )
         status = 'confirmed' if confirmed else 'pending'
         await db.climate_commands.update_one({'_id': key}, {'$set': {'status': status}})
+        if kind == 'hold' and status == 'confirmed':
+            await db.climate_bindings.update_one(
+                {'_id': binding['_id']},
+                {'$set': {
+                    'ross_schedule_paused': requested['mode'] == 'permanent',
+                    'ross_schedule_pause_updated_at': provider.now(),
+                    'ross_schedule_pause_updated_by': actor_id(user),
+                }},
+            )
         await climate_monitor.record_snapshot(db, binding, observed, source=kind)
         return {'status': status}
     except HTTPException:
