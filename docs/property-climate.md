@@ -40,3 +40,68 @@ Web routes: `/admin/climatizacion`, `/tenant/dashboard/climate`. Mobile route: `
 Operational limitations: no self-service removal/reassignment or connection revocation screen in this first increment; coordinate those changes with an administrator/developer after reviewing active leases. At present the admin list is capped at 200 bindings; discovery should remain a small portfolio operation. No provider quota, latency or physical-device test has been performed. Reauthorize once per account, avoiding duplicate connections. If an existing connection must be replaced, update its binding explicitly server-side after review; do not assign duplicate devices to tenants.
 
 Tests: `python -m pytest tests/test_climate.py tests/test_climate_tcc.py tests/test_tenant_identity_integrity.py -q`.
+
+
+## Capability-driven product rules
+
+The UI must expose controls from the device's reported capabilities instead of assuming every thermostat supports the same features.
+
+Temperature flow:
+- Heat mode: show and edit the heat target only. Preserve the cooling target internally.
+- Cool mode: show and edit the cool target only. Preserve the heating target internally.
+- Auto mode: show both targets and enforce the native deadband.
+- Off mode: hide temperature steppers; only a mode change can re-enable conditioning.
+- If the user changes mode before applying, discard any now-hidden local setpoint edits so no invisible command is sent.
+- TCC setpoint writes preserve both setpoints atomically and move the opposite target only when necessary to satisfy the thermostat's native deadband.
+- The display unit toggle converts setpoints as absolute temperatures and deadband as a temperature difference.
+
+Current capability matrix:
+
+| Capability | TCC US / RTH9585WF path | First Alert / Honeywell Home API |
+| --- | --- | --- |
+| Indoor temperature | Supported | Supported |
+| Indoor humidity | Supported when sensor reports it | Supported when device reports it |
+| Heat/Cool/Off/Auto | Supported when advertised | Supported via allowedModes |
+| Heat/cool setpoints | Supported | Supported |
+| Native bounds/deadband | Supported | Supported |
+| Equipment activity | Available on some TCC payloads; otherwise may be unknown/stale | operationStatus is documented |
+| Fan mode | AIOSomecomfort supports Auto/On/Circulate where fanData allows it | Official fan GET/POST API |
+| Fan running state | Available when TCC fanData reports it | Official fan/operation status |
+| Permanent hold | Supported | Supported |
+| Temporary hold / next schedule period | Supported by TCC client | Supported |
+| Hold until a time | Supported by TCC client in 15-minute increments | Supported with nextPeriodTime |
+| Resume schedule / NoHold | Supported by TCC client | Supported |
+| Outdoor temperature/humidity | Supported when TCC reports weather fields | Documented |
+| Weekly schedule editor | Not enabled until real-device validation of this community connector | Official GET/POST schedule APIs |
+| Pause/resume schedule | Not enabled until real-device validation | Official APIs |
+| Adaptive recovery | Not exposed by current TCC bridge | Official API where supported |
+| Emergency heat | Do not expose unless the device explicitly advertises it | Supported only when advertised |
+| Room/sensor priority | Not available through current TCC bridge | T9/T10-specific official APIs; do not assume X2S supports it |
+| Thermostat system configuration / firmware | Limited through current TCC bridge | Official thermostatconfiguration GET |
+| Hardware brightness | Not implemented | Can be reported in thermostat settings; write support must be verified before exposing |
+| Real-time event subscription | Not supported by current TCC bridge | First Alert/Honeywell event APIs are available; First Alert event IDs use the newer UUID/subsystem formats |
+
+### Product roadmap
+
+P1 — validated current-device controls:
+1. Correct mode-specific temperature UX and TCC deadband-safe writes.
+2. Prefer provider-reported equipment activity, fall back to an explicitly labeled estimate only when necessary.
+3. Add fan mode/status when the connected device advertises it.
+4. Add hold controls: Follow schedule, Until next period, Permanent hold; keep Hold-until-time behind capability validation.
+5. Surface outdoor conditions and current hold/schedule state as read-only context when available.
+
+P2 — First Alert / X2S:
+1. Fan control from official capabilities.
+2. Schedule summary and pause/resume.
+3. Full 7-day schedule editor only when scheduleCapabilities advertise a timed schedule.
+4. Adaptive recovery toggle only when supported.
+5. Thermostat configuration/firmware diagnostics for admin.
+6. Event-driven refresh to reduce manual polling when Resideo event subscriptions are enabled.
+
+P3 — model-specific enhancements:
+- Room/sensor priority only for models whose API reports that capability (documented for T9/T10).
+- Emergency heat only when allowedModes/settings explicitly advertise it.
+- Vacation/geofencing/special modes only when the device response exposes the matching capability.
+- Never render unsupported controls merely because another thermostat model supports them.
+
+Public capability references reviewed on 2026-10-05: Resideo Honeywell Home thermostat GET/change-setting, fan, schedule, thermostat-configuration, room-priority and First Alert integration documentation; AIOSomecomfort's current TCC client capabilities. Keep provider-specific writes behind hardware validation before production.
