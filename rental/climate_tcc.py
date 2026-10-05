@@ -67,14 +67,32 @@ async def locations(client):
 def normalize(response):
     if not isinstance(response, dict) or response.get('success') not in (True, 1):
         raise HTTPException(502, 'climate_provider_invalid')
-    ui = (response.get('latestData') or {}).get('uiData')
+    latest = response.get('latestData') or {}
+    ui = latest.get('uiData')
     if not isinstance(ui, dict):
         raise HTTPException(502, 'climate_provider_invalid')
+    fan = latest.get('fanData') or {}
+    has_fan = latest.get('hasFan') is True and isinstance(fan, dict)
+    fan_modes = []
+    if has_fan:
+        for label, key in (
+            ('Auto', 'fanModeAutoAllowed'),
+            ('On', 'fanModeOnAllowed'),
+            ('Circulate', 'fanModeCirculateAllowed'),
+            ('FollowSchedule', 'fanModeFollowScheduleAllowed'),
+        ):
+            if fan.get(key) in (True, 1):
+                fan_modes.append(label)
+    hold_values = {0: 'schedule', 1: 'temporary', 2: 'permanent'}
+    heat_hold, cool_hold = hold_values.get(ui.get('StatusHeat')), hold_values.get(ui.get('StatusCool'))
+    hold_status = heat_hold if heat_hold == cool_hold else ('mixed' if heat_hold or cool_hold else None)
     return {
         'isAlive': response.get('deviceLive') in (True, 1) and response.get('communicationLost') in (False, 0),
         'units': {'F': 'Fahrenheit', 'C': 'Celsius'}.get(ui.get('DisplayUnits')),
         'indoorTemperature': ui.get('DispTemperature'),
         'indoorHumidity': ui.get('IndoorHumidity') if ui.get('IndoorHumiditySensorAvailable') and ui.get('IndoorHumiditySensorNotFault') else None,
+        'outdoorTemperature': ui.get('OutdoorTemperature') if ui.get('OutdoorTemperatureAvailable') else None,
+        'displayedOutdoorHumidity': ui.get('OutdoorHumidity') if ui.get('OutdoorHumidityAvailable') else None,
         'allowedModes': [m for m in ('Off', 'Heat', 'Cool', 'Auto') if ui.get('Switch' + m + 'Allowed') in (True, 1)],
         'changeableValues': {'mode': MODES.get(ui.get('SystemSwitchPosition')),
                              'heatSetpoint': ui.get('HeatSetpoint'), 'coolSetpoint': ui.get('CoolSetpoint')},
@@ -82,6 +100,15 @@ def normalize(response):
         'minCoolSetpoint': ui.get('CoolLowerSetptLimit'), 'maxCoolSetpoint': ui.get('CoolUpperSetptLimit'),
         'deadband': ui.get('Deadband'),
         'activity': {0: 'idle', 1: 'heating', 2: 'cooling'}.get(ui.get('EquipmentOutputStatus')),
+        'fan': {
+            'supported': has_fan and bool(fan_modes),
+            'allowedModes': fan_modes,
+            'mode': {0: 'Auto', 1: 'On', 2: 'Circulate', 3: 'FollowSchedule'}.get(fan.get('fanMode')),
+            'running': fan.get('fanIsRunning') if has_fan else None,
+        },
+        'holdStatus': hold_status,
+        'scheduleStatus': 'resume' if hold_status == 'schedule' else 'hold',
+        'scheduleCapabilities': {'availableScheduleTypes': [], 'schedulableFan': False},
     }
 
 
@@ -207,4 +234,36 @@ async def change(db, binding, values):
         except APIError:
             # The provider explicitly rejected the request; this is not an ambiguous
             # timeout and should not invalidate the authenticated account session.
+            raise HTTPException(409, 'climate_provider_rejected') from None
+
+
+async def change_fan(db, binding, mode):
+    async with account(db, binding['connection_id']) as client:
+        raw = normalize(await client.get_thermostat_data(binding['provider_device_id']))
+        fan = raw.get('fan') or {}
+        if not fan.get('supported') or mode not in fan.get('allowedModes', []):
+            raise HTTPException(422, 'climate_fan_mode_unsupported')
+        if mode == fan.get('mode'):
+            return
+        value = {'Auto': 0, 'On': 1, 'Circulate': 2, 'FollowSchedule': 3}[mode]
+        try:
+            await client.set_thermostat_settings(binding['provider_device_id'], {'FanMode': value})
+        except APIError:
+            raise HTTPException(409, 'climate_provider_rejected') from None
+
+
+async def change_hold(db, binding, mode):
+    if mode not in ('schedule', 'permanent'):
+        raise HTTPException(422, 'climate_hold_mode_unsupported')
+    async with account(db, binding['connection_id']) as client:
+        raw = normalize(await client.get_thermostat_data(binding['provider_device_id']))
+        if raw.get('holdStatus') == mode:
+            return
+        value = 0 if mode == 'schedule' else 2
+        try:
+            await client.set_thermostat_settings(binding['provider_device_id'], {
+                'StatusHeat': value,
+                'StatusCool': value,
+            })
+        except APIError:
             raise HTTPException(409, 'climate_provider_rejected') from None
