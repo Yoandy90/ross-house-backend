@@ -1,3 +1,4 @@
+import asyncio
 import os
 
 import pytest
@@ -229,3 +230,56 @@ def test_advanced_rules_have_safe_defaults():
     assert rules['schedule_grace_minutes'] > 0
     assert rules['thermal_degradation_ratio'] >= 1
     assert rules['emergency_heat_minutes'] > 0
+
+
+def test_read_only_telemetry_loop_never_executes_schedules(monkeypatch):
+    calls = {"sample": 0, "schedule": 0}
+
+    class StopLoop(Exception):
+        pass
+
+    async def fake_sample_all(db):
+        calls["sample"] += 1
+        return {"sampled": 1, "failed": 0}
+
+    async def forbidden_schedule(db):
+        calls["schedule"] += 1
+        raise AssertionError("telemetry loop must never execute schedules")
+
+    async def stop_sleep(seconds):
+        raise StopLoop()
+
+    monkeypatch.setattr(climate_monitor, "sample_all", fake_sample_all)
+    monkeypatch.setattr(climate_monitor, "run_due_schedules", forbidden_schedule)
+    monkeypatch.setattr(climate_monitor.asyncio, "sleep", stop_sleep)
+
+    with pytest.raises(StopLoop):
+        asyncio.run(climate_monitor.telemetry_loop(object()))
+
+    assert calls == {"sample": 1, "schedule": 0}
+
+
+def test_schedule_loop_does_not_collect_telemetry(monkeypatch):
+    calls = {"sample": 0, "schedule": 0}
+
+    class StopLoop(Exception):
+        pass
+
+    async def forbidden_sample(db):
+        calls["sample"] += 1
+        raise AssertionError("schedule loop must not collect telemetry")
+
+    async def fake_schedule(db):
+        calls["schedule"] += 1
+
+    async def stop_sleep(seconds):
+        raise StopLoop()
+
+    monkeypatch.setattr(climate_monitor, "sample_all", forbidden_sample)
+    monkeypatch.setattr(climate_monitor, "run_due_schedules", fake_schedule)
+    monkeypatch.setattr(climate_monitor.asyncio, "sleep", stop_sleep)
+
+    with pytest.raises(StopLoop):
+        asyncio.run(climate_monitor.schedule_loop(object()))
+
+    assert calls == {"sample": 0, "schedule": 1}
