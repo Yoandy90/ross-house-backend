@@ -120,8 +120,14 @@ class AlertRules(StrictModel):
     excessive_runtime_window_minutes: float | None = None
     excessive_runtime_pct: float | None = None
     fan_continuous_minutes: float | None = None
+    emergency_heat_minutes: float | None = None
     stale_reading_minutes: float | None = None
     schedule_grace_minutes: float | None = None
+    unexpected_change_window_minutes: float | None = None
+    thermal_recent_days: float | None = None
+    thermal_baseline_days: float | None = None
+    thermal_degradation_ratio: float | None = None
+    thermal_min_drift_f_per_hour: float | None = None
     efficiency_recent_days: float | None = None
     efficiency_baseline_days: float | None = None
     efficiency_degradation_ratio: float | None = None
