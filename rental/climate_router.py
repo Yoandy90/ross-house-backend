@@ -350,6 +350,18 @@ async def tenant_analytics(device_id: str, request: Request, range: str = '7d'):
     return await climate_monitor.analytics(get_db(), binding['_id'], range)
 
 
+@router.get('/admin/climate/devices/{device_id}/reading')
+async def admin_reading_at(device_id: str, request: Request, at: str):
+    _, binding = await admin_binding(device_id, request)
+    return await climate_monitor.nearest_reading(get_db(), binding['_id'], at)
+
+
+@router.get('/tenant/climate/devices/{device_id}/reading')
+async def tenant_reading_at(device_id: str, request: Request, at: str):
+    _, binding = await tenant_binding(device_id, request)
+    return await climate_monitor.nearest_reading(get_db(), binding['_id'], at)
+
+
 @router.get('/admin/climate/devices/{device_id}/alerts')
 async def admin_alerts(device_id: str, request: Request):
     _, binding = await admin_binding(device_id, request)
