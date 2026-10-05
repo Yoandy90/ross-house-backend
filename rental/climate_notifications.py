@@ -107,6 +107,16 @@ async def _recipients(db, binding):
     return rows
 
 
+def alert_category(alert_type: str) -> str:
+    if alert_type == "offline":
+        return "offline"
+    if alert_type.startswith("temperature_"):
+        return "temperature"
+    if alert_type.startswith("humidity_"):
+        return "humidity"
+    return "predictive"
+
+
 async def notify_transition(
     db,
     binding: dict,
@@ -145,6 +155,9 @@ async def notify_transition(
             continue
         prefs = account.get("notification_preferences") or {}
         if prefs.get("climate") is False:
+            continue
+        climate_prefs = account.get("climate_alert_preferences") or {}
+        if climate_prefs.get(alert_category(alert_type)) is False:
             continue
 
         if active:
