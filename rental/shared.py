@@ -187,15 +187,18 @@ async def _validate_session_claims(payload: dict) -> None:
     unexpired session owned by the same user."""
     sid = payload.get("sid")
     if not sid:
-        # P1B-5: legacy grace period. Set REQUIRE_SESSION_SID=true in Railway
-        # AFTER the cutoff (30 días post-deploy de Phase 1) to reject sid-less
-        # tokens. Until then legacy tokens remain valid to their natural exp.
         from rental.auth_metrics import bump as _bump
-        if os.environ.get("REQUIRE_SESSION_SID", "").lower() == "true":
+        # Production is permanently fail-closed for sid-less JWTs. The flag
+        # remains only as an explicit compatibility gate outside production.
+        require_sid = (
+            os.environ.get("ENVIRONMENT", "").strip().lower() == "production"
+            or os.environ.get("REQUIRE_SESSION_SID", "").lower() == "true"
+        )
+        if require_sid:
             await _bump("sidless_token_rejected")
             raise HTTPException(status_code=401, detail="session_invalid")
         await _bump("sidless_token_accepted")
-        return  # legacy token — valid until natural exp
+        return  # non-production compatibility only
     if not isinstance(sid, str) or len(sid) != 32:
         raise HTTPException(status_code=401, detail="session_invalid")
     ses = await get_db().auth_sessions.find_one({"sid": sid})

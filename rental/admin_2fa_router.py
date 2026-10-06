@@ -659,6 +659,7 @@ async def update_2fa_settings(request: Request, admin=Depends(auth_admin)):
     body = await request.json()
     user_id = str(admin["_id"]) if isinstance(admin.get("_id"), ObjectId) else admin["_id"]
     update: dict = {}
+    current = await _get_settings_for(user_id)
 
     if "channel" in body:
         ch = (body["channel"] or "").strip().lower()
@@ -669,20 +670,44 @@ async def update_2fa_settings(request: Request, admin=Depends(auth_admin)):
         update["channel"] = ch
 
     if "enabled" in body:
-        enabled = bool(body["enabled"])
+        if not isinstance(body["enabled"], bool):
+            raise HTTPException(status_code=400, detail="enabled debe ser booleano")
+        enabled = body["enabled"]
+        if current.get("enabled", True) and not enabled:
+            current_password = (body.get("current_password") or "").strip()
+            if not current_password or not _verify_password(
+                current_password, admin.get("password_hash") or ""
+            ):
+                raise HTTPException(status_code=401, detail="Reautenticación requerida")
         update["enabled"] = enabled
 
     if not update:
         raise HTTPException(status_code=400, detail="Nada para actualizar")
 
+    db = get_db()
     update["updated_at"] = _now_utc()
-    await get_db().admin_2fa_settings.update_one(
+    await db.admin_2fa_settings.update_one(
         {"user_id": user_id},
         {"$set": {"user_id": user_id, **update}},
         upsert=True,
     )
-    return await _get_settings_for(user_id) | {"saved": True}
 
+    if "enabled" in update and update["enabled"] != current.get("enabled", True):
+        await db.admin_trusted_devices.delete_many({"user_id": user_id})
+
+    from rental.security import audit_log
+    await audit_log(
+        admin_user_id=user_id,
+        action="admin_2fa_settings_updated",
+        resource_type="auth",
+        resource_id=user_id,
+        request=request,
+        metadata={
+            "enabled_changed": "enabled" in update and update["enabled"] != current.get("enabled", True),
+            "channel_changed": "channel" in update and update["channel"] != current.get("channel"),
+        },
+    )
+    return await _get_settings_for(user_id) | {"saved": True}
 
 @router.post("/admin/auth/trusted-devices/revoke-all")
 async def revoke_all_trusted(admin=Depends(auth_admin)):

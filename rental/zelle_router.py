@@ -102,7 +102,7 @@ async def _ai_validate(screenshot_b64: str, expected_amount: float,
                        expected_email: str, reference: str) -> dict:
     """Valida la captura del comprobante Zelle con visión AI. Nunca lanza excepción."""
     try:
-        from emergentintegrations.llm.chat import LlmChat, UserMessage, ImageContent
+        from missilya_sdk.compat.emergent import LlmChat, UserMessage, ImageContent
         chat = LlmChat(
             api_key=os.environ["EMERGENT_LLM_KEY"],
             session_id=f"zelle-{datetime.now(timezone.utc).timestamp()}",

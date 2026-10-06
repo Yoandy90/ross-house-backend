@@ -106,7 +106,7 @@ Reglas:
 - Si el texto no es un recibo, devuelve {{"error": "no_receipt"}}."""
 
     try:
-        from emergentintegrations.llm.chat import LlmChat, UserMessage, ImageContent
+        from missilya_sdk.compat.emergent import LlmChat, UserMessage, ImageContent
         chat = LlmChat(
             api_key=api_key,
             session_id=f"receipt-scan-{datetime.utcnow().timestamp()}",

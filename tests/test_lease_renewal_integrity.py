@@ -13,6 +13,21 @@ from rental.lease_renewals_router import router as historical_router
 def run(coro):
     return asyncio.run(coro)
 
+def effective_routes(app):
+    out = []
+
+    def visit(route):
+        candidates = getattr(route, "effective_candidates", None)
+        if callable(candidates):
+            for child in candidates():
+                visit(child)
+            return
+        out.append(route)
+
+    for route in app.routes:
+        visit(route)
+    return out
+
 
 class Result:
     def __init__(self, matched_count=1):
@@ -121,7 +136,7 @@ def test_renewal_routes_have_one_canonical_security_handler():
     for (path, method), name in expected.items():
         matches = [
             route
-            for route in app.routes
+            for route in effective_routes(app)
             if getattr(route, "path", None) == path
             and method in getattr(route, "methods", set())
         ]
