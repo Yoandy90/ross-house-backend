@@ -9,6 +9,7 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
 from pymongo.errors import DuplicateKeyError
 from .shared import auth_admin, auth_marketplace, get_db
+from .security import check_rate_limit_persistent
 from .tenant_integrity import resolve_authenticated_tenant, find_active_contract_for_tenant
 from . import climate_provider as provider
 from .climate_policy import scope_for_contract, snapshot, validate_change
@@ -44,6 +45,20 @@ def actor_id(user):
     if not value:
         raise HTTPException(401, 'climate_identity_required')
     return value
+
+
+async def _rate_limit_physical_command(binding, user):
+    # Physical HVAC writes receive their own persistent, cross-worker limit.
+    # The key is opaque in MongoDB and scoped to actor + device.
+    key = hashlib.sha256(
+        f"{actor_id(user)}:{binding.get('_id', '')}".encode()
+    ).hexdigest()
+    await check_rate_limit_persistent(
+        "climate-physical-command",
+        key,
+        max_requests=12,
+        window_seconds=60,
+    )
 
 def _id_values(value):
     values = [str(value)]
@@ -359,6 +374,7 @@ async def issue_command(binding, user, body):
     require_enabled()
     if not control():
         raise HTTPException(503, 'climate_control_disabled')
+    await _rate_limit_physical_command(binding, user)
     db = get_db()
     values = body.model_dump(exclude_none=True, exclude={'request_id'})
     digest = hashlib.sha256(json.dumps(values, sort_keys=True).encode()).hexdigest()
@@ -417,6 +433,7 @@ async def issue_feature_command(binding, user, request_id, kind, requested):
     require_enabled()
     if not control():
         raise HTTPException(503, 'climate_control_disabled')
+    await _rate_limit_physical_command(binding, user)
     db = get_db()
     digest = hashlib.sha256(json.dumps(requested, sort_keys=True).encode()).hexdigest()
     key = hashlib.sha256((actor_id(user) + str(request_id) + kind).encode()).hexdigest()
@@ -756,6 +773,7 @@ async def admin_run_schedule(device_id: str, schedule_id: str, body: ScheduleRun
     user, binding = await admin_binding(device_id, request)
     if not control():
         raise HTTPException(503, 'climate_control_disabled')
+    await _rate_limit_physical_command(binding, user)
     return {'status': await climate_monitor.run_schedule_now(
         get_db(), binding, schedule_id, body.period_index, actor_id(user))}
 
@@ -765,6 +783,7 @@ async def tenant_run_schedule(device_id: str, schedule_id: str, body: ScheduleRu
     user, binding = await tenant_binding(device_id, request)
     if not control():
         raise HTTPException(503, 'climate_control_disabled')
+    await _rate_limit_physical_command(binding, user)
     return {'status': await climate_monitor.run_schedule_now(
         get_db(), binding, schedule_id, body.period_index, actor_id(user))}
 
