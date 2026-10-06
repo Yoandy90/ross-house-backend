@@ -127,6 +127,7 @@ def command_db(previous=None):
 
 
 def test_timeout_is_unknown_and_never_retried(monkeypatch):
+    monkeypatch.setattr(routes, '_rate_limit_physical_command', AsyncMock())
     monkeypatch.setenv('CLIMATE_ENABLED','true'); monkeypatch.setenv('CLIMATE_CONTROL_ENABLED','true')
     db=command_db(); monkeypatch.setattr(routes,'get_db',lambda:db)
     monkeypatch.setattr(provider,'device',AsyncMock(return_value=deepcopy(RAW)))
@@ -142,6 +143,7 @@ def test_timeout_is_unknown_and_never_retried(monkeypatch):
 
 
 def test_duplicate_request_does_not_reissue(monkeypatch):
+    monkeypatch.setattr(routes, '_rate_limit_physical_command', AsyncMock())
     import hashlib, json
     monkeypatch.setenv('CLIMATE_ENABLED','true');monkeypatch.setenv('CLIMATE_CONTROL_ENABLED','true')
     digest=hashlib.sha256(json.dumps({'mode':'Off'},sort_keys=True).encode()).hexdigest()
@@ -154,6 +156,7 @@ def test_duplicate_request_does_not_reissue(monkeypatch):
 
 
 def test_command_failure_detail_is_sanitized(monkeypatch):
+    monkeypatch.setattr(routes, '_rate_limit_physical_command', AsyncMock())
     monkeypatch.setenv('CLIMATE_ENABLED','true'); monkeypatch.setenv('CLIMATE_CONTROL_ENABLED','true')
     db=command_db(); monkeypatch.setattr(routes,'get_db',lambda:db)
     monkeypatch.setattr(provider,'device',AsyncMock(return_value=deepcopy(RAW)))
@@ -167,6 +170,7 @@ def test_command_failure_detail_is_sanitized(monkeypatch):
 
 
 def test_duplicate_unknown_command_returns_safe_reason_without_reissue(monkeypatch):
+    monkeypatch.setattr(routes, '_rate_limit_physical_command', AsyncMock())
     import hashlib, json
     monkeypatch.setenv('CLIMATE_ENABLED','true');monkeypatch.setenv('CLIMATE_CONTROL_ENABLED','true')
     digest=hashlib.sha256(json.dumps({'mode':'Off'},sort_keys=True).encode()).hexdigest()
