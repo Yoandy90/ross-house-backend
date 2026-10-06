@@ -116,12 +116,12 @@ async def admin_utility_ocr_extract(
         system_prompt += f"\nPista del usuario: bill_type = {bill_type_hint}."
 
     try:
-        from emergentintegrations.llm.chat import LlmChat, UserMessage, FileContentWithMimeType  # type: ignore
+        from missilya_sdk.compat.emergent import LlmChat, UserMessage, FileContentWithMimeType  # type: ignore
     except Exception as e:
-        logger.warning(f"emergentintegrations missing: {e}")
+        logger.warning(f"missilya-sdk missing: {e}")
         return OCRBillResponse(
             success=False,
-            raw_text="emergentintegrations no disponible en el servidor.",
+            raw_text="missilya-sdk no disponible en el servidor.",
             needs_manual_review=True,
         )
 
