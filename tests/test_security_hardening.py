@@ -72,3 +72,8 @@ def test_ai_provider_engine_is_pinned_to_audited_litellm():
     assert "missilya-sdk[ai]==0.2.6" in source
     assert "litellm==1.96.2" in source
     assert "litellm==1.83.0" not in source
+
+
+def test_httpx_success_logs_do_not_pollute_railway_error_stream():
+    server = read("server.py")
+    assert 'logging.getLogger("httpx").setLevel(logging.WARNING)' in server
