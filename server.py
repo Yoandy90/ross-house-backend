@@ -5,6 +5,7 @@ Property management API for Ross House Rentals LLC.
 Handles: Auth, Properties, Tenants, Chat, Payments, Contracts, and more.
 """
 import os
+import sys
 import logging
 from datetime import datetime
 from contextlib import asynccontextmanager
@@ -31,13 +32,39 @@ if "ross-house-" in SECRET_KEY and len(SECRET_KEY) < 40:
 PORT = int(os.environ.get("PORT", 8001))
 
 # ─── Logging ──────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+class _BelowWarningFilter(logging.Filter):
+    def filter(self, record):
+        return record.levelno < logging.WARNING
+
+
+_log_formatter = logging.Formatter(
+    '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
-# httpx logs successful requests at INFO to stderr; Railway classifies stderr as
-# error regardless of Python's log level. Suppress routine request chatter so
-# real warnings/errors remain actionable in Railway observability.
+_stdout_handler = logging.StreamHandler(sys.stdout)
+_stdout_handler.setLevel(logging.DEBUG)
+_stdout_handler.addFilter(_BelowWarningFilter())
+_stdout_handler.setFormatter(_log_formatter)
+
+_stderr_handler = logging.StreamHandler(sys.stderr)
+_stderr_handler.setLevel(logging.WARNING)
+_stderr_handler.setFormatter(_log_formatter)
+
+_root_logger = logging.getLogger()
+_root_logger.handlers.clear()
+_root_logger.setLevel(logging.INFO)
+_root_logger.addHandler(_stdout_handler)
+_root_logger.addHandler(_stderr_handler)
+
+# Uvicorn installs its own stderr handlers before importing this app. Replace
+# them so Railway receives INFO/access logs on stdout and warnings/errors on stderr.
+for _logger_name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+    _uvicorn_logger = logging.getLogger(_logger_name)
+    _uvicorn_logger.handlers.clear()
+    _uvicorn_logger.addHandler(_stdout_handler)
+    _uvicorn_logger.addHandler(_stderr_handler)
+    _uvicorn_logger.propagate = False
+
+# Successful outbound requests are routine telemetry, not application events.
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
