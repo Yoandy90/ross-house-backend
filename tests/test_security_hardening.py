@@ -57,7 +57,8 @@ def test_disabling_2fa_requires_password_and_clears_trusted_devices():
 def test_requirements_avoid_unscoped_private_extra_index():
     source = read("requirements.txt")
     assert "--extra-index-url" not in source
-    assert "emergentintegrations-0.2.2-py3-none-any.whl" in source
+    assert "emergentintegrations" not in source
+    assert "missilya-sdk[ai]==0.2.6" in source
     assert "Pillow==12.3.0" in source
 
 
