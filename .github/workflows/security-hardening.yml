@@ -2,7 +2,7 @@ name: Security Hardening
 
 on:
   pull_request:
-    branches: [main]
+    branches: [main, staging]
   push:
     branches: [main]
 
