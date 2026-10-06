@@ -420,7 +420,7 @@ async def forgot_password(request: Request):
                 body=f"Ross House Rentals: Tu código para restablecer contraseña es {code}. Expira en 10 minutos.",
                 from_=from_phone, to=normalized,
             )
-            logging.info(f"✅ Password reset code sent to {phone[-4:]}")
+            logging.info("✅ Password reset SMS sent")
     except Exception as e:
         logging.error(f"Failed to send SMS for password reset: {e}")
 
