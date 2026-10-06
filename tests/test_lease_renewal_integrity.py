@@ -24,7 +24,7 @@ def effective_routes(app):
             return
         out.append(route)
 
-    for route in effective_routes(app):
+    for route in app.routes:
         visit(route)
     return out
 
