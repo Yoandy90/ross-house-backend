@@ -97,10 +97,12 @@ router.include_router(lease_renewal_tenant_response_router)
 router.include_router(lease_renewal_delivery_recovery_router)
 router.include_router(lease_renewal_notification_sender_router)
 router.include_router(lease_renewal_notification_security_router)
-# The notification-aware approve router is mounted first, so it wins FastAPI's
-# first-match dispatch. Include the canonical renewal router through FastAPI's
-# supported API as well; direct mutation of .routes is not stable across versions.
-router.include_router(lease_renewal_security_router)
+for _route in lease_renewal_security_router.routes:
+    _path = getattr(_route, "path", None)
+    _methods = getattr(_route, "methods", set())
+    if _path == "/admin/lease-renewals/{proposal_id}/approve" and "POST" in _methods:
+        continue
+    router.routes.append(_route)
 
 VALID_METRICS = {
     "legacy_fallback_used", "sidless_token_accepted", "sidless_token_rejected",
