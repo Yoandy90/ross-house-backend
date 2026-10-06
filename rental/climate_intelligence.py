@@ -231,6 +231,19 @@ async def reset_filter(db, binding: dict, actor: str):
     return {"filter_changed_at": now().isoformat()}
 
 
+def schedule_alerts_enabled() -> bool:
+    """Missed automatic schedules only matter when thermostat writes are enabled.
+
+    CLIMATE_MONITOR_ENABLED is a legacy/read-only telemetry flag and must never
+    cause a "schedule missed" alert by itself.
+    """
+    return (
+        os.getenv("CLIMATE_ENABLED") == "true"
+        and os.getenv("CLIMATE_CONTROL_ENABLED") == "true"
+        and os.getenv("CLIMATE_SCHEDULE_WORKER_ENABLED") == "true"
+    )
+
+
 async def predictive_conditions(db, binding: dict, state: dict, rules: dict, sample_minutes=5):
     result = {}
     device_id = binding["_id"]
@@ -366,7 +379,7 @@ async def predictive_conditions(db, binding: dict, state: dict, rules: dict, sam
     # Ross House schedule missed: only meaningful when autonomous climate
     # monitoring is explicitly enabled. Staging keeps this off by policy.
     schedule_missed = False
-    if os.getenv("CLIMATE_MONITOR_ENABLED") == "true":
+    if schedule_alerts_enabled():
         schedules = await db.climate_schedules.find(
             {"device_id": device_id, "enabled": True}
         ).limit(20).to_list(20)
