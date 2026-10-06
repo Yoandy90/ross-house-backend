@@ -13,6 +13,21 @@ from rental.lease_renewal_security_router import router as renewal_router
 def run(coro):
     return asyncio.run(coro)
 
+def effective_routes(app):
+    out = []
+
+    def visit(route):
+        candidates = getattr(route, "effective_candidates", None)
+        if callable(candidates):
+            for child in candidates():
+                visit(child)
+            return
+        out.append(route)
+
+    for route in effective_routes(app):
+        visit(route)
+    return out
+
 
 class Result:
     def __init__(self, matched_count=1, upserted_id=None):
@@ -105,7 +120,7 @@ def test_notification_approve_wins_route_precedence():
     app.include_router(security_router, prefix="/api")
     app.include_router(renewal_router, prefix="/api")
     matches = [
-        r for r in app.routes
+        r for r in effective_routes(app)
         if getattr(r, "path", None) == "/api/admin/lease-renewals/{proposal_id}/approve"
         and "POST" in getattr(r, "methods", set())
     ]
