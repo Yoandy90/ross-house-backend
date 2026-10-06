@@ -73,6 +73,7 @@ async def lifespan(app: FastAPI):
         await db.auth_sessions.create_index("revoked_at")
         await db.rate_limit_events.create_index("created_at", expireAfterSeconds=3600)
         await db.rate_limit_events.create_index([("endpoint", 1), ("key", 1), ("created_at", -1)])
+        await db.password_resets.create_index("expires_at", expireAfterSeconds=0)
         await db.admin_audit_logs.create_index([("timestamp", -1)])
         await db.admin_audit_logs.create_index([("admin_user_id", 1), ("timestamp", -1)])
         await db.admin_audit_logs.create_index([("action", 1), ("timestamp", -1)])

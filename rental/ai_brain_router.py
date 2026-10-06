@@ -7,7 +7,7 @@ Capabilities:
   - Marketing content generator for properties
 
 Architecture:
-  - Anthropic Claude Sonnet 4.5 via emergentintegrations + EMERGENT_LLM_KEY
+  - Anthropic Claude Sonnet 4.5 via MISSILYA compat layer + configured LLM key
   - MongoDB collections:
       ai_conversations: {_id, admin_user, title, created_at, updated_at, last_message}
       ai_messages: {_id, conversation_id, role, content, created_at}
@@ -332,7 +332,7 @@ async def chat_stream(body: ChatRequest, db=Depends(get_db), admin=Depends(auth_
         yield f"data: {json.dumps({'type': 'meta', 'conversation_id': conversation_id})}\n\n"
         full_response = ""
         try:
-            from emergentintegrations.llm.chat import LlmChat, UserMessage, TextDelta, StreamDone
+            from missilya_sdk.compat.emergent import LlmChat, UserMessage, TextDelta, StreamDone
             chat = LlmChat(
                 api_key=api_key, session_id=conversation_id,
                 system_message=system_prompt,
@@ -474,7 +474,7 @@ async def business_insights(
         return _fallback_business_insights(snap)
 
     try:
-        from emergentintegrations.llm.chat import LlmChat, UserMessage
+        from missilya_sdk.compat.emergent import LlmChat, UserMessage
         system_prompt = (
             "Eres el CFO/COO virtual de Ross House Rentals (renta de casas en Amarillo/Dumas, TX). "
             "Analizas los datos operativos del negocio y das un briefing ejecutivo accionable "
@@ -631,7 +631,7 @@ Genera contenido para estos canales:
 {requested_desc}"""
 
     try:
-        from emergentintegrations.llm.chat import LlmChat, UserMessage
+        from missilya_sdk.compat.emergent import LlmChat, UserMessage
         chat = LlmChat(api_key=api_key, session_id=f"marketing_{uuid4()}", system_message=system_msg).with_model(MODEL_PROVIDER, MODEL_NAME)
         resp = await chat.send_message(UserMessage(text=user_msg))
         text = resp.strip()
@@ -696,7 +696,7 @@ Reglas: usa SOLO datos del snapshot. KPIs: 3-5 métricas clave. Tono directo, ej
 Genera el briefing diario para hoy ({snapshot.get('today')})."""
 
     try:
-        from emergentintegrations.llm.chat import LlmChat, UserMessage
+        from missilya_sdk.compat.emergent import LlmChat, UserMessage
         chat = LlmChat(api_key=api_key, session_id=f"briefing_{uuid4()}", system_message=system_msg).with_model(MODEL_PROVIDER, MODEL_NAME)
         resp = await chat.send_message(UserMessage(text=user_msg))
 

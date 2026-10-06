@@ -160,7 +160,7 @@ async def analytics_ai_insights(request: Request, range: str = "7d", refresh: in
         return _rule_based_insights(ctx) | {"cached": False, "source": "fallback"}
 
     try:
-        from emergentintegrations.llm.chat import LlmChat, UserMessage
+        from missilya_sdk.compat.emergent import LlmChat, UserMessage
         system_prompt = (
             "Eres el analista senior de marketing digital de Ross House Rentals, "
             "una empresa de renta de casas en Amarillo, TX. Analizas datos de tráfico web "
