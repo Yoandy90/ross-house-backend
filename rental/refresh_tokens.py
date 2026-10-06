@@ -54,8 +54,12 @@ def refresh_enabled() -> bool:
 
 
 def legacy_user_sessions_allowed() -> bool:
-    # Default true = comportamiento actual de producción. Fase B: poner false.
-    return os.environ.get("ALLOW_LEGACY_USER_SESSIONS", "true").lower() != "false"
+    # Production is fail-closed: raw legacy user_sessions tokens are never
+    # accepted, even if a stale environment variable says otherwise.
+    if os.environ.get("ENVIRONMENT", "").strip().lower() == "production":
+        return False
+    # Non-production must opt in explicitly for compatibility testing.
+    return os.environ.get("ALLOW_LEGACY_USER_SESSIONS", "false").lower() == "true"
 
 
 def generate_refresh_token() -> str:
