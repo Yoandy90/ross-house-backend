@@ -74,6 +74,11 @@ def test_ai_provider_engine_is_pinned_to_audited_litellm():
     assert "litellm==1.83.0" not in source
 
 
-def test_httpx_success_logs_do_not_pollute_railway_error_stream():
+def test_log_streams_preserve_railway_severity():
     server = read("server.py")
+    assert "class _BelowWarningFilter(logging.Filter)" in server
+    assert "return record.levelno < logging.WARNING" in server
+    assert "logging.StreamHandler(sys.stdout)" in server
+    assert "logging.StreamHandler(sys.stderr)" in server
+    assert '("uvicorn", "uvicorn.error", "uvicorn.access")' in server
     assert 'logging.getLogger("httpx").setLevel(logging.WARNING)' in server
