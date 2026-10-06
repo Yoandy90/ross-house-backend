@@ -271,6 +271,13 @@ async def admin_login_step1(request: Request):
         # Generic message to avoid user enumeration.
         raise HTTPException(status_code=401, detail="Credenciales inválidas")
 
+    temporary_expires_at = user.get("temporary_access_expires_at")
+    if temporary_expires_at:
+        if temporary_expires_at.tzinfo is None:
+            temporary_expires_at = temporary_expires_at.replace(tzinfo=timezone.utc)
+        if temporary_expires_at <= _now_utc():
+            raise HTTPException(status_code=401, detail="Credenciales inválidas")
+
     # ── Account lockout (same policy as marketplace-login: 5 fails → 15 min) ──
     now_dt = datetime.utcnow()
     if user.get("locked_until") and user["locked_until"] > now_dt:
@@ -383,6 +390,80 @@ async def admin_login_step1(request: Request):
         "channel": channel,
         "masked": masked,
         "expires_in_seconds": OTP_TTL_MINUTES * 60,
+    }
+
+
+@router.post("/admin/staging-access/temporary-admin")
+async def create_temporary_staging_admin(request: Request, admin=Depends(auth_admin)):
+    """Create or rotate a short-lived, staging-only admin account."""
+    environment = os.getenv("ENVIRONMENT", "").strip().lower()
+    database_name = os.getenv("DB_NAME", "").strip().lower()
+    if environment != "staging":
+        raise HTTPException(status_code=403, detail="temporary_admin_environment_not_staging")
+    if "staging" not in database_name or database_name == "taxportal":
+        raise HTTPException(status_code=403, detail="temporary_admin_database_not_staging")
+
+    body = await request.json()
+    email = (body.get("email") or "").strip().lower()
+    password = body.get("password") or ""
+    confirmation = body.get("confirmation") or ""
+    if confirmation != "CREATE_TEMPORARY_STAGING_ADMIN":
+        raise HTTPException(status_code=400, detail="Confirmación inválida")
+    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+        raise HTTPException(status_code=400, detail="Email inválido")
+    if len(password) < 12 or not re.search(r"[A-Z]", password) or not re.search(r"[a-z]", password) or not re.search(r"\d", password):
+        raise HTTPException(status_code=400, detail="La contraseña debe tener 12 caracteres, mayúscula, minúscula y número")
+
+    db = get_db()
+    existing = await db.app_users.find_one({"email": {"$regex": f"^{re.escape(email)}$", "$options": "i"}})
+    if existing and not existing.get("temporary_staging_admin"):
+        raise HTTPException(status_code=409, detail="Ese email pertenece a una cuenta existente")
+
+    now = _now_utc()
+    expires_at = now + timedelta(hours=24)
+    password_hash = bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode()
+    doc = {
+        "name": "Administrador temporal de staging",
+        "email": email,
+        "role": "admin",
+        "status": "active",
+        "password_hash": password_hash,
+        "temporary_staging_admin": True,
+        "temporary_access_expires_at": expires_at,
+        "created_by_admin": str(admin.get("email") or admin.get("_id") or "admin"),
+        "updated_at": now,
+        "failed_login_attempts": 0,
+        "locked_until": None,
+    }
+    if existing:
+        await db.app_users.update_one({"_id": existing["_id"]}, {"$set": doc})
+        user_id = str(existing["_id"])
+    else:
+        doc["created_at"] = now
+        result = await db.app_users.insert_one(doc)
+        user_id = str(result.inserted_id)
+
+    await db.admin_2fa_settings.update_one(
+        {"user_id": user_id},
+        {"$set": {"user_id": user_id, "enabled": False, "channel": "email", "updated_at": now}},
+        upsert=True,
+    )
+    await db.admin_trusted_devices.delete_many({"user_id": user_id})
+
+    from rental.security import audit_log
+    await audit_log(
+        admin_user_id=str(admin.get("_id") or ""),
+        action="create_temporary_staging_admin",
+        resource_type="auth",
+        resource_id=user_id,
+        result="success",
+        request=request,
+    )
+    return {
+        "success": True,
+        "email": email,
+        "expires_at": expires_at.isoformat(),
+        "two_factor_enabled": False,
     }
 
 
@@ -592,8 +673,6 @@ async def update_2fa_settings(request: Request, admin=Depends(auth_admin)):
         if not isinstance(body["enabled"], bool):
             raise HTTPException(status_code=400, detail="enabled debe ser booleano")
         enabled = body["enabled"]
-        # Disabling MFA is a privilege-reduction operation. A stolen admin
-        # session alone must not be enough: require the current password again.
         if current.get("enabled", True) and not enabled:
             current_password = (body.get("current_password") or "").strip()
             if not current_password or not _verify_password(
@@ -613,8 +692,6 @@ async def update_2fa_settings(request: Request, admin=Depends(auth_admin)):
         upsert=True,
     )
 
-    # A change to the MFA enabled state invalidates every remembered device.
-    # If MFA is later re-enabled, an old trust token must not silently bypass it.
     if "enabled" in update and update["enabled"] != current.get("enabled", True):
         await db.admin_trusted_devices.delete_many({"user_id": user_id})
 
@@ -631,7 +708,6 @@ async def update_2fa_settings(request: Request, admin=Depends(auth_admin)):
         },
     )
     return await _get_settings_for(user_id) | {"saved": True}
-
 
 @router.post("/admin/auth/trusted-devices/revoke-all")
 async def revoke_all_trusted(admin=Depends(auth_admin)):
