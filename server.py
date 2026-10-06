@@ -35,6 +35,10 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
 )
+# httpx logs successful requests at INFO to stderr; Railway classifies stderr as
+# error regardless of Python's log level. Suppress routine request chatter so
+# real warnings/errors remain actionable in Railway observability.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 # ─── Database ─────────────────────────────────────────────────
