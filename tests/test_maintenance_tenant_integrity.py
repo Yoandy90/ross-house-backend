@@ -15,6 +15,21 @@ from rental.service_providers_router import router as historical_provider_router
 def run(coro):
     return asyncio.run(coro)
 
+def effective_routes(app):
+    out = []
+
+    def visit(route):
+        candidates = getattr(route, "effective_candidates", None)
+        if callable(candidates):
+            for child in candidates():
+                visit(child)
+            return
+        out.append(route)
+
+    for route in app.routes:
+        visit(route)
+    return out
+
 
 class Collection:
     def __init__(self, docs):
@@ -36,13 +51,13 @@ def test_secure_maintenance_routes_are_first_runtime_match():
     app.include_router(pre_tenant_router, prefix="/api")
     app.include_router(historical_tenant_router, prefix="/api")
 
-    post_matches = [r for r in app.routes
+    post_matches = [r for r in effective_routes(app)
                     if getattr(r, "path", None) == "/api/tenant/maintenance-request"
                     and "POST" in getattr(r, "methods", set())]
-    get_matches = [r for r in app.routes
+    get_matches = [r for r in effective_routes(app)
                    if getattr(r, "path", None) == "/api/tenant/maintenance-requests"
                    and "GET" in getattr(r, "methods", set())]
-    detail_matches = [r for r in app.routes
+    detail_matches = [r for r in effective_routes(app)
                       if getattr(r, "path", None) == "/api/tenant/maintenance-requests/{request_id}"
                       and "GET" in getattr(r, "methods", set())]
 
@@ -61,7 +76,7 @@ def test_secure_provider_help_route_is_first_runtime_match():
     app.include_router(pre_tenant_router, prefix="/api")
     app.include_router(historical_provider_router, prefix="/api")
 
-    matches = [r for r in app.routes
+    matches = [r for r in effective_routes(app)
                if getattr(r, "path", None) == "/api/tenant/service-providers/request-help"
                and "POST" in getattr(r, "methods", set())]
 
@@ -75,7 +90,7 @@ def test_secure_admin_maintenance_update_is_first_runtime_match():
     app.include_router(pre_tenant_router, prefix="/api")
     app.include_router(historical_tenant_router, prefix="/api")
 
-    matches = [r for r in app.routes
+    matches = [r for r in effective_routes(app)
                if getattr(r, "path", None) == "/api/admin/maintenance-requests/{request_id}"
                and "PUT" in getattr(r, "methods", set())]
 
