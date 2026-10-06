@@ -12,6 +12,7 @@ from bson import ObjectId
 from fastapi import APIRouter, HTTPException, Request
 import os
 import random
+import secrets
 import jwt
 import bcrypt
 from rental.shared import (
@@ -70,7 +71,9 @@ GENERIC_LOGIN_ERROR = "Credenciales inválidas"
 _DUMMY_HASH = hash_password("__timing_constant_dummy_password__")
 MAX_LOGIN_FAILURES = 5
 LOCK_MINUTES = 15
-MAX_PASSWORD_LEN = 256  # bcrypt truncates >72 bytes; reject absurd inputs
+MAX_PASSWORD_LEN = 256  # reject absurd inputs before hashing
+MIN_PASSWORD_LEN = 12
+
 # Password-reset code security
 RESET_MAX_ATTEMPTS = 5
 
@@ -183,8 +186,8 @@ async def marketplace_register(request: Request):
 
     if not name or not email or not phone:
         raise HTTPException(status_code=400, detail="Nombre, email y teléfono son requeridos")
-    if not password or len(password) < 6:
-        raise HTTPException(status_code=400, detail="La contraseña debe tener al menos 6 caracteres")
+    if not password or len(password) < MIN_PASSWORD_LEN:
+        raise HTTPException(status_code=400, detail=f"La contraseña debe tener al menos {MIN_PASSWORD_LEN} caracteres")
     if role not in ("guest", "tenant", "landlord", "buyer"):
         raise HTTPException(status_code=400, detail="Rol inválido")
 
@@ -370,19 +373,38 @@ async def forgot_password(request: Request):
         raise HTTPException(status_code=400, detail="Email es requerido")
 
     user = await get_db().app_users.find_one({"email": {"$regex": f"^{re.escape(email)}$", "$options": "i"}})
+
+    # Enumeration-safe: callers receive the same response whether the account
+    # exists, has a phone, or delivery later fails.
+    generic = {
+        "success": True,
+        "message": "Si el email está registrado, recibirás un código por SMS.",
+        "phone_masked": "***",
+    }
     if not user:
-        return {"success": True, "message": "Si el email está registrado, recibirás un código por SMS."}
+        return generic
 
     phone = user.get("phone", "")
     if not phone:
-        raise HTTPException(status_code=400, detail="No hay teléfono asociado a esta cuenta")
+        return generic
 
-    code = str(random.randint(100000, 999999))
+    # Password-reset OTPs are security tokens: use the OS CSPRNG.
+    code = str(secrets.randbelow(900000) + 100000)
     expires = datetime.utcnow() + timedelta(minutes=10)
 
     await get_db().password_resets.update_one(
         {"email": email},
-        {"$set": {"email": email, "code": code, "expires_at": expires, "used": False, "created_at": datetime.utcnow()}},
+        {
+            "$set": {
+                "email": email,
+                "code_hash": hash_password(code),
+                "expires_at": expires,
+                "used": False,
+                "attempts": 0,
+                "created_at": datetime.utcnow(),
+            },
+            "$unset": {"code": ""},
+        },
         upsert=True,
     )
 
@@ -402,8 +424,7 @@ async def forgot_password(request: Request):
     except Exception as e:
         logging.error(f"Failed to send SMS for password reset: {e}")
 
-    phone_masked = f"***-***-{phone[-4:]}" if len(phone) >= 4 else "***"
-    return {"success": True, "message": "Código enviado por SMS", "phone_masked": phone_masked}
+    return generic
 
 
 @router.post('/auth/reset-password')
@@ -419,8 +440,8 @@ async def reset_password(request: Request):
 
     if not email or not code or not new_password:
         raise HTTPException(status_code=400, detail="Email, código y nueva contraseña son requeridos")
-    if len(new_password) < 6:
-        raise HTTPException(status_code=400, detail="La contraseña debe tener al menos 6 caracteres")
+    if len(new_password) < MIN_PASSWORD_LEN:
+        raise HTTPException(status_code=400, detail=f"La contraseña debe tener al menos {MIN_PASSWORD_LEN} caracteres")
 
     # Atomically reserve one verification attempt (cross-instance safe) — blocks
     # brute-forcing the 6-digit code. find_one_and_update returns None once the
@@ -432,16 +453,36 @@ async def reset_password(request: Request):
         {"$inc": {"attempts": 1}},
         return_document=True,
     )
-    if not reset or reset.get("code") != code:
+    if not reset or not reset.get("code_hash") or not verify_password(code, reset["code_hash"]):
         raise HTTPException(status_code=400, detail="Código inválido o expirado")
 
     await get_db().password_resets.update_one({"_id": reset["_id"]}, {"$set": {"used": True}})
 
     hashed = hash_password(new_password)
+    user = await get_db().app_users.find_one(
+        {"email": {"$regex": f"^{re.escape(email)}$", "$options": "i"}},
+        {"_id": 1},
+    )
     await get_db().app_users.update_one(
         {"email": {"$regex": f"^{re.escape(email)}$", "$options": "i"}},
-        {"$set": {"password_hash": hashed, "updated_at": datetime.utcnow()}}
+        {"$set": {
+            "password_hash": hashed,
+            "updated_at": datetime.utcnow(),
+            "failed_login_attempts": 0,
+            "locked_until": None,
+        }}
     )
+
+    # A password reset is a credential-boundary event: revoke every active
+    # server-side session so a stolen session cannot survive the reset.
+    if user:
+        await get_db().auth_sessions.update_many(
+            {"user_id": str(user["_id"]), "revoked_at": None},
+            {"$set": {
+                "revoked_at": datetime.now(timezone.utc),
+                "revoked_reason": "password_reset",
+            }},
+        )
 
     logging.info(f"✅ Password reset successful for {email}")
     return {"success": True, "message": "Contraseña actualizada exitosamente"}
@@ -455,8 +496,8 @@ async def change_password(request: Request):
     current_password = data.get("current_password", "").strip()
     new_password = data.get("new_password", "").strip()
 
-    if not new_password or len(new_password) < 6:
-        raise HTTPException(status_code=400, detail="La nueva contraseña debe tener al menos 6 caracteres")
+    if not new_password or len(new_password) < MIN_PASSWORD_LEN:
+        raise HTTPException(status_code=400, detail=f"La nueva contraseña debe tener al menos {MIN_PASSWORD_LEN} caracteres")
 
     if user.get("password_hash"):
         if not current_password:
@@ -921,8 +962,8 @@ async def complete_profile(request: Request):
         errors.append("Email inválido")
     if not password:
         errors.append("Contraseña es requerida")
-    elif len(password) < 6:
-        errors.append("La contraseña debe tener al menos 6 caracteres")
+    elif len(password) < MIN_PASSWORD_LEN:
+        errors.append(f"La contraseña debe tener al menos {MIN_PASSWORD_LEN} caracteres")
     
     if errors:
         raise HTTPException(status_code=400, detail=", ".join(errors))
