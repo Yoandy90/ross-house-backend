@@ -24,6 +24,14 @@ COPY = {
         "es": ("Temperatura interior alta", "La propiedad superó el umbral de protección."),
         "en": ("High indoor temperature", "The property exceeded the protection threshold."),
     },
+    "humidity_high": {
+        "es": ("Humedad interior alta", "La propiedad superó el umbral configurado de humedad."),
+        "en": ("High indoor humidity", "The property exceeded the configured humidity threshold."),
+    },
+    "humidity_low": {
+        "es": ("Humedad interior baja", "La propiedad cayó por debajo del umbral configurado de humedad."),
+        "en": ("Low indoor humidity", "The property dropped below the configured humidity threshold."),
+    },
     "humidity_high_sustained": {
         "es": ("Humedad alta prolongada", "La humedad interior se mantiene elevada y debe revisarse."),
         "en": ("Sustained high humidity", "Indoor humidity has remained elevated and should be reviewed."),
