@@ -23,6 +23,7 @@ def test_password_recovery_is_enumeration_safe_and_hashes_otp():
     assert 'phone[-4:]' not in forgot
     assert '"phone_masked": "***"' in forgot
     assert 'verify_password(code, reset["code_hash"])' in reset
+    assert 'password_resets.delete_one' in reset
     assert '"revoked_reason": "password_reset"' in reset
 
 
@@ -58,3 +59,8 @@ def test_requirements_avoid_unscoped_private_extra_index():
     assert "--extra-index-url" not in source
     assert "emergentintegrations-0.2.2-py3-none-any.whl" in source
     assert "Pillow==12.3.0" in source
+
+
+def test_password_reset_records_have_ttl_cleanup():
+    server = read("server.py")
+    assert 'password_resets.create_index("expires_at", expireAfterSeconds=0)' in server
