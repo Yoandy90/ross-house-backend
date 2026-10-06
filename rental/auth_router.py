@@ -12,7 +12,7 @@ from bson import ObjectId
 from fastapi import APIRouter, HTTPException, Request
 import os
 import random
-import uuid
+import secrets
 import jwt
 import bcrypt
 from rental.shared import (
@@ -23,7 +23,6 @@ from rental.shared import (
     TENANT_JWT_SECRET,
 )
 from rental.security_email import send_password_changed_email
-from rental.notification_identity import notification_audience, push_recipient
 
 router = APIRouter()
 
@@ -72,7 +71,9 @@ GENERIC_LOGIN_ERROR = "Credenciales inválidas"
 _DUMMY_HASH = hash_password("__timing_constant_dummy_password__")
 MAX_LOGIN_FAILURES = 5
 LOCK_MINUTES = 15
-MAX_PASSWORD_LEN = 256  # bcrypt truncates >72 bytes; reject absurd inputs
+MAX_PASSWORD_LEN = 256  # reject absurd inputs before hashing
+MIN_PASSWORD_LEN = 12
+
 # Password-reset code security
 RESET_MAX_ATTEMPTS = 5
 
@@ -93,42 +94,24 @@ async def marketplace_register_push_token(request: Request):
     user = await auth_marketplace(request)
     data = await request.json()
     
-    push_token = data.get("push_token", "")
+    push_token = data.get("push_token", "").strip()
     platform = data.get("platform", "ios")
     device_name = data.get("device_name", "")
     
-    if not isinstance(push_token, str) or not re.fullmatch(
-        r"(?:ExponentPushToken|ExpoPushToken)\[[A-Za-z0-9_-]+\]", push_token.strip()
-    ) or len(push_token) > 256:
-        raise HTTPException(status_code=400, detail="Token de Expo inválido")
-    push_token = push_token.strip()
-    if platform not in ("ios", "android") or not isinstance(device_name, str):
-        raise HTTPException(status_code=400, detail="Dispositivo inválido")
-    db = get_db()
-    collection, recipient = await push_recipient(db, user["_id"])
-    if not recipient:
-        raise HTTPException(status_code=404, detail="Cuenta no encontrada")
+    if not push_token:
+        raise HTTPException(status_code=400, detail="push_token es requerido")
     
-    result = await db[collection].update_one(
-        {"_id": recipient["_id"]},
+    await get_db().app_users.update_one(
+        {"_id": user["_id"]},
         {"$set": {
             "push_token": push_token,
             "push_platform": platform,
-            "push_device_name": device_name[:120],
+            "push_device_name": device_name,
             "push_token_updated_at": datetime.utcnow(),
         }}
     )
-    if result.matched_count != 1:
-        raise HTTPException(status_code=409, detail="No se pudo registrar el dispositivo")
     
-    # A shared phone belongs to the most recently authenticated account.
-    if collection == "app_users":
-        for field in ("push_token", "expo_push_token"):
-            await db.app_users.update_many(
-                {"_id": {"$ne": recipient["_id"]}, field: push_token},
-                {"$unset": {field: ""}},
-            )
-    logging.info("Push device registered (%s)", platform)
+    logging.info(f"📱 Push token registered for {user.get('email', '')} ({platform}/{device_name})")
     return {"success": True, "message": "Push token registrado"}
 
 
@@ -138,17 +121,11 @@ async def marketplace_get_notifications(request: Request):
     user = await auth_marketplace(request)
     user_id = str(user["_id"])
     
-    try:
-        limit = max(1, min(100, int(request.query_params.get("limit", "30"))))
-    except (ValueError, TypeError):
-        raise HTTPException(status_code=400, detail="Límite inválido")
-    audience = await notification_audience(get_db(), user)
-    from rental.store_notifications import sync_inbox_safely
-    await sync_inbox_safely(get_db())
+    limit = int(request.query_params.get("limit", "30"))
     
     notifications = []
     cursor = get_db().rental_notifications.find(
-        audience
+        {"$or": [{"user_id": user_id}, {"target": "all"}, {"target": user.get("role", "")}]}
     ).sort("created_at", -1).limit(limit)
     
     async for n in cursor:
@@ -165,7 +142,7 @@ async def marketplace_get_notifications(request: Request):
         })
     
     unread = await get_db().rental_notifications.count_documents({
-        **audience,
+        "$or": [{"user_id": user_id}, {"target": "all"}, {"target": user.get("role", "")}],
         "read_by": {"$ne": user_id}
     })
     
@@ -178,15 +155,10 @@ async def marketplace_mark_notification_read(notif_id: str, request: Request):
     user = await auth_marketplace(request)
     user_id = str(user["_id"])
     
-    if not ObjectId.is_valid(notif_id):
-        raise HTTPException(status_code=404, detail="Notificación no encontrada")
-    audience = await notification_audience(get_db(), user)
-    result = await get_db().rental_notifications.update_one(
-        {"_id": ObjectId(notif_id), **audience},
+    await get_db().rental_notifications.update_one(
+        {"_id": ObjectId(notif_id)},
         {"$addToSet": {"read_by": user_id}}
     )
-    if result.matched_count != 1:
-        raise HTTPException(status_code=404, detail="Notificación no encontrada")
     
     return {"success": True}
 
@@ -195,12 +167,7 @@ async def marketplace_mark_notification_read(notif_id: str, request: Request):
 
 @router.post('/public/marketplace-register')
 async def marketplace_register(request: Request):
-    """Register a public marketplace user or independent contractor.
-
-    Public users may register as contractors, but never as company employees.
-    Contractor accounts remain pending until an administrator approves their
-    service-provider profile.
-    """
+    """Register a new marketplace user (tenant, landlord, or buyer)"""
     # Rate limiting to prevent spam registrations
     client_ip = request.client.host if request.client else "unknown"
     check_rate_limit(client_ip, "register")
@@ -215,36 +182,19 @@ async def marketplace_register(request: Request):
     email = data.get("email", "").strip().lower()
     phone = data.get("phone", "").strip()
     password = data.get("password", "").strip()
-    requested_role = data.get("role", "guest")
-    role = requested_role  # tenant and maintenance employee are admin-only
+    role = data.get("role", "guest")  # guest, landlord, buyer (tenant is admin-only)
 
     if not name or not email or not phone:
         raise HTTPException(status_code=400, detail="Nombre, email y teléfono son requeridos")
-    if not password or len(password) < 6:
-        raise HTTPException(status_code=400, detail="La contraseña debe tener al menos 6 caracteres")
-    if role not in ("guest", "tenant", "landlord", "buyer", "contractor"):
+    if not password or len(password) < MIN_PASSWORD_LEN:
+        raise HTTPException(status_code=400, detail=f"La contraseña debe tener al menos {MIN_PASSWORD_LEN} caracteres")
+    if role not in ("guest", "tenant", "landlord", "buyer"):
         raise HTTPException(status_code=400, detail="Rol inválido")
 
     # Self-registration: if someone picks 'tenant', downgrade to 'guest'
     # Real tenant role is only assigned by admin when creating an actual tenant
     if role == "tenant":
         role = "guest"
-
-    contractor_services = []
-    if requested_role == "contractor":
-        from rental.service_providers_router import VALID_SERVICES
-
-        raw_services = data.get("services")
-        if not isinstance(raw_services, list) or not 1 <= len(raw_services) <= 10:
-            raise HTTPException(status_code=400, detail="Selecciona al menos un oficio")
-        contractor_services = list(dict.fromkeys(
-            str(service).strip().lower() for service in raw_services
-        ))
-        if any(service not in VALID_SERVICES for service in contractor_services):
-            raise HTTPException(status_code=400, detail="Oficio de contratista inválido")
-        # Internally both approved contractors and employees use the capability
-        # role `maintenance`; worker_type preserves their employment category.
-        role = "maintenance"
 
     # Check if email already exists
     existing = await get_db().app_users.find_one({"email": email})
@@ -262,38 +212,6 @@ async def marketplace_register(request: Request):
         "created_at": datetime.utcnow(),
     }
 
-    provider = None
-    if requested_role == "contractor":
-        provider_id = str(uuid.uuid4())
-        user["service_provider_id"] = provider_id
-        user["maintenance_worker_type"] = "contractor"
-        provider = {
-            "_id": provider_id,
-            "app_user_id": None,
-            "name": name,
-            "company_name": str(data.get("company_name") or "").strip(),
-            "email": email,
-            "phone": phone,
-            "services": contractor_services,
-            "service_areas": data.get("service_areas") if isinstance(data.get("service_areas"), list) else [],
-            "billing_type": "per_hour",
-            "languages": [data.get("language_pref", "es")],
-            "language_pref": data.get("language_pref", "es") if data.get("language_pref") in ("es", "en") else "es",
-            "worker_type": "contractor",
-            "status": "pending_review",
-            "rating": 0.0,
-            "total_jobs": 0,
-            "completed_jobs": 0,
-            "ratings_history": [],
-            "dispatch_history": [],
-            "admin_notes": "",
-            "is_featured": False,
-            "source": "mobile_app",
-            "onboarding": {"w9_complete": False, "profile_complete": True},
-            "created_at": datetime.utcnow(),
-            "updated_at": datetime.utcnow(),
-        }
-
     # For landlords, also save company info if provided
     if role == "landlord":
         user["company_name"] = data.get("company_name", "")
@@ -302,16 +220,6 @@ async def marketplace_register(request: Request):
 
     result = await get_db().app_users.insert_one(user)
     user_id = str(result.inserted_id)
-
-    if provider is not None:
-        provider["app_user_id"] = user_id
-        try:
-            await get_db().service_providers.insert_one(provider)
-        except Exception:
-            # Do not leave a maintenance-capable account without its scoped
-            # provider record if the second write fails.
-            await get_db().app_users.delete_one({"_id": result.inserted_id})
-            raise
 
     # Also create in tenants collection if tenant role (admin-created tenants only, not guest self-reg)
     if role == "tenant":
@@ -347,9 +255,7 @@ async def marketplace_register(request: Request):
             "name": name,
             "email": email,
             "role": role,
-            "maintenance_worker_type": "contractor" if requested_role == "contractor" else None,
-        },
-        "registration_status": "pending_review" if requested_role == "contractor" else "active",
+        }
     }
 
 
@@ -435,7 +341,6 @@ async def marketplace_login(request: Request):
             "name": user.get("name", ""),
             "email": user.get("email", email),
             "role": role,
-            "maintenance_worker_type": user.get("maintenance_worker_type"),
             "tenant_number": user.get("tenant_number", ""),
             "has_password": True,
         },
@@ -468,19 +373,38 @@ async def forgot_password(request: Request):
         raise HTTPException(status_code=400, detail="Email es requerido")
 
     user = await get_db().app_users.find_one({"email": {"$regex": f"^{re.escape(email)}$", "$options": "i"}})
+
+    # Enumeration-safe: callers receive the same response whether the account
+    # exists, has a phone, or delivery later fails.
+    generic = {
+        "success": True,
+        "message": "Si el email está registrado, recibirás un código por SMS.",
+        "phone_masked": "***",
+    }
     if not user:
-        return {"success": True, "message": "Si el email está registrado, recibirás un código por SMS."}
+        return generic
 
     phone = user.get("phone", "")
     if not phone:
-        raise HTTPException(status_code=400, detail="No hay teléfono asociado a esta cuenta")
+        return generic
 
-    code = str(random.randint(100000, 999999))
+    # Password-reset OTPs are security tokens: use the OS CSPRNG.
+    code = str(secrets.randbelow(900000) + 100000)
     expires = datetime.utcnow() + timedelta(minutes=10)
 
     await get_db().password_resets.update_one(
         {"email": email},
-        {"$set": {"email": email, "code": code, "expires_at": expires, "used": False, "created_at": datetime.utcnow()}},
+        {
+            "$set": {
+                "email": email,
+                "code_hash": hash_password(code),
+                "expires_at": expires,
+                "used": False,
+                "attempts": 0,
+                "created_at": datetime.utcnow(),
+            },
+            "$unset": {"code": ""},
+        },
         upsert=True,
     )
 
@@ -496,12 +420,11 @@ async def forgot_password(request: Request):
                 body=f"Ross House Rentals: Tu código para restablecer contraseña es {code}. Expira en 10 minutos.",
                 from_=from_phone, to=normalized,
             )
-            logging.info(f"✅ Password reset code sent to {phone[-4:]}")
+            logging.info("✅ Password reset SMS sent")
     except Exception as e:
         logging.error(f"Failed to send SMS for password reset: {e}")
 
-    phone_masked = f"***-***-{phone[-4:]}" if len(phone) >= 4 else "***"
-    return {"success": True, "message": "Código enviado por SMS", "phone_masked": phone_masked}
+    return generic
 
 
 @router.post('/auth/reset-password')
@@ -517,8 +440,8 @@ async def reset_password(request: Request):
 
     if not email or not code or not new_password:
         raise HTTPException(status_code=400, detail="Email, código y nueva contraseña son requeridos")
-    if len(new_password) < 6:
-        raise HTTPException(status_code=400, detail="La contraseña debe tener al menos 6 caracteres")
+    if len(new_password) < MIN_PASSWORD_LEN:
+        raise HTTPException(status_code=400, detail=f"La contraseña debe tener al menos {MIN_PASSWORD_LEN} caracteres")
 
     # Atomically reserve one verification attempt (cross-instance safe) — blocks
     # brute-forcing the 6-digit code. find_one_and_update returns None once the
@@ -530,16 +453,36 @@ async def reset_password(request: Request):
         {"$inc": {"attempts": 1}},
         return_document=True,
     )
-    if not reset or reset.get("code") != code:
+    if not reset or not reset.get("code_hash") or not verify_password(code, reset["code_hash"]):
         raise HTTPException(status_code=400, detail="Código inválido o expirado")
 
-    await get_db().password_resets.update_one({"_id": reset["_id"]}, {"$set": {"used": True}})
+    await get_db().password_resets.delete_one({"_id": reset["_id"]})
 
     hashed = hash_password(new_password)
+    user = await get_db().app_users.find_one(
+        {"email": {"$regex": f"^{re.escape(email)}$", "$options": "i"}},
+        {"_id": 1},
+    )
     await get_db().app_users.update_one(
         {"email": {"$regex": f"^{re.escape(email)}$", "$options": "i"}},
-        {"$set": {"password_hash": hashed, "updated_at": datetime.utcnow()}}
+        {"$set": {
+            "password_hash": hashed,
+            "updated_at": datetime.utcnow(),
+            "failed_login_attempts": 0,
+            "locked_until": None,
+        }}
     )
+
+    # A password reset is a credential-boundary event: revoke every active
+    # server-side session so a stolen session cannot survive the reset.
+    if user:
+        await get_db().auth_sessions.update_many(
+            {"user_id": str(user["_id"]), "revoked_at": None},
+            {"$set": {
+                "revoked_at": datetime.now(timezone.utc),
+                "revoked_reason": "password_reset",
+            }},
+        )
 
     logging.info(f"✅ Password reset successful for {email}")
     return {"success": True, "message": "Contraseña actualizada exitosamente"}
@@ -553,8 +496,8 @@ async def change_password(request: Request):
     current_password = data.get("current_password", "").strip()
     new_password = data.get("new_password", "").strip()
 
-    if not new_password or len(new_password) < 6:
-        raise HTTPException(status_code=400, detail="La nueva contraseña debe tener al menos 6 caracteres")
+    if not new_password or len(new_password) < MIN_PASSWORD_LEN:
+        raise HTTPException(status_code=400, detail=f"La nueva contraseña debe tener al menos {MIN_PASSWORD_LEN} caracteres")
 
     if user.get("password_hash"):
         if not current_password:
@@ -929,7 +872,6 @@ async def get_marketplace_profile(request: Request):
             "email": user.get("email", ""),
             "phone": user.get("phone", ""),
             "role": user.get("role", "tenant"),
-            "maintenance_worker_type": user.get("maintenance_worker_type"),
             "profile_photo_url": user.get("profile_photo_url", ""),
             "company_name": user.get("company_name", ""),
             "created_at": str(user.get("created_at", "")),
@@ -1020,8 +962,8 @@ async def complete_profile(request: Request):
         errors.append("Email inválido")
     if not password:
         errors.append("Contraseña es requerida")
-    elif len(password) < 6:
-        errors.append("La contraseña debe tener al menos 6 caracteres")
+    elif len(password) < MIN_PASSWORD_LEN:
+        errors.append(f"La contraseña debe tener al menos {MIN_PASSWORD_LEN} caracteres")
     
     if errors:
         raise HTTPException(status_code=400, detail=", ".join(errors))
