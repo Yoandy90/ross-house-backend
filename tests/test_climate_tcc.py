@@ -1,13 +1,14 @@
 import asyncio
 from contextlib import asynccontextmanager
 from copy import deepcopy
+from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 from cryptography.fernet import Fernet
 from fastapi import HTTPException
-from aiosomecomfort.exceptions import APIError
+from aiosomecomfort.exceptions import APIError, APIRateLimited, UnauthorizedError
 from yarl import URL
 from rental import climate_tcc as tcc, climate_provider as provider, climate_router as routes
 from rental.climate_policy import validate_change
@@ -145,8 +146,43 @@ def test_timeout_clears_session_and_releases_account_lock(monkeypatch):
             raise TimeoutError
     with pytest.raises(HTTPException): asyncio.run(fail())
     updates = [call.args[1] for call in collection.update_one.call_args_list]
-    assert 'session' in updates[0]['$unset'] and 'retry_after' in updates[0]['$set']
+    failure = updates[0]['$set']
+    assert 'session' in updates[0]['$unset'] and 'retry_after' in failure
+    assert failure['last_failure_kind'] == 'transport'
+    assert failure['retry_after'] - failure['last_failure_at'] == timedelta(minutes=2)
     assert 'session_lock' in updates[-1]['$unset']
+
+
+def test_auth_and_rate_limit_failures_back_off_for_ten_minutes():
+    for exc in (UnauthorizedError('expired'), APIRateLimited('slow down')):
+        kind, cooldown = tcc._failure_policy(exc)
+        assert kind in ('session', 'rate_limited')
+        assert cooldown == timedelta(minutes=10)
+
+
+def test_success_slides_session_cache_and_clears_failure_state(monkeypatch):
+    monkeypatch.setenv('CLIMATE_TOKEN_KEY', Fernet.generate_key().decode())
+    collection = SimpleNamespace(find_one_and_update=AsyncMock(return_value={
+        'credentials': provider.seal({'username':'owner','password':'private'}),
+    }), update_one=AsyncMock())
+    client = SimpleNamespace(login=AsyncMock())
+    @asynccontextmanager
+    async def fake_session(*args):
+        yield client, object()
+    monkeypatch.setattr(tcc, 'session_client', fake_session)
+    monkeypatch.setattr(tcc, 'cookie_values', lambda session: {'.ASPXAUTH_TRUEHOME': 'opaque'})
+
+    async def succeed():
+        async with tcc.account(SimpleNamespace(climate_connections=collection), 'a'):
+            pass
+    asyncio.run(succeed())
+
+    updates = [call.args[1] for call in collection.update_one.call_args_list]
+    saved = updates[0]
+    success_at = saved['$set']['last_success_at']
+    assert saved['$set']['session_until'] - success_at == timedelta(hours=6)
+    assert set(saved['$unset']) >= {'retry_after', 'last_failure_kind', 'last_failure_at'}
+    assert client.login.await_count == 1
 
 
 def test_fan_control_uses_advertised_mode_once(monkeypatch):
