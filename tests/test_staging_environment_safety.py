@@ -76,3 +76,24 @@ def test_actual_isolated_environment_can_pass():
         "TWILIO_AUTH_TOKEN": "",
     })
     assert validator.validate(values, template=False) == []
+
+
+def test_staging_climate_telemetry_can_run_without_write_workers():
+    values = template_values()
+    values["CLIMATE_TELEMETRY_ENABLED"] = "true"
+    values["CLIMATE_SCHEDULE_WORKER_ENABLED"] = "false"
+    values["CLIMATE_ALERT_NOTIFICATIONS_ENABLED"] = "false"
+    values["CLIMATE_ALERT_PUSH_ENABLED"] = "false"
+    assert validator.validate(values, template=True) == []
+
+
+def test_staging_rejects_climate_schedule_or_external_alert_delivery():
+    for key in (
+        "CLIMATE_SCHEDULE_WORKER_ENABLED",
+        "CLIMATE_ALERT_NOTIFICATIONS_ENABLED",
+        "CLIMATE_ALERT_PUSH_ENABLED",
+    ):
+        values = template_values()
+        values[key] = "true"
+        errors = validator.validate(values, template=True)
+        assert errors, key
