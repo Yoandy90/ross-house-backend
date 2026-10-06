@@ -64,3 +64,10 @@ def test_requirements_avoid_unscoped_private_extra_index():
 def test_password_reset_records_have_ttl_cleanup():
     server = read("server.py")
     assert 'password_resets.create_index("expires_at", expireAfterSeconds=0)' in server
+
+
+def test_ai_provider_engine_is_pinned_to_audited_litellm():
+    source = read("requirements.txt")
+    assert "missilya-sdk[ai]==0.2.6" in source
+    assert "litellm==1.96.2" in source
+    assert "litellm==1.83.0" not in source
