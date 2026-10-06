@@ -47,6 +47,24 @@ def actor_id(user):
     return value
 
 
+def _connection_detail(connection):
+    def iso(value):
+        return value.isoformat() if hasattr(value, 'isoformat') else None
+
+    # Admin-safe diagnostics only. Never return encrypted credentials/cookies,
+    # actor identifiers, provider device IDs or raw session material.
+    return {
+        'id': str(connection['_id']),
+        'provider': connection.get('provider', 'first_alert'),
+        'session_cached': bool(connection.get('session')),
+        'session_until': iso(connection.get('session_until')),
+        'last_success_at': iso(connection.get('last_success_at')),
+        'last_failure_at': iso(connection.get('last_failure_at')),
+        'last_failure_kind': connection.get('last_failure_kind'),
+        'retry_after': iso(connection.get('retry_after')),
+    }
+
+
 async def _rate_limit_physical_command(binding, user):
     # Physical HVAC writes receive their own persistent, cross-worker limit.
     # The key is opaque in MongoDB and scoped to actor + device.
@@ -248,7 +266,16 @@ async def admin_list(request: Request):
     await auth_admin(request)
     db = get_db()
     bindings = await db.climate_bindings.find({}).limit(200).to_list(200)
-    connections = await db.climate_connections.find({}, {'_id': 1, 'provider': 1}).limit(100).to_list(100)
+    connections = await db.climate_connections.find({}, {
+        '_id': 1,
+        'provider': 1,
+        'session': 1,
+        'session_until': 1,
+        'last_success_at': 1,
+        'last_failure_at': 1,
+        'last_failure_kind': 1,
+        'retry_after': 1,
+    }).limit(100).to_list(100)
     properties = await db.properties.find({}, {'address': 1}).limit(500).to_list(500)
     units = await db.property_units.find({}, {'property_id': 1, 'unit_name': 1}).limit(2000).to_list(2000)
     return {'enabled': enabled(), 'configured': provider.configured(), 'control_enabled': control(),
@@ -257,7 +284,7 @@ async def admin_list(request: Request):
             'schedule_worker_enabled': climate_monitor.schedule_worker_enabled(),
             'history_bucket_minutes': climate_monitor._sample_minutes(),
             'providers': {'first_alert': provider.configured(), 'tcc_us': provider.tcc_configured()},
-            'connection_details': [{'id': str(c['_id']), 'provider': c.get('provider', 'first_alert')} for c in connections],
+            'connection_details': [_connection_detail(c) for c in connections],
             'devices': [await read_binding(b) for b in bindings],
             'connections': [str(c['_id']) for c in connections],
             'properties': [{'id': str(p['_id']), 'name': str(p.get('address') or p['_id'])} for p in properties],
