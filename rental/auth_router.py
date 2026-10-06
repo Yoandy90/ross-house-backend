@@ -456,7 +456,7 @@ async def reset_password(request: Request):
     if not reset or not reset.get("code_hash") or not verify_password(code, reset["code_hash"]):
         raise HTTPException(status_code=400, detail="Código inválido o expirado")
 
-    await get_db().password_resets.update_one({"_id": reset["_id"]}, {"$set": {"used": True}})
+    await get_db().password_resets.delete_one({"_id": reset["_id"]})
 
     hashed = hash_password(new_password)
     user = await get_db().app_users.find_one(
