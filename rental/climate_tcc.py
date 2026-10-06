@@ -13,7 +13,7 @@ from datetime import timedelta
 
 import aiohttp
 from aiosomecomfort import AIOSomeComfort, SomeComfortError
-from aiosomecomfort.exceptions import APIError
+from aiosomecomfort.exceptions import APIError, APIRateLimited, AuthError, SessionTimedOut, UnauthorizedError
 from fastapi import HTTPException
 from yarl import URL
 
@@ -24,6 +24,24 @@ from .climate_policy import validate_change
 logging.getLogger('somecomfort').disabled = True
 ORIGIN = URL('https://mytotalconnectcomfort.com')
 MODES = {0: 'EmergencyHeat', 1: 'Heat', 2: 'Off', 3: 'Cool', 4: 'Auto', 5: 'Auto'}
+
+
+def _failure_policy(exc):
+    """Return a safe diagnostic category and reconnect cooldown.
+
+    TCC aggressively rate-limits repeated logins. Authentication/session failures
+    therefore back off longer than ordinary network failures. Only the category
+    is persisted; exception messages can contain account identifiers.
+    """
+    if isinstance(exc, APIRateLimited):
+        return 'rate_limited', timedelta(minutes=10)
+    if isinstance(exc, (AuthError, UnauthorizedError, SessionTimedOut)):
+        return 'session', timedelta(minutes=10)
+    if isinstance(exc, (aiohttp.ClientError, TimeoutError)):
+        return 'transport', timedelta(minutes=2)
+    if isinstance(exc, SomeComfortError):
+        return 'provider', timedelta(minutes=5)
+    return 'invalid_response', timedelta(minutes=5)
 
 
 async def safe_redirect(session, context, params):
@@ -164,12 +182,32 @@ async def account(db, connection_id):
             if not cookies:
                 await client.login()
             yield client
-            await db.climate_connections.update_one(query, {'$set': {
-                'session': crypto.seal(cookie_values(session)),
-                'session_until': (expiry if cookies else crypto.now() + timedelta(hours=6))}})
-    except (SomeComfortError, aiohttp.ClientError, TimeoutError, KeyError, TypeError, ValueError):
-        await db.climate_connections.update_one(query, {'$unset': {'session': '', 'session_until': ''},
-            '$set': {'retry_after': crypto.now() + timedelta(minutes=2)}})
+            success_at = crypto.now()
+            await db.climate_connections.update_one(query, {
+                '$set': {
+                    'session': crypto.seal(cookie_values(session)),
+                    # Sliding local cache avoids unnecessary forced re-logins while
+                    # the provider continues accepting the session cookie.
+                    'session_until': success_at + timedelta(hours=6),
+                    'last_success_at': success_at,
+                },
+                '$unset': {
+                    'retry_after': '',
+                    'last_failure_kind': '',
+                    'last_failure_at': '',
+                },
+            })
+    except (SomeComfortError, aiohttp.ClientError, TimeoutError, KeyError, TypeError, ValueError) as exc:
+        failure_at = crypto.now()
+        failure_kind, cooldown = _failure_policy(exc)
+        await db.climate_connections.update_one(query, {
+            '$unset': {'session': '', 'session_until': ''},
+            '$set': {
+                'retry_after': failure_at + cooldown,
+                'last_failure_kind': failure_kind,
+                'last_failure_at': failure_at,
+            },
+        })
         raise HTTPException(503, 'climate_provider_unavailable') from None
     finally:
         await db.climate_connections.update_one(query, {'$unset': {'session_busy_until': '', 'session_lock': ''}})
