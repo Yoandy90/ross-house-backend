@@ -11,11 +11,14 @@ Flujo:
 """
 import json
 import logging
+import hashlib
+import uuid
 import os
 import re
 from datetime import datetime, timezone
 
 from bson import ObjectId
+from pymongo.errors import DuplicateKeyError
 from fastapi import APIRouter, HTTPException, Request
 
 from .shared import get_db, auth_admin, auth_tenant_flex
@@ -216,50 +219,186 @@ async def admin_zelle_detail(sub_id: str, request: Request):
 
 @router.post("/admin/zelle-payments/{sub_id}/confirm")
 async def admin_zelle_confirm(sub_id: str, request: Request):
+    """Confirm a Zelle deposit exactly once against the submitted rent period."""
     admin = await auth_admin(request)
     db = get_db()
     s = await db.zelle_submissions.find_one({"_id": ObjectId(sub_id)})
     if not s:
         raise HTTPException(status_code=404, detail="No encontrado")
-    if s["status"] == "confirmed":
-        return {"success": True, "already": True}
+    if s.get("status") == "confirmed":
+        return {"success": True, "already": True, "receipt_number": s.get("receipt_number", "")}
+    if s.get("status") != "pending_review":
+        raise HTTPException(status_code=409, detail="Este comprobante ya está siendo procesado o fue resuelto")
 
+    # Recovery: if the ledger write succeeded but the final submission update
+    # did not, reuse that financial record instead of creating/settling again.
+    existing_paid = await db.rental_payments.find_one({
+        "$or": [
+            {"zelle_submission_id": sub_id},
+            {"reference_number": s.get("reference", ""), "payment_method": "zelle"},
+        ],
+        "status": {"$in": ["completed", "paid"]},
+    })
+    if existing_paid:
+        await db.zelle_submissions.update_one(
+            {"_id": s["_id"], "status": {"$ne": "confirmed"}},
+            {"$set": {
+                "status": "confirmed",
+                "confirmed_by": admin.get("email", "admin"),
+                "confirmed_at": datetime.now(timezone.utc),
+                "receipt_number": existing_paid.get("receipt_number", ""),
+                "rental_payment_id": str(existing_paid["_id"]),
+                "updated_at": datetime.now(timezone.utc),
+            }},
+        )
+        return {
+            "success": True, "already": True,
+            "receipt_number": existing_paid.get("receipt_number", ""),
+            "payment_id": str(existing_paid["_id"]),
+        }
+
+    claim_id = uuid.uuid4().hex
     now = datetime.now(timezone.utc)
+    claim = await db.zelle_submissions.update_one(
+        {"_id": s["_id"], "status": "pending_review"},
+        {"$set": {"status": "confirming", "confirmation_claim": claim_id, "updated_at": now}},
+    )
+    if claim.modified_count != 1:
+        raise HTTPException(status_code=409, detail="El comprobante cambió mientras se confirmaba. Actualiza la lista.")
+
     receipt = f"ZEL-{now.strftime('%Y%m%d')}-{s['tenant_id'][-4:]}"
-    # Si existe un rental_payment pendiente del período, complétalo; si no, créalo
     pending = await db.rental_payments.find_one({
         "contract_id": s["contract_id"],
-        "period_month": s["period_month"], "period_year": s["period_year"],
-        "status": {"$in": ["pending", "late", "partial"]}})
-    if pending:
-        await db.rental_payments.update_one({"_id": pending["_id"]}, {"$set": {
-            "status": "completed", "payment_method": "zelle",
-            "receipt_number": receipt, "reference_number": s["reference"],
-            "total_paid": s["amount"], "payment_date": now.isoformat(), "updated_at": now}})
-        payment_id = str(pending["_id"])
-    else:
-        r = await db.rental_payments.insert_one({
-            "contract_id": s["contract_id"], "property_id": s.get("property_id", ""),
-            "tenant_id": s["tenant_id"], "tenant_name": s.get("tenant_name", ""),
-            "amount": s["amount"] - s.get("late_fee", 0), "late_fee": s.get("late_fee", 0),
-            "total_paid": s["amount"], "payment_method": "zelle",
-            "reference_number": s["reference"], "receipt_number": receipt,
-            "period_month": s["period_month"], "period_year": s["period_year"],
-            "status": "completed", "payment_date": now.isoformat(),
-            "submitted_by": "tenant_zelle", "submitted_at": s["created_at"],
-            "created_at": now, "updated_at": now})
-        payment_id = str(r.inserted_id)
+        "period_month": s["period_month"],
+        "period_year": s["period_year"],
+        "status": {"$in": ["pending", "late", "partial"]},
+    })
 
-    await db.zelle_submissions.update_one({"_id": s["_id"]}, {"$set": {
-        "status": "confirmed", "confirmed_by": admin.get("email", "admin"),
-        "confirmed_at": now, "receipt_number": receipt,
-        "rental_payment_id": payment_id, "updated_at": now}})
-    logger.info("✅ Zelle confirmado: %s — %s $%.2f", s.get("tenant_name"), receipt, s["amount"])
+    try:
+        if pending:
+            amount = float(pending.get("amount") or 0)
+            late_fee = float(pending.get("late_fee") or 0)
+            total_due = float(pending.get("total_due") or (amount + late_fee))
+            prior_paid = float(pending.get("total_paid") or 0)
+            outstanding = round(max(0.0, total_due - prior_paid), 2)
+            if abs(outstanding - float(s.get("amount") or 0)) > 0.01:
+                raise HTTPException(
+                    status_code=409,
+                    detail="El saldo de la factura cambió desde que se envió el comprobante. Revisa antes de confirmar.",
+                )
+
+            updated = await db.rental_payments.update_one(
+                {
+                    "_id": pending["_id"],
+                    "status": {"$in": ["pending", "late", "partial"]},
+                    "total_paid": pending.get("total_paid", 0),
+                },
+                {"$set": {
+                    "status": "completed",
+                    "paid": True,
+                    "payment_method": "zelle",
+                    "receipt_number": receipt,
+                    "reference_number": s["reference"],
+                    "zelle_submission_id": sub_id,
+                    "total_due": total_due,
+                    "total_paid": total_due,
+                    "payment_date": now,
+                    "updated_at": now,
+                }},
+            )
+            if updated.modified_count != 1:
+                raise HTTPException(
+                    status_code=409,
+                    detail="La factura cambió mientras se confirmaba. Actualiza y revisa sus datos.",
+                )
+            payment_id = str(pending["_id"])
+        else:
+            already_period_paid = await db.rental_payments.find_one({
+                "contract_id": s["contract_id"],
+                "period_month": s["period_month"],
+                "period_year": s["period_year"],
+                "status": {"$in": ["completed", "paid"]},
+            })
+            if already_period_paid:
+                raise HTTPException(status_code=409, detail="Ese período de renta ya aparece pagado")
+
+            deterministic_id = ObjectId(hashlib.sha256(f"zelle:{sub_id}".encode()).hexdigest()[:24])
+            amount = float(s.get("amount") or 0)
+            doc = {
+                "_id": deterministic_id,
+                "contract_id": s["contract_id"],
+                "property_id": s.get("property_id", ""),
+                "tenant_id": s["tenant_id"],
+                "tenant_name": s.get("tenant_name", ""),
+                "amount": amount - float(s.get("late_fee", 0)),
+                "late_fee": float(s.get("late_fee", 0)),
+                "total_due": amount,
+                "total_paid": amount,
+                "paid": True,
+                "payment_method": "zelle",
+                "reference_number": s["reference"],
+                "receipt_number": receipt,
+                "zelle_submission_id": sub_id,
+                "period_month": s["period_month"],
+                "period_year": s["period_year"],
+                "status": "completed",
+                "payment_date": now,
+                "submitted_by": "tenant_zelle",
+                "submitted_at": s["created_at"],
+                "created_at": now,
+                "updated_at": now,
+            }
+            try:
+                await db.rental_payments.insert_one(doc)
+            except DuplicateKeyError:
+                existing = await db.rental_payments.find_one({"_id": deterministic_id})
+                if not existing:
+                    raise
+                receipt = existing.get("receipt_number", receipt)
+            payment_id = str(deterministic_id)
+
+        finalized = await db.zelle_submissions.update_one(
+            {"_id": s["_id"], "status": "confirming", "confirmation_claim": claim_id},
+            {"$set": {
+                "status": "confirmed",
+                "confirmed_by": admin.get("email", "admin"),
+                "confirmed_at": now,
+                "receipt_number": receipt,
+                "rental_payment_id": payment_id,
+                "updated_at": now,
+            }, "$unset": {"confirmation_claim": ""}},
+        )
+        if finalized.modified_count != 1:
+            logger.error("Zelle ledger settled but submission finalization failed: %s", sub_id)
+            raise HTTPException(
+                status_code=409,
+                detail="El pago quedó registrado pero la confirmación requiere revisión. No vuelvas a confirmarlo.",
+            )
+    except Exception:
+        # Only release the claim when no ledger record tied to this submission
+        # exists. A completed financial write must fail closed for recovery.
+        linked = await db.rental_payments.find_one({
+            "zelle_submission_id": sub_id,
+            "status": {"$in": ["completed", "paid"]},
+        })
+        if not linked:
+            await db.zelle_submissions.update_one(
+                {"_id": s["_id"], "status": "confirming", "confirmation_claim": claim_id},
+                {"$set": {"status": "pending_review", "updated_at": datetime.now(timezone.utc)},
+                 "$unset": {"confirmation_claim": ""}},
+            )
+        raise
+
+    logger.info("Zelle confirmado: %s — %s $%.2f", s.get("tenant_name"), receipt, float(s.get("amount") or 0))
     from rental.security import audit_log
-    await audit_log(admin_user_id=admin.get("_id", admin.get("id", "")),
-                    action="zelle_payment_confirmed", resource_type="zelle_submission",
-                    resource_id=sub_id, request=request,
-                    metadata={"amount": s["amount"], "receipt": receipt})
+    await audit_log(
+        admin_user_id=admin.get("_id", admin.get("id", "")),
+        action="zelle_payment_confirmed",
+        resource_type="zelle_submission",
+        resource_id=sub_id,
+        request=request,
+        metadata={"amount": s.get("amount"), "receipt": receipt, "payment_id": payment_id},
+    )
     return {"success": True, "receipt_number": receipt, "payment_id": payment_id}
 
 
