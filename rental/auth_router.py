@@ -13,6 +13,7 @@ from fastapi import APIRouter, HTTPException, Request
 import os
 import random
 import secrets
+import uuid
 import jwt
 import bcrypt
 from rental.shared import (
@@ -23,6 +24,7 @@ from rental.shared import (
     TENANT_JWT_SECRET,
 )
 from rental.security_email import send_password_changed_email
+from rental.notification_identity import notification_audience, push_recipient
 
 router = APIRouter()
 
@@ -71,9 +73,8 @@ GENERIC_LOGIN_ERROR = "Credenciales inválidas"
 _DUMMY_HASH = hash_password("__timing_constant_dummy_password__")
 MAX_LOGIN_FAILURES = 5
 LOCK_MINUTES = 15
-MAX_PASSWORD_LEN = 256  # reject absurd inputs before hashing
+MAX_PASSWORD_LEN = 256  # bcrypt truncates >72 bytes; reject absurd inputs
 MIN_PASSWORD_LEN = 12
-
 # Password-reset code security
 RESET_MAX_ATTEMPTS = 5
 
@@ -94,24 +95,42 @@ async def marketplace_register_push_token(request: Request):
     user = await auth_marketplace(request)
     data = await request.json()
     
-    push_token = data.get("push_token", "").strip()
+    push_token = data.get("push_token", "")
     platform = data.get("platform", "ios")
     device_name = data.get("device_name", "")
     
-    if not push_token:
-        raise HTTPException(status_code=400, detail="push_token es requerido")
+    if not isinstance(push_token, str) or not re.fullmatch(
+        r"(?:ExponentPushToken|ExpoPushToken)\[[A-Za-z0-9_-]+\]", push_token.strip()
+    ) or len(push_token) > 256:
+        raise HTTPException(status_code=400, detail="Token de Expo inválido")
+    push_token = push_token.strip()
+    if platform not in ("ios", "android") or not isinstance(device_name, str):
+        raise HTTPException(status_code=400, detail="Dispositivo inválido")
+    db = get_db()
+    collection, recipient = await push_recipient(db, user["_id"])
+    if not recipient:
+        raise HTTPException(status_code=404, detail="Cuenta no encontrada")
     
-    await get_db().app_users.update_one(
-        {"_id": user["_id"]},
+    result = await db[collection].update_one(
+        {"_id": recipient["_id"]},
         {"$set": {
             "push_token": push_token,
             "push_platform": platform,
-            "push_device_name": device_name,
+            "push_device_name": device_name[:120],
             "push_token_updated_at": datetime.utcnow(),
         }}
     )
+    if result.matched_count != 1:
+        raise HTTPException(status_code=409, detail="No se pudo registrar el dispositivo")
     
-    logging.info(f"📱 Push token registered for {user.get('email', '')} ({platform}/{device_name})")
+    # A shared phone belongs to the most recently authenticated account.
+    if collection == "app_users":
+        for field in ("push_token", "expo_push_token"):
+            await db.app_users.update_many(
+                {"_id": {"$ne": recipient["_id"]}, field: push_token},
+                {"$unset": {field: ""}},
+            )
+    logging.info("Push device registered (%s)", platform)
     return {"success": True, "message": "Push token registrado"}
 
 
@@ -121,11 +140,17 @@ async def marketplace_get_notifications(request: Request):
     user = await auth_marketplace(request)
     user_id = str(user["_id"])
     
-    limit = int(request.query_params.get("limit", "30"))
+    try:
+        limit = max(1, min(100, int(request.query_params.get("limit", "30"))))
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="Límite inválido")
+    audience = await notification_audience(get_db(), user)
+    from rental.store_notifications import sync_inbox_safely
+    await sync_inbox_safely(get_db())
     
     notifications = []
     cursor = get_db().rental_notifications.find(
-        {"$or": [{"user_id": user_id}, {"target": "all"}, {"target": user.get("role", "")}]}
+        audience
     ).sort("created_at", -1).limit(limit)
     
     async for n in cursor:
@@ -142,7 +167,7 @@ async def marketplace_get_notifications(request: Request):
         })
     
     unread = await get_db().rental_notifications.count_documents({
-        "$or": [{"user_id": user_id}, {"target": "all"}, {"target": user.get("role", "")}],
+        **audience,
         "read_by": {"$ne": user_id}
     })
     
@@ -155,10 +180,15 @@ async def marketplace_mark_notification_read(notif_id: str, request: Request):
     user = await auth_marketplace(request)
     user_id = str(user["_id"])
     
-    await get_db().rental_notifications.update_one(
-        {"_id": ObjectId(notif_id)},
+    if not ObjectId.is_valid(notif_id):
+        raise HTTPException(status_code=404, detail="Notificación no encontrada")
+    audience = await notification_audience(get_db(), user)
+    result = await get_db().rental_notifications.update_one(
+        {"_id": ObjectId(notif_id), **audience},
         {"$addToSet": {"read_by": user_id}}
     )
+    if result.matched_count != 1:
+        raise HTTPException(status_code=404, detail="Notificación no encontrada")
     
     return {"success": True}
 
@@ -167,7 +197,12 @@ async def marketplace_mark_notification_read(notif_id: str, request: Request):
 
 @router.post('/public/marketplace-register')
 async def marketplace_register(request: Request):
-    """Register a new marketplace user (tenant, landlord, or buyer)"""
+    """Register a public marketplace user or independent contractor.
+
+    Public users may register as contractors, but never as company employees.
+    Contractor accounts remain pending until an administrator approves their
+    service-provider profile.
+    """
     # Rate limiting to prevent spam registrations
     client_ip = request.client.host if request.client else "unknown"
     check_rate_limit(client_ip, "register")
@@ -182,19 +217,36 @@ async def marketplace_register(request: Request):
     email = data.get("email", "").strip().lower()
     phone = data.get("phone", "").strip()
     password = data.get("password", "").strip()
-    role = data.get("role", "guest")  # guest, landlord, buyer (tenant is admin-only)
+    requested_role = data.get("role", "guest")
+    role = requested_role  # tenant and maintenance employee are admin-only
 
     if not name or not email or not phone:
         raise HTTPException(status_code=400, detail="Nombre, email y teléfono son requeridos")
     if not password or len(password) < MIN_PASSWORD_LEN:
         raise HTTPException(status_code=400, detail=f"La contraseña debe tener al menos {MIN_PASSWORD_LEN} caracteres")
-    if role not in ("guest", "tenant", "landlord", "buyer"):
+    if role not in ("guest", "tenant", "landlord", "buyer", "contractor"):
         raise HTTPException(status_code=400, detail="Rol inválido")
 
     # Self-registration: if someone picks 'tenant', downgrade to 'guest'
     # Real tenant role is only assigned by admin when creating an actual tenant
     if role == "tenant":
         role = "guest"
+
+    contractor_services = []
+    if requested_role == "contractor":
+        from rental.service_providers_router import VALID_SERVICES
+
+        raw_services = data.get("services")
+        if not isinstance(raw_services, list) or not 1 <= len(raw_services) <= 10:
+            raise HTTPException(status_code=400, detail="Selecciona al menos un oficio")
+        contractor_services = list(dict.fromkeys(
+            str(service).strip().lower() for service in raw_services
+        ))
+        if any(service not in VALID_SERVICES for service in contractor_services):
+            raise HTTPException(status_code=400, detail="Oficio de contratista inválido")
+        # Internally both approved contractors and employees use the capability
+        # role `maintenance`; worker_type preserves their employment category.
+        role = "maintenance"
 
     # Check if email already exists
     existing = await get_db().app_users.find_one({"email": email})
@@ -212,6 +264,38 @@ async def marketplace_register(request: Request):
         "created_at": datetime.utcnow(),
     }
 
+    provider = None
+    if requested_role == "contractor":
+        provider_id = str(uuid.uuid4())
+        user["service_provider_id"] = provider_id
+        user["maintenance_worker_type"] = "contractor"
+        provider = {
+            "_id": provider_id,
+            "app_user_id": None,
+            "name": name,
+            "company_name": str(data.get("company_name") or "").strip(),
+            "email": email,
+            "phone": phone,
+            "services": contractor_services,
+            "service_areas": data.get("service_areas") if isinstance(data.get("service_areas"), list) else [],
+            "billing_type": "per_hour",
+            "languages": [data.get("language_pref", "es")],
+            "language_pref": data.get("language_pref", "es") if data.get("language_pref") in ("es", "en") else "es",
+            "worker_type": "contractor",
+            "status": "pending_review",
+            "rating": 0.0,
+            "total_jobs": 0,
+            "completed_jobs": 0,
+            "ratings_history": [],
+            "dispatch_history": [],
+            "admin_notes": "",
+            "is_featured": False,
+            "source": "mobile_app",
+            "onboarding": {"w9_complete": False, "profile_complete": True},
+            "created_at": datetime.utcnow(),
+            "updated_at": datetime.utcnow(),
+        }
+
     # For landlords, also save company info if provided
     if role == "landlord":
         user["company_name"] = data.get("company_name", "")
@@ -220,6 +304,16 @@ async def marketplace_register(request: Request):
 
     result = await get_db().app_users.insert_one(user)
     user_id = str(result.inserted_id)
+
+    if provider is not None:
+        provider["app_user_id"] = user_id
+        try:
+            await get_db().service_providers.insert_one(provider)
+        except Exception:
+            # Do not leave a maintenance-capable account without its scoped
+            # provider record if the second write fails.
+            await get_db().app_users.delete_one({"_id": result.inserted_id})
+            raise
 
     # Also create in tenants collection if tenant role (admin-created tenants only, not guest self-reg)
     if role == "tenant":
@@ -255,7 +349,9 @@ async def marketplace_register(request: Request):
             "name": name,
             "email": email,
             "role": role,
-        }
+            "maintenance_worker_type": "contractor" if requested_role == "contractor" else None,
+        },
+        "registration_status": "pending_review" if requested_role == "contractor" else "active",
     }
 
 
@@ -341,6 +437,7 @@ async def marketplace_login(request: Request):
             "name": user.get("name", ""),
             "email": user.get("email", email),
             "role": role,
+            "maintenance_worker_type": user.get("maintenance_worker_type"),
             "tenant_number": user.get("tenant_number", ""),
             "has_password": True,
         },
@@ -872,6 +969,7 @@ async def get_marketplace_profile(request: Request):
             "email": user.get("email", ""),
             "phone": user.get("phone", ""),
             "role": user.get("role", "tenant"),
+            "maintenance_worker_type": user.get("maintenance_worker_type"),
             "profile_photo_url": user.get("profile_photo_url", ""),
             "company_name": user.get("company_name", ""),
             "created_at": str(user.get("created_at", "")),
