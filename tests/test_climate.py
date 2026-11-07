@@ -180,3 +180,30 @@ def test_duplicate_unknown_command_returns_safe_reason_without_reissue(monkeypat
     result=run(routes.issue_command({'_id':'device'},{'id':'admin'},routes.Command(request_id=uuid4(),mode='Off')))
     assert result == {'status':'unknown', 'reason':'climate_provider_rejected'}
     change.assert_not_awaited()
+
+
+
+def test_connection_detail_exposes_only_safe_diagnostics():
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+    detail = routes._connection_detail({
+        '_id': 'conn',
+        'provider': 'tcc_us',
+        'session': 'encrypted-cookie-material',
+        'credentials': 'encrypted-credentials',
+        'created_by': 'admin-id',
+        'session_until': now,
+        'last_success_at': now,
+        'last_failure_at': now,
+        'last_failure_kind': 'transport',
+        'retry_after': now,
+    })
+    assert detail['id'] == 'conn'
+    assert detail['provider'] == 'tcc_us'
+    assert detail['session_cached'] is True
+    assert detail['last_failure_kind'] == 'transport'
+    assert detail['last_success_at'] == now.isoformat()
+    assert detail['retry_after'] == now.isoformat()
+    assert 'session' not in detail
+    assert 'credentials' not in detail
+    assert 'created_by' not in detail
