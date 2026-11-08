@@ -508,3 +508,29 @@ def test_shared_read_releases_lock_after_unexpected_failure():
         assert load.await_count == 2
     run(scenario())
 
+
+def test_physical_command_uses_fresh_reads_and_invalidates_display_cache(monkeypatch):
+    from rental import climate_read_cache as cache
+    monkeypatch.setenv('CLIMATE_ENABLED', 'true')
+    monkeypatch.setenv('CLIMATE_CONTROL_ENABLED', 'true')
+    monkeypatch.setattr(routes, '_rate_limit_physical_command', AsyncMock())
+    db = command_db()
+    db.climate_read_cache = SimpleNamespace(delete_one=AsyncMock())
+    monkeypatch.setattr(routes, 'get_db', lambda: db)
+    observed = deepcopy(RAW)
+    observed['changeableValues']['mode'] = 'Heat'
+    reads = AsyncMock(side_effect=[deepcopy(RAW), observed])
+    monkeypatch.setattr(provider, 'device', reads)
+    change = AsyncMock()
+    monkeypatch.setattr(provider, 'change', change)
+    cached = AsyncMock(side_effect=AssertionError('physical controls must not use display cache'))
+    monkeypatch.setattr(cache, 'shared_read', cached)
+    monkeypatch.setattr(routes.climate_monitor, 'record_snapshot', AsyncMock())
+    result = run(routes.issue_command({'_id': 'device', 'provider': 'tcc_us'}, {'id': 'admin'},
+                                      routes.Command(request_id=uuid4(), mode='Heat')))
+    assert result == {'status': 'confirmed'}
+    assert reads.await_count == 2
+    assert change.await_count == 1
+    assert db.climate_read_cache.delete_one.await_count == 2
+    cached.assert_not_awaited()
+
