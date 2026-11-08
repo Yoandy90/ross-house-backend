@@ -8,6 +8,7 @@ import asyncio
 import hashlib
 import logging
 import secrets
+from time import monotonic
 from contextlib import asynccontextmanager
 from datetime import timedelta
 
@@ -165,7 +166,7 @@ async def connect(db, actor, username, password):
 
 
 @asynccontextmanager
-async def account(db, connection_id):
+async def account(db, connection_id, operation='other'):
     lock = secrets.token_hex(16)
     now = crypto.now()
     connection = await db.climate_connections.find_one_and_update({
@@ -174,9 +175,13 @@ async def account(db, connection_id):
             {'$or': [{'retry_after': {'$exists': False}}, {'retry_after': {'$lt': now}}]}]},
         {'$set': {'session_busy_until': now + timedelta(seconds=60), 'session_lock': lock}})
     if not connection:
+        from . import climate_tcc_metrics
+        await climate_tcc_metrics.record(db, connection_id, operation, 'busy', 'lease', 0, False, False)
         raise HTTPException(503, 'climate_busy')
     query = {'_id': connection_id, 'session_lock': lock}
     cookies = None
+    started = monotonic()
+    phase, outcome, login_attempted = 'session_restore', 'other', False
     try:
         credentials = crypto.unseal(connection['credentials'])
         expiry = connection.get('session_until')
@@ -185,8 +190,11 @@ async def account(db, connection_id):
         cookies = crypto.unseal(connection['session']) if expiry and expiry > now and connection.get('session') else None
         async with asyncio.timeout(45), session_client(credentials, cookies) as (client, session):
             if not cookies:
+                phase, login_attempted = 'login', True
                 await client.login()
+            phase = 'operation'
             yield client
+            phase = 'session_persist'
             success_at = crypto.now()
             await db.climate_connections.update_one(query, {
                 '$set': {
@@ -202,9 +210,14 @@ async def account(db, connection_id):
                     'last_failure_at': '',
                 },
             })
+            outcome = 'success'
+    except HTTPException:
+        outcome = 'controlled'
+        raise
     except (SomeComfortError, aiohttp.ClientError, TimeoutError, KeyError, TypeError, ValueError) as exc:
         failure_at = crypto.now()
         failure_kind, cooldown = _failure_policy(exc)
+        outcome = failure_kind
         update = {'$set': {
                 'retry_after': failure_at + cooldown,
                 'last_failure_kind': failure_kind,
@@ -219,20 +232,23 @@ async def account(db, connection_id):
         raise HTTPException(503, 'climate_provider_unavailable') from None
     finally:
         await db.climate_connections.update_one(query, {'$unset': {'session_busy_until': '', 'session_lock': ''}})
+        from . import climate_tcc_metrics
+        await climate_tcc_metrics.record(db, connection_id, operation, outcome, phase,
+                                         round((monotonic() - started) * 1000), bool(cookies), login_attempted)
 
 
 async def discover(db, connection_id):
-    async with account(db, connection_id) as client:
+    async with account(db, connection_id, 'discovery') as client:
         return await locations(client)
 
 
 async def device(db, binding):
-    async with account(db, binding['connection_id']) as client:
+    async with account(db, binding['connection_id'], 'read') as client:
         return normalize(await client.get_thermostat_data(binding['provider_device_id']))
 
 
 async def change(db, binding, values):
-    async with account(db, binding['connection_id']) as client:
+    async with account(db, binding['connection_id'], 'change') as client:
         raw = normalize(await client.get_thermostat_data(binding['provider_device_id']))
         # Revalidate inside the account lock; send only values actually changed.
         command = {k: v for k, v in values.items() if k in ('mode', 'heatSetpoint', 'coolSetpoint')
@@ -287,7 +303,7 @@ async def change(db, binding, values):
 
 
 async def change_fan(db, binding, mode):
-    async with account(db, binding['connection_id']) as client:
+    async with account(db, binding['connection_id'], 'fan') as client:
         raw = normalize(await client.get_thermostat_data(binding['provider_device_id']))
         if not snapshot(raw)['online']:
             raise HTTPException(409, 'climate_device_offline')
@@ -306,7 +322,7 @@ async def change_fan(db, binding, mode):
 async def change_hold(db, binding, mode):
     if mode not in ('schedule', 'permanent'):
         raise HTTPException(422, 'climate_hold_mode_unsupported')
-    async with account(db, binding['connection_id']) as client:
+    async with account(db, binding['connection_id'], 'hold') as client:
         raw = normalize(await client.get_thermostat_data(binding['provider_device_id']))
         if not snapshot(raw)['online']:
             raise HTTPException(409, 'climate_device_offline')
