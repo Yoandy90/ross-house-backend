@@ -86,10 +86,14 @@ def normalize(response):
     if not isinstance(response, dict) or response.get('success') not in (True, 1):
         raise HTTPException(502, 'climate_provider_invalid')
     latest = response.get('latestData') or {}
+    if not isinstance(latest, dict):
+        raise HTTPException(502, 'climate_provider_invalid')
     ui = latest.get('uiData')
     if not isinstance(ui, dict):
         raise HTTPException(502, 'climate_provider_invalid')
     fan = latest.get('fanData') or {}
+    if not isinstance(fan, dict):
+        raise HTTPException(502, 'climate_provider_invalid')
     has_fan = latest.get('hasFan') is True and isinstance(fan, dict)
     fan_modes = []
     if has_fan:

@@ -278,3 +278,16 @@ def test_feature_write_rechecks_connectivity_under_account_lock(monkeypatch, kin
     assert exc.value.detail == 'climate_device_offline'
     client.set_thermostat_settings.assert_not_awaited()
 
+
+@pytest.mark.parametrize('field', ['latestData', 'fanData'])
+def test_malformed_provider_objects_fail_with_safe_error(field):
+    response = deepcopy(RESPONSE)
+    if field == 'latestData':
+        response['latestData'] = ['malformed']
+    else:
+        response['latestData']['fanData'] = ['malformed']
+    with pytest.raises(HTTPException) as exc:
+        tcc.normalize(response)
+    assert exc.value.status_code == 502
+    assert exc.value.detail == 'climate_provider_invalid'
+
