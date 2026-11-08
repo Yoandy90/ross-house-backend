@@ -346,3 +346,191 @@ def test_climate_notifications_use_exact_contract_unit_scope(monkeypatch):
     result = run(notifications._recipients(db, {'property_id': 'home', 'unit_id': ''}))
     assert result == []
 
+
+# Shared cache tests use a small atomic in-memory collection; the load callback
+# represents the public read path, never a thermostat write.
+class ReadCacheCollection:
+    def __init__(self):
+        self.rows = {}
+    async def find_one(self, query):
+        return deepcopy(self.rows.get(query['_id']))
+    async def update_one(self, query, update, upsert=False):
+        key = query['_id']
+        if key not in self.rows:
+            if not upsert: return
+            self.rows[key] = {'_id': key, **deepcopy(update.get('$setOnInsert', {}))}
+        row = self.rows[key]
+        if 'lock_token' in query and row.get('lock_token') != query['lock_token']: return
+        row.update(deepcopy(update.get('$set', {})))
+        for field in update.get('$unset', {}): row.pop(field, None)
+    async def find_one_and_update(self, query, update, **kwargs):
+        row = self.rows.get(query['_id'])
+        if not row or row['expires_at'] > query['expires_at']['$lte'] or row['lock_until'] > query['lock_until']['$lte']:
+            return None
+        row.update(deepcopy(update['$set']))
+        return deepcopy(row)
+    async def delete_one(self, query):
+        self.rows.pop(query['_id'], None)
+
+
+def read_cache_db():
+    return SimpleNamespace(climate_read_cache=ReadCacheCollection(),
+                           climate_read_metrics=SimpleNamespace(update_one=AsyncMock()))
+
+
+def test_shared_tcc_read_preserves_timestamp_and_excludes_nonpublic_data():
+    from rental import climate_read_cache as cache
+    db = read_cache_db()
+    binding = {'_id': 'device', 'provider': 'tcc_us', 'connection_id': 'connection',
+               'property_id': 'home', 'unit_id': 'A', 'name': 'Test'}
+    load = AsyncMock(return_value={'id': 'device', 'online': True, 'temperature': 75,
+                                  'observed_at': '2026-11-08T00:00:00+00:00',
+                                  'credentials': 'secret', 'request_id': 'old', 'control_enabled': True})
+    async def scenario():
+        first = await cache.shared_read(db, binding, load)
+        second = await cache.shared_read(db, binding, load)
+        assert first == second
+        assert second['observed_at'] == '2026-11-08T00:00:00+00:00'
+        assert not {'credentials', 'request_id', 'control_enabled'} & set(second)
+        second['temperature'] = 99
+        assert (await cache.shared_read(db, binding, load))['temperature'] == 75
+        assert load.await_count == 1
+        await cache.invalidate(db, binding)
+        await cache.shared_read(db, binding, load)
+        assert load.await_count == 2
+    run(scenario())
+
+
+def test_shared_tcc_read_expiration_and_negative_cache(monkeypatch):
+    from datetime import datetime, timezone
+    from rental import climate_read_cache as cache
+    clock = [datetime(2026, 11, 8, tzinfo=timezone.utc)]
+    monkeypatch.setattr(cache, 'now', lambda: clock[0])
+    db = read_cache_db()
+    binding = {'_id': 'device'}
+    load = AsyncMock(return_value={'online': False, 'error': 'climate_device_unavailable'})
+    async def scenario():
+        await cache.shared_read(db, binding, load)
+        clock[0] += timedelta(seconds=14)
+        await cache.shared_read(db, binding, load)
+        assert load.await_count == 1
+        clock[0] += timedelta(seconds=2)
+        await cache.shared_read(db, binding, load)
+        assert load.await_count == 2
+        load.return_value = {'online': True, 'temperature': 75}
+        clock[0] += timedelta(seconds=16)
+        await cache.shared_read(db, binding, load)
+        clock[0] += timedelta(seconds=59)
+        await cache.shared_read(db, binding, load)
+        assert load.await_count == 3
+        clock[0] += timedelta(seconds=2)
+        await cache.shared_read(db, binding, load)
+        assert load.await_count == 4
+    run(scenario())
+
+
+def test_shared_tcc_read_coalesces_concurrent_workers(monkeypatch):
+    from rental import climate_read_cache as cache
+    db = read_cache_db()
+    binding = {'_id': 'device'}
+    async def scenario():
+        entered, release = asyncio.Event(), asyncio.Event()
+        calls = []
+        async def load():
+            calls.append(1)
+            entered.set()
+            await release.wait()
+            return {'online': True, 'temperature': 75}
+        first = asyncio.create_task(cache.shared_read(db, binding, load))
+        await entered.wait()
+        async def join_sleep(seconds):
+            release.set()
+            await first
+        monkeypatch.setattr(cache.asyncio, 'sleep', join_sleep)
+        second = await cache.shared_read(db, binding, load)
+        assert second['temperature'] == 75
+        assert len(calls) == 1
+    run(scenario())
+
+
+def test_cache_identity_changes_with_home_and_connection():
+    from rental import climate_read_cache as cache
+    binding = {'_id': 'device', 'connection_id': 'a', 'property_id': 'home', 'unit_id': 'A'}
+    for patch in ({'connection_id': 'b'}, {'property_id': 'other'}, {'unit_id': 'B'}):
+        assert cache.key_for(binding) != cache.key_for({**binding, **patch})
+
+
+def test_cached_route_refreshes_command_identity_and_current_flags(monkeypatch):
+    from rental import climate_read_cache as cache
+    binding = {'_id': 'device', 'provider': 'tcc_us'}
+    monkeypatch.setattr(routes, 'enabled', lambda: True)
+    monkeypatch.setattr(routes, 'control', lambda: False)
+    monkeypatch.setattr(routes, 'get_db', lambda: object())
+    monkeypatch.setattr(cache, 'shared_read', AsyncMock(return_value={
+        'id': 'device', 'online': True, 'observed_at': 'original'}))
+    a, b = run(routes.read_binding(binding)), run(routes.read_binding(binding))
+    assert a['observed_at'] == b['observed_at'] == 'original'
+    assert a['request_id'] != b['request_id']
+    assert a['control_enabled'] is False
+
+
+def test_cache_invalidation_prevents_inflight_read_repopulating_old_state():
+    from rental import climate_read_cache as cache
+    db = read_cache_db()
+    binding = {'_id': 'device', 'provider': 'tcc_us'}
+    async def scenario():
+        entered, release = asyncio.Event(), asyncio.Event()
+        async def old_read():
+            entered.set()
+            await release.wait()
+            return {'online': True, 'temperature': 70}
+        pending = asyncio.create_task(cache.shared_read(db, binding, old_read))
+        await entered.wait()
+        await cache.invalidate(db, binding)
+        fresh = AsyncMock(return_value={'online': True, 'temperature': 75})
+        await cache.shared_read(db, binding, fresh)
+        release.set()
+        await pending
+        assert (await cache.shared_read(db, binding, fresh))['temperature'] == 75
+        assert fresh.await_count == 1
+    run(scenario())
+
+
+def test_shared_read_releases_lock_after_unexpected_failure():
+    from rental import climate_read_cache as cache
+    db = read_cache_db()
+    binding = {'_id': 'device'}
+    load = AsyncMock(side_effect=[RuntimeError('safe-test'), {'online': True, 'temperature': 75}])
+    async def scenario():
+        with pytest.raises(RuntimeError):
+            await cache.shared_read(db, binding, load)
+        assert (await cache.shared_read(db, binding, load))['temperature'] == 75
+        assert load.await_count == 2
+    run(scenario())
+
+
+def test_physical_command_uses_fresh_reads_and_invalidates_display_cache(monkeypatch):
+    from rental import climate_read_cache as cache
+    monkeypatch.setenv('CLIMATE_ENABLED', 'true')
+    monkeypatch.setenv('CLIMATE_CONTROL_ENABLED', 'true')
+    monkeypatch.setattr(routes, '_rate_limit_physical_command', AsyncMock())
+    db = command_db()
+    db.climate_read_cache = SimpleNamespace(delete_one=AsyncMock())
+    monkeypatch.setattr(routes, 'get_db', lambda: db)
+    observed = deepcopy(RAW)
+    observed['changeableValues']['mode'] = 'Heat'
+    reads = AsyncMock(side_effect=[deepcopy(RAW), observed])
+    monkeypatch.setattr(provider, 'device', reads)
+    change = AsyncMock()
+    monkeypatch.setattr(provider, 'change', change)
+    cached = AsyncMock(side_effect=AssertionError('physical controls must not use display cache'))
+    monkeypatch.setattr(cache, 'shared_read', cached)
+    monkeypatch.setattr(routes.climate_monitor, 'record_snapshot', AsyncMock())
+    result = run(routes.issue_command({'_id': 'device', 'provider': 'tcc_us'}, {'id': 'admin'},
+                                      routes.Command(request_id=uuid4(), mode='Heat')))
+    assert result == {'status': 'confirmed'}
+    assert reads.await_count == 2
+    assert change.await_count == 1
+    assert db.climate_read_cache.delete_one.await_count == 2
+    cached.assert_not_awaited()
+

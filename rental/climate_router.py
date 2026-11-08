@@ -14,6 +14,7 @@ from .tenant_integrity import resolve_authenticated_tenant, find_active_contract
 from . import climate_provider as provider
 from .climate_policy import scope_for_contract, snapshot, validate_change
 from . import climate_monitor
+from . import climate_read_cache
 from . import climate_intelligence
 from . import weather_intelligence
 
@@ -24,6 +25,7 @@ async def ensure_indexes(db):
     await db.climate_bindings.create_index([('property_id', 1), ('unit_id', 1)])
     await db.climate_commands.create_index([('device_id', 1), ('created_at', -1)])
     await climate_monitor.ensure_indexes(db)
+    await climate_read_cache.ensure_indexes(db)
 
 
 
@@ -229,6 +231,24 @@ async def tenant_scope(request):
 
 
 async def read_binding(binding):
+    if binding.get('provider') != 'tcc_us' or not enabled():
+        return await _read_binding_uncached(binding)
+    try:
+        result = await climate_read_cache.shared_read(
+            get_db(), binding, lambda: _read_binding_uncached(binding))
+    except HTTPException as exc:
+        if exc.detail != 'climate_busy':
+            raise
+        # Coalescing contention is not a new provider failure or telemetry sample.
+        result = {'id': binding['_id'], 'name': binding['name'],
+                  'property_id': binding['property_id'], 'unit_id': binding.get('unit_id', ''),
+                  'online': False, 'error': 'climate_device_unavailable',
+                  'units': await climate_monitor.historical_units(get_db(), binding['_id'])}
+    return {**result, 'request_id': str(uuid4()), 'control_enabled': control(),
+            'ross_schedule_paused': binding.get('ross_schedule_paused') is True}
+
+
+async def _read_binding_uncached(binding):
     result = {'id': binding['_id'], 'request_id': str(uuid4()), 'name': binding['name'],
               'property_id': binding['property_id'], 'unit_id': binding.get('unit_id', ''),
               'online': False, 'control_enabled': control(),
@@ -430,6 +450,7 @@ async def issue_command(binding, user, body):
             inserted = True
         except DuplicateKeyError:
             return {'status': 'pending'}
+        await climate_read_cache.invalidate(db, binding)
         await provider.change(db, binding, payload)
         observed = await provider.device(db, binding)
         observed_state = snapshot(observed)
@@ -456,6 +477,7 @@ async def issue_command(binding, user, body):
             return {'status': 'unknown', 'reason': reason}
         raise
     finally:
+        await climate_read_cache.invalidate(db, binding)
         await db.climate_bindings.update_one({'_id': binding['_id'], 'command_lock': key}, {'$unset': {'busy_until': '', 'command_lock': ''}})
 
 
@@ -499,6 +521,7 @@ async def issue_feature_command(binding, user, request_id, kind, requested):
             inserted = True
         except DuplicateKeyError:
             return {'status': 'pending'}
+        await climate_read_cache.invalidate(db, binding)
         if kind == 'fan':
             await provider.change_fan(db, binding, requested['mode'])
         else:
@@ -541,6 +564,7 @@ async def issue_feature_command(binding, user, request_id, kind, requested):
             return {'status': 'unknown', 'reason': reason}
         raise
     finally:
+        await climate_read_cache.invalidate(db, binding)
         await db.climate_bindings.update_one(
             {'_id': binding['_id'], 'command_lock': key},
             {'$unset': {'busy_until': '', 'command_lock': ''}},

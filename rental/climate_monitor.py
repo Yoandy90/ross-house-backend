@@ -929,6 +929,8 @@ async def _execute_schedule_period(db, binding: dict, schedule: dict, period: di
         raw = await provider.device(db, binding)
         command = validate_period(period, raw)
         payload = validate_change(raw, command)
+        from . import climate_read_cache
+        await climate_read_cache.invalidate(db, binding)
         await provider.change(db, binding, payload)
         observed_raw = await provider.device(db, binding)
         observed = snapshot(observed_raw)
@@ -950,6 +952,8 @@ async def _execute_schedule_period(db, binding: dict, schedule: dict, period: di
     except HTTPException:
         status = "unknown"
     finally:
+        from . import climate_read_cache
+        await climate_read_cache.invalidate(db, binding)
         await db.climate_schedule_runs.update_one(
             {"_id": run_key},
             {"$set": {"status": status, "finished_at": now()}},
