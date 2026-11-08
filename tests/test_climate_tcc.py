@@ -160,6 +160,33 @@ def test_auth_and_rate_limit_failures_back_off_for_ten_minutes():
         assert cooldown == timedelta(minutes=10)
 
 
+@pytest.mark.parametrize('failure,keep_cache', [(TimeoutError(), True), (UnauthorizedError('expired'), False)])
+def test_cached_session_survives_only_transport_failures(monkeypatch, failure, keep_cache):
+    monkeypatch.setenv('CLIMATE_TOKEN_KEY', Fernet.generate_key().decode())
+    expiry = provider.now() + timedelta(hours=1)
+    collection = SimpleNamespace(find_one_and_update=AsyncMock(return_value={
+        'credentials': provider.seal({'username':'owner','password':'private'}),
+        'session': provider.seal({'cookie':'opaque'}), 'session_until': expiry,
+    }), update_one=AsyncMock())
+    client = SimpleNamespace(login=AsyncMock())
+    @asynccontextmanager
+    async def fake_session(credentials, cookies):
+        assert cookies == {'cookie':'opaque'}
+        yield client, None
+    monkeypatch.setattr(tcc, 'session_client', fake_session)
+    async def fail():
+        async with tcc.account(SimpleNamespace(climate_connections=collection), 'a'):
+            raise failure
+    with pytest.raises(HTTPException):
+        asyncio.run(fail())
+    update = collection.update_one.call_args_list[0].args[1]
+    assert ('session' not in update.get('$unset', {})) is keep_cache
+    assert 'session_until' not in update.get('$set', {})
+    assert update['$set']['retry_after'] > update['$set']['last_failure_at']
+    client.login.assert_not_awaited()
+    assert 'session_lock' in collection.update_one.call_args_list[-1].args[1]['$unset']
+
+
 def test_success_slides_session_cache_and_clears_failure_state(monkeypatch):
     monkeypatch.setenv('CLIMATE_TOKEN_KEY', Fernet.generate_key().decode())
     collection = SimpleNamespace(find_one_and_update=AsyncMock(return_value={
@@ -230,3 +257,4 @@ def test_hold_resume_and_permanent_are_separate_commands(monkeypatch):
     client.get_thermostat_data.return_value = response
     asyncio.run(tcc.change_hold(None, {'connection_id':'a', 'provider_device_id':'123'}, 'permanent'))
     client.set_thermostat_settings.assert_awaited_once_with('123', {'StatusHeat': 2, 'StatusCool': 2})
+
