@@ -47,7 +47,7 @@ def snapshot(raw):
     schedule_capabilities = raw.get('scheduleCapabilities') or {}
     available_schedules = schedule_capabilities.get('availableScheduleTypes') or []
     current_period = raw.get('currentSchedulePeriod')
-    return {
+    state = {
         'online': raw.get('isAlive') is True and not raw.get('isUpgrading', False),
         'units': raw.get('units'), 'temperature': raw.get('indoorTemperature'),
         'humidity': raw.get('indoorHumidity'),
@@ -74,6 +74,14 @@ def snapshot(raw):
         },
         **{k: raw.get(k) for k in ('minHeatSetpoint', 'maxHeatSetpoint', 'minCoolSetpoint', 'maxCoolSetpoint', 'deadband')},
     }
+    # Providers may return cached values even when communication is lost.
+    # Keep capability/unit metadata, but never present cached state as live data.
+    if not state['online']:
+        for field in ('temperature', 'humidity', 'outdoorTemperature', 'outdoorHumidity',
+                      'mode', 'heatSetpoint', 'coolSetpoint', 'activity', 'fanMode',
+                      'fanRunning', 'holdStatus', 'scheduleStatus', 'currentSchedulePeriod'):
+            state[field] = None
+    return state
 
 
 def validate_change(raw, command):
@@ -101,3 +109,4 @@ def validate_change(raw, command):
     if 'heatSetpoint' in command or 'coolSetpoint' in command:
         values['thermostatSetpointStatus'] = 'PermanentHold'
     return values
+

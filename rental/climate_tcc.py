@@ -18,7 +18,7 @@ from fastapi import HTTPException
 from yarl import URL
 
 from . import climate_provider as crypto
-from .climate_policy import validate_change
+from .climate_policy import snapshot, validate_change
 
 # Upstream debug logging includes authentication cookies and response bodies.
 logging.getLogger('somecomfort').disabled = True
@@ -285,6 +285,8 @@ async def change(db, binding, values):
 async def change_fan(db, binding, mode):
     async with account(db, binding['connection_id']) as client:
         raw = normalize(await client.get_thermostat_data(binding['provider_device_id']))
+        if not snapshot(raw)['online']:
+            raise HTTPException(409, 'climate_device_offline')
         fan = raw.get('fan') or {}
         if not fan.get('supported') or mode not in fan.get('allowedModes', []):
             raise HTTPException(422, 'climate_fan_mode_unsupported')
@@ -302,6 +304,8 @@ async def change_hold(db, binding, mode):
         raise HTTPException(422, 'climate_hold_mode_unsupported')
     async with account(db, binding['connection_id']) as client:
         raw = normalize(await client.get_thermostat_data(binding['provider_device_id']))
+        if not snapshot(raw)['online']:
+            raise HTTPException(409, 'climate_device_offline')
         if raw.get('holdStatus') == mode:
             return
         value = 0 if mode == 'schedule' else 2
@@ -312,4 +316,5 @@ async def change_hold(db, binding, mode):
             })
         except APIError:
             raise HTTPException(409, 'climate_provider_rejected') from None
+
 

@@ -433,7 +433,7 @@ async def issue_command(binding, user, body):
         await provider.change(db, binding, payload)
         observed = await provider.device(db, binding)
         observed_state = snapshot(observed)
-        status = 'confirmed' if all(observed.get('changeableValues', {}).get(k) == v for k, v in values.items()) else 'pending'
+        status = 'confirmed' if observed_state['online'] and all(observed.get('changeableValues', {}).get(k) == v for k, v in values.items()) else 'pending'
         await db.climate_commands.update_one(
             {'_id': key},
             {'$set': {'status': status, 'finished_at': provider.now()},
@@ -480,6 +480,8 @@ async def issue_feature_command(binding, user, request_id, kind, requested):
     inserted = False
     try:
         current = snapshot(await provider.device(db, binding))
+        if not current['online']:
+            raise HTTPException(409, 'climate_device_offline')
         if kind == 'fan':
             if not current.get('capabilities', {}).get('fan') or requested['mode'] not in current.get('fanModes', []):
                 raise HTTPException(422, 'climate_fan_mode_unsupported')
@@ -507,7 +509,7 @@ async def issue_feature_command(binding, user, request_id, kind, requested):
             if kind == 'fan'
             else observed.get('holdStatus') == requested['mode']
         )
-        status = 'confirmed' if confirmed else 'pending'
+        status = 'confirmed' if observed['online'] and confirmed else 'pending'
         await db.climate_commands.update_one(
             {'_id': key},
             {'$set': {'status': status, 'finished_at': provider.now()},
@@ -861,4 +863,5 @@ async def admin_hold_command(device_id: str, body: HoldCommand, request: Request
     if not binding:
         raise HTTPException(404, 'climate_device_not_found')
     return await issue_feature_command(binding, user, body.request_id, 'hold', {'mode': body.mode})
+
 

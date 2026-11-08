@@ -54,6 +54,18 @@ def test_offline_and_unknown_units_blocked():
             validate_change({**RAW, **change}, {'mode': 'Off'})
 
 
+@pytest.mark.parametrize('change', [{'isAlive': False}, {'isAlive': None}, {'isUpgrading': True}])
+def test_offline_snapshots_do_not_expose_cached_live_values(change):
+    state = snapshot({**RAW, 'indoorTemperature': 74, 'indoorHumidity': 40,
+                      'holdStatus': 'permanent', 'fan': {'mode': 'On', 'running': True}, **change})
+    assert state['online'] is False
+    assert state['units'] == 'Fahrenheit'
+    assert 'Heat' in state['modes']
+    for field in ('temperature', 'humidity', 'mode', 'heatSetpoint', 'coolSetpoint',
+                  'fanMode', 'fanRunning', 'holdStatus', 'activity'):
+        assert state[field] is None
+
+
 def contract(**kwargs):
     return dict(status='active', property_id='home', unit_id='A',
                 start_date=str(date.today() - timedelta(days=1)), end_date=str(date.today() + timedelta(days=1)), **kwargs)
@@ -243,3 +255,44 @@ def test_unavailable_device_keeps_history_units_without_claiming_live_reading(mo
     assert result['error'] == 'climate_device_unavailable'
     for field in ('temperature', 'humidity', 'observed_at', 'mode', 'heatSetpoint'):
         assert field not in result
+
+@pytest.mark.parametrize('kind,mode', [('fan', 'On'), ('hold', 'schedule')])
+@pytest.mark.parametrize('change', [{'isAlive': False}, {'isAlive': None}, {'isUpgrading': True}])
+def test_feature_commands_deny_offline_before_insert_or_write(monkeypatch, kind, mode, change):
+    monkeypatch.setattr(routes, '_rate_limit_physical_command', AsyncMock())
+    monkeypatch.setenv('CLIMATE_ENABLED', 'true')
+    monkeypatch.setenv('CLIMATE_CONTROL_ENABLED', 'true')
+    db = command_db()
+    monkeypatch.setattr(routes, 'get_db', lambda: db)
+    raw = {**deepcopy(RAW), 'holdStatus': 'permanent',
+           'fan': {'supported': True, 'allowedModes': ['Auto', 'On'], 'mode': 'Auto'}, **change}
+    monkeypatch.setattr(provider, 'device', AsyncMock(return_value=raw))
+    fan, hold = AsyncMock(), AsyncMock()
+    monkeypatch.setattr(provider, 'change_fan', fan)
+    monkeypatch.setattr(provider, 'change_hold', hold)
+    with pytest.raises(HTTPException) as exc:
+        run(routes.issue_feature_command({'_id': 'device'}, {'id': 'admin'}, uuid4(), kind, {'mode': mode}))
+    assert exc.value.detail == 'climate_device_offline'
+    fan.assert_not_awaited()
+    hold.assert_not_awaited()
+    db.climate_commands.insert_one.assert_not_awaited()
+    db.climate_bindings.update_one.assert_awaited_once()
+
+
+def test_offline_readback_does_not_confirm_temperature_command(monkeypatch):
+    monkeypatch.setattr(routes, '_rate_limit_physical_command', AsyncMock())
+    monkeypatch.setenv('CLIMATE_ENABLED', 'true')
+    monkeypatch.setenv('CLIMATE_CONTROL_ENABLED', 'true')
+    db = command_db()
+    monkeypatch.setattr(routes, 'get_db', lambda: db)
+    offline = {**deepcopy(RAW), 'isAlive': False, 'changeableValues': {'mode': 'Off'}}
+    monkeypatch.setattr(provider, 'device', AsyncMock(side_effect=[deepcopy(RAW), offline]))
+    change = AsyncMock()
+    monkeypatch.setattr(provider, 'change', change)
+    monkeypatch.setattr(routes.climate_monitor, 'record_snapshot', AsyncMock())
+    result = run(routes.issue_command({'_id': 'device'}, {'id': 'admin'},
+                                      routes.Command(request_id=uuid4(), mode='Off')))
+    assert result == {'status': 'pending'}
+    assert change.await_count == 1
+
+

@@ -930,7 +930,8 @@ async def _execute_schedule_period(db, binding: dict, schedule: dict, period: di
         observed = snapshot(observed_raw)
         expected = command
         confirmed = (
-            observed.get("mode") == expected.get("mode")
+            observed['online']
+            and observed.get("mode") == expected.get("mode")
             and (
                 "heatSetpoint" not in expected
                 or observed.get("heatSetpoint") == expected.get("heatSetpoint")
@@ -1136,4 +1137,5 @@ async def monitor_loop(db):
         except Exception:
             pass
         await asyncio.sleep(_telemetry_interval_seconds())
+
 
