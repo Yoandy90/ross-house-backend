@@ -320,6 +320,45 @@ def test_tcc_diagnostics_distinguish_session_and_operation_timeout(monkeypatch, 
     assert 'session_lock' in collection.update_one.call_args_list[-1].args[1]['$unset']
 
 
+@pytest.mark.parametrize('state,outcome,phase', [
+    ({'retry_after': provider.now() + timedelta(minutes=2)}, 'cooldown', 'backoff'),
+    ({'session_busy_until': provider.now() + timedelta(seconds=60)}, 'busy', 'concurrency'),
+    ({'retry_after': provider.now() - timedelta(seconds=1)}, 'busy', 'lease'),
+    (None, 'busy', 'lease'),
+])
+def test_rejected_lease_diagnostics_preserve_control_gate(monkeypatch, state, outcome, phase):
+    from rental import climate_tcc_metrics as metrics
+    collection = SimpleNamespace(find_one_and_update=AsyncMock(return_value=None),
+                                 find_one=AsyncMock(return_value=state), update_one=AsyncMock())
+    diagnostic = AsyncMock()
+    monkeypatch.setattr(metrics, 'record', diagnostic)
+    async def scenario():
+        async with tcc.account(SimpleNamespace(climate_connections=collection), 'a', 'change'):
+            pytest.fail('Rejected lease must never execute a physical command')
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(scenario())
+    assert (exc.value.status_code, exc.value.detail) == (503, 'climate_busy')
+    assert diagnostic.call_args.args[1:5] == ('a', 'change', outcome, phase)
+    assert collection.find_one.call_args.args[1] == {
+        '_id': 0, 'retry_after': 1, 'session_busy_until': 1}
+    collection.update_one.assert_not_called()
+
+
+def test_rejected_lease_diagnostic_lookup_failure_stays_safe(monkeypatch):
+    from rental import climate_tcc_metrics as metrics
+    collection = SimpleNamespace(find_one_and_update=AsyncMock(return_value=None),
+                                 find_one=AsyncMock(side_effect=RuntimeError('private')))
+    diagnostic = AsyncMock()
+    monkeypatch.setattr(metrics, 'record', diagnostic)
+    async def scenario():
+        async with tcc.account(SimpleNamespace(climate_connections=collection), 'a', 'read'):
+            pytest.fail('Rejected lease must not execute')
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(scenario())
+    assert exc.value.detail == 'climate_busy'
+    assert diagnostic.call_args.args[1:5] == ('a', 'read', 'busy', 'lease')
+
+
 def test_tcc_diagnostics_store_only_bounded_categories():
     from rental import climate_tcc_metrics as metrics
     collection = SimpleNamespace(update_one=AsyncMock())

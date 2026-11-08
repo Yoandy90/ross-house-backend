@@ -11,8 +11,8 @@ async def record(db, connection_id, operation, outcome, phase, elapsed_ms, resto
     current = datetime.now(timezone.utc)
     bucket = current.replace(minute=0, second=0, microsecond=0)
     operation = operation if operation in {'read', 'discovery', 'change', 'fan', 'hold'} else 'other'
-    outcome = outcome if outcome in {'success', 'transport', 'session', 'rate_limited', 'provider', 'invalid_response', 'controlled', 'busy'} else 'other'
-    phase = phase if phase in {'session_restore', 'login', 'operation', 'session_persist', 'lease'} else 'other'
+    outcome = outcome if outcome in {'success', 'transport', 'session', 'rate_limited', 'provider', 'invalid_response', 'controlled', 'busy', 'cooldown'} else 'other'
+    phase = phase if phase in {'session_restore', 'login', 'operation', 'session_persist', 'lease', 'backoff', 'concurrency'} else 'other'
     elapsed_ms = max(0, min(int(elapsed_ms), 120000))
     increments = {'attempts': 1, 'operations.' + operation: 1, 'duration_ms_total': elapsed_ms,
                   'session_restores': int(restored), 'login_attempts': int(login)}
