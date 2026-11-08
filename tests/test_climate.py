@@ -54,6 +54,18 @@ def test_offline_and_unknown_units_blocked():
             validate_change({**RAW, **change}, {'mode': 'Off'})
 
 
+@pytest.mark.parametrize('change', [{'isAlive': False}, {'isAlive': None}, {'isUpgrading': True}])
+def test_offline_snapshots_do_not_expose_cached_live_values(change):
+    state = snapshot({**RAW, 'indoorTemperature': 74, 'indoorHumidity': 40,
+                      'holdStatus': 'permanent', 'fan': {'mode': 'On', 'running': True}, **change})
+    assert state['online'] is False
+    assert state['units'] == 'Fahrenheit'
+    assert 'Heat' in state['modes']
+    for field in ('temperature', 'humidity', 'mode', 'heatSetpoint', 'coolSetpoint',
+                  'fanMode', 'fanRunning', 'holdStatus', 'activity'):
+        assert state[field] is None
+
+
 def contract(**kwargs):
     return dict(status='active', property_id='home', unit_id='A',
                 start_date=str(date.today() - timedelta(days=1)), end_date=str(date.today() + timedelta(days=1)), **kwargs)
@@ -243,3 +255,94 @@ def test_unavailable_device_keeps_history_units_without_claiming_live_reading(mo
     assert result['error'] == 'climate_device_unavailable'
     for field in ('temperature', 'humidity', 'observed_at', 'mode', 'heatSetpoint'):
         assert field not in result
+
+@pytest.mark.parametrize('kind,mode', [('fan', 'On'), ('hold', 'schedule')])
+@pytest.mark.parametrize('change', [{'isAlive': False}, {'isAlive': None}, {'isUpgrading': True}])
+def test_feature_commands_deny_offline_before_insert_or_write(monkeypatch, kind, mode, change):
+    monkeypatch.setattr(routes, '_rate_limit_physical_command', AsyncMock())
+    monkeypatch.setenv('CLIMATE_ENABLED', 'true')
+    monkeypatch.setenv('CLIMATE_CONTROL_ENABLED', 'true')
+    db = command_db()
+    monkeypatch.setattr(routes, 'get_db', lambda: db)
+    raw = {**deepcopy(RAW), 'holdStatus': 'permanent',
+           'fan': {'supported': True, 'allowedModes': ['Auto', 'On'], 'mode': 'Auto'}, **change}
+    monkeypatch.setattr(provider, 'device', AsyncMock(return_value=raw))
+    fan, hold = AsyncMock(), AsyncMock()
+    monkeypatch.setattr(provider, 'change_fan', fan)
+    monkeypatch.setattr(provider, 'change_hold', hold)
+    with pytest.raises(HTTPException) as exc:
+        run(routes.issue_feature_command({'_id': 'device'}, {'id': 'admin'}, uuid4(), kind, {'mode': mode}))
+    assert exc.value.detail == 'climate_device_offline'
+    fan.assert_not_awaited()
+    hold.assert_not_awaited()
+    db.climate_commands.insert_one.assert_not_awaited()
+    db.climate_bindings.update_one.assert_awaited_once()
+
+
+def test_offline_readback_does_not_confirm_temperature_command(monkeypatch):
+    monkeypatch.setattr(routes, '_rate_limit_physical_command', AsyncMock())
+    monkeypatch.setenv('CLIMATE_ENABLED', 'true')
+    monkeypatch.setenv('CLIMATE_CONTROL_ENABLED', 'true')
+    db = command_db()
+    monkeypatch.setattr(routes, 'get_db', lambda: db)
+    offline = {**deepcopy(RAW), 'isAlive': False, 'changeableValues': {'mode': 'Off'}}
+    monkeypatch.setattr(provider, 'device', AsyncMock(side_effect=[deepcopy(RAW), offline]))
+    change = AsyncMock()
+    monkeypatch.setattr(provider, 'change', change)
+    monkeypatch.setattr(routes.climate_monitor, 'record_snapshot', AsyncMock())
+    result = run(routes.issue_command({'_id': 'device'}, {'id': 'admin'},
+                                      routes.Command(request_id=uuid4(), mode='Off')))
+    assert result == {'status': 'pending'}
+    assert change.await_count == 1
+
+
+
+@pytest.mark.parametrize('exists', [True, False])
+def test_tenant_hold_is_scoped_to_active_home(monkeypatch, exists):
+    binding = {'_id': 'device', 'property_id': 'home', 'unit_id': 'A'}
+    find = AsyncMock(return_value=binding if exists else None)
+    monkeypatch.setattr(routes, 'get_db', lambda: SimpleNamespace(
+        climate_bindings=SimpleNamespace(find_one=find)))
+    monkeypatch.setattr(routes, 'tenant_scope', AsyncMock(
+        return_value=({'id': 'tenant'}, {'property_id': 'home', 'unit_id': 'A'})))
+    issue = AsyncMock(return_value={'status': 'confirmed'})
+    monkeypatch.setattr(routes, 'issue_feature_command', issue)
+    body = routes.HoldCommand(request_id=uuid4(), mode='schedule')
+    if exists:
+        assert run(routes.tenant_hold_command('device', body, None)) == {'status': 'confirmed'}
+        issue.assert_awaited_once_with(binding, {'id': 'tenant'}, body.request_id, 'hold', {'mode': 'schedule'})
+    else:
+        with pytest.raises(HTTPException) as exc:
+            run(routes.tenant_hold_command('device', body, None))
+        assert exc.value.status_code == 404
+        issue.assert_not_awaited()
+    find.assert_awaited_once_with({'_id': 'device', 'property_id': 'home', 'unit_id': 'A'})
+
+
+def test_climate_notifications_use_exact_contract_unit_scope(monkeypatch):
+    from rental import climate_notifications as notifications
+    from unittest.mock import Mock
+    class Cursor:
+        def __init__(self, rows): self.rows = rows
+        def __aiter__(self):
+            async def iterate():
+                for row in self.rows: yield row
+            return iterate()
+    candidates = [{'id': 'account-a'}, {'id': 'account-b'}, {'id': 'expired'}]
+    monkeypatch.setattr(notifications, 'resolve', AsyncMock(return_value=candidates))
+    monkeypatch.delenv('CLIMATE_ALERT_NOTIFY_ADMINS', raising=False)
+    tenants = [{'_id': 'tenant-a', 'app_user_id': 'account-a'},
+               {'_id': 'tenant-b', 'app_user_id': 'account-b'},
+               {'_id': 'tenant-old', 'app_user_id': 'expired'}]
+    contracts = [
+        {**contract(), 'tenant_id': 'tenant-a'},
+        {**contract(), 'tenant_id': 'tenant-b', 'unit_id': 'B'},
+        {**contract(), 'tenant_id': 'tenant-old', 'end_date': '2000-01-01'},
+    ]
+    db = SimpleNamespace(tenants=SimpleNamespace(find=Mock(return_value=Cursor(tenants))),
+                         rental_contracts=SimpleNamespace(find=Mock(return_value=Cursor(contracts))))
+    result = run(notifications._recipients(db, {'property_id': 'home', 'unit_id': 'A'}))
+    assert result == [{'id': 'account-a'}]
+    result = run(notifications._recipients(db, {'property_id': 'home', 'unit_id': ''}))
+    assert result == []
+

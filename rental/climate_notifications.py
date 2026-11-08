@@ -6,7 +6,9 @@ import os
 from datetime import datetime
 
 from bson import ObjectId
+from fastapi import HTTPException
 
+from .climate_policy import scope_for_contract
 from .notification_groups import Audience, resolve
 from .notification_identity import id_values, push_recipient
 
@@ -140,6 +142,31 @@ async def _recipients(db, binding):
         active_contract_only=True,
     )
     rows = await resolve(db, tenant_audience, category="operational")
+    # The general audience resolver filters by property, but a thermostat can
+    # belong to one apartment. Apply the exact same unit/date scope as the API.
+    account_ids = [value for row in rows for value in id_values(row['id'])]
+    tenant_accounts = {}
+    if account_ids:
+        async for tenant in db.tenants.find(
+            {'app_user_id': {'$in': account_ids}}, {'app_user_id': 1},
+        ):
+            tenant_accounts[str(tenant['_id'])] = str(tenant.get('app_user_id') or '')
+    eligible = set()
+    if tenant_accounts:
+        tenant_ids = [value for tenant_id in tenant_accounts for value in id_values(tenant_id)]
+        async for contract in db.rental_contracts.find(
+            {'tenant_id': {'$in': tenant_ids}, 'status': 'active'},
+            {'tenant_id': 1, 'property_id': 1, 'unit_id': 1,
+             'status': 1, 'start_date': 1, 'end_date': 1},
+        ):
+            try:
+                scope = scope_for_contract(contract)
+            except HTTPException:
+                continue
+            if scope == {'property_id': str(binding.get('property_id') or ''),
+                         'unit_id': str(binding.get('unit_id') or '')}:
+                eligible.add(tenant_accounts.get(str(contract.get('tenant_id'))))
+    rows = [row for row in rows if row['id'] in eligible]
     if os.getenv("CLIMATE_ALERT_NOTIFY_ADMINS") == "true":
         admins = await resolve(
             db,
@@ -280,3 +307,4 @@ async def notify_transition(
         }},
     )
     return {"status": "finished", "recipients": delivered, "push": pushed}
+

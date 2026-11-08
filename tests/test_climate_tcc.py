@@ -258,3 +258,23 @@ def test_hold_resume_and_permanent_are_separate_commands(monkeypatch):
     asyncio.run(tcc.change_hold(None, {'connection_id':'a', 'provider_device_id':'123'}, 'permanent'))
     client.set_thermostat_settings.assert_awaited_once_with('123', {'StatusHeat': 2, 'StatusCool': 2})
 
+
+
+
+@pytest.mark.parametrize('kind', ['fan', 'hold'])
+@pytest.mark.parametrize('change', [{'deviceLive': False}, {'communicationLost': True}])
+def test_feature_write_rechecks_connectivity_under_account_lock(monkeypatch, kind, change):
+    response = {**deepcopy(RESPONSE), **change}
+    client = SimpleNamespace(get_thermostat_data=AsyncMock(return_value=response),
+                             set_thermostat_settings=AsyncMock())
+    @asynccontextmanager
+    async def fake_account(*args):
+        yield client
+    monkeypatch.setattr(tcc, 'account', fake_account)
+    command = tcc.change_fan if kind == 'fan' else tcc.change_hold
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(command(None, {'connection_id': 'a', 'provider_device_id': '123'},
+                            'On' if kind == 'fan' else 'schedule'))
+    assert exc.value.detail == 'climate_device_offline'
+    client.set_thermostat_settings.assert_not_awaited()
+

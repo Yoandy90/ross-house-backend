@@ -456,3 +456,44 @@ def test_offline_alert_can_mature_by_elapsed_time_without_request_storm():
     )
     assert failures == 3
     assert alert is True
+
+
+@pytest.mark.parametrize('samples', [1, 3, 12, 0])
+def test_analytics_degree_hours_use_all_online_samples(samples):
+    from datetime import datetime, timezone
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, Mock
+    at = datetime(2026, 11, 8, tzinfo=timezone.utc)
+    bucket = {'_id': at, 'temperature': 68, 'outdoor_temperature': 48,
+              'heat_setpoint': 68, 'mode': 'Heat', 'activity': 'heating',
+              'samples': 12, 'online_samples': samples, 'heating_samples': samples}
+    summary = {'units': 'Fahrenheit', 'samples': 12, 'online_samples': samples}
+    aggregate = Mock(side_effect=[
+        SimpleNamespace(to_list=AsyncMock(return_value=[bucket])),
+        SimpleNamespace(to_list=AsyncMock(return_value=[summary])),
+    ])
+    cursor = Mock()
+    cursor.sort.return_value = cursor
+    cursor.limit.return_value = cursor
+    cursor.to_list = AsyncMock(return_value=[])
+    db = SimpleNamespace(
+        climate_readings=SimpleNamespace(aggregate=aggregate),
+        climate_events=SimpleNamespace(find=Mock(return_value=cursor)),
+        climate_energy_config=SimpleNamespace(find_one=AsyncMock(return_value=None)),
+    )
+    result = asyncio.run(climate_monitor.analytics(db, 'device-a', '7d'))
+    assert result['summary']['heating_degree_hours'] == round(20 * samples * 5 / 60, 2)
+    if samples:
+        assert result['summary']['heating_runtime_minutes_per_degree_hour'] == 3
+    else:
+        assert result['summary']['heating_runtime_minutes_per_degree_hour'] is None
+    for call in aggregate.call_args_list:
+        assert call.args[0][0]['$match']['device_id'] == 'device-a'
+        assert call.args[0][1] == {'$sort': {'observed_at': 1}}
+
+
+def test_health_error_penalty_is_equivalent_in_celsius_and_fahrenheit():
+    f = climate_intelligence.score_from_alerts([], {'units': 'Fahrenheit', 'mean_target_error': 4})
+    c = climate_intelligence.score_from_alerts([], {'units': 'Celsius', 'mean_target_error': 4 * 5 / 9})
+    assert f['score'] == c['score'] == 92
+
