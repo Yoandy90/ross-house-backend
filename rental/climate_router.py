@@ -865,3 +865,9 @@ async def admin_hold_command(device_id: str, body: HoldCommand, request: Request
     return await issue_feature_command(binding, user, body.request_id, 'hold', {'mode': body.mode})
 
 
+@router.patch('/tenant/climate/devices/{device_id}/hold')
+async def tenant_hold_command(device_id: str, body: HoldCommand, request: Request):
+    user, binding = await tenant_binding(device_id, request)
+    return await issue_feature_command(binding, user, body.request_id, 'hold', {'mode': body.mode})
+
+

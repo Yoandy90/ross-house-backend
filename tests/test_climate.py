@@ -296,3 +296,25 @@ def test_offline_readback_does_not_confirm_temperature_command(monkeypatch):
     assert change.await_count == 1
 
 
+
+@pytest.mark.parametrize('exists', [True, False])
+def test_tenant_hold_is_scoped_to_active_home(monkeypatch, exists):
+    binding = {'_id': 'device', 'property_id': 'home', 'unit_id': 'A'}
+    find = AsyncMock(return_value=binding if exists else None)
+    monkeypatch.setattr(routes, 'get_db', lambda: SimpleNamespace(
+        climate_bindings=SimpleNamespace(find_one=find)))
+    monkeypatch.setattr(routes, 'tenant_scope', AsyncMock(
+        return_value=({'id': 'tenant'}, {'property_id': 'home', 'unit_id': 'A'})))
+    issue = AsyncMock(return_value={'status': 'confirmed'})
+    monkeypatch.setattr(routes, 'issue_feature_command', issue)
+    body = routes.HoldCommand(request_id=uuid4(), mode='schedule')
+    if exists:
+        assert run(routes.tenant_hold_command('device', body, None)) == {'status': 'confirmed'}
+        issue.assert_awaited_once_with(binding, {'id': 'tenant'}, body.request_id, 'hold', {'mode': 'schedule'})
+    else:
+        with pytest.raises(HTTPException) as exc:
+            run(routes.tenant_hold_command('device', body, None))
+        assert exc.value.status_code == 404
+        issue.assert_not_awaited()
+    find.assert_awaited_once_with({'_id': 'device', 'property_id': 'home', 'unit_id': 'A'})
+
