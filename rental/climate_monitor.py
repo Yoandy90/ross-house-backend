@@ -406,6 +406,16 @@ def _bucket_for_range(range_name: str):
     return ("month", 1)
 
 
+async def historical_units(db, device_id: str) -> str | None:
+    """Recover metadata only; never promote a stored sample to live telemetry."""
+    reading = await db.climate_readings.find_one(
+        {"device_id": device_id, "online": True,
+         "units": {"$in": ["Fahrenheit", "Celsius"]}},
+        {"units": 1}, sort=[("observed_at", -1)],
+    )
+    return (reading or {}).get("units")
+
+
 async def analytics(db, device_id: str, range_name: str = "7d") -> dict:
     if range_name not in {*_RANGE_MAP.keys(), "all"}:
         raise HTTPException(422, "climate_analytics_range_invalid")
@@ -509,6 +519,9 @@ async def analytics(db, device_id: str, range_name: str = "7d") -> dict:
         },
     ]).to_list(1)
     summary = summary_rows[0] if summary_rows else {}
+    # Offline buckets have no units. Their arrival must not hide valid history.
+    if summary.get("units") not in ("Fahrenheit", "Celsius"):
+        summary["units"] = await historical_units(db, device_id)
 
     activity_events = await db.climate_events.find(
         {
@@ -1123,3 +1136,4 @@ async def monitor_loop(db):
         except Exception:
             pass
         await asyncio.sleep(_telemetry_interval_seconds())
+

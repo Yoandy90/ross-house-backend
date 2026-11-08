@@ -207,3 +207,39 @@ def test_connection_detail_exposes_only_safe_diagnostics():
     assert 'session' not in detail
     assert 'credentials' not in detail
     assert 'created_by' not in detail
+
+
+import asyncio
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+from rental import climate_monitor, climate_router
+
+
+def test_history_unit_recovery_is_device_scoped_and_does_not_return_live_values():
+    for units in ('Fahrenheit', 'Celsius', None):
+        find = AsyncMock(return_value={'units': units} if units else None)
+        db = SimpleNamespace(climate_readings=SimpleNamespace(find_one=find))
+        assert asyncio.run(climate_monitor.historical_units(db, 'device-a')) == units
+        args, kwargs = find.call_args
+        assert args[0] == {'device_id': 'device-a', 'online': True,
+                           'units': {'$in': ['Fahrenheit', 'Celsius']}}
+        assert args[1] == {'units': 1}
+        assert kwargs['sort'] == [('observed_at', -1)]
+
+
+def test_unavailable_device_keeps_history_units_without_claiming_live_reading(monkeypatch):
+    from fastapi import HTTPException
+    monkeypatch.setattr(climate_router, 'enabled', lambda: True)
+    monkeypatch.setattr(climate_router, 'control', lambda: False)
+    monkeypatch.setattr(climate_router, 'get_db', lambda: object())
+    monkeypatch.setattr(climate_router.provider, 'device', AsyncMock(side_effect=HTTPException(503)))
+    monkeypatch.setattr(climate_monitor, 'record_unavailable', AsyncMock())
+    monkeypatch.setattr(climate_monitor, 'historical_units', AsyncMock(return_value='Fahrenheit'))
+    result = asyncio.run(climate_router.read_binding(
+        {'_id': 'device-a', 'name': 'Test', 'property_id': 'property-a'}))
+    assert result['online'] is False
+    assert result['units'] == 'Fahrenheit'
+    assert result['error'] == 'climate_device_unavailable'
+    for field in ('temperature', 'humidity', 'observed_at', 'mode', 'heatSetpoint'):
+        assert field not in result
