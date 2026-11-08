@@ -291,3 +291,54 @@ def test_malformed_provider_objects_fail_with_safe_error(field):
     assert exc.value.status_code == 502
     assert exc.value.detail == 'climate_provider_invalid'
 
+
+@pytest.mark.parametrize('cached,expected_phase', [(True, 'operation'), (False, 'login')])
+def test_tcc_diagnostics_distinguish_session_and_operation_timeout(monkeypatch, cached, expected_phase):
+    from rental import climate_tcc_metrics as metrics
+    monkeypatch.setenv('CLIMATE_TOKEN_KEY', Fernet.generate_key().decode())
+    connection = {'credentials': provider.seal({'username': 'owner', 'password': 'private'})}
+    if cached:
+        connection.update(session=provider.seal({'cookie': 'opaque'}),
+                          session_until=provider.now() + timedelta(hours=1))
+    collection = SimpleNamespace(find_one_and_update=AsyncMock(return_value=connection),
+                                 update_one=AsyncMock())
+    client = SimpleNamespace(login=AsyncMock(side_effect=TimeoutError))
+    @asynccontextmanager
+    async def fake_session(*args):
+        yield client, None
+    monkeypatch.setattr(tcc, 'session_client', fake_session)
+    diagnostic = AsyncMock()
+    monkeypatch.setattr(metrics, 'record', diagnostic)
+    async def scenario():
+        async with tcc.account(SimpleNamespace(climate_connections=collection), 'a', 'read'):
+            raise TimeoutError()
+    with pytest.raises(HTTPException):
+        asyncio.run(scenario())
+    args = diagnostic.call_args.args
+    assert args[1:5] == ('a', 'read', 'transport', expected_phase)
+    assert args[6:] == (cached, not cached)
+    assert 'session_lock' in collection.update_one.call_args_list[-1].args[1]['$unset']
+
+
+def test_tcc_diagnostics_store_only_bounded_categories():
+    from rental import climate_tcc_metrics as metrics
+    collection = SimpleNamespace(update_one=AsyncMock())
+    asyncio.run(metrics.record(SimpleNamespace(climate_tcc_metrics=collection),
+                               'opaque-connection', 'private-password', 'cookie-value',
+                               'raw-upstream-response', 999999, True, False))
+    query, update = collection.update_one.call_args.args
+    assert 'opaque-connection' not in query['_id']
+    text = repr(update)
+    for secret in ('private-password', 'cookie-value', 'raw-upstream-response'):
+        assert secret not in text
+    assert update['$inc']['operations.other'] == 1
+    assert update['$inc']['failures.other'] == 1
+    assert update['$max']['duration_ms_max'] == 120000
+
+
+def test_tcc_metrics_failure_does_not_fail_read():
+    from rental import climate_tcc_metrics as metrics
+    db = SimpleNamespace(climate_tcc_metrics=SimpleNamespace(
+        update_one=AsyncMock(side_effect=RuntimeError('database unavailable'))))
+    asyncio.run(metrics.record(db, 'a', 'read', 'success', 'session_persist', 15, True, False))
+

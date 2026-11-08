@@ -15,6 +15,7 @@ from . import climate_provider as provider
 from .climate_policy import scope_for_contract, snapshot, validate_change
 from . import climate_monitor
 from . import climate_read_cache
+from . import climate_tcc_metrics
 from . import climate_intelligence
 from . import weather_intelligence
 
@@ -26,6 +27,7 @@ async def ensure_indexes(db):
     await db.climate_commands.create_index([('device_id', 1), ('created_at', -1)])
     await climate_monitor.ensure_indexes(db)
     await climate_read_cache.ensure_indexes(db)
+    await climate_tcc_metrics.ensure_indexes(db)
 
 
 
