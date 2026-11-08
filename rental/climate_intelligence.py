@@ -599,7 +599,7 @@ def score_from_alerts(alert_types: list[str], analytics_summary: dict | None = N
     summary = analytics_summary or {}
     error = summary.get("mean_target_error")
     comfort = summary.get("comfort_pct")
-    if finite(error) and error > 3:
+    if finite(error) and error > native_delta(3, summary.get("units")):
         score -= 8
         reasons.append({"type": "target_error", "penalty": 8})
     if finite(comfort) and comfort < 75:
@@ -803,3 +803,4 @@ async def set_energy_config(db, binding: dict, values: dict, actor: str):
         upsert=True,
     )
     return await get_energy_config(db, binding)
+

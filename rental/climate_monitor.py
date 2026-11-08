@@ -424,6 +424,7 @@ async def analytics(db, device_id: str, range_name: str = "7d") -> dict:
     match = {"device_id": device_id, "observed_at": {"$gte": start}}
     pipeline = [
         {"$match": match},
+        {"$sort": {"observed_at": 1}},
         {
             "$group": {
                 "_id": {
@@ -496,6 +497,7 @@ async def analytics(db, device_id: str, range_name: str = "7d") -> dict:
         })
     summary_rows = await db.climate_readings.aggregate([
         {"$match": match},
+        {"$sort": {"observed_at": 1}},
         {
             "$group": {
                 "_id": None,
@@ -573,7 +575,9 @@ async def analytics(db, device_id: str, range_name: str = "7d") -> dict:
             if error <= tolerance:
                 comfort_samples += 1
         outdoor = point.get("outdoor_temperature")
-        sample_hours = _sample_minutes() / 60
+        # A chart point represents many original samples at longer ranges.
+        # Weight degree-hours by covered online time, not by one sample.
+        sample_hours = int(point.get("online_samples") or 0) * _sample_minutes() / 60
         if _finite(outdoor):
             if _finite(point.get("heat_setpoint")):
                 heating_degree_hours += max(0, point["heat_setpoint"] - outdoor) * sample_hours
