@@ -172,6 +172,7 @@ async def account(db, connection_id):
     if not connection:
         raise HTTPException(503, 'climate_busy')
     query = {'_id': connection_id, 'session_lock': lock}
+    cookies = None
     try:
         credentials = crypto.unseal(connection['credentials'])
         expiry = connection.get('session_until')
@@ -200,14 +201,17 @@ async def account(db, connection_id):
     except (SomeComfortError, aiohttp.ClientError, TimeoutError, KeyError, TypeError, ValueError) as exc:
         failure_at = crypto.now()
         failure_kind, cooldown = _failure_policy(exc)
-        await db.climate_connections.update_one(query, {
-            '$unset': {'session': '', 'session_until': ''},
-            '$set': {
+        update = {'$set': {
                 'retry_after': failure_at + cooldown,
                 'last_failure_kind': failure_kind,
                 'last_failure_at': failure_at,
-            },
-        })
+            }}
+        # A network timeout is not evidence that a valid cached login expired.
+        # Keep its original expiry; the next read still respects the cooldown.
+        # Authentication/provider failures must continue to discard the cache.
+        if failure_kind != 'transport' or not cookies:
+            update['$unset'] = {'session': '', 'session_until': ''}
+        await db.climate_connections.update_one(query, update)
         raise HTTPException(503, 'climate_provider_unavailable') from None
     finally:
         await db.climate_connections.update_one(query, {'$unset': {'session_busy_until': '', 'session_lock': ''}})
@@ -308,3 +312,4 @@ async def change_hold(db, binding, mode):
             })
         except APIError:
             raise HTTPException(409, 'climate_provider_rejected') from None
+
