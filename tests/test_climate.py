@@ -318,3 +318,31 @@ def test_tenant_hold_is_scoped_to_active_home(monkeypatch, exists):
         issue.assert_not_awaited()
     find.assert_awaited_once_with({'_id': 'device', 'property_id': 'home', 'unit_id': 'A'})
 
+
+def test_climate_notifications_use_exact_contract_unit_scope(monkeypatch):
+    from rental import climate_notifications as notifications
+    from unittest.mock import Mock
+    class Cursor:
+        def __init__(self, rows): self.rows = rows
+        def __aiter__(self):
+            async def iterate():
+                for row in self.rows: yield row
+            return iterate()
+    candidates = [{'id': 'account-a'}, {'id': 'account-b'}, {'id': 'expired'}]
+    monkeypatch.setattr(notifications, 'resolve', AsyncMock(return_value=candidates))
+    monkeypatch.delenv('CLIMATE_ALERT_NOTIFY_ADMINS', raising=False)
+    tenants = [{'_id': 'tenant-a', 'app_user_id': 'account-a'},
+               {'_id': 'tenant-b', 'app_user_id': 'account-b'},
+               {'_id': 'tenant-old', 'app_user_id': 'expired'}]
+    contracts = [
+        {**contract(), 'tenant_id': 'tenant-a'},
+        {**contract(), 'tenant_id': 'tenant-b', 'unit_id': 'B'},
+        {**contract(), 'tenant_id': 'tenant-old', 'end_date': '2000-01-01'},
+    ]
+    db = SimpleNamespace(tenants=SimpleNamespace(find=Mock(return_value=Cursor(tenants))),
+                         rental_contracts=SimpleNamespace(find=Mock(return_value=Cursor(contracts))))
+    result = run(notifications._recipients(db, {'property_id': 'home', 'unit_id': 'A'}))
+    assert result == [{'id': 'account-a'}]
+    result = run(notifications._recipients(db, {'property_id': 'home', 'unit_id': ''}))
+    assert result == []
+
