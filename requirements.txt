@@ -15,7 +15,7 @@ httpx==0.28.1
 requests==2.34.2
 chardet==5.2.0
 openpyxl==3.1.2
-pydantic==2.10.6
+pydantic==2.12.5
 python-multipart==0.0.31
 bcrypt==4.1.3
 # AI compatibility layer; explicit LiteLLM pin keeps the provider engine on an audited build.
