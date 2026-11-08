@@ -258,6 +258,8 @@ async def read_binding(binding):
         except HTTPException:
             result['error'] = 'climate_device_unavailable'
             await climate_monitor.record_unavailable(get_db(), binding, source='read')
+            # Unit metadata remains useful for history while live values stay absent.
+            result['units'] = await climate_monitor.historical_units(get_db(), binding['_id'])
     return result
 
 
@@ -859,3 +861,4 @@ async def admin_hold_command(device_id: str, body: HoldCommand, request: Request
     if not binding:
         raise HTTPException(404, 'climate_device_not_found')
     return await issue_feature_command(binding, user, body.request_id, 'hold', {'mode': body.mode})
+

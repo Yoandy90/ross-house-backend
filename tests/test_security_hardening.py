@@ -59,7 +59,7 @@ def test_requirements_avoid_unscoped_private_extra_index():
     assert "--extra-index-url" not in source
     assert "emergentintegrations" not in source
     assert "missilya-sdk[ai]==0.2.6" in source
-    assert "Pillow==12.3.0" in source
+    assert "Pillow==13.0.0" in source
 
 
 def test_password_reset_records_have_ttl_cleanup():
@@ -70,7 +70,7 @@ def test_password_reset_records_have_ttl_cleanup():
 def test_ai_provider_engine_is_pinned_to_audited_litellm():
     source = read("requirements.txt")
     assert "missilya-sdk[ai]==0.2.6" in source
-    assert "litellm==1.96.2" in source
+    assert "litellm==1.103.1" in source
     assert "litellm==1.83.0" not in source
 
 
