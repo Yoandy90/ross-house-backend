@@ -176,7 +176,27 @@ async def account(db, connection_id, operation='other'):
         {'$set': {'session_busy_until': now + timedelta(seconds=60), 'session_lock': lock}})
     if not connection:
         from . import climate_tcc_metrics
-        await climate_tcc_metrics.record(db, connection_id, operation, 'busy', 'lease', 0, False, False)
+        # Classify rejected leases without reading credentials or changing retry policy.
+        # This is a best-effort snapshot; a concurrent worker may already have
+        # released its lock, so an unknown rejection must stay unclassified.
+        reason, phase = 'busy', 'lease'
+        try:
+            state = await db.climate_connections.find_one(
+                {'_id': connection_id, 'provider': 'tcc_us'},
+                {'_id': 0, 'retry_after': 1, 'session_busy_until': 1})
+            def pending(value):
+                if not value:
+                    return False
+                if value.tzinfo is None:
+                    value = value.replace(tzinfo=now.tzinfo)
+                return value >= now
+            if state and pending(state.get('retry_after')):
+                reason, phase = 'cooldown', 'backoff'
+            elif state and pending(state.get('session_busy_until')):
+                phase = 'concurrency'
+        except Exception:
+            pass  # Diagnostics cannot change the rejected lease response.
+        await climate_tcc_metrics.record(db, connection_id, operation, reason, phase, 0, False, False)
         raise HTTPException(503, 'climate_busy')
     query = {'_id': connection_id, 'session_lock': lock}
     cookies = None
